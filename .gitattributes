@@ -1,0 +1,11 @@
+# Enforce LF line endings across platforms.
+* text=auto eol=lf
+
+*.md text
+
+# Binary assets keep their own bytes.
+*.png binary
+*.jpg binary
+*.ico binary
+*.wav binary
+*.ogg binary

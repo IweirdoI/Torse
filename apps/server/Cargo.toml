@@ -3,3 +3,9 @@ name = "torse-server"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+crc32c = "=0.6.8"
+torse-codec = { path = "../../crates/codec" }
+torse-storage = { path = "../../crates/storage" }
+torse-types = { path = "../../crates/types" }

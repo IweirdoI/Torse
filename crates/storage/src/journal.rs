@@ -57,7 +57,8 @@ pub struct JournalConfig {
 }
 
 impl JournalConfig {
-    fn validate(self) -> Result<(), Fault> {
+    /// Validate local queue policy before a host opens or repairs world data.
+    pub fn validate(self) -> Result<(), Fault> {
         if self.max_pending_records == 0
             || self.max_pending_bytes < record::OVERHEAD_BYTES as u64
             || self.codec_budget.max_items == 0

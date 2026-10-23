@@ -59,7 +59,7 @@ impl JournalBackend for MemoryBackend {
 /// Owns an exclusively locked file for the entire journal lifetime.
 ///
 /// The per-file lock prevents two journal instances from writing the same file. The broader
-/// world-directory lock and atomic checkpoint/manifest publication belong to later stages.
+/// application owns the broader world-directory lease; checkpoints use a separate backend.
 #[derive(Debug)]
 pub struct FileBackend {
     pub(crate) file: File,

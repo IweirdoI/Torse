@@ -23,7 +23,8 @@ pub struct CheckpointConfig {
 }
 
 impl CheckpointConfig {
-    fn validate(self) -> Result<(), Fault> {
+    /// Validate local retention policy before a host opens or repairs world data.
+    pub fn validate(self) -> Result<(), Fault> {
         if self.max_manifest_bytes < manifest::ENTRY_BYTES as u64 || self.max_snapshot_files < 2 {
             return Err(Fault::invalid_data(
                 "checkpoint policy must fit a manifest and two snapshots",
@@ -74,6 +75,8 @@ pub struct Checkpoints<M: AuthorityData, C, B> {
     manifest_bytes: u64,
     next_generation: u64,
     stopped: bool,
+    active: bool,
+    incomplete_tail: bool,
     model: PhantomData<fn() -> M>,
 }
 
@@ -82,6 +85,20 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: CheckpointBackend> Checkpoints<M, 
     /// is authoritative; a missing or corrupt referenced snapshot never triggers fallback.
     /// Orphans are retained until explicit pruning, and their generation numbers are skipped.
     pub fn open(
+        binding: Binding,
+        codec: C,
+        config: CheckpointConfig,
+        backend: B,
+    ) -> Result<Self, Fault> {
+        let mut store = Self::inspect(binding, codec, config, backend)?;
+        store.activate()?;
+        Ok(store)
+    }
+
+    /// Validate without repairing or synchronizing storage. Startup uses this phase while
+    /// an isolated authority builder checks domain invariants. Publication and pruning stay
+    /// disabled until activation succeeds, so a rejected world leaves both data tails intact.
+    pub fn inspect(
         binding: Binding,
         codec: C,
         config: CheckpointConfig,
@@ -109,16 +126,36 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: CheckpointBackend> Checkpoints<M, 
             manifest_bytes: valid_bytes as u64,
             next_generation,
             stopped: false,
+            active: false,
+            incomplete_tail: valid_bytes != bytes.len(),
             model: PhantomData,
         };
         store.load_current()?;
+        Ok(store)
+    }
+
+    /// Repair only a previously validated incomplete suffix and establish the barrier
+    /// before this instance may publish or delete files. Repeated activation is harmless.
+    pub fn activate(&mut self) -> Result<(), Fault> {
+        self.ensure_running()?;
+        if self.active {
+            return Ok(());
+        }
         // Even an intact prefix must pass a synchronization barrier before this instance
         // publishes or prunes. A complete last entry may have survived a failed prior sync.
-        if valid_bytes != bytes.len() {
-            store.backend.truncate_manifest(valid_bytes as u64)?;
+        let result = (|| {
+            if self.incomplete_tail {
+                self.backend.truncate_manifest(self.manifest_bytes)?;
+            }
+            self.backend.sync_manifest()
+        })();
+        if let Err(error) = result {
+            self.stopped = true;
+            return Err(error);
         }
-        store.backend.sync_manifest()?;
-        Ok(store)
+        self.active = true;
+        self.incomplete_tail = false;
+        Ok(())
     }
 
     pub fn current(&self) -> Option<CheckpointManifest> {
@@ -149,7 +186,7 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: CheckpointBackend> Checkpoints<M, 
     /// Retained predecessors are maintenance data, not an automatic recovery fallback.
     /// A cleanup failure stops the instance; the active snapshot is never a deletion target.
     pub fn prune(&mut self, retain: usize) -> Result<CheckpointRetention, Fault> {
-        self.ensure_running()?;
+        self.ensure_active()?;
         if retain == 0 {
             return Err(Fault::invalid_data(
                 "retain at least one published checkpoint",
@@ -199,6 +236,17 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: CheckpointBackend> Checkpoints<M, 
         Ok(())
     }
 
+    fn ensure_active(&self) -> Result<(), Fault> {
+        self.ensure_running()?;
+        if !self.active {
+            return Err(Fault::new(
+                FaultCode::InvalidState,
+                "checkpoint instance is not activated",
+            ));
+        }
+        Ok(())
+    }
+
     fn load(&mut self, entry: CheckpointManifest) -> Result<ModelSnapshot<M>, Fault> {
         let bytes = self
             .backend
@@ -239,7 +287,7 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: CheckpointBackend> CheckpointStore
         snapshot: &ModelSnapshot<M>,
         durable: Durability,
     ) -> Result<(), Fault> {
-        self.ensure_running()?;
+        self.ensure_active()?;
         manifest::validate_meta(snapshot.meta, self.binding)?;
         if durable.binding != self.binding || !durable.covers(snapshot.meta.cursor) {
             return Err(Fault::invalid_data(

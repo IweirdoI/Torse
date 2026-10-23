@@ -2634,6 +2634,12 @@ dependencies = [
 [[package]]
 name = "torse-server"
 version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "torse-codec",
+ "torse-storage",
+ "torse-types",
+]
 
 [[package]]
 name = "torse-sim"

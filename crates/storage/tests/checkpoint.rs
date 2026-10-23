@@ -760,6 +760,58 @@ fn invalid_policy_and_memory_capacity_are_explicit_failures() {
 }
 
 #[test]
+fn inspection_preserves_torn_tail_until_explicit_activation() {
+    let mut initial = memory();
+    initial
+        .publish_checkpoint(&snapshot(0), durable(0))
+        .unwrap();
+    let mut backend = initial.into_backend();
+    backend.append_manifest(b"TOR").unwrap();
+    let original = backend.read_manifest(4096).unwrap();
+    let mut inspected =
+        Checkpoints::<TestModel, _, _>::inspect(binding(), TestCodec::new(), policy(), backend)
+            .unwrap();
+    assert_eq!(
+        inspected.load_current().unwrap().unwrap().meta.cursor,
+        cursor(0)
+    );
+    assert!(
+        inspected
+            .publish_checkpoint(&snapshot(1), durable(1))
+            .is_err()
+    );
+    assert!(inspected.prune(1).is_err());
+    let mut backend = inspected.into_backend();
+    assert_eq!(backend.read_manifest(4096).unwrap(), original);
+    let mut store =
+        Checkpoints::<TestModel, _, _>::inspect(binding(), TestCodec::new(), policy(), backend)
+            .unwrap();
+    store.activate().unwrap();
+    store.activate().unwrap();
+    store.publish_checkpoint(&snapshot(1), durable(1)).unwrap();
+}
+
+#[test]
+fn activation_barrier_failure_permanently_stops_the_inspected_instance() {
+    let source = seeded(Failure::None).into_backend();
+    // A valid third publication is obtained through the same tested writer before the
+    // injected opening barrier fails. No malformed history is needed to trigger this case.
+    let mut store =
+        Checkpoints::<TestModel, _, _>::open(binding(), TestCodec::new(), policy(), source)
+            .unwrap();
+    store.publish_checkpoint(&snapshot(3), durable(3)).unwrap();
+    let mut backend = store.into_backend();
+    backend.failure = Failure::ManifestSync;
+    let mut inspected =
+        Checkpoints::<TestModel, _, _>::inspect(binding(), TestCodec::new(), policy(), backend)
+            .unwrap();
+    assert!(inspected.activate().is_err());
+    assert!(inspected.is_stopped());
+    assert!(inspected.activate().is_err());
+    assert!(inspected.load_current().is_err());
+}
+
+#[test]
 fn checkpoint_and_contiguous_journal_suffix_restore_the_expected_position() {
     use std::io::Cursor;
     use torse_storage::{CommitJournal, MemoryBackend, MemoryJournal, scan_journal};

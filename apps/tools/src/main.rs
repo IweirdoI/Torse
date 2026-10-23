@@ -11,6 +11,7 @@ use torse_content::{compile, m0_fixture_pack};
 use torse_modules::resolve_modules;
 use torse_types::Digest;
 
+mod commit_scenario;
 mod scenario;
 
 fn main() -> ExitCode {
@@ -18,18 +19,37 @@ fn main() -> ExitCode {
     match command.as_str() {
         "content-fixture" => content_fixture(),
         "m1-scenario" => m1_scenario(),
+        "commit-scenario" => commit_scenario(),
         "ecs-probe" => ecs_probe(),
         "wasm-probe" => wasm_probe(),
         "gpu-probe" => gpu_probe(),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: torse-tools <content-fixture|m1-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
+                "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
                  experimental probes require their matching cargo feature"
             );
             ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown command: {other}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn commit_scenario() -> ExitCode {
+    match commit_scenario::run() {
+        Ok(report) => {
+            println!("committed={}", report.committed);
+            println!("conflicts={}", report.conflicts);
+            println!("commit_seq={}", report.commit_seq);
+            println!("winner_seq={}", report.winner_seq);
+            println!("contested_state={}", report.contested_state);
+            println!("unrelated_committed={}", report.unrelated_committed);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("commit scenario failed: {error}");
             ExitCode::FAILURE
         }
     }

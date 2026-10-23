@@ -17,7 +17,9 @@ torse-mod-host = { path = "../../crates/mod_host" }
 torse-modules = { path = "../../crates/modules" }
 torse-render = { path = "../../crates/render" }
 torse-runtime = { path = "../../crates/runtime" }
+torse-sim = { path = "../../crates/sim" }
 torse-types = { path = "../../crates/types" }
 torse-world = { path = "../../crates/world" }
 torse-world-services = { path = "../../crates/world_services" }
+
 

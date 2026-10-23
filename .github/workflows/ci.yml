@@ -24,6 +24,8 @@ jobs:
         run: cargo run -p torse-tools -- content-fixture
       - name: M1 scenario
         run: cargo run -p torse-tools -- m1-scenario
+      - name: Commit arbitration scenario
+        run: cargo run -p torse-tools -- commit-scenario
 
   experiments:
     runs-on: macos-latest

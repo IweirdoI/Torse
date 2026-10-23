@@ -23,6 +23,7 @@ const END_MAGIC: [u8; 4] = *b"TEND";
 pub enum RecordKind {
     Commit = 1,
     Snapshot = 2,
+    Manifest = 3,
 }
 
 /// A validated header permits bounded allocation before reading the payload.
@@ -78,6 +79,7 @@ pub fn read_header(input: &[u8], limits: CodecLimits) -> EncodeResult<Option<Rec
         match u16::from_le_bytes([input[10], input[11]]) {
             1 => RecordKind::Commit,
             2 => RecordKind::Snapshot,
+            3 => RecordKind::Manifest,
             _ => {
                 return Err(Fault::new(
                     FaultCode::Incompatible,

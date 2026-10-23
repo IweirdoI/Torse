@@ -2648,6 +2648,7 @@ dependencies = [
 name = "torse-storage"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "torse-codec",
  "torse-types",
 ]

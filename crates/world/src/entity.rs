@@ -1,0 +1,465 @@
+//! Entity storage with a per-section spatial index.
+//!
+//! Entities have two identities. The persistent [`EntityId`] is what saves and
+//! network messages may reference; the runtime [`EntityHandle`] is a slot plus
+//! generation and becomes invalid the moment the slot is reused. This split is
+//! what lets a delayed task or an old packet fail cleanly instead of reaching a
+//! different entity.
+//!
+//! The spatial index maps a section to the entities whose position falls inside
+//! it. It is maintained by this store rather than by callers: moving an entity
+//! through the API updates the index in the same call, so the index cannot drift
+//! when a system forgets a step.
+
+use std::collections::BTreeMap;
+
+use torse_types::{BlockPos, EntityHandle, EntityId, SectionPos};
+
+use crate::component::ComponentSet;
+use crate::section::MAX_SECTION_SIDE;
+
+/// Fractional world position of an entity.
+///
+/// Coordinates are absolute block units. The client converts to camera-relative
+/// floats when it submits geometry; the authority keeps absolute values so
+/// collision, distance checks, and replication share one meaning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Position {
+    /// World x in block units.
+    pub x: f64,
+    /// World y in block units.
+    pub y: f64,
+    /// World z in block units.
+    pub z: f64,
+}
+
+impl Position {
+    /// Construct a position without validation.
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Return whether every component is finite.
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+
+    /// Translate by a delta.
+    pub fn translated(self, delta: [f64; 3]) -> Self {
+        Self::new(self.x + delta[0], self.y + delta[1], self.z + delta[2])
+    }
+
+    /// Floor position to the containing block cell.
+    pub fn block(self) -> BlockPos {
+        BlockPos::new(
+            self.x.floor() as i64,
+            self.y.floor() as i64,
+            self.z.floor() as i64,
+        )
+    }
+
+    /// Section that contains this position, given a section side.
+    pub fn section(self, side: u32) -> Option<SectionPos> {
+        let block = self.block();
+        block.to_section(side).ok().map(|(section, _)| section)
+    }
+}
+
+/// One stored entity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entity {
+    /// Persistent identity stable across save and reload.
+    pub id: EntityId,
+    /// Current world position.
+    pub position: Position,
+    /// Bounded components owned by modules.
+    pub components: ComponentSet,
+}
+
+#[derive(Debug)]
+struct Slot {
+    generation: u32,
+    entity: Option<Entity>,
+}
+
+/// Entity table with a section index.
+#[derive(Debug)]
+pub struct EntityStore {
+    side: u32,
+    slots: Vec<Slot>,
+    free: Vec<u32>,
+    index: BTreeMap<SectionPos, Vec<u32>>,
+    next_id: u128,
+    live: usize,
+}
+
+impl EntityStore {
+    /// Create an empty store for a section side.
+    pub fn new(side: u32) -> Result<Self, EntityError> {
+        if side == 0 || side > MAX_SECTION_SIDE {
+            return Err(EntityError::InvalidSide { side });
+        }
+        Ok(Self {
+            side,
+            slots: Vec::new(),
+            free: Vec::new(),
+            index: BTreeMap::new(),
+            next_id: 1,
+            live: 0,
+        })
+    }
+
+    /// Section side used by the spatial index.
+    pub const fn side(&self) -> u32 {
+        self.side
+    }
+
+    /// Spawn an entity at a position.
+    pub fn spawn(&mut self, position: Position) -> Result<EntityHandle, EntityError> {
+        if !position.is_finite() {
+            return Err(EntityError::InvalidPosition);
+        }
+        let id = EntityId(self.next_id);
+        id.validate().map_err(|_| EntityError::IdExhausted)?;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(EntityError::IdExhausted)?;
+
+        let section = position
+            .section(self.side)
+            .ok_or(EntityError::InvalidPosition)?;
+        let entity = Entity {
+            id,
+            position,
+            components: ComponentSet::new(),
+        };
+        let (slot_index, generation) = match self.free.pop() {
+            Some(index) => {
+                let slot = &mut self.slots[index as usize];
+                debug_assert!(slot.entity.is_none());
+                slot.entity = Some(entity);
+                (index, slot.generation)
+            }
+            None => {
+                let index =
+                    u32::try_from(self.slots.len()).map_err(|_| EntityError::IdExhausted)?;
+                self.slots.push(Slot {
+                    generation: 1,
+                    entity: Some(entity),
+                });
+                (index, 1)
+            }
+        };
+        self.index.entry(section).or_default().push(slot_index);
+        if let Some(list) = self.index.get_mut(&section) {
+            list.sort_unstable();
+        }
+        self.live += 1;
+        Ok(EntityHandle {
+            slot: slot_index,
+            generation,
+        })
+    }
+
+    /// Remove an entity and invalidate its handle.
+    pub fn despawn(&mut self, handle: EntityHandle) -> Option<Entity> {
+        let slot = self.slots.get_mut(handle.slot as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        let entity = slot.entity.take()?;
+        if let Some(section) = entity.position.section(self.side) {
+            let empty = match self.index.get_mut(&section) {
+                Some(list) => {
+                    list.retain(|index| *index != handle.slot);
+                    list.is_empty()
+                }
+                None => false,
+            };
+            if empty {
+                self.index.remove(&section);
+            }
+        }
+        if slot.generation < u32::MAX {
+            slot.generation += 1;
+            self.free.push(handle.slot);
+        }
+        self.live -= 1;
+        Some(entity)
+    }
+
+    /// Borrow an entity by handle.
+    pub fn get(&self, handle: EntityHandle) -> Option<&Entity> {
+        let slot = self.slots.get(handle.slot as usize)?;
+        (slot.generation == handle.generation)
+            .then_some(slot.entity.as_ref())
+            .flatten()
+    }
+
+    /// Mutate the component set of an entity.
+    pub fn components_mut(&mut self, handle: EntityHandle) -> Option<&mut ComponentSet> {
+        let slot = self.slots.get_mut(handle.slot as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        slot.entity.as_mut().map(|entity| &mut entity.components)
+    }
+
+    /// Move an entity and update the index.
+    pub fn move_to(&mut self, handle: EntityHandle, position: Position) -> Result<(), EntityError> {
+        if !position.is_finite() {
+            return Err(EntityError::InvalidPosition);
+        }
+        let new_section = position
+            .section(self.side)
+            .ok_or(EntityError::InvalidPosition)?;
+        let old_section = {
+            let slot = self
+                .slots
+                .get_mut(handle.slot as usize)
+                .ok_or(EntityError::StaleHandle)?;
+            if slot.generation != handle.generation {
+                return Err(EntityError::StaleHandle);
+            }
+            let entity = slot.entity.as_mut().ok_or(EntityError::StaleHandle)?;
+            let old = entity.position.section(self.side);
+            entity.position = position;
+            old
+        };
+        if old_section == Some(new_section) {
+            return Ok(());
+        }
+        if let Some(section) = old_section {
+            let empty = match self.index.get_mut(&section) {
+                Some(list) => {
+                    list.retain(|index| *index != handle.slot);
+                    list.is_empty()
+                }
+                None => false,
+            };
+            if empty {
+                self.index.remove(&section);
+            }
+        }
+        let list = self.index.entry(new_section).or_default();
+        list.push(handle.slot);
+        list.sort_unstable();
+        Ok(())
+    }
+
+    /// Handles of entities whose position falls inside a section.
+    pub fn entities_in_section(
+        &self,
+        section: SectionPos,
+    ) -> impl Iterator<Item = EntityHandle> + '_ {
+        let slots = &self.slots;
+        self.index
+            .get(&section)
+            .into_iter()
+            .flat_map(move |indices| indices.iter())
+            .filter_map(move |index| {
+                let slot = slots.get(*index as usize)?;
+                slot.entity.as_ref().map(|_| EntityHandle {
+                    slot: *index,
+                    generation: slot.generation,
+                })
+            })
+    }
+
+    /// Number of live entities.
+    pub fn len(&self) -> usize {
+        self.live
+    }
+
+    /// Return whether no entity is live.
+    pub fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// Iterate live entities with their handles, ordered by slot.
+    pub fn iter(&self) -> impl Iterator<Item = (EntityHandle, &Entity)> {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            slot.entity.as_ref().map(|entity| {
+                (
+                    EntityHandle {
+                        slot: index as u32,
+                        generation: slot.generation,
+                    },
+                    entity,
+                )
+            })
+        })
+    }
+
+    /// Number of entries in the spatial index, used by consistency checks.
+    pub fn indexed_count(&self) -> usize {
+        self.index.values().map(Vec::len).sum()
+    }
+}
+
+/// Failure produced by entity storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityError {
+    /// The section side is outside the supported range.
+    InvalidSide {
+        /// Requested side.
+        side: u32,
+    },
+    /// A position was not finite or could not be converted to a section.
+    InvalidPosition,
+    /// The handle is stale or was never issued.
+    StaleHandle,
+    /// The persistent identifier space is exhausted.
+    IdExhausted,
+}
+
+impl std::fmt::Display for EntityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSide { side } => write!(f, "section side {side} is not supported"),
+            Self::InvalidPosition => write!(f, "entity position is not finite"),
+            Self::StaleHandle => write!(f, "entity handle is stale"),
+            Self::IdExhausted => write!(f, "entity id space exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for EntityError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::ComponentSchemas;
+    use torse_content::{compile, m0_fixture_pack};
+    use torse_types::ContentKey;
+
+    fn key(value: &str) -> ContentKey {
+        ContentKey::parse(value).expect("test key is valid")
+    }
+
+    fn store() -> EntityStore {
+        EntityStore::new(16).expect("side is valid")
+    }
+
+    #[test]
+    fn spawn_assigns_persistent_ids_and_handles() {
+        let mut store = store();
+        let first = store
+            .spawn(Position::new(0.5, 0.5, 0.5))
+            .expect("spawn works");
+        let second = store
+            .spawn(Position::new(1.5, 0.5, 0.5))
+            .expect("spawn works");
+        assert_eq!(store.get(first).map(|entity| entity.id), Some(EntityId(1)));
+        assert_eq!(store.get(second).map(|entity| entity.id), Some(EntityId(2)));
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.indexed_count(), 2);
+    }
+
+    #[test]
+    fn despawn_invalidates_the_handle_and_reuse_bumps_generation() {
+        let mut store = store();
+        let old = store
+            .spawn(Position::new(0.5, 0.5, 0.5))
+            .expect("spawn works");
+        assert!(store.despawn(old).is_some());
+        assert!(store.get(old).is_none());
+        let reused = store
+            .spawn(Position::new(2.5, 0.5, 0.5))
+            .expect("spawn works");
+        assert_eq!(reused.slot, old.slot);
+        assert_ne!(reused.generation, old.generation);
+        assert!(store.get(old).is_none());
+        assert!(store.get(reused).is_some());
+        assert_eq!(store.indexed_count(), 1);
+    }
+
+    #[test]
+    fn moving_across_a_section_boundary_updates_the_index() {
+        let mut store = store();
+        let handle = store
+            .spawn(Position::new(15.5, 0.5, 0.5))
+            .expect("spawn works");
+        assert_eq!(store.entities_in_section(SectionPos::ZERO).count(), 1);
+        store
+            .move_to(handle, Position::new(16.5, 0.5, 0.5))
+            .expect("move works");
+        assert_eq!(store.entities_in_section(SectionPos::ZERO).count(), 0);
+        assert_eq!(
+            store.entities_in_section(SectionPos::new(1, 0, 0)).count(),
+            1
+        );
+        assert_eq!(store.indexed_count(), 1);
+    }
+
+    #[test]
+    fn negative_positions_use_negative_sections() {
+        let mut store = store();
+        let handle = store
+            .spawn(Position::new(-0.5, 0.5, -17.5))
+            .expect("spawn works");
+        assert_eq!(
+            store
+                .entities_in_section(SectionPos::new(-1, 0, -2))
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.get(handle).map(|entity| entity.position.block()),
+            Some(BlockPos::new(-1, 0, -18))
+        );
+    }
+
+    #[test]
+    fn invalid_positions_are_rejected() {
+        let mut store = store();
+        assert_eq!(
+            store.spawn(Position::new(f64::NAN, 0.0, 0.0)),
+            Err(EntityError::InvalidPosition)
+        );
+        let handle = store
+            .spawn(Position::new(0.5, 0.5, 0.5))
+            .expect("spawn works");
+        assert_eq!(
+            store.move_to(handle, Position::new(0.0, f64::INFINITY, 0.0)),
+            Err(EntityError::InvalidPosition)
+        );
+    }
+
+    #[test]
+    fn components_follow_the_entity_and_survive_moves() {
+        let mut store = store();
+        let handle = store
+            .spawn(Position::new(0.5, 0.5, 0.5))
+            .expect("spawn works");
+        let content = compile(m0_fixture_pack()).expect("fixture content compiles");
+        let schemas = ComponentSchemas::build(&content);
+        let schema = key("base:schema/inventory_content");
+        store
+            .components_mut(handle)
+            .expect("entity exists")
+            .insert(&schemas, &schema, Default::default())
+            .expect("component is valid");
+        store
+            .move_to(handle, Position::new(40.5, 0.5, 0.5))
+            .expect("move works");
+        let entity = store.get(handle).expect("entity exists");
+        assert_eq!(entity.components.len(), 1);
+        assert_eq!(entity.position.block(), BlockPos::new(40, 0, 0));
+    }
+
+    #[test]
+    fn stale_handle_cannot_move_or_mutate() {
+        let mut store = store();
+        let handle = store
+            .spawn(Position::new(0.5, 0.5, 0.5))
+            .expect("spawn works");
+        store.despawn(handle);
+        assert_eq!(
+            store.move_to(handle, Position::new(1.5, 0.5, 0.5)),
+            Err(EntityError::StaleHandle)
+        );
+        assert!(store.components_mut(handle).is_none());
+    }
+}

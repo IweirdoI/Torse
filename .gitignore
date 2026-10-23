@@ -11,3 +11,9 @@ desktop.ini
 # Local scratch files
 *.log
 *.tmp
+
+# Rust build output
+/target/
+
+# Workspace scratch files
+/.work/

@@ -6,7 +6,9 @@
 //! the final design allows, but it is a correct one, and it gives parallel
 //! execution something to compare against later.
 
-use torse_types::{CommitSeq, ContentKey, Tick, TransactionOutcome, TransactionResult, WorldId};
+use torse_types::{
+    CommitSeq, ContentKey, ResumePoint, Tick, TransactionOutcome, TransactionResult, WorldId,
+};
 use torse_world::{EntityStore, SectionStore};
 
 use crate::clock::{TickClock, TickReport};
@@ -195,6 +197,15 @@ impl Simulation {
                 phase_transactions.push(transaction);
             }
 
+            // The resume point recorded by these commits is "this phase, first
+            // step": after a crash the world replays this phase from the state
+            // committed at the end of the previous phase.
+            self.coordinator.set_resume_point(ResumePoint {
+                tick,
+                next_phase: phase.index_u16(),
+                next_step: 0,
+            });
+
             let phase_results = self
                 .coordinator
                 .commit_ordered(store, phase_transactions)
@@ -208,7 +219,14 @@ impl Simulation {
         }
 
         let report = self.clock.finish(elapsed_ms);
-        self.clock.advance().ok_or(SimulationError::TickExhausted)?;
+        let next_tick = self.clock.advance().ok_or(SimulationError::TickExhausted)?;
+        // After the publish phase the next authority work is the input phase of
+        // the following tick.
+        self.coordinator.set_resume_point(ResumePoint {
+            tick: next_tick,
+            next_phase: Phase::Input.index_u16(),
+            next_step: 0,
+        });
         Ok(TickOutcome {
             tick,
             committed: results.len() - rejected,

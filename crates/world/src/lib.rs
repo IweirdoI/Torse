@@ -25,6 +25,6 @@ pub use section::{
     DEFAULT_SECTION_SIDE, MAX_SECTION_SIDE, Section, SectionError, SectionStorage, linear_index,
 };
 pub use store::{
-    SectionPhase, SectionStore, StoreError, StoreStats, TICKET_QUOTA_PER_KIND, TerrainQuery,
-    TicketHandle, TicketKind, WorldBounds,
+    BlockEdit, SectionPhase, SectionStore, StoreError, StoreStats, TICKET_QUOTA_PER_KIND,
+    TerrainQuery, TicketHandle, TicketKind, WorldBounds,
 };

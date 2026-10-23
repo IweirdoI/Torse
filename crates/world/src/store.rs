@@ -368,6 +368,104 @@ impl SectionStore {
         Ok(entry.section.revision())
     }
 
+    /// Apply a group of cell edits as one all-or-nothing group.
+    ///
+    /// Every target is validated before the first write, so a missing section or
+    /// an out-of-range coordinate cannot leave half a transaction applied. The
+    /// call is not a transaction in the simulation sense: it neither checks
+    /// preconditions nor assigns a commit sequence. The coordinator does that
+    /// before calling here.
+    pub fn apply_edits(
+        &mut self,
+        edits: &[BlockEdit],
+    ) -> Result<Vec<(SectionPos, Revision)>, StoreError> {
+        let mut touched: Vec<SectionPos> = Vec::new();
+        for edit in edits {
+            if !self.bounds.contains_y(edit.pos.y) {
+                return Err(StoreError::OutOfBounds { pos: edit.pos });
+            }
+            let (section_pos, _) = edit
+                .pos
+                .to_section(self.side)
+                .map_err(|_| StoreError::OutOfBounds { pos: edit.pos })?;
+            let entry = self
+                .sections
+                .get(&section_pos)
+                .ok_or(StoreError::NotLoaded { pos: section_pos })?;
+            match entry.phase {
+                SectionPhase::Ready | SectionPhase::Active => {}
+                phase => {
+                    return Err(StoreError::NotEditable {
+                        pos: section_pos,
+                        phase,
+                    });
+                }
+            }
+            if !touched.contains(&section_pos) {
+                touched.push(section_pos);
+            }
+        }
+
+        for edit in edits {
+            let (section_pos, local) = edit
+                .pos
+                .to_section(self.side)
+                .map_err(|_| StoreError::OutOfBounds { pos: edit.pos })?;
+            let entry = self
+                .sections
+                .get_mut(&section_pos)
+                .ok_or(StoreError::NotLoaded { pos: section_pos })?;
+            entry.section.set(local, edit.state)?;
+        }
+
+        touched.sort();
+        let mut revisions = Vec::with_capacity(touched.len());
+        for section_pos in touched {
+            let entry = self
+                .sections
+                .get(&section_pos)
+                .ok_or(StoreError::NotLoaded { pos: section_pos })?;
+            revisions.push((section_pos, entry.section.revision()));
+        }
+        Ok(revisions)
+    }
+
+    /// Place a block only when the target cell is currently empty.
+    pub fn place(&mut self, pos: BlockPos, state: BlockStateId) -> Result<Revision, StoreError> {
+        if state.is_empty() {
+            return Err(StoreError::InvalidPlacement { pos });
+        }
+        match self.query(pos) {
+            TerrainQuery::Ready(current) if current.is_empty() => self.edit(pos, state),
+            TerrainQuery::Ready(_) => Err(StoreError::Occupied { pos }),
+            TerrainQuery::NotLoaded => Err(StoreError::NotLoaded {
+                pos: self.section_of(pos)?,
+            }),
+            TerrainQuery::OutOfBounds => Err(StoreError::OutOfBounds { pos }),
+        }
+    }
+
+    /// Remove the block in a cell only when the cell is currently occupied.
+    pub fn break_block(&mut self, pos: BlockPos) -> Result<(BlockStateId, Revision), StoreError> {
+        match self.query(pos) {
+            TerrainQuery::Ready(current) if !current.is_empty() => {
+                let revision = self.edit(pos, BlockStateId::EMPTY)?;
+                Ok((current, revision))
+            }
+            TerrainQuery::Ready(_) => Err(StoreError::EmptyCell { pos }),
+            TerrainQuery::NotLoaded => Err(StoreError::NotLoaded {
+                pos: self.section_of(pos)?,
+            }),
+            TerrainQuery::OutOfBounds => Err(StoreError::OutOfBounds { pos }),
+        }
+    }
+
+    fn section_of(&self, pos: BlockPos) -> Result<SectionPos, StoreError> {
+        pos.to_section(self.side)
+            .map(|(section, _)| section)
+            .map_err(|_| StoreError::OutOfBounds { pos })
+    }
+
     /// Terrain revision of a section, if it has data.
     pub fn revision(&self, pos: SectionPos) -> Option<Revision> {
         self.sections
@@ -522,8 +620,37 @@ pub enum StoreError {
         /// Number of outstanding tickets.
         tickets: u32,
     },
+    /// The section has no authoritative data.
+    NotLoaded {
+        /// Section that is absent or still loading.
+        pos: SectionPos,
+    },
+    /// A placement target already contains a block.
+    Occupied {
+        /// Target coordinate.
+        pos: BlockPos,
+    },
+    /// A break target contains no block.
+    EmptyCell {
+        /// Target coordinate.
+        pos: BlockPos,
+    },
+    /// A placement requested the empty sentinel as the new state.
+    InvalidPlacement {
+        /// Target coordinate.
+        pos: BlockPos,
+    },
     /// Section storage rejected the operation.
     Section(SectionError),
+}
+
+/// One authoritative cell edit, used by batch apply and by commit records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockEdit {
+    /// Cell coordinate.
+    pub pos: BlockPos,
+    /// State to write.
+    pub state: BlockStateId,
 }
 
 impl std::fmt::Display for StoreError {
@@ -575,6 +702,28 @@ impl std::fmt::Display for StoreError {
             Self::TicketsHeld { pos, tickets } => write!(
                 f,
                 "section [{}, {}, {}] still holds {tickets} tickets",
+                pos.x, pos.y, pos.z
+            ),
+            Self::NotLoaded { pos } => write!(
+                f,
+                "section [{}, {}, {}] has no authoritative data",
+                pos.x, pos.y, pos.z
+            ),
+            Self::Occupied { pos } => write!(
+                f,
+                "block [{}, {}, {}] is already occupied",
+                pos.x, pos.y, pos.z
+            ),
+            Self::EmptyCell { pos } => {
+                write!(
+                    f,
+                    "block [{}, {}, {}] is already empty",
+                    pos.x, pos.y, pos.z
+                )
+            }
+            Self::InvalidPlacement { pos } => write!(
+                f,
+                "placement at [{}, {}, {}] requested the empty sentinel",
                 pos.x, pos.y, pos.z
             ),
             Self::Section(error) => write!(f, "{error}"),
@@ -762,5 +911,102 @@ mod tests {
             .expect("conversion succeeds");
         assert_eq!(section, SectionPos::new(-1, 0, -2));
         assert_eq!(local, LocalPos { x: 15, y: 5, z: 15 });
+    }
+
+    #[test]
+    fn placement_requires_an_empty_target() {
+        let mut store = store();
+        ready(&mut store, SectionPos::ZERO, BlockStateId::EMPTY);
+        store
+            .place(BlockPos::new(1, 2, 3), BlockStateId(7))
+            .expect("place succeeds");
+        assert!(matches!(
+            store.place(BlockPos::new(1, 2, 3), BlockStateId(8)),
+            Err(StoreError::Occupied { .. })
+        ));
+        assert!(matches!(
+            store.place(BlockPos::new(2, 2, 3), BlockStateId::EMPTY),
+            Err(StoreError::InvalidPlacement { .. })
+        ));
+        assert_eq!(
+            store.query(BlockPos::new(1, 2, 3)),
+            TerrainQuery::Ready(BlockStateId(7)),
+            "a failed placement must not change the cell"
+        );
+    }
+
+    #[test]
+    fn break_requires_an_occupied_cell() {
+        let mut store = store();
+        ready(&mut store, SectionPos::ZERO, BlockStateId::EMPTY);
+        assert!(matches!(
+            store.break_block(BlockPos::new(1, 2, 3)),
+            Err(StoreError::EmptyCell { .. })
+        ));
+        store
+            .edit(BlockPos::new(1, 2, 3), BlockStateId(4))
+            .expect("edit succeeds");
+        let (previous, _) = store
+            .break_block(BlockPos::new(1, 2, 3))
+            .expect("break succeeds");
+        assert_eq!(previous, BlockStateId(4));
+        assert_eq!(
+            store.query(BlockPos::new(1, 2, 3)),
+            TerrainQuery::Ready(BlockStateId::EMPTY)
+        );
+    }
+
+    #[test]
+    fn batch_apply_writes_nothing_when_any_target_is_missing() {
+        let mut store = store();
+        ready(&mut store, SectionPos::ZERO, BlockStateId::EMPTY);
+        let edits = [
+            BlockEdit {
+                pos: BlockPos::new(1, 1, 1),
+                state: BlockStateId(3),
+            },
+            // This one belongs to a section that was never loaded.
+            BlockEdit {
+                pos: BlockPos::new(40, 1, 1),
+                state: BlockStateId(3),
+            },
+        ];
+        assert!(matches!(
+            store.apply_edits(&edits),
+            Err(StoreError::NotLoaded { .. })
+        ));
+        assert_eq!(
+            store.query(BlockPos::new(1, 1, 1)),
+            TerrainQuery::Ready(BlockStateId::EMPTY),
+            "validation must run before the first write"
+        );
+    }
+
+    #[test]
+    fn batch_apply_reports_touched_sections_once() {
+        let mut store = store();
+        ready(&mut store, SectionPos::ZERO, BlockStateId::EMPTY);
+        let edits = [
+            BlockEdit {
+                pos: BlockPos::new(1, 1, 1),
+                state: BlockStateId(3),
+            },
+            BlockEdit {
+                pos: BlockPos::new(2, 1, 1),
+                state: BlockStateId(4),
+            },
+            BlockEdit {
+                pos: BlockPos::new(1, 1, 1),
+                state: BlockStateId(5),
+            },
+        ];
+        let touched = store.apply_edits(&edits).expect("edits are applied");
+        assert_eq!(touched.len(), 1);
+        assert_eq!(touched[0].0, SectionPos::ZERO);
+        assert_eq!(
+            store.query(BlockPos::new(1, 1, 1)),
+            TerrainQuery::Ready(BlockStateId(5)),
+            "later edits in the same batch win"
+        );
     }
 }

@@ -13,6 +13,7 @@ use torse_types::Digest;
 
 mod commit_scenario;
 mod scenario;
+mod tick_scenario;
 
 fn main() -> ExitCode {
     let command = std::env::args().nth(1).unwrap_or_else(|| "help".to_owned());
@@ -20,18 +21,39 @@ fn main() -> ExitCode {
         "content-fixture" => content_fixture(),
         "m1-scenario" => m1_scenario(),
         "commit-scenario" => commit_scenario(),
+        "tick-scenario" => tick_scenario(),
         "ecs-probe" => ecs_probe(),
         "wasm-probe" => wasm_probe(),
         "gpu-probe" => gpu_probe(),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
+                "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|tick-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
                  experimental probes require their matching cargo feature"
             );
             ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown command: {other}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn tick_scenario() -> ExitCode {
+    match tick_scenario::run() {
+        Ok(report) => {
+            println!("ticks={}", report.ticks);
+            println!("committed={}", report.committed);
+            println!("rejected={}", report.rejected);
+            println!("commit_seq={}", report.commit_seq);
+            println!("overruns={}", report.overruns);
+            println!("entities={}", report.entities);
+            println!("moved_section_entities={}", report.moved_section_entities);
+            println!("contested_state={}", report.contested_state);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("tick scenario failed: {error}");
             ExitCode::FAILURE
         }
     }

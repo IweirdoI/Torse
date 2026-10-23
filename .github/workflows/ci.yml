@@ -26,6 +26,8 @@ jobs:
         run: cargo run -p torse-tools -- m1-scenario
       - name: Commit arbitration scenario
         run: cargo run -p torse-tools -- commit-scenario
+      - name: Tick scenario
+        run: cargo run -p torse-tools -- tick-scenario
 
   experiments:
     runs-on: macos-latest

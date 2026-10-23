@@ -13,6 +13,7 @@
 
 pub mod clock;
 pub mod coordinator;
+pub mod payload;
 pub mod phase;
 pub mod simulation;
 pub mod system;
@@ -22,6 +23,7 @@ pub use clock::{TickClock, TickReport};
 pub use coordinator::{
     CommitCoordinator, CommitFault, Committed, PrepareError, PreparedChange, Publication,
 };
+pub use payload::changes_from_committed;
 pub use phase::{OrderError, Phase, SystemSpec, order_phase};
 pub use simulation::{
     DEFAULT_PHASE_TRANSACTION_LIMIT, Simulation, SimulationError, SimulationLimits, TickOutcome,

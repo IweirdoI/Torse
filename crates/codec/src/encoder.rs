@@ -60,6 +60,11 @@ impl<'a> Encoder<'a> {
         self.write(&value.to_le_bytes())
     }
 
+    /// Write a two's-complement signed value in little-endian order.
+    pub fn write_i64(&mut self, value: i64) -> EncodeResult<()> {
+        self.write(&value.to_le_bytes())
+    }
+
     /// Write a u32 length prefix and the data, bounded by the configured field limit.
     pub fn write_field(&mut self, data: &[u8]) -> EncodeResult<()> {
         self.write_prefixed(data, self.limits.max_field_bytes, "field")

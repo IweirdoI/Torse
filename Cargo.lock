@@ -2559,7 +2559,9 @@ name = "torse-codec"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "torse-content",
  "torse-types",
+ "torse-world",
 ]
 
 [[package]]
@@ -2672,12 +2674,15 @@ dependencies = [
 name = "torse-tools"
 version = "0.1.0"
 dependencies = [
+ "torse-codec",
  "torse-content",
+ "torse-inventory",
  "torse-mod-host",
  "torse-modules",
  "torse-render",
  "torse-runtime",
  "torse-sim",
+ "torse-storage",
  "torse-types",
  "torse-world",
  "torse-world-services",

@@ -32,6 +32,8 @@ jobs:
         run: cargo run -p torse-tools -- exchange-scenario
       - name: Recovery scenario
         run: cargo run -p torse-tools -- recovery-scenario
+      - name: Persistence scenario
+        run: cargo run -p torse-tools -- persistence-scenario
 
   experiments:
     runs-on: macos-latest

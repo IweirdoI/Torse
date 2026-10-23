@@ -76,6 +76,11 @@ impl<'a> Decoder<'a> {
         Ok(u128::from_le_bytes(self.read_array()?))
     }
 
+    /// Read a two's-complement signed value in little-endian order.
+    pub fn read_i64(&mut self) -> EncodeResult<i64> {
+        Ok(i64::from_le_bytes(self.read_array()?))
+    }
+
     /// Read a u32 length prefix and the data, bounded by the configured field limit.
     pub fn read_field(&mut self) -> EncodeResult<&'a [u8]> {
         self.read_prefixed(self.limits.max_field_bytes, "field")

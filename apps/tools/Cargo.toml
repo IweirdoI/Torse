@@ -12,12 +12,15 @@ wasm-probe = ["torse-mod-host/wasm-probe"]
 experiments = ["ecs-probe", "gpu-probe", "wasm-probe"]
 
 [dependencies]
+torse-codec = { path = "../../crates/codec" }
 torse-content = { path = "../../crates/content" }
+torse-inventory = { path = "../../modules/inventory" }
 torse-mod-host = { path = "../../crates/mod_host" }
 torse-modules = { path = "../../crates/modules" }
 torse-render = { path = "../../crates/render" }
 torse-runtime = { path = "../../crates/runtime" }
 torse-sim = { path = "../../crates/sim" }
+torse-storage = { path = "../../crates/storage" }
 torse-types = { path = "../../crates/types" }
 torse-world = { path = "../../crates/world" }
 torse-world-services = { path = "../../crates/world_services" }

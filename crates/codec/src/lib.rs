@@ -2,6 +2,10 @@
 //!
 //! This module provides explicit field-based encoding for snapshots and commit records.
 //! Encoding must be deterministic, versioned, and respect budget constraints.
+//!
+//! The crate has two layers. The generic layer (`Encoder`, `Decoder`, budgets, `record`,
+//! `metadata`) knows nothing about the world. [`WorldCodec`] builds on it to encode the
+//! world exchange payloads; its byte layout is documented in `WORLD.md`.
 
 #![forbid(unsafe_code)]
 
@@ -14,10 +18,13 @@ pub mod metadata;
 pub mod record;
 mod registry;
 mod snapshot;
+mod value;
+mod world;
 
 pub use budget::{BudgetGuard, CodecLimits};
 pub use decoder::Decoder;
 pub use encoder::Encoder;
+pub use world::{MIN_WORLD_DEPTH, WORLD_FORMAT_VERSION, WorldCodec};
 
 use torse_types::{AuthorityData, Fault, ModelCommit, ModelSnapshot, OutputBudget};
 

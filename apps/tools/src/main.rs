@@ -14,6 +14,7 @@ use torse_types::Digest;
 mod commit_scenario;
 mod exchange_scenario;
 mod movement_scenario;
+mod persistence_scenario;
 mod recovery_scenario;
 mod scenario;
 mod tick_scenario;
@@ -28,13 +29,15 @@ fn main() -> ExitCode {
         "exchange-scenario" => exchange_scenario(),
         "recovery-scenario" => recovery_scenario(),
         "movement-scenario" => movement_scenario(),
+        "persistence-scenario" => persistence_scenario(),
         "ecs-probe" => ecs_probe(),
         "wasm-probe" => wasm_probe(),
         "gpu-probe" => gpu_probe(),
         "help" | "--help" | "-h" => {
             println!(
                 "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|tick-scenario|\
-                 exchange-scenario|recovery-scenario|movement-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
+                 exchange-scenario|recovery-scenario|movement-scenario|persistence-scenario|\
+                 ecs-probe|wasm-probe|gpu-probe>\n\
                  experimental probes require their matching cargo feature"
             );
             ExitCode::SUCCESS
@@ -62,6 +65,28 @@ fn movement_scenario() -> ExitCode {
         }
         Err(error) => {
             eprintln!("movement scenario failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn persistence_scenario() -> ExitCode {
+    match persistence_scenario::run() {
+        Ok(report) => {
+            println!("snapshot_bytes={}", report.snapshot_bytes);
+            println!("sections={}", report.sections);
+            println!("states={}", report.states);
+            println!("entities={}", report.entities);
+            println!("journal_records={}", report.journal_records);
+            println!("journal_bytes={}", report.journal_bytes);
+            println!("recovered_seq={}", report.recovered_seq);
+            println!("continued_seq={}", report.continued_seq);
+            println!("loaded_equal={}", report.loaded_equal);
+            println!("recovered_equal={}", report.recovered_equal);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("persistence scenario failed: {error}");
             ExitCode::FAILURE
         }
     }

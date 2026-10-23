@@ -19,7 +19,9 @@ WorldHost消耗一个初始化完成的WorldAuthority，后续只提供只读wor
 
 生成位置须在可读区域，坐标每轴不超过正负1048576格；生成记录不隐含碰撞体。每事务生成和销毁合计上限256，生命周期保守载荷上限8MiB，实际日志预算仍可更低。ActionService在动作权限扩展前拒绝处理器输出生命周期计划，ActionOutput::Mutation现持有Box<Transaction>。
 
-该模型固定在初始Tick边界执行本地事务，不驱动Simulation。恢复允许保留非零Tick的基线，但日志不能改变该基线的Tick、阶段或步骤。LocalWorldModel的网络输入、输出和复制载荷使用Infallible，网络接纳入口无法构造请求。TransactionId只供诊断，不提供请求去重语义。待执行事件、会话、动作结果和复制订阅继续由后续阶段接入。
+Server::advance_phase在可信调用方完成当前阶段工作后，经相同日志门槛持久推进一个完整阶段。阶段0到5顺序推进，发布阶段完成后进入下一Tick的输入阶段，next_step保持0。进度记录使用空ChangeSet；普通世界事务保持当前恢复位置。预留受阻不改变进度，刷盘失败停止实例并禁止读取。该接口不调用Simulation或玩法系统，调用方仍负责确认阶段工作已完成。
+
+WorldHostRecovery允许从日志恢复到Tick中间的完整阶段边界，拒绝跳阶段、倒退、非零步骤及同条记录同时推进和修改世界。检查点仍只在Tick起点捕获，关闭时把当前Tick剩余阶段依次写入日志，再保存下一Tick起点。LocalWorldModel的网络输入、输出和复制载荷使用Infallible，网络接纳入口无法构造请求。TransactionId只供诊断，不提供请求去重语义。待执行事件、会话、动作结果和复制订阅继续由后续阶段接入。
 
 capture_snapshot_with_budget先借用世界检查条目和字节预算，再捕获完整快照。条目包括根、状态、分区、实体、组件、字段和嵌套集合项；字节包括结构、集合元素、字符串和稠密格值，宿主另计封装元数据。预算不包含分配器开销和临时捕获索引，编码预算与文件容量继续单独检查。世界全部驻留，运行期没有可变存储或卸载入口。
 
@@ -30,6 +32,8 @@ cargo run -p torse-server --example durable_world -- .work/local-world
 ```
 
 [真实世界测试](tests/world.rs)覆盖混合事务与库存争用、检查点和日志尾恢复、超限后重试、刷盘失败门槛、领域拒绝时保持文件尾部，以及两个进程中止位置。详细结果见[验证记录](../../benchmarks/M3-local-world.md)。
+
+阶段推进的逐阶段恢复、受阻重试、有界关闭、非法进度及进程退出验证见[阶段记录](../../benchmarks/M3-phase-progress.md)。
 
 ## 提交与访问
 

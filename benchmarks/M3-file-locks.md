@@ -17,4 +17,4 @@ cargo test -p torse-storage -p torse-server --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-上述Windows验证通过。CI增加Windows完整检查，并在Linux上连续十轮执行检查点并发测试。Linux验收结果随对应提交的GitHub运行记录维护，不以本地Windows结果替代。
+上述Windows验证通过。[修复提交4bfe317的CI](https://github.com/invefa/Torse/actions/runs/39995008946)全部通过：Linux与Windows完整检查、Linux连续十轮检查点并发测试，以及macOS实验。该结果覆盖本次软件回归，不构成硬件断电验收。

@@ -783,12 +783,20 @@ fn crash_child() {
     let codec = Codec::new(config.journal.codec_limits).unwrap();
     let mode = std::env::var("TORSE_WORLD_CRASH_MODE").unwrap();
     let lifecycle = mode.ends_with("lifecycle");
+    let phase = mode.ends_with("phase");
     if mode.starts_with("durable") {
         let mut server =
             Files::create_file(lease, support::compatibility(), codec, config, |binding| {
                 WorldHost::new(binding, world())
             })
             .unwrap();
+        if phase {
+            assert!(matches!(
+                server.advance_phase().unwrap(),
+                LocalCommit::Durable(_)
+            ));
+            std::process::exit(74);
+        }
         let tx = if lifecycle {
             lifecycle_plan(server.authority().unwrap().world(), 1)
         } else {
@@ -826,6 +834,10 @@ fn crash_child() {
         config.server,
     )
     .unwrap();
+    if phase {
+        let _ = server.advance_phase();
+        panic!("expected exit between phase publication and journal acceptance");
+    }
     let tx = if lifecycle {
         lifecycle_plan(server.authority().unwrap().world(), 1)
     } else {
@@ -842,6 +854,8 @@ fn process_exit_recovers_only_the_durable_world_prefix() {
         ("durable", 74, 1),
         ("before_accept_lifecycle", 73, 0),
         ("durable_lifecycle", 74, 1),
+        ("before_accept_phase", 73, 0),
+        ("durable_phase", 74, 1),
     ] {
         let directory = Directory::new();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -859,12 +873,17 @@ fn process_exit_recovers_only_the_durable_world_prefix() {
         let server = open(&directory).unwrap();
         let mut expected = world();
         if sequence == 1 {
-            let tx = if mode.ends_with("lifecycle") {
-                lifecycle_plan(&expected, 1)
+            if mode.ends_with("phase") {
+                let prepared = expected.prepare_phase_advance().unwrap();
+                expected.publish(prepared).unwrap();
             } else {
-                mixed(&expected, EntityId(2))
-            };
-            expected.commit(&tx).unwrap();
+                let tx = if mode.ends_with("lifecycle") {
+                    lifecycle_plan(&expected, 1)
+                } else {
+                    mixed(&expected, EntityId(2))
+                };
+                expected.commit(&tx).unwrap();
+            }
         }
         assert_eq!(
             capture(server.authority().unwrap().world()),
@@ -952,4 +971,179 @@ fn local_recovery_rejects_metadata_progress_and_compatibility_mismatches() {
             .seq(),
         CommitSeq(0)
     );
+}
+
+#[test]
+fn durable_phase_progress_recovers_at_every_phase_and_checkpoints_only_at_tick_start() {
+    let directory = Directory::new();
+    let mut server = create(&directory, policy());
+    for phase in 0..6 {
+        let live = server.authority().unwrap().world();
+        assert_eq!(live.coordinator().resume_point().next_phase, phase);
+        let tx = block(live, u128::from(phase) + 1, i64::from(phase));
+        assert!(matches!(
+            server.commit_transaction(&tx).unwrap(),
+            LocalCommit::Durable(_)
+        ));
+        assert!(matches!(
+            server.advance_phase().unwrap(),
+            LocalCommit::Durable(_)
+        ));
+        let expected = capture(server.authority().unwrap().world());
+        assert_eq!(
+            server.durability().through,
+            DurableSeq(u64::from(phase + 1) * 2)
+        );
+        if phase < 5 {
+            assert_eq!(
+                server.checkpoint().unwrap_err().code,
+                FaultCode::InvalidState
+            );
+        } else {
+            server.checkpoint().unwrap();
+        }
+        drop(server);
+        server = open(&directory).unwrap();
+        assert_eq!(capture(server.authority().unwrap().world()), expected);
+    }
+    assert_eq!(
+        server.authority().unwrap().resume_point(),
+        ResumePoint {
+            tick: Tick(1),
+            next_phase: 0,
+            next_step: 0,
+        }
+    );
+}
+
+#[test]
+fn phase_staging_rejection_preserves_progress_and_shutdown_persists_the_next_tick() {
+    let directory = Directory::new();
+    let mut config = policy();
+    config.journal.codec_budget.max_bytes = 1;
+    let mut server = create(&directory, config);
+    let before = capture(server.authority().unwrap().world());
+    for _ in 0..2 {
+        assert!(matches!(
+            server.advance_phase().unwrap(),
+            LocalCommit::Blocked(StageError::TooLarge)
+        ));
+        assert_eq!(capture(server.authority().unwrap().world()), before);
+        assert_eq!(server.durability().through, DurableSeq(0));
+    }
+    drop(server);
+    let mut server = open(&directory).unwrap();
+    assert!(matches!(
+        server.advance_phase().unwrap(),
+        LocalCommit::Durable(_)
+    ));
+    let report = server.shutdown(Tick(0), &mut NoReplicas).unwrap();
+    assert_eq!(report.committed_during_shutdown, 5);
+    assert_eq!(report.through.seq, CommitSeq(6));
+    let server = open(&directory).unwrap();
+    let live = server.authority().unwrap().world();
+    assert_eq!(
+        live.coordinator().resume_point(),
+        ResumePoint {
+            tick: Tick(1),
+            next_phase: 0,
+            next_step: 0,
+        }
+    );
+    let mut expected = before;
+    expected.meta.cursor.seq = CommitSeq(6);
+    expected.meta.resume_at = live.coordinator().resume_point();
+    assert_eq!(capture(live), expected);
+}
+
+#[test]
+fn bounded_shutdown_failure_leaves_a_recoverable_phase_prefix() {
+    let directory = Directory::new();
+    let mut config = policy();
+    config.server.shutdown_max_steps = 2;
+    let mut server = create(&directory, config);
+    server.advance_phase().unwrap();
+    assert_eq!(
+        server.shutdown(Tick(0), &mut NoReplicas).unwrap_err().code,
+        FaultCode::ResourceLimit
+    );
+    let server = open(&directory).unwrap();
+    assert_eq!(server.authority().unwrap().resume_point().next_phase, 3);
+    assert_eq!(server.durability().through, DurableSeq(3));
+    server.shutdown(Tick(0), &mut NoReplicas).unwrap();
+    let server = open(&directory).unwrap();
+    assert_eq!(server.authority().unwrap().resume_point().tick, Tick(1));
+}
+
+#[test]
+fn recovery_rejects_progress_skips_rewinds_steps_and_mixed_writes() {
+    let mut world = world();
+    let snapshot = capture(&world);
+    let binding = Binding {
+        world: WORLD,
+        epoch: WorldEpoch(2),
+        compatibility: support::compatibility(),
+    };
+    let mut recovery = WorldHostRecovery::new(binding, world.registry(), world.schemas());
+    recovery
+        .restore_snapshot(WorldSnapshot {
+            meta: snapshot.meta,
+            state: snapshot,
+        })
+        .unwrap();
+    let prepared = world.prepare_phase_advance().unwrap();
+    let original = torse_sim::changes_from_prepared(world.registry(), &prepared).unwrap();
+    for variant in 0..6 {
+        let mut changes = original.clone();
+        match variant {
+            0 => changes.meta.resume_at.next_phase = 2,
+            1 => changes.meta.resume_at.tick = Tick(1),
+            2 => changes.meta.resume_at.next_step = 1,
+            3 => changes.meta.resume_at.next_phase = 6,
+            4 => changes.meta.previous = CommitSeq(1),
+            _ => {
+                changes.edits = torse_sim::changes_from_prepared(
+                    world.registry(),
+                    &world.prepare(&block(&world, 1, 2)).unwrap(),
+                )
+                .unwrap()
+                .edits
+            }
+        }
+        assert!(
+            recovery
+                .replay(CommitRecord {
+                    meta: changes.meta,
+                    changes
+                })
+                .is_err()
+        );
+    }
+    recovery
+        .replay(CommitRecord {
+            meta: original.meta,
+            changes: original,
+        })
+        .unwrap();
+    // Rewind with a consecutive sequence must still be rejected.
+    let mut rewind = torse_sim::changes_from_prepared(world.registry(), &prepared).unwrap();
+    rewind.meta.previous = CommitSeq(1);
+    rewind.meta.cursor.seq = CommitSeq(2);
+    rewind.meta.resume_at.next_phase = 0;
+    assert!(
+        recovery
+            .replay(CommitRecord {
+                meta: rewind.meta,
+                changes: rewind
+            })
+            .is_err()
+    );
+    let restored = recovery
+        .finish(CommitCursor {
+            world: WORLD,
+            seq: CommitSeq(1),
+        })
+        .unwrap();
+    world.publish(prepared).unwrap();
+    assert_eq!(capture(restored.world()), capture(&world));
 }

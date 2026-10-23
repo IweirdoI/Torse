@@ -37,6 +37,7 @@ use crate::transaction::Transaction;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedChange {
     meta: CommitMeta,
+    observed_resume: ResumePoint,
     transaction: TransactionId,
     source: ContentKey,
     phase: Phase,
@@ -226,6 +227,38 @@ impl CommitCoordinator {
         self.resume = resume;
     }
 
+    /// Prepare a journaled whole-phase completion without publishing progress.
+    /// The trusted driver must have settled all work in the current phase first.
+    pub fn prepare_phase_advance(&self) -> Result<PreparedChange, CommitFault> {
+        let resume_at = crate::phase::next_resume_point(self.resume).ok_or(
+            CommitFault::Invariant("phase progress is invalid or exhausted"),
+        )?;
+        let seq = self.seq.next().ok_or(CommitFault::SequenceExhausted)?;
+        Ok(PreparedChange {
+            meta: CommitMeta {
+                cursor: CommitCursor {
+                    world: self.world,
+                    seq,
+                },
+                previous: self.seq,
+                compatibility: self.compatibility,
+                resume_at,
+            },
+            observed_resume: self.resume,
+            transaction: TransactionId(u128::from(seq.0)),
+            source: ContentKey::parse("torse:phase").expect("static phase identity is valid"),
+            phase: Phase::from_index(self.resume.next_phase).expect("phase was validated"),
+            edits: Vec::new(),
+            touched: Vec::new(),
+            entity_moves: Vec::new(),
+            movement_reads: Vec::new(),
+            movement_handles: Vec::new(),
+            component_edits: Vec::new(),
+            component_batch: ComponentBatch::default(),
+            lifecycle_batch: None,
+        })
+    }
+
     /// Validate a transaction and build its record without touching the world.
     pub fn prepare(
         &self,
@@ -382,6 +415,7 @@ impl CommitCoordinator {
                 compatibility: self.compatibility,
                 resume_at: self.resume,
             },
+            observed_resume: self.resume,
             transaction: transaction.id,
             source: transaction.source.clone(),
             phase: transaction.ordering.phase,
@@ -490,6 +524,8 @@ impl CommitCoordinator {
         if prepared.meta.previous != self.seq
             || prepared.meta.cursor.world != self.world
             || Some(prepared.meta.cursor.seq) != expected
+            || prepared.observed_resume != self.resume
+            || prepared.meta.compatibility != self.compatibility
         {
             return Err(CommitFault::Invariant(
                 "prepared change is not at the current commit position",
@@ -499,6 +535,7 @@ impl CommitCoordinator {
             .apply_edits(&prepared.edits)
             .map_err(|_| CommitFault::Invariant("prepared change no longer applies"))?;
         self.seq = prepared.meta.cursor.seq;
+        self.resume = prepared.meta.resume_at;
         Ok(Publication {
             cursor: prepared.meta.cursor,
             touched,
@@ -768,6 +805,59 @@ mod tests {
             .prepare(&store, &transaction)
             .expect("prepare works again");
         let _ = &mut store;
+    }
+
+    #[test]
+    fn phase_preparation_is_inert_and_rechecks_observed_progress() {
+        let mut store = store();
+        let mut coordinator = CommitCoordinator::new(WorldId(1));
+        let initial = coordinator.resume_point();
+        let prepared = coordinator.prepare_phase_advance().unwrap();
+        assert_eq!(prepared.meta().resume_at.next_phase, 1);
+        drop(prepared);
+        assert_eq!(coordinator.seq(), CommitSeq::INITIAL);
+        assert_eq!(coordinator.resume_point(), initial);
+
+        let mut transaction = tx(1);
+        transaction.write_block(BlockPos::new(1, 1, 1), BlockStateId(5));
+        let stale = coordinator.prepare(&store, &transaction).unwrap();
+        let progress = coordinator.prepare_phase_advance().unwrap();
+        coordinator.set_resume_point(ResumePoint {
+            next_phase: 2,
+            ..initial
+        });
+        assert!(coordinator.publish(&mut store, progress).is_err());
+        assert!(coordinator.publish(&mut store, stale).is_err());
+        assert_eq!(coordinator.seq(), CommitSeq::INITIAL);
+        assert_eq!(
+            store.query(BlockPos::new(1, 1, 1)),
+            TerrainQuery::Ready(BlockStateId::EMPTY)
+        );
+
+        let progress = coordinator.prepare_phase_advance().unwrap();
+        coordinator.publish(&mut store, progress).unwrap();
+        assert_eq!(coordinator.resume_point().next_phase, 3);
+        assert_eq!(coordinator.seq(), CommitSeq(1));
+    }
+
+    #[test]
+    fn phase_preparation_rejects_exhausted_sequence_and_progress_without_mutation() {
+        let mut coordinator = CommitCoordinator::new(WorldId(1)).resumed_at(CommitSeq(u64::MAX));
+        assert_eq!(
+            coordinator.prepare_phase_advance().unwrap_err(),
+            CommitFault::SequenceExhausted
+        );
+        assert_eq!(coordinator.seq(), CommitSeq(u64::MAX));
+        coordinator = CommitCoordinator::new(WorldId(1));
+        let point = ResumePoint {
+            tick: Tick(u64::MAX),
+            next_phase: 5,
+            next_step: 0,
+        };
+        coordinator.set_resume_point(point);
+        assert!(coordinator.prepare_phase_advance().is_err());
+        assert_eq!(coordinator.resume_point(), point);
+        assert_eq!(coordinator.seq(), CommitSeq::INITIAL);
     }
 
     #[test]

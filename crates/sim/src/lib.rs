@@ -30,7 +30,7 @@ pub use coordinator::{
     CommitCoordinator, CommitFault, Committed, PrepareError, PreparedChange, Publication,
 };
 pub use payload::{changes_from_committed, changes_from_prepared};
-pub use phase::{OrderError, Phase, SystemSpec, order_phase};
+pub use phase::{OrderError, Phase, SystemSpec, next_resume_point, order_phase};
 pub use simulation::{
     DEFAULT_PHASE_TRANSACTION_LIMIT, Simulation, SimulationError, SimulationLimits, TickOutcome,
 };

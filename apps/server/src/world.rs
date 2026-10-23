@@ -1,4 +1,4 @@
-//! Real world integration for trusted, synchronous local transactions at tick boundaries.
+//! Real world integration for trusted, synchronous local transactions and phase progress.
 //!
 //! This model has no network inputs, results, scheduled events, or replica subscriptions.
 //! A caller plans a transaction from a durable read, then submits it through the server.
@@ -7,7 +7,10 @@
 
 use std::convert::Infallible;
 
-use torse_sim::{PrepareError, Recovery, Transaction, WorldAuthority, changes_from_prepared};
+use torse_sim::{
+    Phase, PrepareError, Recovery, Transaction, WorldAuthority, changes_from_prepared,
+    next_resume_point,
+};
 use torse_storage::CommitJournal;
 use torse_types::{
     Admission, AuthorityData, Binding, CommitCursor, CommitRecord, Fault, FaultCode, ModelCommit,
@@ -56,14 +59,15 @@ pub struct WorldHost {
 }
 
 impl WorldHost {
-    /// Consume an initialized finite, fully resident world at a tick boundary.
+    /// Consume a finite, fully resident world at a whole-phase boundary.
+    /// Initial server creation additionally requires a tick boundary.
     pub fn new(binding: Binding, world: WorldAuthority) -> Result<Self, Fault> {
         if binding.world != world.world()
             || binding.compatibility != world.coordinator().compatibility()
-            || !tick_start(world.coordinator().resume_point())
+            || !phase_boundary(world.coordinator().resume_point())
         {
             return Err(Fault::invalid_data(
-                "local world binding or tick boundary mismatch",
+                "local world binding or phase boundary mismatch",
             ));
         }
         Ok(Self {
@@ -77,6 +81,18 @@ impl WorldHost {
     /// The server releases this read only after the current position is durable.
     pub fn world(&self) -> &WorldAuthority {
         &self.world
+    }
+
+    fn wrap(&self, change: torse_sim::PreparedChange) -> Result<WorldPrepared, Fault> {
+        let changes = changes_from_prepared(self.world.registry(), &change)
+            .map_err(|error| invariant(error.to_string()))?;
+        Ok(WorldPrepared {
+            record: CommitRecord {
+                meta: changes.meta,
+                changes,
+            },
+            change,
+        })
     }
 }
 
@@ -108,7 +124,17 @@ impl HostAuthority for WorldHost {
     }
 
     fn prepare_next(&mut self) -> Result<Option<Self::Prepared>, Fault> {
-        Ok(self.prepared.take())
+        if let Some(prepared) = self.prepared.take() {
+            return Ok(Some(prepared));
+        }
+        if self.stopping && !self.at_tick_boundary() {
+            let change = self
+                .world
+                .prepare_phase_advance()
+                .map_err(|error| invariant(error.to_string()))?;
+            return self.wrap(change).map(Some);
+        }
+        Ok(None)
     }
 
     fn publish(&mut self, prepared: Self::Prepared) -> Result<Publication, Fault> {
@@ -178,16 +204,24 @@ impl<J: CommitJournal<LocalWorldModel>, S: HostCheckpointStore<LocalWorldModel>>
                 return Err(self.fail(invariant("world commit sequence exhausted")));
             }
         };
-        let changes = match changes_from_prepared(self.authority.world.registry(), &change) {
-            Ok(changes) => changes,
+        self.commit_local(change)
+    }
+
+    /// Declare the current phase settled and durably advance one whole phase.
+    /// This primitive does not run systems, schedule events, or persist queued requests.
+    pub fn advance_phase(&mut self) -> Result<LocalCommit, Fault> {
+        self.authority()?;
+        let change = match self.authority.world.prepare_phase_advance() {
+            Ok(change) => change,
             Err(error) => return Err(self.fail(invariant(error.to_string()))),
         };
-        self.authority.prepared = Some(WorldPrepared {
-            record: CommitRecord {
-                meta: changes.meta,
-                changes,
-            },
-            change,
+        self.commit_local(change)
+    }
+
+    fn commit_local(&mut self, change: torse_sim::PreparedChange) -> Result<LocalCommit, Fault> {
+        self.authority.prepared = Some(match self.authority.wrap(change) {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(self.fail(error)),
         });
         match self.drive_one(&mut NoReplicas)? {
             CommitStep::Durable(value) => Ok(LocalCommit::Durable(value)),
@@ -225,9 +259,9 @@ impl<'a> WorldHostRecovery<'a> {
         if compatibility != self.binding.compatibility {
             return Err(Fault::incompatible("local recovery compatibility mismatch"));
         }
-        if !tick_start(point) {
+        if !phase_boundary(point) {
             return Err(Fault::invalid_data(
-                "local recovery requires a tick boundary",
+                "local recovery requires a whole-phase boundary",
             ));
         }
         Ok(())
@@ -243,6 +277,11 @@ impl RecoveryTarget for WorldHostRecovery<'_> {
             return Err(Fault::invalid_data("snapshot metadata mismatch"));
         }
         self.validate(snapshot.meta.compatibility, snapshot.meta.resume_at)?;
+        if !tick_start(snapshot.meta.resume_at) {
+            return Err(Fault::invalid_data(
+                "local checkpoint requires a tick boundary",
+            ));
+        }
         self.recovery
             .restore_snapshot(&snapshot.state)
             .map_err(|error| Fault::invalid_data(error.to_string()))?;
@@ -255,15 +294,26 @@ impl RecoveryTarget for WorldHostRecovery<'_> {
             return Err(Fault::invalid_data("commit metadata mismatch"));
         }
         self.validate(record.meta.compatibility, record.meta.resume_at)?;
-        if self.resume != Some(record.meta.resume_at) {
-            return Err(Fault::invalid_data(
-                "local transactions cannot advance recovery progress",
-            ));
+        let previous = self
+            .resume
+            .ok_or_else(|| Fault::invalid_data("missing local snapshot"))?;
+        let point = record.meta.resume_at;
+        if previous != point {
+            let changes = &record.changes;
+            if next_resume_point(previous) != Some(point)
+                || !changes.edits.is_empty()
+                || !changes.entity_moves.is_empty()
+                || !changes.component_edits.is_empty()
+                || changes.entity_lifecycle.is_some()
+            {
+                return Err(Fault::invalid_data("invalid local phase progress record"));
+            }
         }
         self.recovery
             .replay(&record.changes)
-            .map(|_| ())
-            .map_err(|error| Fault::invalid_data(error.to_string()))
+            .map_err(|error| Fault::invalid_data(error.to_string()))?;
+        self.resume = Some(point);
+        Ok(())
     }
 
     fn finish(self, expected: CommitCursor) -> Result<Self::Authority, Fault> {
@@ -280,6 +330,10 @@ impl RecoveryTarget for WorldHostRecovery<'_> {
 
 fn tick_start(point: ResumePoint) -> bool {
     point.next_phase == 0 && point.next_step == 0
+}
+
+fn phase_boundary(point: ResumePoint) -> bool {
+    point.next_step == 0 && Phase::from_index(point.next_phase).is_some()
 }
 
 fn invariant(context: impl Into<String>) -> Fault {

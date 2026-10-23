@@ -116,6 +116,11 @@ pub struct WorldAuthority {
 }
 
 impl WorldAuthority {
+    /// Prepare a durable whole-phase completion after the driver settles its work.
+    pub fn prepare_phase_advance(&self) -> Result<PreparedChange, CommitFault> {
+        self.coordinator.prepare_phase_advance()
+    }
+
     /// Assemble an empty world.
     pub fn new(
         world: WorldId,

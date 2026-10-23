@@ -11,7 +11,25 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use torse_types::ContentKey;
+use torse_types::{ContentKey, ResumePoint, Tick};
+
+/// Next whole-phase boundary, or `None` for unsupported steps or tick overflow.
+pub fn next_resume_point(point: ResumePoint) -> Option<ResumePoint> {
+    Phase::from_index(point.next_phase)?;
+    if point.next_step != 0 {
+        return None;
+    }
+    let (tick, next_phase) = if point.next_phase == Phase::Publish.index_u16() {
+        (Tick(point.tick.0.checked_add(1)?), 0)
+    } else {
+        (point.tick, point.next_phase + 1)
+    };
+    Some(ResumePoint {
+        tick,
+        next_phase,
+        next_step: 0,
+    })
+}
 
 /// Simulation phase, in execution order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -225,6 +243,53 @@ pub fn order_phase(specs: &[SystemSpec]) -> Result<Vec<ContentKey>, OrderError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_progress_wraps_only_after_publish_and_rejects_invalid_points() {
+        let mut point = ResumePoint {
+            tick: Tick(9),
+            next_phase: 0,
+            next_step: 0,
+        };
+        for phase in 1..6 {
+            point = next_resume_point(point).unwrap();
+            assert_eq!(
+                point,
+                ResumePoint {
+                    tick: Tick(9),
+                    next_phase: phase,
+                    next_step: 0
+                }
+            );
+        }
+        assert_eq!(
+            next_resume_point(point),
+            Some(ResumePoint {
+                tick: Tick(10),
+                next_phase: 0,
+                next_step: 0,
+            })
+        );
+        for invalid in [
+            ResumePoint {
+                tick: Tick(0),
+                next_phase: 6,
+                next_step: 0,
+            },
+            ResumePoint {
+                tick: Tick(0),
+                next_phase: 0,
+                next_step: 1,
+            },
+            ResumePoint {
+                tick: Tick(u64::MAX),
+                next_phase: 5,
+                next_step: 0,
+            },
+        ] {
+            assert_eq!(next_resume_point(invalid), None);
+        }
+    }
 
     fn key(value: &str) -> ContentKey {
         ContentKey::parse(value).expect("test key is valid")

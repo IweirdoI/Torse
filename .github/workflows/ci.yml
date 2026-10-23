@@ -22,6 +22,8 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Content fixture
         run: cargo run -p torse-tools -- content-fixture
+      - name: M1 scenario
+        run: cargo run -p torse-tools -- m1-scenario
 
   experiments:
     runs-on: macos-latest

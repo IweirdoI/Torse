@@ -1,8 +1,9 @@
-//! Reproducible developer probes for the M0 contracts.
+//! Reproducible developer probes and headless scenarios.
 //!
-//! The default build only exposes dependency-free content validation. Expensive
-//! ECS, Wasmtime, and graphics integrations are feature-gated so ordinary code
-//! checks and CI do not download or initialize those runtimes by accident.
+//! The default build exposes dependency-free content validation and the M1
+//! world scenario. Expensive ECS, Wasmtime, and graphics integrations are
+//! feature-gated so ordinary code checks and CI do not download or initialize
+//! those runtimes by accident.
 
 use std::process::ExitCode;
 
@@ -10,22 +11,52 @@ use torse_content::{compile, m0_fixture_pack};
 use torse_modules::resolve_modules;
 use torse_types::Digest;
 
+mod scenario;
+
 fn main() -> ExitCode {
     let command = std::env::args().nth(1).unwrap_or_else(|| "help".to_owned());
     match command.as_str() {
         "content-fixture" => content_fixture(),
+        "m1-scenario" => m1_scenario(),
         "ecs-probe" => ecs_probe(),
         "wasm-probe" => wasm_probe(),
         "gpu-probe" => gpu_probe(),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: torse-tools <content-fixture|ecs-probe|wasm-probe|gpu-probe>\n\
+                "usage: torse-tools <content-fixture|m1-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
                  experimental probes require their matching cargo feature"
             );
             ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown command: {other}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn m1_scenario() -> ExitCode {
+    // The scenario asserts every M1 acceptance property it exercises, so a
+    // nonzero exit means a property regressed rather than that a measurement
+    // moved.
+    match scenario::run() {
+        Ok(report) => {
+            println!("sections_loaded={}", report.sections_loaded);
+            println!("dense_cells={}", report.dense_cells);
+            println!("blocks_edited={}", report.blocks_edited);
+            println!("steps={}", report.steps);
+            println!("blocked_steps={}", report.blocked_steps);
+            println!("final_x={:.3}", report.final_x);
+            println!("seam_x={:.3}", report.seam_x);
+            println!("mesh_faces={}", report.mesh_faces);
+            println!("stale_rejected={}", report.stale_rejected);
+            println!("cache_bytes={}", report.cache_bytes);
+            println!("unloaded_blocked={}", report.unloaded_blocked);
+            println!("unloaded_edit_refused={}", report.unloaded_edit_refused);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("m1 scenario failed: {error}");
             ExitCode::FAILURE
         }
     }

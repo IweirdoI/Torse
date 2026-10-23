@@ -69,6 +69,27 @@ impl Section {
         Self::new(side, BlockStateId::EMPTY)
     }
 
+    /// Create a section from an explicit cell layout.
+    ///
+    /// Used by restore, which receives storage that was already validated by the
+    /// snapshot but still must match the side length of this run.
+    pub fn from_storage(side: u32, storage: SectionStorage) -> Result<Self, SectionError> {
+        let expected = checked_cell_count(side)?;
+        if let SectionStorage::Dense(cells) = &storage
+            && cells.len() != expected
+        {
+            return Err(SectionError::CellCountMismatch {
+                expected,
+                actual: cells.len(),
+            });
+        }
+        Ok(Self {
+            side,
+            revision: Revision::INITIAL,
+            storage,
+        })
+    }
+
     /// Section side length in cells.
     pub const fn side(&self) -> u32 {
         self.side
@@ -212,6 +233,13 @@ pub enum SectionError {
     },
     /// The revision counter cannot advance without wrapping.
     RevisionExhausted,
+    /// A dense layout did not contain exactly `side^3` cells.
+    CellCountMismatch {
+        /// Expected number of cells.
+        expected: usize,
+        /// Observed number of cells.
+        actual: usize,
+    },
 }
 
 impl std::fmt::Display for SectionError {
@@ -226,6 +254,9 @@ impl std::fmt::Display for SectionError {
                 local[0], local[1], local[2]
             ),
             Self::RevisionExhausted => write!(f, "section revision counter exhausted"),
+            Self::CellCountMismatch { expected, actual } => {
+                write!(f, "dense section has {actual} cells, expected {expected}")
+            }
         }
     }
 }

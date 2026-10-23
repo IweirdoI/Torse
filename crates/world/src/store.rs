@@ -488,6 +488,14 @@ impl SectionStore {
         self.sections.get(&pos).map(|entry| &entry.section)
     }
 
+    /// Every tracked section coordinate, ascending.
+    ///
+    /// The iterator includes sections that are still loading; callers that need
+    /// readable data must check the phase.
+    pub fn positions(&self) -> impl Iterator<Item = SectionPos> + '_ {
+        self.sections.keys().copied()
+    }
+
     /// Remove a section that no caller is using.
     pub fn unload(&mut self, pos: SectionPos) -> Result<(), StoreError> {
         let entry = self

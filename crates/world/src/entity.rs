@@ -162,6 +162,59 @@ impl EntityStore {
         })
     }
 
+    /// Insert an entity with a given persistent identity.
+    ///
+    /// Used by restore. The identity must be valid, unique, and not zero; the
+    /// store advances its own allocator past it so later spawns cannot collide.
+    pub fn insert_restored(
+        &mut self,
+        id: EntityId,
+        position: Position,
+        components: ComponentSet,
+    ) -> Result<EntityHandle, EntityError> {
+        id.validate().map_err(|_| EntityError::InvalidId)?;
+        if !position.is_finite() {
+            return Err(EntityError::InvalidPosition);
+        }
+        if self.iter().any(|(_, entity)| entity.id == id) {
+            return Err(EntityError::DuplicateId { id });
+        }
+        let section = position
+            .section(self.side)
+            .ok_or(EntityError::InvalidPosition)?;
+        let entity = Entity {
+            id,
+            position,
+            components,
+        };
+        let (slot_index, generation) = match self.free.pop() {
+            Some(index) => {
+                let slot = &mut self.slots[index as usize];
+                slot.entity = Some(entity);
+                (index, slot.generation)
+            }
+            None => {
+                let index =
+                    u32::try_from(self.slots.len()).map_err(|_| EntityError::IdExhausted)?;
+                self.slots.push(Slot {
+                    generation: 1,
+                    entity: Some(entity),
+                });
+                (index, 1)
+            }
+        };
+        self.index.entry(section).or_default().push(slot_index);
+        if let Some(list) = self.index.get_mut(&section) {
+            list.sort_unstable();
+        }
+        self.live += 1;
+        self.next_id = self.next_id.max(id.0.saturating_add(1));
+        Ok(EntityHandle {
+            slot: slot_index,
+            generation,
+        })
+    }
+
     /// Remove an entity and invalidate its handle.
     pub fn despawn(&mut self, handle: EntityHandle) -> Option<Entity> {
         let slot = self.slots.get_mut(handle.slot as usize)?;
@@ -312,6 +365,13 @@ pub enum EntityError {
     StaleHandle,
     /// The persistent identifier space is exhausted.
     IdExhausted,
+    /// A persisted identifier was zero or otherwise invalid.
+    InvalidId,
+    /// Restore tried to insert an identity that is already live.
+    DuplicateId {
+        /// Conflicting identity.
+        id: EntityId,
+    },
 }
 
 impl std::fmt::Display for EntityError {
@@ -321,6 +381,8 @@ impl std::fmt::Display for EntityError {
             Self::InvalidPosition => write!(f, "entity position is not finite"),
             Self::StaleHandle => write!(f, "entity handle is stale"),
             Self::IdExhausted => write!(f, "entity id space exhausted"),
+            Self::InvalidId => write!(f, "entity id is invalid"),
+            Self::DuplicateId { id } => write!(f, "entity {} already exists", id.0),
         }
     }
 }

@@ -1,10 +1,9 @@
 //! Authoritative world storage and lifecycle primitives.
 //!
 //! The crate covers compact block-state identity, section storage and lifecycle,
-//! entity storage with a section index, and bounded component instances.
-//! Simulation phases and commit transactions live in `torse-sim`; persistence
-//! lives behind the storage contract. This crate deliberately exposes no "world"
-//! facade yet.
+//! entity storage with a section index, bounded component instances, and the
+//! exchange payloads that cross the authority boundary. Simulation phases and
+//! commit transactions live in `torse-sim`; encoding lives in `torse-codec`.
 //!
 //! Three invariants shape the API:
 //!
@@ -19,6 +18,7 @@
 
 mod component;
 mod entity;
+mod exchange;
 mod handles;
 mod registry;
 mod section;
@@ -28,6 +28,10 @@ pub use component::{
     ComponentError, ComponentSchemas, ComponentSet, ComponentValue, MAX_VALUE_DEPTH,
 };
 pub use entity::{Entity, EntityError, EntityStore, Position};
+pub use exchange::{
+    CellContent, ChangeEdit, ChangeSet, ExchangeError, RestoredWorld, Snapshot, SnapshotCells,
+    SnapshotComponent, SnapshotEntity, SnapshotSection, SnapshotValue, StateEntry,
+};
 pub use handles::HandleTable;
 pub use registry::{BlockStateId, BlockStateRegistry, EMPTY_BLOCK_KEY, RegistryError};
 pub use section::{

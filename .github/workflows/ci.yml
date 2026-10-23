@@ -9,7 +9,11 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
@@ -20,6 +24,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets
+      - name: Repeat checkpoint concurrency tests
+        if: runner.os == 'Linux'
+        run: |
+          for attempt in {1..10}; do
+            echo "Checkpoint concurrency iteration $attempt"
+            cargo test -p torse-storage --test checkpoint
+          done
       - name: Content fixture
         run: cargo run -p torse-tools -- content-fixture
       - name: M1 scenario

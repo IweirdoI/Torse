@@ -65,6 +65,13 @@ pub struct FileBackend {
     pub(crate) file: File,
 }
 
+impl Drop for FileBackend {
+    fn drop(&mut self) {
+        // Release ownership even if a child or duplicate still holds the file description.
+        let _ = self.file.unlock();
+    }
+}
+
 impl JournalBackend for FileBackend {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.file.write_all(bytes)
@@ -72,5 +79,47 @@ impl JournalBackend for FileBackend {
 
     fn sync(&mut self) -> io::Result<()> {
         self.file.sync_all()
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::fs::{self, OpenOptions};
+    use std::path::PathBuf;
+
+    #[test]
+    fn dropping_journal_owner_releases_lock_with_a_duplicate_descriptor_alive() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.work/lock-tests");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("journal-{}", std::process::id()));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.try_lock().unwrap();
+        let owner = FileBackend { file };
+        let duplicate = owner.file.try_clone().unwrap();
+        drop(owner);
+        let reopened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let acquired = reopened.try_lock();
+        drop(duplicate);
+        acquired.expect("owner drop must unlock despite a duplicate descriptor");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(contender.try_lock().is_err());
+        drop(contender);
+        reopened.unlock().unwrap();
+        drop(reopened);
+        fs::remove_file(path).unwrap();
     }
 }

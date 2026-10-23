@@ -16,7 +16,16 @@ pub struct WorldDirectory {
     root: PathBuf,
     world: WorldId,
     epoch: WorldEpoch,
-    _lock: File,
+    _lock: DirectoryLock,
+}
+
+/// Construct immediately after acquisition so every validation failure unlocks explicitly.
+struct DirectoryLock(File);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl WorldDirectory {
@@ -45,7 +54,7 @@ impl WorldDirectory {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_fault("inspect world lock", error)),
         }
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -54,6 +63,8 @@ impl WorldDirectory {
             .map_err(|e| io_fault("open world lock", e))?;
         file.try_lock()
             .map_err(|e| io_fault("lock world directory", e))?;
+        let mut lock = DirectoryLock(file);
+        let file = &mut lock.0;
         let length = file
             .metadata()
             .map_err(|e| io_fault("stat epoch ledger", e))?
@@ -135,7 +146,7 @@ impl WorldDirectory {
             root,
             world,
             epoch: WorldEpoch(epoch),
-            _lock: file,
+            _lock: lock,
         })
     }
 
@@ -169,4 +180,29 @@ pub(crate) fn io_fault(operation: &str, error: impl std::fmt::Display) -> Fault 
 
 fn corrupt(context: &str) -> Fault {
     Fault::new(FaultCode::CorruptData, context)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_directory_owner_releases_lock_with_a_duplicate_descriptor_alive() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.work/lock-tests")
+            .join(format!("world-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let owner = WorldDirectory::acquire(&root, WorldId(7), 8192).unwrap();
+        let duplicate = owner._lock.0.try_clone().unwrap();
+        assert!(WorldDirectory::acquire(&root, WorldId(7), 8192).is_err());
+        drop(owner);
+        let reopened = WorldDirectory::acquire(&root, WorldId(7), 8192);
+        drop(duplicate);
+        let reopened = reopened.expect("owner drop must unlock despite a duplicate descriptor");
+        assert_eq!(reopened.epoch(), WorldEpoch(2));
+        assert!(WorldDirectory::acquire(&root, WorldId(7), 8192).is_err());
+        drop(reopened);
+        fs::remove_file(root.join("world.lock")).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }

@@ -152,6 +152,14 @@ pub struct FileCheckpointBackend {
     manifest: File,
 }
 
+impl Drop for FileCheckpointBackend {
+    fn drop(&mut self) {
+        // A forked child or duplicate descriptor can outlive this owner. Closing only
+        // our descriptor would leave its lock alive until every duplicate closes.
+        let _ = self.manifest.unlock();
+    }
+}
+
 impl FileCheckpointBackend {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, Fault> {
         let root =
@@ -337,5 +345,29 @@ fn reject_symlink(path: &Path, allow_missing: bool) -> Result<(), Fault> {
             FaultCode::StorageUnavailable,
             format!("inspect checkpoint: {error}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_checkpoint_owner_releases_lock_with_a_duplicate_descriptor_alive() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.work/lock-tests")
+            .join(format!("checkpoint-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let owner = FileCheckpointBackend::open(&root).unwrap();
+        let duplicate = owner.manifest.try_clone().unwrap();
+        assert!(FileCheckpointBackend::open(&root).is_err());
+        drop(owner);
+        let reopened = FileCheckpointBackend::open(&root);
+        drop(duplicate);
+        let reopened = reopened.expect("owner drop must unlock despite a duplicate descriptor");
+        assert!(FileCheckpointBackend::open(&root).is_err());
+        drop(reopened);
+        fs::remove_file(root.join("manifest.log")).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 }

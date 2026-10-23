@@ -263,15 +263,16 @@ impl<M: AuthorityData, C: StorageCodec<M>> FileJournal<M, C> {
         config: JournalConfig,
     ) -> Result<(Self, RecoveryReport), Fault> {
         validate_baseline(binding, baseline, config)?;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(|error| io_fault("open journal", error))?;
         file.try_lock()
             .map_err(|error| io_fault("lock journal", error))?;
+        let mut backend = FileBackend { file };
         let report = scan_journal::<M, _, _, _>(
-            &mut file,
+            &mut backend.file,
             binding,
             baseline,
             &codec,
@@ -280,15 +281,20 @@ impl<M: AuthorityData, C: StorageCodec<M>> FileJournal<M, C> {
             |_| Ok(()),
         )?;
         if report.incomplete_tail {
-            file.set_len(report.valid_bytes)
+            backend
+                .file
+                .set_len(report.valid_bytes)
                 .map_err(|error| io_fault("truncate incomplete journal tail", error))?;
         }
-        file.sync_all()
+        backend
+            .file
+            .sync_all()
             .map_err(|error| io_fault("sync recovered journal", error))?;
-        file.seek(SeekFrom::End(0))
+        backend
+            .file
+            .seek(SeekFrom::End(0))
             .map_err(|error| io_fault("seek journal end", error))?;
-        let journal =
-            Self::with_backend(binding, report.through, codec, config, FileBackend { file })?;
+        let journal = Self::with_backend(binding, report.through, codec, config, backend)?;
         Ok((journal, report))
     }
 }

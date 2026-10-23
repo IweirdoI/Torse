@@ -2609,6 +2609,7 @@ name = "torse-render"
 version = "0.1.0"
 dependencies = [
  "pollster",
+ "torse-types",
  "wgpu",
  "winit",
 ]
@@ -2642,6 +2643,8 @@ dependencies = [
  "torse-render",
  "torse-runtime",
  "torse-types",
+ "torse-world",
+ "torse-world-services",
 ]
 
 [[package]]
@@ -2652,12 +2655,17 @@ version = "0.1.0"
 name = "torse-world"
 version = "0.1.0"
 dependencies = [
+ "torse-content",
  "torse-types",
 ]
 
 [[package]]
 name = "torse-world-services"
 version = "0.1.0"
+dependencies = [
+ "torse-types",
+ "torse-world",
+]
 
 [[package]]
 name = "tracing"

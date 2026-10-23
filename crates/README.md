@@ -1,14 +1,14 @@
 # 框架库
 
-下表对应架构总览的模块职责。M0已实现公共类型、内容契约、内容与模块编译、动作声明、codec原语和三组技术探针。M1补上块状态编号、Section存储与生命周期、确定性生成、AABB碰撞和CPU网格；模拟、正式存储、协议和网络仍为骨架。
+下表对应架构总览的模块职责。M0已实现公共类型、内容契约、内容与模块编译、动作声明、codec原语和三组技术探针。M1补上块状态编号、Section存储与生命周期、确定性生成、AABB碰撞和CPU网格。M2从模拟执行模型开始，已有固定步长时钟、阶段内系统排序、类型化事务与单协调器提交。正式存储、协议和网络仍为骨架。
 
 | 目录 | 职责 |
 |---|---|
 | [types](types/src/lib.rs) | 身份、坐标、时间与通用错误等公共基础类型 |
 | [runtime](runtime/src/lib.rs) | CPU任务、I/O、执行预算与ECS探针 |
 | [content](content/src/lib.rs) | 内容契约、编译、摘要与M0夹具 |
-| [world](world/src/lib.rs) | 块状态注册、Section存储、分区生命周期与票据、权威地形查询 |
-| [sim](sim/src/lib.rs) | Tick阶段、模拟任务、事务与事件 |
+| [world](world/src/lib.rs) | 块状态注册、Section存储、分区生命周期与票据、权威地形查询与成组编辑 |
+| [sim](sim/src/lib.rs) | 固定步长时钟、阶段与系统排序、事务前置条件、单协调器提交 |
 | [actions](actions/src/lib.rs) | 动作声明、命令冲突与注册检查 |
 | [modules](modules/src/lib.rs) | 模块依赖、服务与注册解析 |
 | [world_services](world_services/src/lib.rs) | 确定性地形生成与AABB碰撞；光照与寻路待实现 |

@@ -2628,6 +2628,11 @@ version = "0.1.0"
 [[package]]
 name = "torse-sim"
 version = "0.1.0"
+dependencies = [
+ "torse-content",
+ "torse-types",
+ "torse-world",
+]
 
 [[package]]
 name = "torse-storage"
@@ -2642,6 +2647,7 @@ dependencies = [
  "torse-modules",
  "torse-render",
  "torse-runtime",
+ "torse-sim",
  "torse-types",
  "torse-world",
  "torse-world-services",

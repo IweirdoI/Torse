@@ -368,17 +368,12 @@ impl SectionStore {
         Ok(entry.section.revision())
     }
 
-    /// Apply a group of cell edits as one all-or-nothing group.
+    /// Check a group of edits without writing anything.
     ///
-    /// Every target is validated before the first write, so a missing section or
-    /// an out-of-range coordinate cannot leave half a transaction applied. The
-    /// call is not a transaction in the simulation sense: it neither checks
-    /// preconditions nor assigns a commit sequence. The coordinator does that
-    /// before calling here.
-    pub fn apply_edits(
-        &mut self,
-        edits: &[BlockEdit],
-    ) -> Result<Vec<(SectionPos, Revision)>, StoreError> {
+    /// Returns the touched sections in coordinate order. The coordinator uses
+    /// this at prepare time so a published change cannot fail on a missing
+    /// section: the same checks have already passed.
+    pub fn validate_edits(&self, edits: &[BlockEdit]) -> Result<Vec<SectionPos>, StoreError> {
         let mut touched: Vec<SectionPos> = Vec::new();
         for edit in edits {
             if !self.bounds.contains_y(edit.pos.y) {
@@ -405,6 +400,22 @@ impl SectionStore {
                 touched.push(section_pos);
             }
         }
+        touched.sort();
+        Ok(touched)
+    }
+
+    /// Apply a group of cell edits as one all-or-nothing group.
+    ///
+    /// Every target is validated before the first write, so a missing section or
+    /// an out-of-range coordinate cannot leave half a transaction applied. The
+    /// call is not a transaction in the simulation sense: it neither checks
+    /// preconditions nor assigns a commit sequence. The coordinator does that
+    /// before calling here.
+    pub fn apply_edits(
+        &mut self,
+        edits: &[BlockEdit],
+    ) -> Result<Vec<(SectionPos, Revision)>, StoreError> {
+        let touched = self.validate_edits(edits)?;
 
         for edit in edits {
             let (section_pos, local) = edit
@@ -418,7 +429,6 @@ impl SectionStore {
             entry.section.set(local, edit.state)?;
         }
 
-        touched.sort();
         let mut revisions = Vec::with_capacity(touched.len());
         for section_pos in touched {
             let entry = self

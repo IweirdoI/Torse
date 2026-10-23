@@ -8,7 +8,7 @@
 | [runtime](runtime/src/lib.rs) | CPU任务、I/O、执行预算与ECS探针 |
 | [content](content/src/lib.rs) | 内容契约、编译、摘要与M0夹具 |
 | [world](world/src/lib.rs) | 块状态注册、Section存储、分区生命周期与票据、实体存储与空间索引、有界组件 |
-| [sim](sim/src/lib.rs) | 固定步长时钟、阶段与系统排序、事务前置条件、单协调器提交、Tick驱动 |
+| [sim](sim/src/lib.rs) | 固定步长时钟、阶段与系统排序、事务前置条件、准备与发布两步提交、Tick驱动 |
 | [actions](actions/src/lib.rs) | 动作声明、命令冲突与注册检查 |
 | [modules](modules/src/lib.rs) | 模块依赖、服务与注册解析 |
 | [world_services](world_services/src/lib.rs) | 确定性地形生成与AABB碰撞；光照与寻路待实现 |

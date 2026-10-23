@@ -68,6 +68,7 @@ fn commit_scenario() -> ExitCode {
             println!("winner_seq={}", report.winner_seq);
             println!("contested_state={}", report.contested_state);
             println!("unrelated_committed={}", report.unrelated_committed);
+            println!("dropped={}", report.dropped);
             ExitCode::SUCCESS
         }
         Err(error) => {

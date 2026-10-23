@@ -53,6 +53,27 @@ impl Phase {
         }
     }
 
+    /// Position of this phase as the `u16` used by `ResumePoint::next_phase`.
+    pub const fn index_u16(self) -> u16 {
+        self.index() as u16
+    }
+
+    /// Resolve a `ResumePoint::next_phase` value.
+    ///
+    /// Values outside `0..=5` are rejected so a corrupt or future record cannot
+    /// silently resume at an arbitrary phase.
+    pub const fn from_index(index: u16) -> Option<Self> {
+        Some(match index {
+            0 => Self::Input,
+            1 => Self::Lifecycle,
+            2 => Self::Interaction,
+            3 => Self::Simulation,
+            4 => Self::Followup,
+            5 => Self::Publish,
+            _ => return None,
+        })
+    }
+
     /// Stable name used in diagnostics and recorded rule summaries.
     pub const fn name(self) -> &'static str {
         match self {

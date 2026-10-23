@@ -12,6 +12,7 @@ use torse_modules::resolve_modules;
 use torse_types::Digest;
 
 mod commit_scenario;
+mod exchange_scenario;
 mod scenario;
 mod tick_scenario;
 
@@ -22,18 +23,39 @@ fn main() -> ExitCode {
         "m1-scenario" => m1_scenario(),
         "commit-scenario" => commit_scenario(),
         "tick-scenario" => tick_scenario(),
+        "exchange-scenario" => exchange_scenario(),
         "ecs-probe" => ecs_probe(),
         "wasm-probe" => wasm_probe(),
         "gpu-probe" => gpu_probe(),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|tick-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
+                "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|tick-scenario|exchange-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
                  experimental probes require their matching cargo feature"
             );
             ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown command: {other}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn exchange_scenario() -> ExitCode {
+    match exchange_scenario::run() {
+        Ok(report) => {
+            println!("sections={}", report.sections);
+            println!("states={}", report.states);
+            println!("entities={}", report.entities);
+            println!("cells_checked={}", report.cells_checked);
+            println!("changes={}", report.changes);
+            println!("commit_seq={}", report.commit_seq);
+            println!("restored_equal={}", report.restored_equal);
+            println!("replayed_equal={}", report.replayed_equal);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("exchange scenario failed: {error}");
             ExitCode::FAILURE
         }
     }

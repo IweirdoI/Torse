@@ -25,9 +25,14 @@ mod section;
 mod store;
 
 pub use component::{
-    ComponentError, ComponentSchemas, ComponentSet, ComponentValue, MAX_VALUE_DEPTH,
+    ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue,
+    MAX_COMPONENT_BYTES, MAX_COMPONENT_INSTANCES, MAX_COMPONENT_NODES, MAX_VALUE_DEPTH,
+    component_size,
 };
-pub use entity::{Entity, EntityError, EntityStore, Position};
+pub use entity::{
+    ComponentBatch, ComponentEdit, Entity, EntityError, EntityMove, EntityStore,
+    MAX_COMPONENT_EDITS, Position,
+};
 pub use exchange::{
     CellContent, ChangeEdit, ChangeSet, ExchangeError, RestoredWorld, Snapshot, SnapshotCells,
     SnapshotComponent, SnapshotEntity, SnapshotSection, SnapshotValue, StateEntry,

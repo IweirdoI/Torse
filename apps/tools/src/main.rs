@@ -13,6 +13,7 @@ use torse_types::Digest;
 
 mod commit_scenario;
 mod exchange_scenario;
+mod movement_scenario;
 mod recovery_scenario;
 mod scenario;
 mod tick_scenario;
@@ -26,18 +27,41 @@ fn main() -> ExitCode {
         "tick-scenario" => tick_scenario(),
         "exchange-scenario" => exchange_scenario(),
         "recovery-scenario" => recovery_scenario(),
+        "movement-scenario" => movement_scenario(),
         "ecs-probe" => ecs_probe(),
         "wasm-probe" => wasm_probe(),
         "gpu-probe" => gpu_probe(),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|tick-scenario|exchange-scenario|recovery-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
+                "usage: torse-tools <content-fixture|m1-scenario|commit-scenario|tick-scenario|\
+                 exchange-scenario|recovery-scenario|movement-scenario|ecs-probe|wasm-probe|gpu-probe>\n\
                  experimental probes require their matching cargo feature"
             );
             ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown command: {other}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn movement_scenario() -> ExitCode {
+    match movement_scenario::run() {
+        Ok(report) => {
+            println!("moved_entities={}", report.moved_entities);
+            println!("discarded_preparations={}", report.discarded_preparations);
+            println!("negative_x={:.3}", report.negative_x);
+            println!("wall_x={:.3}", report.wall_x);
+            println!("unloaded_x={:.3}", report.unloaded_x);
+            println!("recovered_seq={}", report.recovered_seq);
+            println!("continued_seq={}", report.continued_seq);
+            println!("indexed_entities={}", report.indexed_entities);
+            println!("replayed_equal={}", report.replayed_equal);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("movement scenario failed: {error}");
             ExitCode::FAILURE
         }
     }

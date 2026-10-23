@@ -11,9 +11,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod action;
 pub mod authority;
+pub mod block_actions;
 pub mod clock;
 pub mod coordinator;
+pub mod movement;
 pub mod payload;
 pub mod phase;
 pub mod simulation;
@@ -25,10 +28,10 @@ pub use clock::{TickClock, TickReport};
 pub use coordinator::{
     CommitCoordinator, CommitFault, Committed, PrepareError, PreparedChange, Publication,
 };
-pub use payload::changes_from_committed;
+pub use payload::{changes_from_committed, changes_from_prepared};
 pub use phase::{OrderError, Phase, SystemSpec, order_phase};
 pub use simulation::{
     DEFAULT_PHASE_TRANSACTION_LIMIT, Simulation, SimulationError, SimulationLimits, TickOutcome,
 };
 pub use system::{System, SystemContext};
-pub use transaction::{BlockPrecondition, Mutation, OrderingKey, Transaction};
+pub use transaction::{BlockPrecondition, Movement, Mutation, OrderingKey, Transaction};

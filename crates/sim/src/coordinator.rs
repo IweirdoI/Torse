@@ -17,11 +17,14 @@
 //! without a journal. It performs prepare and publish back to back.
 
 use torse_types::{
-    BlockPos, CommitCursor, CommitMeta, CommitSeq, Compatibility, ContentKey, Digest, RejectCode,
-    ResumePoint, Revision, SectionPos, Tick, TransactionId, TransactionOutcome, TransactionResult,
-    WorldId,
+    BlockPos, CommitCursor, CommitMeta, CommitSeq, Compatibility, ContentKey, Digest, EntityHandle,
+    EntityId, RejectCode, ResumePoint, Revision, SectionPos, Tick, TransactionId,
+    TransactionOutcome, TransactionResult, WorldId,
 };
-use torse_world::{BlockEdit, SectionStore, StoreError, TerrainQuery};
+use torse_world::{
+    BlockEdit, BlockStateRegistry, ComponentBatch, ComponentEdit, ComponentSchemas, EntityError,
+    EntityMove, EntityStore, SectionStore, StoreError, TerrainQuery,
+};
 
 use crate::phase::Phase;
 use crate::transaction::Transaction;
@@ -38,9 +41,23 @@ pub struct PreparedChange {
     phase: Phase,
     edits: Vec<BlockEdit>,
     touched: Vec<SectionPos>,
+    entity_moves: Vec<EntityMove>,
+    movement_reads: Vec<(BlockPos, TerrainQuery)>,
+    movement_handles: Vec<(EntityHandle, EntityId)>,
+    component_edits: Vec<ComponentEdit>,
+    component_batch: ComponentBatch,
 }
 
 impl PreparedChange {
+    /// Exact component replacements available before journal reservation.
+    pub fn component_edits(&self) -> &[ComponentEdit] {
+        &self.component_edits
+    }
+    /// Exact translations for staging before the authority publishes them.
+    pub fn entity_moves(&self) -> &[EntityMove] {
+        &self.entity_moves
+    }
+
     /// Metadata that will appear in the commit record.
     pub const fn meta(&self) -> CommitMeta {
         self.meta
@@ -79,6 +96,10 @@ pub struct Publication {
     pub cursor: CommitCursor,
     /// Sections whose revisions changed, in coordinate order.
     pub touched: Vec<(SectionPos, Revision)>,
+    /// Persistent identities moved by this publication, in transaction order.
+    pub moved: Vec<EntityId>,
+    /// Component owners and schemas changed, in transaction order.
+    pub components: Vec<(EntityId, ContentKey)>,
 }
 
 /// Changes produced by one committed transaction.
@@ -88,6 +109,10 @@ pub struct Committed {
     pub meta: CommitMeta,
     /// Ordered writes that were applied.
     pub edits: Vec<BlockEdit>,
+    /// Collision-resolved entity translations suitable for deterministic replay.
+    pub entity_moves: Vec<EntityMove>,
+    /// Protected component replacements with stable identity and expected fields.
+    pub component_edits: Vec<ComponentEdit>,
     /// Sections touched by the commit, in coordinate order.
     pub touched: Vec<(SectionPos, Revision)>,
 }
@@ -199,7 +224,100 @@ impl CommitCoordinator {
         store: &SectionStore,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
-        if transaction.mutations.is_empty() || has_duplicate_targets(transaction) {
+        if !transaction.movements.is_empty() || !transaction.components.is_empty() {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        self.prepare_blocks(store, transaction)
+    }
+
+    /// Resolve terrain writes and entity translations without publishing either.
+    pub fn prepare_with_entities(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        transaction: &Transaction,
+    ) -> Result<PreparedChange, PrepareError> {
+        if !transaction.components.is_empty() {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        self.prepare_world(store, entities, registry, transaction)
+    }
+
+    /// Validate a mixed group, enforcing generic component ownership and shape.
+    ///
+    /// Item conservation and other gameplay rules remain module responsibilities;
+    /// the kernel checks ownership, identity, source fields, and schema limits.
+    pub fn prepare_with_components(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        transaction: &Transaction,
+    ) -> Result<PreparedChange, PrepareError> {
+        if transaction.components.len() > torse_world::MAX_COMPONENT_EDITS {
+            return Err(PrepareError::Rejected(RejectCode::QuotaExceeded));
+        }
+        for edit in &transaction.components {
+            let schema = schemas
+                .get(&edit.schema)
+                .ok_or(PrepareError::Rejected(RejectCode::InvalidData))?;
+            if schema.owner_module != transaction.source {
+                return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
+            }
+        }
+        let batch = entities
+            .prepare_components(&transaction.components, schemas)
+            .map_err(|error| {
+                PrepareError::Rejected(match error {
+                    EntityError::StaleHandle => RejectCode::MissingTarget,
+                    EntityError::ComponentConflict => RejectCode::Conflict,
+                    _ => RejectCode::InvalidData,
+                })
+            })?;
+        let mut prepared = self.prepare_world(store, entities, registry, transaction)?;
+        prepared.component_edits = transaction.components.clone();
+        prepared.component_batch = batch;
+        Ok(prepared)
+    }
+
+    fn prepare_world(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        transaction: &Transaction,
+    ) -> Result<PreparedChange, PrepareError> {
+        let mut prepared = self.prepare_blocks(store, transaction)?;
+        let resolved = crate::movement::prepare_movements(
+            store,
+            entities,
+            registry,
+            &prepared.edits,
+            &transaction.movements,
+        )
+        .map_err(PrepareError::Rejected)?;
+        prepared.entity_moves = resolved.moves;
+        prepared.movement_reads = resolved.reads;
+        prepared.movement_handles = transaction
+            .movements
+            .iter()
+            .map(|request| (request.handle, request.id))
+            .collect();
+        Ok(prepared)
+    }
+
+    fn prepare_blocks(
+        &self,
+        store: &SectionStore,
+        transaction: &Transaction,
+    ) -> Result<PreparedChange, PrepareError> {
+        if (transaction.mutations.is_empty()
+            && transaction.movements.is_empty()
+            && transaction.components.is_empty())
+            || has_duplicate_targets(transaction)
+        {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
 
@@ -249,6 +367,11 @@ impl CommitCoordinator {
             phase: transaction.ordering.phase,
             edits,
             touched,
+            entity_moves: Vec::new(),
+            movement_reads: Vec::new(),
+            movement_handles: Vec::new(),
+            component_edits: Vec::new(),
+            component_batch: ComponentBatch::default(),
         })
     }
 
@@ -258,6 +381,68 @@ impl CommitCoordinator {
     /// second record was published in between, which the single-coordinator loop
     /// does not allow.
     pub fn publish(
+        &mut self,
+        store: &mut SectionStore,
+        prepared: PreparedChange,
+    ) -> Result<Publication, CommitFault> {
+        if !prepared.entity_moves.is_empty() || !prepared.component_edits.is_empty() {
+            return Err(CommitFault::Invariant(
+                "entity movements require entity-aware publication",
+            ));
+        }
+        self.publish_blocks(store, prepared)
+    }
+
+    /// Publish an already resolved mixed group under exclusive authority access.
+    ///
+    /// All entity targets and collision reads are checked before terrain writes.
+    /// No rule or collision callback executes after the first authoritative write.
+    pub fn publish_with_entities(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        prepared: PreparedChange,
+    ) -> Result<Publication, CommitFault> {
+        prepared
+            .component_batch
+            .validate(entities)
+            .map_err(|_| CommitFault::Invariant("prepared component observations changed"))?;
+        if prepared
+            .movement_reads
+            .iter()
+            .any(|(pos, expected)| store.query(*pos) != *expected)
+            || prepared
+                .movement_handles
+                .iter()
+                .any(|(handle, id)| entities.get(*handle).is_none_or(|entity| entity.id != *id))
+        {
+            return Err(CommitFault::Invariant(
+                "prepared movement observations changed",
+            ));
+        }
+        entities
+            .validate_moves(&prepared.entity_moves)
+            .map_err(|_| CommitFault::Invariant("prepared entity targets changed"))?;
+        let entity_moves = prepared.entity_moves.clone();
+        let components = prepared
+            .component_edits
+            .iter()
+            .map(|edit| (edit.id, edit.schema.clone()))
+            .collect();
+        let component_batch = prepared.component_batch.clone();
+        let mut publication = self.publish_blocks(store, prepared)?;
+        entities
+            .apply_moves(&entity_moves)
+            .map_err(|_| CommitFault::Invariant("prevalidated entity moves no longer apply"))?;
+        publication.moved = entity_moves.iter().map(|movement| movement.id).collect();
+        entities.publish_components(component_batch).map_err(|_| {
+            CommitFault::Invariant("prevalidated component group no longer applies")
+        })?;
+        publication.components = components;
+        Ok(publication)
+    }
+
+    fn publish_blocks(
         &mut self,
         store: &mut SectionStore,
         prepared: PreparedChange,
@@ -278,6 +463,8 @@ impl CommitCoordinator {
         Ok(Publication {
             cursor: prepared.meta.cursor,
             touched,
+            moved: Vec::new(),
+            components: Vec::new(),
         })
     }
 
@@ -304,6 +491,66 @@ impl CommitCoordinator {
                 value: Committed {
                     meta,
                     edits,
+                    entity_moves: Vec::new(),
+                    component_edits: Vec::new(),
+                    touched: publication.touched,
+                },
+            },
+        })
+    }
+
+    /// Prepare and publish a mixed group, for hosts without a journal.
+    pub fn commit_with_entities(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        transaction: &Transaction,
+    ) -> Result<TransactionResult<Committed>, CommitFault> {
+        let prepared = self.prepare_with_entities(store, entities, registry, transaction);
+        self.finish_commit(store, entities, transaction.id, prepared)
+    }
+
+    /// Prepare and publish a schema-aware group for hosts without a journal.
+    pub fn commit_with_components(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        transaction: &Transaction,
+    ) -> Result<TransactionResult<Committed>, CommitFault> {
+        let prepared =
+            self.prepare_with_components(store, entities, registry, schemas, transaction);
+        self.finish_commit(store, entities, transaction.id, prepared)
+    }
+
+    fn finish_commit(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        transaction: TransactionId,
+        prepared: Result<PreparedChange, PrepareError>,
+    ) -> Result<TransactionResult<Committed>, CommitFault> {
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(PrepareError::Rejected(code)) => return Ok(rejected(transaction, code)),
+            Err(PrepareError::SequenceExhausted) => return Err(CommitFault::SequenceExhausted),
+        };
+        let meta = prepared.meta;
+        let edits = prepared.edits.clone();
+        let entity_moves = prepared.entity_moves.clone();
+        let component_edits = prepared.component_edits.clone();
+        let publication = self.publish_with_entities(store, entities, prepared)?;
+        Ok(TransactionResult {
+            transaction,
+            outcome: TransactionOutcome::Committed {
+                at: publication.cursor,
+                value: Committed {
+                    meta,
+                    edits,
+                    entity_moves,
+                    component_edits,
                     touched: publication.touched,
                 },
             },

@@ -6,4 +6,4 @@
 | [crafting](crafting/src/lib.rs) | 配方描述与原子加工结算 |
 | [energy](energy/src/lib.rs) | 能量单位、存储、端口与结算 |
 
-当前各模块只有空库入口，待对应负责人实现。通过公开模块、内容、动作与模拟接口注册，世界内核不依赖具体玩法模块。GameDefinition选择启用哪些模块。
+库存模块已实现有界槽位、物品目录、查询与原子转移，说明见[inventory/README.md](inventory/README.md)。配方与能量仍为空库入口。模块通过公开内容、动作与模拟接口注册，世界内核不依赖具体玩法模块。GameDefinition选择启用哪些模块。

@@ -5,6 +5,8 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+torse-actions = { path = "../actions" }
 torse-content = { path = "../content" }
 torse-types = { path = "../types" }
 torse-world = { path = "../world" }
+torse-world-services = { path = "../world_services" }

@@ -1,4 +1,4 @@
-//! Conversion from committed runtime edits to stable exchange payloads.
+//! Conversion from prepared or committed edits to stable exchange payloads.
 //!
 //! A commit record holds runtime state identifiers because those are what the
 //! store applies. The persistent payload must not: it carries stable content
@@ -8,14 +8,31 @@
 
 use torse_world::{BlockStateRegistry, ChangeSet, ExchangeError};
 
-use crate::coordinator::Committed;
+use crate::coordinator::{Committed, PreparedChange};
+
+/// Build a complete domain payload before publication, for journal reservation.
+///
+/// The caller owns the resulting payload independently of the preparation. A
+/// rejected reservation can drop both values without changing world state.
+pub fn changes_from_prepared(
+    registry: &BlockStateRegistry,
+    prepared: &PreparedChange,
+) -> Result<ChangeSet, ExchangeError> {
+    let mut changes = ChangeSet::from_edits(prepared.meta(), registry, prepared.edits())?;
+    changes.entity_moves = prepared.entity_moves().to_vec();
+    changes.component_edits = prepared.component_edits().to_vec();
+    Ok(changes)
+}
 
 /// Build the persistent change payload of a committed transaction.
 pub fn changes_from_committed(
     registry: &BlockStateRegistry,
     committed: &Committed,
 ) -> Result<ChangeSet, ExchangeError> {
-    ChangeSet::from_edits(committed.meta, registry, &committed.edits)
+    let mut changes = ChangeSet::from_edits(committed.meta, registry, &committed.edits)?;
+    changes.entity_moves = committed.entity_moves.clone();
+    changes.component_edits = committed.component_edits.clone();
+    Ok(changes)
 }
 
 #[cfg(test)]

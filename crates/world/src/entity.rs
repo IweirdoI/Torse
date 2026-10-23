@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use torse_types::{BlockPos, EntityHandle, EntityId, SectionPos};
 
-use crate::component::ComponentSet;
+use crate::component::{ComponentFields, ComponentSchemas, ComponentSet, MAX_COMPONENT_INSTANCES};
 use crate::section::MAX_SECTION_SIDE;
 
 /// Fractional world position of an entity.
@@ -34,6 +34,20 @@ pub struct Position {
 }
 
 impl Position {
+    /// Preserve the exact IEEE-754 representation in exchange records.
+    pub fn to_bits(self) -> [u64; 3] {
+        [self.x.to_bits(), self.y.to_bits(), self.z.to_bits()]
+    }
+
+    /// Rebuild a position; callers must validate it before storing it.
+    pub fn from_bits(bits: [u64; 3]) -> Self {
+        Self::new(
+            f64::from_bits(bits[0]),
+            f64::from_bits(bits[1]),
+            f64::from_bits(bits[2]),
+        )
+    }
+
     /// Construct a position without validation.
     pub const fn new(x: f64, y: f64, z: f64) -> Self {
         Self { x, y, z }
@@ -65,6 +79,81 @@ impl Position {
     }
 }
 
+/// One authoritative entity translation, with exact optimistic concurrency data.
+///
+/// Persistent identities, rather than runtime slots, let the same record replay
+/// after a restart. The previous position prevents a misplaced or duplicate
+/// record from moving an entity from an unrelated state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntityMove {
+    /// Persistent entity identity.
+    pub id: EntityId,
+    /// Position observed during preparation.
+    pub previous_bits: [u64; 3],
+    /// Collision-resolved position to publish.
+    pub position_bits: [u64; 3],
+}
+
+/// One stable component replacement or removal with an exact read precondition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentEdit {
+    /// Persistent owner identity; runtime handles never enter a saved record.
+    pub id: EntityId,
+    /// Component schema and ownership declaration.
+    pub schema: torse_types::ContentKey,
+    /// Observed component, or absence when creating a new instance.
+    pub previous: Option<ComponentFields>,
+    /// Replacement fields, or absence when removing an existing instance.
+    pub fields: Option<ComponentFields>,
+}
+
+/// Opaque component replacements validated before terrain or entity publication.
+///
+/// Keeping validated replacements private prevents the publishing caller from
+/// injecting unchecked fields after the journal has reserved the record.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComponentBatch {
+    updates: Vec<ComponentUpdate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ComponentUpdate {
+    handle: EntityHandle,
+    edit: ComponentEdit,
+}
+
+/// Maximum protected component targets in one atomic transaction.
+pub const MAX_COMPONENT_EDITS: usize = 256;
+
+impl ComponentBatch {
+    /// Recheck observed fields and final object capacity before the first write.
+    pub fn validate(&self, entities: &EntityStore) -> Result<(), EntityError> {
+        let mut counts = BTreeMap::new();
+        for ComponentUpdate { handle, edit } in &self.updates {
+            let current = entities.get(*handle).ok_or(EntityError::StaleHandle)?;
+            if current.id != edit.id
+                || current.components.component(&edit.schema) != edit.previous.as_ref()
+            {
+                return Err(EntityError::ComponentConflict);
+            }
+            let count = counts.entry(edit.id).or_insert(current.components.len());
+            if edit.previous.is_none() {
+                *count += 1;
+            }
+            if edit.fields.is_none() {
+                *count -= 1;
+            }
+        }
+        if counts
+            .values()
+            .any(|count| *count > MAX_COMPONENT_INSTANCES)
+        {
+            return Err(EntityError::InvalidComponents);
+        }
+        Ok(())
+    }
+}
+
 /// One stored entity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entity {
@@ -89,11 +178,64 @@ pub struct EntityStore {
     slots: Vec<Slot>,
     free: Vec<u32>,
     index: BTreeMap<SectionPos, Vec<u32>>,
+    by_id: BTreeMap<EntityId, u32>,
     next_id: u128,
     live: usize,
 }
 
 impl EntityStore {
+    /// Resolve and validate a bounded component group without changing storage.
+    pub fn prepare_components(
+        &self,
+        edits: &[ComponentEdit],
+        schemas: &ComponentSchemas,
+    ) -> Result<ComponentBatch, EntityError> {
+        if edits.len() > MAX_COMPONENT_EDITS {
+            return Err(EntityError::InvalidComponents);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut updates = Vec::with_capacity(edits.len());
+        for edit in edits {
+            if !seen.insert((edit.id, edit.schema.clone())) {
+                return Err(EntityError::InvalidComponents);
+            }
+            let handle = self.handle_of(edit.id).ok_or(EntityError::StaleHandle)?;
+            let entity = self.get(handle).ok_or(EntityError::StaleHandle)?;
+            if entity.components.component(&edit.schema) != edit.previous.as_ref() {
+                return Err(EntityError::ComponentConflict);
+            }
+            if schemas.get(&edit.schema).is_none()
+                || (edit.previous.is_none() && edit.fields.is_none())
+            {
+                return Err(EntityError::InvalidComponents);
+            }
+            if let Some(fields) = &edit.fields {
+                ComponentSet::validate(schemas, &edit.schema, fields)
+                    .map_err(|_| EntityError::InvalidComponents)?;
+            }
+            updates.push(ComponentUpdate {
+                handle,
+                edit: edit.clone(),
+            });
+        }
+        let batch = ComponentBatch { updates };
+        batch.validate(self)?;
+        Ok(batch)
+    }
+
+    /// Publish an opaque, prevalidated group under exclusive storage access.
+    pub fn publish_components(&mut self, batch: ComponentBatch) -> Result<(), EntityError> {
+        batch.validate(self)?;
+        for ComponentUpdate { handle, edit } in batch.updates {
+            // No callback or lifecycle change can occur after validation. Each
+            // handle remains live while only its component set is replaced.
+            self.components_mut(handle)
+                .expect("validated component owner remains live")
+                .apply_validated(edit.schema, edit.fields);
+        }
+        Ok(())
+    }
+
     /// Create an empty store for a section side.
     pub fn new(side: u32) -> Result<Self, EntityError> {
         if side == 0 || side > MAX_SECTION_SIDE {
@@ -104,6 +246,7 @@ impl EntityStore {
             slots: Vec::new(),
             free: Vec::new(),
             index: BTreeMap::new(),
+            by_id: BTreeMap::new(),
             next_id: 1,
             live: 0,
         })
@@ -156,6 +299,7 @@ impl EntityStore {
             list.sort_unstable();
         }
         self.live += 1;
+        self.by_id.insert(id, slot_index);
         Ok(EntityHandle {
             slot: slot_index,
             generation,
@@ -176,7 +320,7 @@ impl EntityStore {
         if !position.is_finite() {
             return Err(EntityError::InvalidPosition);
         }
-        if self.iter().any(|(_, entity)| entity.id == id) {
+        if self.by_id.contains_key(&id) {
             return Err(EntityError::DuplicateId { id });
         }
         let section = position
@@ -208,6 +352,7 @@ impl EntityStore {
             list.sort_unstable();
         }
         self.live += 1;
+        self.by_id.insert(id, slot_index);
         self.next_id = self.next_id.max(id.0.saturating_add(1));
         Ok(EntityHandle {
             slot: slot_index,
@@ -222,6 +367,7 @@ impl EntityStore {
             return None;
         }
         let entity = slot.entity.take()?;
+        self.by_id.remove(&entity.id);
         if let Some(section) = entity.position.section(self.side) {
             let empty = match self.index.get_mut(&section) {
                 Some(list) => {
@@ -301,6 +447,53 @@ impl EntityStore {
         Ok(())
     }
 
+    /// Resolve a persistent identity without scanning every live entity.
+    pub fn handle_of(&self, id: EntityId) -> Option<EntityHandle> {
+        let index = *self.by_id.get(&id)?;
+        let slot = self.slots.get(index as usize)?;
+        Some(EntityHandle {
+            slot: index,
+            generation: slot.generation,
+        })
+    }
+
+    /// Validate an entire movement group before publishing any member.
+    pub fn validate_moves(&self, moves: &[EntityMove]) -> Result<(), EntityError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for movement in moves {
+            if !seen.insert(movement.id) {
+                return Err(EntityError::DuplicateId { id: movement.id });
+            }
+            let handle = self
+                .handle_of(movement.id)
+                .ok_or(EntityError::StaleHandle)?;
+            let entity = self.get(handle).ok_or(EntityError::StaleHandle)?;
+            if entity.position.to_bits() != movement.previous_bits {
+                return Err(EntityError::PositionConflict);
+            }
+            let position = Position::from_bits(movement.position_bits);
+            if !position.is_finite() || position.section(self.side).is_none() {
+                return Err(EntityError::InvalidPosition);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply prevalidated translations and keep both spatial indexes coherent.
+    ///
+    /// No callbacks run between validation and application. Each identity and
+    /// destination is already checked before the first entity is changed.
+    pub fn apply_moves(&mut self, moves: &[EntityMove]) -> Result<(), EntityError> {
+        self.validate_moves(moves)?;
+        for movement in moves {
+            let handle = self
+                .handle_of(movement.id)
+                .ok_or(EntityError::StaleHandle)?;
+            self.move_to(handle, Position::from_bits(movement.position_bits))?;
+        }
+        Ok(())
+    }
+
     /// Handles of entities whose position falls inside a section.
     pub fn entities_in_section(
         &self,
@@ -354,6 +547,12 @@ impl EntityStore {
 /// Failure produced by entity storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntityError {
+    /// A component observed by the transaction has changed.
+    ComponentConflict,
+    /// Component fields, schema, duplicates, or group size are invalid.
+    InvalidComponents,
+    /// A recorded source position no longer matches the authority.
+    PositionConflict,
     /// The section side is outside the supported range.
     InvalidSide {
         /// Requested side.
@@ -377,6 +576,9 @@ pub enum EntityError {
 impl std::fmt::Display for EntityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ComponentConflict => write!(f, "entity component no longer matches the record"),
+            Self::InvalidComponents => write!(f, "entity component group is invalid"),
+            Self::PositionConflict => write!(f, "entity position no longer matches the record"),
             Self::InvalidSide { side } => write!(f, "section side {side} is not supported"),
             Self::InvalidPosition => write!(f, "entity position is not finite"),
             Self::StaleHandle => write!(f, "entity handle is stale"),
@@ -402,6 +604,101 @@ mod tests {
 
     fn store() -> EntityStore {
         EntityStore::new(16).expect("side is valid")
+    }
+
+    #[test]
+    fn component_capacity_uses_the_final_group_and_is_rechecked_before_publication() {
+        use torse_content::{ComponentSchema, PersistencePolicy};
+        use torse_types::ReplicationDeclaration;
+        let mut pack = m0_fixture_pack();
+        let ids: Vec<_> = (0..=MAX_COMPONENT_INSTANCES)
+            .map(|n| key(&format!("test:component{n}")))
+            .collect();
+        pack.state_schemas[0]
+            .value
+            .component_schemas
+            .extend(ids.iter().map(|id| ComponentSchema {
+                id: id.clone(),
+                schema_version: 1,
+                owner_module: key("base:inventory"),
+                fields: Vec::new(),
+                persistence: PersistencePolicy::Always,
+                replication: ReplicationDeclaration::SERVER_PRIVATE,
+                migration_binding: None,
+            }));
+        let schemas = ComponentSchemas::build(&compile(pack).expect("capacity fixture"));
+        let mut store = store();
+        let handle = store.spawn(Position::new(2.0, 2.0, 2.0)).expect("spawn");
+        let id = store.get(handle).expect("entity").id;
+        for schema in &ids[..MAX_COMPONENT_INSTANCES] {
+            store
+                .components_mut(handle)
+                .expect("components")
+                .insert(&schemas, schema, BTreeMap::new())
+                .expect("initial capacity");
+        }
+        let add = ComponentEdit {
+            id,
+            schema: ids[MAX_COMPONENT_INSTANCES].clone(),
+            previous: None,
+            fields: Some(BTreeMap::new()),
+        };
+        assert!(
+            store
+                .prepare_components(std::slice::from_ref(&add), &schemas)
+                .is_err()
+        );
+        let remove = ComponentEdit {
+            id,
+            schema: ids[0].clone(),
+            previous: Some(BTreeMap::new()),
+            fields: None,
+        };
+        // The record intentionally adds first. Only its final component count
+        // matters, and no observer can see the intermediate private mutation.
+        let batch = store
+            .prepare_components(&[add, remove], &schemas)
+            .expect("capacity-neutral group");
+        store.publish_components(batch).expect("publish");
+        assert_eq!(
+            store.get(handle).expect("entity").components.len(),
+            MAX_COMPONENT_INSTANCES
+        );
+        store
+            .components_mut(handle)
+            .expect("components")
+            .remove(&ids[1]);
+        let add = ComponentEdit {
+            id,
+            schema: ids[0].clone(),
+            previous: None,
+            fields: Some(BTreeMap::new()),
+        };
+        let batch = store
+            .prepare_components(std::slice::from_ref(&add), &schemas)
+            .expect("prepare");
+        store
+            .components_mut(handle)
+            .expect("components")
+            .insert(&schemas, &ids[1], BTreeMap::new())
+            .expect("external insertion");
+        assert_eq!(
+            store.publish_components(batch),
+            Err(EntityError::InvalidComponents)
+        );
+        assert!(
+            store
+                .get(handle)
+                .expect("entity")
+                .components
+                .component(&ids[0])
+                .is_none()
+        );
+        assert!(
+            store
+                .prepare_components(&vec![add; MAX_COMPONENT_EDITS + 1], &schemas)
+                .is_err()
+        );
     }
 
     #[test]

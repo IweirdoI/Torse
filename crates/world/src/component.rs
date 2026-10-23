@@ -16,6 +16,14 @@ use torse_types::{ContentKey, EntityId};
 
 /// Maximum nesting depth accepted inside a list or record value.
 pub const MAX_VALUE_DEPTH: u32 = 8;
+/// Aggregate limits apply even inside schema-less nested lists and records.
+pub const MAX_COMPONENT_NODES: usize = 4096;
+/// Maximum conservative payload size of a component instance.
+pub const MAX_COMPONENT_BYTES: u64 = 65_536;
+/// Maximum component instances attached to a single object.
+pub const MAX_COMPONENT_INSTANCES: usize = 64;
+/// Stable field representation shared by transactions and exchange records.
+pub type ComponentFields = BTreeMap<ContentKey, ComponentValue>;
 
 /// One component field value.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,11 +109,39 @@ impl ComponentSet {
         id: &ContentKey,
         fields: BTreeMap<ContentKey, ComponentValue>,
     ) -> Result<(), ComponentError> {
+        if !self.components.contains_key(id) && self.components.len() >= MAX_COMPONENT_INSTANCES {
+            return Err(ComponentError::BudgetExceeded);
+        }
+        Self::validate(schemas, id, &fields)?;
+        self.components.insert(id.clone(), fields);
+        Ok(())
+    }
+
+    /// Apply fields already validated by an opaque world component batch.
+    /// Capacity is checked for the complete batch, including removals.
+    pub(crate) fn apply_validated(&mut self, id: ContentKey, fields: Option<ComponentFields>) {
+        match fields {
+            Some(fields) => {
+                self.components.insert(id, fields);
+            }
+            None => {
+                self.components.remove(&id);
+            }
+        }
+    }
+
+    /// Validate a component without cloning or publishing its fields.
+    pub fn validate(
+        schemas: &ComponentSchemas,
+        id: &ContentKey,
+        fields: &ComponentFields,
+    ) -> Result<(), ComponentError> {
+        component_size(fields)?;
         let schema = schemas
             .get(id)
             .ok_or_else(|| ComponentError::UnknownSchema { id: id.clone() })?;
 
-        for (field, value) in &fields {
+        for (field, value) in fields {
             let declared = schema
                 .fields
                 .iter()
@@ -125,7 +161,6 @@ impl ComponentSet {
             }
         }
 
-        self.components.insert(id.clone(), fields);
         Ok(())
     }
 
@@ -153,6 +188,66 @@ impl ComponentSet {
     pub fn ids(&self) -> impl Iterator<Item = &ContentKey> {
         self.components.keys()
     }
+}
+
+/// Validate aggregate work bounds and estimate an upper bound on value bytes.
+///
+/// The estimate includes tags, counts, and key lengths; it is a runtime budget,
+/// not a promise about B5's eventual wire format. Checking depth before recursion
+/// also prevents a malicious nested request from exhausting the native stack.
+pub fn component_size(fields: &ComponentFields) -> Result<u64, ComponentError> {
+    fn key_bytes(key: &ContentKey) -> u64 {
+        (key.namespace().len() + key.path().len() + 1) as u64 + 8
+    }
+    fn visit(
+        value: &ComponentValue,
+        depth: u32,
+        nodes: &mut usize,
+        bytes: &mut u64,
+    ) -> Result<(), ComponentError> {
+        if depth > MAX_VALUE_DEPTH || *nodes >= MAX_COMPONENT_NODES {
+            return Err(ComponentError::BudgetExceeded);
+        }
+        *nodes += 1;
+        *bytes += 9;
+        match value {
+            ComponentValue::Text(value) => *bytes += value.len() as u64,
+            ComponentValue::Content(value) => *bytes += key_bytes(value),
+            ComponentValue::Entity(_) => *bytes += 16,
+            ComponentValue::List(values) => {
+                if values.len() > MAX_COMPONENT_NODES {
+                    return Err(ComponentError::BudgetExceeded);
+                }
+                for value in values {
+                    visit(value, depth + 1, nodes, bytes)?;
+                }
+            }
+            ComponentValue::Record(values) => {
+                if values.len() > MAX_COMPONENT_NODES {
+                    return Err(ComponentError::BudgetExceeded);
+                }
+                for (key, value) in values {
+                    *bytes += key_bytes(key);
+                    visit(value, depth + 1, nodes, bytes)?;
+                }
+            }
+            _ => {}
+        }
+        if *bytes > MAX_COMPONENT_BYTES {
+            return Err(ComponentError::BudgetExceeded);
+        }
+        Ok(())
+    }
+    if fields.len() > MAX_COMPONENT_NODES {
+        return Err(ComponentError::BudgetExceeded);
+    }
+    let mut nodes = 0;
+    let mut bytes = 8;
+    for (key, value) in fields {
+        bytes += key_bytes(key);
+        visit(value, 0, &mut nodes, &mut bytes)?;
+    }
+    Ok(bytes)
 }
 
 fn validate_value(
@@ -257,6 +352,8 @@ fn validate_element(
 /// Failure produced by component validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComponentError {
+    /// The aggregate byte, value-count, or nesting budget was exceeded.
+    BudgetExceeded,
     /// The schema identity is not registered.
     UnknownSchema {
         /// Missing schema.
@@ -304,6 +401,7 @@ pub enum ComponentError {
 impl std::fmt::Display for ComponentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BudgetExceeded => write!(f, "component aggregate budget exceeded"),
             Self::UnknownSchema { id } => write!(f, "component schema {id} is not registered"),
             Self::UnknownField { schema, field } => {
                 write!(f, "component {schema} has no field {field}")

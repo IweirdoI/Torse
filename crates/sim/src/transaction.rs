@@ -9,7 +9,8 @@
 //! for full totality, by transaction identity. None of those fields depends on a
 //! thread number or on the order in which results happened to be produced.
 
-use torse_types::{BlockPos, ContentKey, TransactionId};
+use torse_types::{BlockPos, ContentKey, EntityHandle, EntityId, TransactionId};
+use torse_world::{ComponentEdit, Position};
 
 use crate::phase::Phase;
 
@@ -34,6 +35,24 @@ pub struct Mutation {
     pub pos: BlockPos,
     /// State to write.
     pub state: torse_world::BlockStateId,
+}
+
+/// A requested translation whose final position is resolved during preparation.
+///
+/// The caller supplies an observed identity and position, never an unchecked
+/// final position. Exact bits make signed zero and stale observations explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Movement {
+    /// Runtime handle, including its generation.
+    pub handle: EntityHandle,
+    /// Persistent identity observed through that handle.
+    pub id: EntityId,
+    /// Source position observed by the producing system.
+    pub previous_bits: [u64; 3],
+    /// Requested translation, in world block units.
+    pub delta_bits: [u64; 3],
+    /// Positive collider half extents; the entity position is its center.
+    pub half_bits: [u64; 3],
 }
 
 /// Stable ordering key of one transaction.
@@ -62,6 +81,10 @@ pub struct Transaction {
     pub preconditions: Vec<BlockPrecondition>,
     /// Writes applied atomically when every precondition holds.
     pub mutations: Vec<Mutation>,
+    /// Translations resolved against authoritative collision before publication.
+    pub movements: Vec<Movement>,
+    /// Schema-validated protected fields; only the schema owner may write them.
+    pub components: Vec<ComponentEdit>,
 }
 
 impl Transaction {
@@ -73,6 +96,8 @@ impl Transaction {
             ordering,
             preconditions: Vec::new(),
             mutations: Vec::new(),
+            movements: Vec::new(),
+            components: Vec::new(),
         }
     }
 
@@ -85,6 +110,25 @@ impl Transaction {
     /// Record a write.
     pub fn write_block(&mut self, pos: BlockPos, state: torse_world::BlockStateId) -> &mut Self {
         self.mutations.push(Mutation { pos, state });
+        self
+    }
+
+    /// Request one collision-resolved move with an optimistic source position.
+    pub fn move_entity(
+        &mut self,
+        handle: EntityHandle,
+        id: EntityId,
+        previous: Position,
+        delta: [f64; 3],
+        half: [f64; 3],
+    ) -> &mut Self {
+        self.movements.push(Movement {
+            handle,
+            id,
+            previous_bits: previous.to_bits(),
+            delta_bits: delta.map(f64::to_bits),
+            half_bits: half.map(f64::to_bits),
+        });
         self
     }
 

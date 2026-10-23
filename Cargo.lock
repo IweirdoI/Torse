@@ -2586,6 +2586,13 @@ version = "0.1.0"
 [[package]]
 name = "torse-inventory"
 version = "0.1.0"
+dependencies = [
+ "torse-actions",
+ "torse-content",
+ "torse-sim",
+ "torse-types",
+ "torse-world",
+]
 
 [[package]]
 name = "torse-mod-api"
@@ -2645,9 +2652,11 @@ dependencies = [
 name = "torse-sim"
 version = "0.1.0"
 dependencies = [
+ "torse-actions",
  "torse-content",
  "torse-types",
  "torse-world",
+ "torse-world-services",
 ]
 
 [[package]]

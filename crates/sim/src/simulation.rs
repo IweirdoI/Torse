@@ -9,7 +9,7 @@
 use torse_types::{
     CommitSeq, ContentKey, ResumePoint, Tick, TransactionOutcome, TransactionResult, WorldId,
 };
-use torse_world::{EntityStore, SectionStore};
+use torse_world::{BlockStateRegistry, ComponentSchemas, EntityStore, SectionStore};
 
 use crate::clock::{TickClock, TickReport};
 use crate::coordinator::{CommitCoordinator, CommitFault, Committed};
@@ -110,6 +110,24 @@ pub struct Simulation {
     limits: SimulationLimits,
 }
 
+enum EntityAccess<'a> {
+    ReadOnly(&'a EntityStore),
+    Writable {
+        entities: &'a mut EntityStore,
+        registry: &'a BlockStateRegistry,
+        schemas: Option<&'a ComponentSchemas>,
+    },
+}
+
+impl EntityAccess<'_> {
+    fn view(&self) -> &EntityStore {
+        match self {
+            Self::ReadOnly(entities) => entities,
+            Self::Writable { entities, .. } => entities,
+        }
+    }
+}
+
 impl Simulation {
     /// Create a simulation with no systems.
     pub fn new(world: WorldId, budget_ms: u64, limits: SimulationLimits) -> Self {
@@ -160,6 +178,58 @@ impl Simulation {
         entities: &EntityStore,
         elapsed_ms: u64,
     ) -> Result<TickOutcome, SimulationError> {
+        self.tick_inner(store, EntityAccess::ReadOnly(entities), elapsed_ms)
+    }
+
+    /// Execute a tick with collision-resolved entity transactions enabled.
+    ///
+    /// Systems still read an immutable phase view. The coordinator revalidates
+    /// each transaction after its sorted predecessors have committed, so two
+    /// systems moving the same observed entity conflict deterministically.
+    pub fn tick_with_entities(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        elapsed_ms: u64,
+    ) -> Result<TickOutcome, SimulationError> {
+        self.tick_inner(
+            store,
+            EntityAccess::Writable {
+                entities,
+                registry,
+                schemas: None,
+            },
+            elapsed_ms,
+        )
+    }
+
+    /// Execute a tick with protected component transactions enabled.
+    pub fn tick_with_components(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        elapsed_ms: u64,
+    ) -> Result<TickOutcome, SimulationError> {
+        self.tick_inner(
+            store,
+            EntityAccess::Writable {
+                entities,
+                registry,
+                schemas: Some(schemas),
+            },
+            elapsed_ms,
+        )
+    }
+
+    fn tick_inner(
+        &mut self,
+        store: &mut SectionStore,
+        mut entities: EntityAccess<'_>,
+        elapsed_ms: u64,
+    ) -> Result<TickOutcome, SimulationError> {
         let tick = self.clock.current();
         let mut results = Vec::new();
         let mut rejected = 0usize;
@@ -171,7 +241,7 @@ impl Simulation {
                 let system = &mut self.systems[index];
                 let system_id = system.spec().id.clone();
                 let mut context =
-                    SystemContext::new(tick, phase, system_id.clone(), store, entities);
+                    SystemContext::new(tick, phase, system_id.clone(), store, entities.view());
                 system.run(&mut context);
                 for transaction in context.into_transactions() {
                     collected.push((system_id.clone(), transaction));
@@ -206,10 +276,40 @@ impl Simulation {
                 next_step: 0,
             });
 
-            let phase_results = self
-                .coordinator
-                .commit_ordered(store, phase_transactions)
-                .map_err(SimulationError::Commit)?;
+            let phase_results = match &mut entities {
+                EntityAccess::ReadOnly(_) => self
+                    .coordinator
+                    .commit_ordered(store, phase_transactions)
+                    .map_err(SimulationError::Commit)?,
+                EntityAccess::Writable {
+                    entities,
+                    registry,
+                    schemas,
+                } => {
+                    let mut results = Vec::with_capacity(phase_transactions.len());
+                    for transaction in Transaction::order(phase_transactions) {
+                        results.push(
+                            match schemas {
+                                Some(schemas) => self.coordinator.commit_with_components(
+                                    store,
+                                    entities,
+                                    registry,
+                                    schemas,
+                                    &transaction,
+                                ),
+                                None => self.coordinator.commit_with_entities(
+                                    store,
+                                    entities,
+                                    registry,
+                                    &transaction,
+                                ),
+                            }
+                            .map_err(SimulationError::Commit)?,
+                        );
+                    }
+                    results
+                }
+            };
             for result in &phase_results {
                 if matches!(result.outcome, TransactionOutcome::Rejected(_)) {
                     rejected += 1;

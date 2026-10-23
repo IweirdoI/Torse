@@ -15,9 +15,9 @@
 //!   content key, record entries by key, and list entries keep their semantic
 //!   order.
 //!
-//! Entity mutations are not part of the change payload yet: M2 only moves blocks
-//! and stores entities. Snapshots do include entities so a restored world keeps
-//! what the authority had.
+//! Entity translations carry persistent identities and exact source/destination
+//! bits. Replay applies resolved positions directly; it never reruns collision
+//! against a potentially different rule implementation.
 
 use std::collections::BTreeMap;
 
@@ -26,7 +26,7 @@ use torse_types::{
 };
 
 use crate::component::{ComponentSchemas, ComponentSet, ComponentValue};
-use crate::entity::{EntityStore, Position};
+use crate::entity::{ComponentBatch, ComponentEdit, EntityMove, EntityStore, Position};
 use crate::registry::{BlockStateId, BlockStateRegistry};
 use crate::section::{Section, SectionStorage};
 use crate::store::{BlockEdit, SectionStore, StoreError, WorldBounds};
@@ -152,6 +152,10 @@ pub struct ChangeSet {
     pub meta: CommitMeta,
     /// Writes in commit order.
     pub edits: Vec<ChangeEdit>,
+    /// Entity translations in commit order, with no duplicate identities.
+    pub entity_moves: Vec<EntityMove>,
+    /// Protected component replacements in transaction order.
+    pub component_edits: Vec<ComponentEdit>,
 }
 
 /// World rebuilt from a snapshot.
@@ -466,6 +470,8 @@ impl ChangeSet {
         Ok(Self {
             meta,
             edits: changes,
+            entity_moves: Vec::new(),
+            component_edits: Vec::new(),
         })
     }
 
@@ -478,6 +484,82 @@ impl ChangeSet {
         store: &mut SectionStore,
         registry: &BlockStateRegistry,
     ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
+        if !self.entity_moves.is_empty() || !self.component_edits.is_empty() {
+            return Err(ExchangeError::Store {
+                detail: "entity movements require the entity-aware replay path".to_owned(),
+            });
+        }
+        let edits = self.resolve_edits(registry)?;
+        store.apply_edits(&edits).map_err(store_error)
+    }
+
+    /// Replay one mixed terrain/entity record as a fully validated group.
+    ///
+    /// Replay trusts the authoritative collision result but still checks source
+    /// positions, identity, duplicates, and storage targets. A bad entity tail
+    /// cannot partially apply otherwise valid terrain writes.
+    pub fn apply_with_entities(
+        &self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+    ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
+        if !self.component_edits.is_empty() {
+            return Err(ExchangeError::Store {
+                detail: "component edits require schema-aware replay".to_owned(),
+            });
+        }
+        self.apply_group(store, entities, registry, ComponentBatch::default())
+    }
+
+    /// Replay terrain, movement, and protected components after full validation.
+    pub fn apply_with_components(
+        &self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+    ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
+        let batch = entities
+            .prepare_components(&self.component_edits, schemas)
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
+        self.apply_group(store, entities, registry, batch)
+    }
+
+    fn apply_group(
+        &self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        components: ComponentBatch,
+    ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
+        let edits = self.resolve_edits(registry)?;
+        entities
+            .validate_moves(&self.entity_moves)
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
+        store.validate_edits(&edits).map_err(store_error)?;
+        let touched = store.apply_edits(&edits).map_err(store_error)?;
+        entities
+            .apply_moves(&self.entity_moves)
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
+        entities
+            .publish_components(components)
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
+        Ok(touched)
+    }
+
+    fn resolve_edits(
+        &self,
+        registry: &BlockStateRegistry,
+    ) -> Result<Vec<BlockEdit>, ExchangeError> {
         let mut edits = Vec::with_capacity(self.edits.len());
         for edit in &self.edits {
             let state = match &edit.content {
@@ -494,7 +576,7 @@ impl ChangeSet {
                 state,
             });
         }
-        store.apply_edits(&edits).map_err(store_error)
+        Ok(edits)
     }
 }
 
@@ -773,6 +855,8 @@ mod tests {
             .restore(&registry, &schemas())
             .expect("restore works");
         let changes = ChangeSet {
+            component_edits: Vec::new(),
+            entity_moves: Vec::new(),
             meta: torse_types::CommitMeta {
                 cursor: torse_types::CommitCursor {
                     world: WorldId(3),

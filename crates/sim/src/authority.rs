@@ -169,7 +169,10 @@ impl WorldAuthority {
         &self.entities
     }
 
-    /// Mutable entity access for load and movement paths.
+    /// Mutable entity access for initialization and load paths.
+    ///
+    /// Authoritative movement should use transactions so journal reservation,
+    /// conflict checks, and recovery observe the same publication boundary.
     pub fn entities_mut(&mut self) -> &mut EntityStore {
         &mut self.entities
     }
@@ -196,12 +199,19 @@ impl WorldAuthority {
 
     /// Validate a transaction without changing the world.
     pub fn prepare(&self, transaction: &Transaction) -> Result<PreparedChange, PrepareError> {
-        self.coordinator.prepare(&self.store, transaction)
+        self.coordinator.prepare_with_components(
+            &self.store,
+            &self.entities,
+            &self.registry,
+            &self.schemas,
+            transaction,
+        )
     }
 
     /// Publish a prepared change.
     pub fn publish(&mut self, prepared: PreparedChange) -> Result<Publication, CommitFault> {
-        self.coordinator.publish(&mut self.store, prepared)
+        self.coordinator
+            .publish_with_entities(&mut self.store, &mut self.entities, prepared)
     }
 
     /// Prepare and publish one transaction.
@@ -209,7 +219,13 @@ impl WorldAuthority {
         &mut self,
         transaction: &Transaction,
     ) -> Result<TransactionResult<Committed>, CommitFault> {
-        self.coordinator.commit(&mut self.store, transaction)
+        self.coordinator.commit_with_components(
+            &mut self.store,
+            &mut self.entities,
+            &self.registry,
+            &self.schemas,
+            transaction,
+        )
     }
 
     /// Capture the whole world at its current commit position.
@@ -331,7 +347,12 @@ impl<'a> Recovery<'a> {
             });
         }
         changes
-            .apply(&mut restored.store, self.registry)
+            .apply_with_components(
+                &mut restored.store,
+                &mut restored.entities,
+                self.registry,
+                self.schemas,
+            )
             .map_err(RecoveryError::Payload)?;
         self.seq = expected;
         self.compatibility = changes.meta.compatibility;
@@ -539,6 +560,8 @@ mod tests {
             .restore_snapshot(&snapshot)
             .expect("snapshot applies");
         let change = ChangeSet {
+            component_edits: Vec::new(),
+            entity_moves: Vec::new(),
             meta: torse_types::CommitMeta {
                 cursor: CommitCursor {
                     world: WorldId(5),

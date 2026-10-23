@@ -1,0 +1,143 @@
+//! Optional native place/break actions, shared by every input adapter.
+
+use torse_actions::{
+    ActionDescriptor, ActionKind, ActionPhase, CommandBinding, HandlerBinding, PermissionRule,
+};
+use torse_content::{
+    ComponentField, ComponentFieldType, ComponentSchema, ContentPack, PersistencePolicy,
+};
+use torse_types::{ContentKey, RejectCode, ReplicationDeclaration};
+use torse_world::{BlockStateId, ComponentValue, TerrainQuery};
+
+use crate::Transaction;
+use crate::action::{
+    ActionHandler, ActionOutput, ActionRequest, ActionTarget, ActionView, NativeHandler,
+    register_action_module,
+};
+
+fn key(value: &str) -> ContentKey {
+    ContentKey::parse(value).expect("block action key")
+}
+
+/// Module identity checked by the dispatcher and generic component boundary.
+pub fn owner() -> ContentKey {
+    key("world:module")
+}
+
+/// Frozen descriptors; handlers must be explicitly bound by the application.
+pub fn descriptors() -> Vec<ActionDescriptor> {
+    ["place", "break"]
+        .into_iter()
+        .map(|name| ActionDescriptor {
+            id: key(&format!("world:action/{name}")),
+            api_version: 1,
+            kind: ActionKind::Mutation,
+            parameter_schema: key(&format!("world:schema/{name}")),
+            result_schema: key("world:schema/result"),
+            permission: PermissionRule {
+                permission: Some(key("world:permission/edit")),
+            },
+            target_constraints: Vec::new(),
+            phase: ActionPhase::Interaction,
+            max_items: 1,
+            max_bytes: 64,
+            handler: HandlerBinding {
+                handler: key(&format!("world:handler/{name}")),
+                owner_module: owner(),
+            },
+            commands: vec![CommandBinding {
+                name: key(&format!("world:command.{name}")),
+                aliases: Vec::new(),
+                usage_key: key(&format!("world:text/{name}")),
+            }],
+        })
+        .collect()
+}
+
+/// Install optional block action metadata without altering the M0 fixture.
+pub fn register_content(pack: &mut ContentPack) {
+    let components = ["place", "break", "result"]
+        .into_iter()
+        .map(|name| ComponentSchema {
+            id: key(&format!("world:schema/{name}")),
+            schema_version: 1,
+            owner_module: owner(),
+            fields: if name == "place" {
+                vec![ComponentField {
+                    id: key("world:field/block"),
+                    field_type: ComponentFieldType::ContentReference,
+                    required: true,
+                }]
+            } else {
+                Vec::new()
+            },
+            persistence: PersistencePolicy::Never,
+            replication: ReplicationDeclaration::SERVER_PRIVATE,
+            migration_binding: None,
+        })
+        .collect();
+    register_action_module(
+        pack,
+        owner(),
+        key("world:state/actions"),
+        components,
+        descriptors(),
+        Vec::new(),
+    );
+}
+
+/// Bounded implementations for the two descriptors above.
+pub fn handlers() -> Vec<NativeHandler> {
+    [false, true]
+        .into_iter()
+        .map(|place| NativeHandler {
+            handler: key(if place {
+                "world:handler/place"
+            } else {
+                "world:handler/break"
+            }),
+            owner: owner(),
+            implementation: Box::new(BlockHandler { place }),
+        })
+        .collect()
+}
+
+struct BlockHandler {
+    place: bool,
+}
+
+impl ActionHandler for BlockHandler {
+    fn plan(
+        &self,
+        view: &ActionView<'_>,
+        request: &ActionRequest,
+    ) -> Result<ActionOutput, RejectCode> {
+        let ActionTarget::Block(pos) = request.target else {
+            return Err(RejectCode::InvalidData);
+        };
+        let current = match view.terrain(pos)? {
+            TerrainQuery::Ready(state) => state,
+            TerrainQuery::NotLoaded => return Err(RejectCode::NotLoaded),
+            TerrainQuery::OutOfBounds => return Err(RejectCode::MissingTarget),
+        };
+        let state = if self.place {
+            if !current.is_empty() {
+                return Err(RejectCode::Conflict);
+            }
+            let Some(ComponentValue::Content(block)) =
+                request.parameters.get(&key("world:field/block"))
+            else {
+                return Err(RejectCode::InvalidData);
+            };
+            view.default_state(block).ok_or(RejectCode::MissingTarget)?
+        } else {
+            if current.is_empty() {
+                return Err(RejectCode::Conflict);
+            }
+            BlockStateId::EMPTY
+        };
+        let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
+        tx.read_block(pos, current).write_block(pos, state);
+        Ok(ActionOutput::Mutation(tx))
+    }
+}

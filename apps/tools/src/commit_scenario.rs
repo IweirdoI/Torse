@@ -11,8 +11,9 @@
 
 use torse_content::{compile, m0_fixture_pack};
 use torse_sim::{CommitCoordinator, OrderingKey, Phase, Transaction};
-use torse_types::SectionPos;
-use torse_types::{BlockPos, ContentKey, TransactionId, TransactionOutcome, WorldId};
+use torse_types::{
+    BlockPos, CommitSeq, ContentKey, SectionPos, TransactionId, TransactionOutcome, WorldId,
+};
 use torse_world::{
     BlockStateId, BlockStateRegistry, Section, SectionStore, TerrainQuery, WorldBounds,
 };
@@ -32,6 +33,8 @@ pub struct CommitScenarioReport {
     pub contested_state: u16,
     /// Whether the unrelated transaction also committed.
     pub unrelated_committed: bool,
+    /// Preparations dropped before publication because storage refused them.
+    pub dropped: usize,
 }
 
 /// Failure produced by the scenario.
@@ -108,6 +111,29 @@ pub fn run() -> Result<CommitScenarioReport, CommitScenarioError> {
         .write_block(unrelated, stone);
 
     let mut coordinator = CommitCoordinator::new(WorldId(42));
+
+    // Storage refuses the record before publication: prepare the change, then
+    // drop it as a journal that has no capacity would. Nothing may change.
+    let refused_cell = BlockPos::new(5, 1, 3);
+    let mut refused = transaction(4, 3);
+    refused
+        .read_block(refused_cell, BlockStateId::EMPTY)
+        .write_block(refused_cell, stone);
+    let prepared = coordinator
+        .prepare(&store, &refused)
+        .map_err(|error| CommitScenarioError::new(format!("prepare failed: {error:?}")))?;
+    drop(prepared);
+    if coordinator.seq() != CommitSeq::INITIAL {
+        return Err(CommitScenarioError::new(
+            "a dropped preparation consumed a commit sequence",
+        ));
+    }
+    if store.query(refused_cell) != TerrainQuery::Ready(BlockStateId::EMPTY) {
+        return Err(CommitScenarioError::new(
+            "a dropped preparation changed the world",
+        ));
+    }
+
     let results = coordinator
         .commit_ordered(&mut store, vec![second, third, first])
         .map_err(|fault| CommitScenarioError::new(format!("coordinator fault: {fault}")))?;
@@ -115,6 +141,7 @@ pub fn run() -> Result<CommitScenarioReport, CommitScenarioError> {
     let mut report = CommitScenarioReport {
         commit_seq: coordinator.seq().0,
         contested_state: 0,
+        dropped: 1,
         ..CommitScenarioReport::default()
     };
     for result in &results {
@@ -163,6 +190,11 @@ pub fn run() -> Result<CommitScenarioReport, CommitScenarioError> {
             "a rejected transaction must not consume a commit sequence",
         ));
     }
+    if report.dropped != 1 {
+        return Err(CommitScenarioError::new(
+            "the dropped preparation must be counted",
+        ));
+    }
     Ok(report)
 }
 
@@ -193,5 +225,6 @@ mod tests {
         assert_eq!(report.commit_seq, 2);
         assert_eq!(report.winner_seq, 1);
         assert!(report.unrelated_committed);
+        assert_eq!(report.dropped, 1);
     }
 }

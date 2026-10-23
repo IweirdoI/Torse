@@ -3,3 +3,7 @@ name = "torse-storage"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+torse-codec = { path = "../codec" }
+torse-types = { path = "../types" }

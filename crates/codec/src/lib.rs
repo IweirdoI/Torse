@@ -10,6 +10,8 @@ mod decoder;
 mod encoder;
 pub mod frame;
 mod journal;
+pub mod metadata;
+pub mod record;
 mod registry;
 mod snapshot;
 

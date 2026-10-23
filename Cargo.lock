@@ -17,6 +17,9 @@ version = "0.1.0"
 [[package]]
 name = "torse-codec"
 version = "0.1.0"
+dependencies = [
+ "torse-types",
+]
 
 [[package]]
 name = "torse-content"

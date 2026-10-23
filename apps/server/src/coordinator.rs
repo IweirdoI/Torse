@@ -436,7 +436,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         Ok(())
     }
 
-    fn fail(&mut self, fault: Fault) -> Fault {
+    pub(crate) fn fail(&mut self, fault: Fault) -> Fault {
         self.state = ServerState::Faulted;
         // Never attempt another world publication or claim saved state after a terminal error.
         let _ = self

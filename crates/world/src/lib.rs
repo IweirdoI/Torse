@@ -22,6 +22,7 @@ mod exchange;
 mod handles;
 mod registry;
 mod section;
+mod snapshot_budget;
 mod store;
 
 pub use component::{

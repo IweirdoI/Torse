@@ -43,8 +43,9 @@ M2已开始，当前覆盖模拟执行模型与实体存储：
 - 权威装配与恢复：`WorldAuthority`统一持有存储、实体、注册表与协调器；`Recovery`在快照与日志尾都通过后才产出世界，续号与在线世界一致。
 - 提交仲裁、Tick与交换场景：同格争用只有一个成功，准备项被拒时世界不变，实体跨界移动后索引正确，快照往返与变更重放一致。
 - 世界载荷编码：快照与变更集按显式字段写入，读写两侧检查规范顺序、重复项、嵌套与预算；经文件日志与检查点保存后，可在新权威中恢复并续号。格式为M1临时版本，不承诺兼容。
+- 服务端真实世界装配：WorldHost接入B4协调器，可信本地事务经日志预留、发布与刷盘后返回持久位置；支持有界完整快照、文件恢复和关闭。网络请求、持久事件及去重结果仍待B6后续。
 
-M1尚未完成：GPU上传与可视客户端（窗口、相机、渲染管线）、可玩角色的输入装配。放置破坏已提供统一动作路径，实际UI与网络适配仍待装配；服务端的真实世界持久化装配仍待B6。
+M1尚未完成：GPU上传与可视客户端（窗口、相机、渲染管线）、可玩角色的输入装配。放置破坏已提供统一动作路径，实际UI与网络适配仍待装配。B6已接入可信本地事务，完整执行循环与请求恢复仍待后续。
 
 ## 目录
 
@@ -104,7 +105,10 @@ cargo run -p torse-tools -- exchange-scenario
 cargo run -p torse-tools -- recovery-scenario
 cargo run -p torse-tools -- movement-scenario
 cargo run -p torse-tools -- persistence-scenario
+cargo run -p torse-server --example durable_world -- .work/local-world
 ```
+
+重复运行durable_world会从同一目录恢复并切换一个方块，提交序号和运行代数连续递增。真实世界持久化的故障边界与范围见[验证记录](benchmarks/M3-local-world.md)。
 
 技术实验需要显式开启组件：
 

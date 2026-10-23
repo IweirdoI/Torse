@@ -233,6 +233,15 @@ impl WorldAuthority {
         Snapshot::capture(meta, &self.store, &self.entities, &self.registry)
     }
 
+    /// Check the complete owned output budget before allocating a world snapshot.
+    pub fn capture_snapshot_with_budget(
+        &self,
+        meta: SnapshotMeta,
+        budget: torse_types::OutputBudget,
+    ) -> Result<Snapshot, torse_types::Fault> {
+        Snapshot::capture_with_budget(meta, &self.store, &self.entities, &self.registry, budget)
+    }
+
     /// Start building a recovered world.
     pub fn begin_restore(&self) -> Recovery<'_> {
         Recovery::new(self.world, &self.registry, &self.schemas)

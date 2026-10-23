@@ -291,7 +291,8 @@ impl Snapshot {
         }
         sections.sort_by_key(|section| section.pos);
 
-        let mut states = Vec::with_capacity(used.len());
+        let state_count = used.len() - usize::from(used.contains_key(&BlockStateId::EMPTY));
+        let mut states = Vec::with_capacity(state_count);
         for state in used.into_keys() {
             if state.is_empty() {
                 continue;
@@ -308,38 +309,36 @@ impl Snapshot {
             });
         }
 
-        let mut entity_list: Vec<SnapshotEntity> = entities
-            .iter()
-            .map(|(_, entity)| {
-                let mut components: Vec<SnapshotComponent> = entity
-                    .components
-                    .ids()
-                    .map(|schema| SnapshotComponent {
-                        schema: schema.clone(),
-                        fields: entity
-                            .components
-                            .component(schema)
-                            .map(|fields| {
-                                fields
-                                    .iter()
-                                    .map(|(key, value)| (key.clone(), to_snapshot_value(value)))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    })
-                    .collect();
-                components.sort_by(|left, right| left.schema.cmp(&right.schema));
-                SnapshotEntity {
-                    id: entity.id,
-                    position_bits: [
-                        entity.position.x.to_bits(),
-                        entity.position.y.to_bits(),
-                        entity.position.z.to_bits(),
-                    ],
-                    components,
-                }
-            })
-            .collect();
+        let mut entity_list = Vec::with_capacity(entities.len());
+        for (_, entity) in entities.iter() {
+            let mut components: Vec<SnapshotComponent> = entity
+                .components
+                .ids()
+                .map(|schema| SnapshotComponent {
+                    schema: schema.clone(),
+                    fields: entity
+                        .components
+                        .component(schema)
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .map(|(key, value)| (key.clone(), to_snapshot_value(value)))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect();
+            components.sort_by(|left, right| left.schema.cmp(&right.schema));
+            entity_list.push(SnapshotEntity {
+                id: entity.id,
+                position_bits: [
+                    entity.position.x.to_bits(),
+                    entity.position.y.to_bits(),
+                    entity.position.z.to_bits(),
+                ],
+                components,
+            });
+        }
         entity_list.sort_by_key(|entity| entity.id.0);
 
         Ok(Self {

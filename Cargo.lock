@@ -2646,8 +2646,12 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "torse-codec",
+ "torse-content",
+ "torse-inventory",
+ "torse-sim",
  "torse-storage",
  "torse-types",
+ "torse-world",
 ]
 
 [[package]]

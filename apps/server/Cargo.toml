@@ -9,3 +9,9 @@ crc32c = "=0.6.8"
 torse-codec = { path = "../../crates/codec" }
 torse-storage = { path = "../../crates/storage" }
 torse-types = { path = "../../crates/types" }
+torse-sim = { path = "../../crates/sim" }
+torse-world = { path = "../../crates/world" }
+
+[dev-dependencies]
+torse-content = { path = "../../crates/content" }
+torse-inventory = { path = "../../modules/inventory" }

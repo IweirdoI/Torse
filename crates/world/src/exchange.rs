@@ -120,6 +120,8 @@ pub struct Snapshot {
     pub sections: Vec<SnapshotSection>,
     /// Entities, ascending by identity.
     pub entities: Vec<SnapshotEntity>,
+    /// Persistent allocator watermark, including despawned identities.
+    pub next_entity_id: u128,
 }
 
 /// Stable content of one written cell.
@@ -347,6 +349,7 @@ impl Snapshot {
             states,
             sections,
             entities: entity_list,
+            next_entity_id: entities.next_entity_id(),
         })
     }
 
@@ -360,6 +363,7 @@ impl Snapshot {
         registry: &BlockStateRegistry,
         schemas: &ComponentSchemas,
     ) -> Result<RestoredWorld, ExchangeError> {
+        self.validate_entity_allocator()?;
         if self.side == 0 {
             return Err(ExchangeError::InvalidWorld { side: self.side });
         }
@@ -435,11 +439,33 @@ impl Snapshot {
                 })?;
         }
 
+        entities
+            .restore_next_entity_id(self.next_entity_id)
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
         Ok(RestoredWorld {
             store,
             entities,
             resume: self.meta.resume_at,
         })
+    }
+
+    /// Reject a watermark that could reissue a live identity. The maximum value
+    /// represents an exhausted allocator and also covers a restored maximum ID.
+    pub fn validate_entity_allocator(&self) -> Result<(), ExchangeError> {
+        if self.next_entity_id == 0
+            || (self.next_entity_id != u128::MAX
+                && self
+                    .entities
+                    .iter()
+                    .any(|entity| entity.id.0 >= self.next_entity_id))
+        {
+            return Err(ExchangeError::Store {
+                detail: "invalid entity allocator watermark".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 

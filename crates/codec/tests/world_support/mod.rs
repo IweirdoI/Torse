@@ -99,6 +99,7 @@ pub fn bits(x: f64, y: f64, z: f64) -> [u64; 3] {
 pub fn sample_snapshot() -> Snapshot {
     let dense = [0, 1, 3, 0, 0, 0, 0, 1].map(BlockStateId).to_vec();
     Snapshot {
+        next_entity_id: 8,
         meta: snapshot_meta(),
         side: 2,
         bounds: WorldBounds::new(-2, 2).expect("bounds are valid"),

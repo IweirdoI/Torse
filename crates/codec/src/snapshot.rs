@@ -52,6 +52,9 @@ fn cells_per_section(side: u32) -> EncodeResult<usize> {
 
 /// Append one snapshot body: metadata, extent, state table, sections, then entities.
 pub(crate) fn write_snapshot(out: &mut Encoder<'_>, value: &Snapshot) -> EncodeResult<()> {
+    value
+        .validate_entity_allocator()
+        .map_err(|error| invalid(error.to_string()))?;
     let cells = cells_per_section(value.side)?;
     // `WorldBounds` is constructible with public fields, so its invariant is checked here
     // rather than trusted; the reader rebuilds the bounds through `WorldBounds::new`.
@@ -65,7 +68,8 @@ pub(crate) fn write_snapshot(out: &mut Encoder<'_>, value: &Snapshot) -> EncodeR
     out.write_i64(value.bounds.max_y)?;
     write_states(out, &value.states)?;
     write_sections(out, &value.sections, cells)?;
-    write_entities(out, &value.entities)
+    write_entities(out, &value.entities)?;
+    out.write_u128(value.next_entity_id)
 }
 
 pub(crate) fn read_snapshot(input: &mut Decoder<'_>) -> EncodeResult<Snapshot> {
@@ -78,14 +82,20 @@ pub(crate) fn read_snapshot(input: &mut Decoder<'_>) -> EncodeResult<Snapshot> {
     let states = read_states(input)?;
     let sections = read_sections(input, cells)?;
     let entities = read_entities(input)?;
-    Ok(Snapshot {
+    let next_entity_id = input.read_u128()?;
+    let snapshot = Snapshot {
         meta,
         side,
         bounds,
         states,
         sections,
         entities,
-    })
+        next_entity_id,
+    };
+    snapshot
+        .validate_entity_allocator()
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(snapshot)
 }
 
 // State table -------------------------------------------------------------------------------

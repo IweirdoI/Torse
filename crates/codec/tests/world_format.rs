@@ -1,4 +1,4 @@
-//! Byte-level checks of world format version 1 against an independent specification.
+//! Byte-level checks of world format version 2 against an independent specification.
 //!
 //! The expected bytes below are assembled field by field from `WORLD.md`, without calling
 //! the encoder. The encoder output, the stored fixture, and this specification must all
@@ -7,7 +7,7 @@
 //!
 //! Regenerate the fixtures after an intentional layout change with
 //! `TORSE_BLESS_FIXTURES=1 cargo test -p torse-codec --test world_format`; a layout change
-//! inside version 1 is a compatibility break and must also bump `WORLD_FORMAT_VERSION`.
+//! inside version 2 is a compatibility break and must also bump `WORLD_FORMAT_VERSION`.
 
 mod world_support;
 
@@ -84,7 +84,12 @@ impl Spec {
     }
 
     fn push(mut self, label: &'static str, bytes: Vec<u8>) -> Self {
-        self.0.push((label, bytes));
+        let index = self
+            .0
+            .iter()
+            .position(|(name, _)| *name == "allocator")
+            .unwrap_or(self.0.len());
+        self.0.insert(index, (label, bytes));
         self
     }
 
@@ -115,7 +120,7 @@ fn compatibility_lines() -> Vec<(&'static str, Vec<u8>)> {
 fn snapshot_spec() -> Spec {
     let dense: Vec<Vec<u8>> = [0u16, 1, 3, 0, 0, 0, 0, 1].map(u16s).to_vec();
     let mut lines = vec![
-        ("version", u16s(1)),
+        ("version", u16s(2)),
         ("meta.cursor", join(&[u128s(1), u64s(2)])),
     ];
     lines.extend(compatibility_lines());
@@ -157,13 +162,14 @@ fn snapshot_spec() -> Spec {
         ("field.g.0", join(&[u8s(1), u32s(1)])),
         ("field.g.1", join(&[u8s(7), u32s(1)])),
         ("field.h", join(&[keys("base:field/h"), u8s(0), u8s(0)])),
+        ("allocator", u128s(8)),
     ]);
     Spec(lines)
 }
 
 fn changes_spec() -> Spec {
     let mut lines = vec![
-        ("version", u16s(1)),
+        ("version", u16s(2)),
         ("meta.cursor", join(&[u128s(1), u64s(2)])),
         ("meta.previous", u64s(1)),
     ];
@@ -221,6 +227,20 @@ fn changes_spec() -> Spec {
         ("remove.fields", u8s(0)),
     ]);
     Spec(lines)
+}
+
+#[test]
+fn invalid_allocator_watermarks_are_rejected_before_restore() {
+    for watermark in [0, 1, 5] {
+        assert_fault(
+            decode_snapshot(
+                &snapshot_spec()
+                    .replace("allocator", u128s(watermark))
+                    .bytes(),
+            ),
+            "allocator watermark",
+        );
+    }
 }
 
 /// Logical items in each sample, counted by hand from the rules in `WORLD.md`.
@@ -297,7 +317,7 @@ fn snapshot_matches_specification_and_fixture() {
     check_fixture(
         "world_snapshot.hex",
         &spec,
-        "world snapshot, format version 1",
+        "world snapshot, format version 2",
     );
     let expected = spec.bytes();
     assert_eq!(encode_snapshot(&sample_snapshot()).unwrap(), expected);
@@ -313,7 +333,7 @@ fn changes_match_specification_and_fixture() {
     check_fixture(
         "world_changes.hex",
         &spec,
-        "world change set, format version 1",
+        "world change set, format version 2",
     );
     let expected = spec.bytes();
     assert_eq!(encode_changes(&sample_changes()).unwrap(), expected);
@@ -369,7 +389,7 @@ fn trailing_bytes_are_rejected() {
 
 #[test]
 fn unknown_format_versions_are_incompatible() {
-    for version in [0, 2, u16::MAX] {
+    for version in [0, 1, u16::MAX] {
         let snapshot = snapshot_spec().replace("version", u16s(version)).bytes();
         assert_code(decode_snapshot(&snapshot), FaultCode::Incompatible);
         let changes = changes_spec().replace("version", u16s(version)).bytes();
@@ -568,7 +588,7 @@ fn entity_identities_must_ascend() {
 fn repeated_moves_and_component_edits_are_rejected() {
     // A minimal record with two moves, so only the move identities differ between cases.
     let duplicate_move = Spec(vec![
-        ("version", u16s(1)),
+        ("version", u16s(2)),
         ("meta", changes_spec().bytes()[2..120].to_vec()),
         ("edits", u32s(0)),
         ("moves", u32s(2)),

@@ -5,8 +5,9 @@
 //! independently of the outer record envelope and of `Compatibility::authority_schema`, which
 //! the host derives from compiled content.
 //!
-//! Version 1 is the M1 interim format. It has no compatibility promise: a later formal format
-//! will use a new version number, and readers built for it may reject version 1 outright.
+//! Version 2 adds the persisted entity allocator watermark. Version 1 is rejected rather
+//! than guessing allocation history from live entities. This M1 interim format has no
+//! compatibility promise; the outer record envelope remains unchanged.
 //! The complete byte layout is documented in `WORLD.md` next to this crate's manifest.
 
 use std::marker::PhantomData;
@@ -22,7 +23,7 @@ use crate::value::invalid;
 use crate::{CodecLimits, Decoder, EncodeResult, Encoder, StorageCodec};
 
 /// Domain format version written at the start of every world payload.
-pub const WORLD_FORMAT_VERSION: u16 = 1;
+pub const WORLD_FORMAT_VERSION: u16 = 2;
 
 /// Smallest `CodecLimits::max_depth` that can carry every component the world accepts.
 ///

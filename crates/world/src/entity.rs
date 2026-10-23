@@ -257,6 +257,22 @@ impl EntityStore {
         self.side
     }
 
+    /// Allocation watermark, including identities of entities already removed.
+    /// `u128::MAX` denotes exhaustion; spawning never wraps or reuses an identity.
+    pub const fn next_entity_id(&self) -> u128 {
+        self.next_id
+    }
+
+    /// Restore a persisted watermark after rebuilding the live entity table.
+    /// A checkpoint may advance the derived watermark but must never rewind it.
+    pub fn restore_next_entity_id(&mut self, next: u128) -> Result<(), EntityError> {
+        if next == 0 || next < self.next_id {
+            return Err(EntityError::InvalidId);
+        }
+        self.next_id = next;
+        Ok(())
+    }
+
     /// Spawn an entity at a position.
     pub fn spawn(&mut self, position: Position) -> Result<EntityHandle, EntityError> {
         if !position.is_finite() {

@@ -1,12 +1,12 @@
 # 世界载荷格式
 
-版本：1。实施阶段：B5。本文规定`WorldCodec`写入记录包裹的领域载荷，包裹本身见[记录包裹与元数据](FORMAT.md)。字段来源为A登记的`Snapshot`与`ChangeSet`，见`torse-world::exchange`。
+版本：2。实施阶段：B5。本文规定`WorldCodec`写入记录包裹的领域载荷，包裹本身见[记录包裹与元数据](FORMAT.md)。字段来源为A登记的`Snapshot`与`ChangeSet`，见`torse-world::exchange`。
 
-版本1是M1临时格式，不承诺兼容。正式格式将使用新的版本号，届时读取器可以直接拒绝版本1。M3前迁移或弃用版本1。
+版本2在快照末尾增加实体身份分配器水位，避免删除后的编号在恢复时被重用。版本1缺失该状态，当前读取器明确拒绝，不提供自动迁移。版本2仍为M1临时格式，不承诺兼容，M3前迁移或弃用。
 
 ## 通用约定
 
-整数均为小端，`i64`为二进制补码。载荷开头是2字节的世界格式版本，当前为1；读取到其他值返回`Incompatible`，不猜测布局。该版本只描述本文的领域布局，与包裹版本及`Compatibility.authority_schema`各自维护。解码必须恰好消费全部载荷，多余字节按数据错误拒绝。
+整数均为小端，`i64`为二进制补码。载荷开头是2字节的世界格式版本，当前为2；读取到其他值返回`Incompatible`，不猜测布局。该版本只描述本文的领域布局，与包裹版本及`Compatibility.authority_schema`各自维护。解码必须恰好消费全部载荷，多余字节按数据错误拒绝。
 
 | 记号 | 编码 |
 |---|---|
@@ -25,13 +25,14 @@
 
 | 顺序 | 字段 | 编码 |
 |---|---|---|
-| 1 | version | u16，值为1 |
+| 1 | version | u16，值为2 |
 | 2 | meta | 110字节SnapshotMeta，布局同B1 |
 | 3 | side | u32，范围1到64 |
 | 4 | min_y、max_y | 两个i64，要求`min_y < max_y` |
 | 5 | states | 计数加StateEntry |
 | 6 | sections | 计数加SnapshotSection |
 | 7 | entities | 计数加SnapshotEntity |
+| 8 | next_entity_id | u128，非0；最大值表示耗尽 |
 
 | 结构 | 字段与顺序 |
 |---|---|
@@ -39,6 +40,8 @@
 | SnapshotSection | x、y、z各为i64；cells标签u8，0为Uniform后接u16，1为Dense后接`side^3`个u16 |
 | SnapshotEntity | id:实体身份；position_bits:位置；components:计数加SnapshotComponent |
 | SnapshotComponent | schema:内容键；fields:字段表 |
+
+next_entity_id保存包含已删除身份的分配历史，必须大于所有存活身份；u128最大值作为耗尽状态允许存活最大身份。恢复不能只按存活实体推导水位。变更集布局保持不变，但使用同一世界格式版本2前缀；外层记录包裹版本仍为1。
 
 Dense不带长度前缀，单元数由side确定，单元按A登记的线性序`x + side * (z + side * y)`排列。状态表不登记编号0，该编号固定为空占用。
 
@@ -48,7 +51,7 @@ Dense不带长度前缀，单元数由side确定，单元按A登记的线性序`
 
 | 顺序 | 字段 | 编码 |
 |---|---|---|
-| 1 | version | u16，值为1 |
+| 1 | version | u16，值为2 |
 | 2 | meta | 118字节CommitMeta，布局同B1，读写都检查`cursor = previous + 1` |
 | 3 | edits | 计数加ChangeEdit，保持提交顺序 |
 | 4 | entity_moves | 计数加EntityMove，保持提交顺序 |
@@ -112,4 +115,4 @@ codec只检查结构。状态编号是否在状态表中、内容键能否解析
 
 样例逐行标注字段名。[格式测试](tests/world_format.rs)用独立于编码器的逐字段规格核对编码结果、样例与解码结果，并核对元数据段与B1的`snapshot.hex`、`commit.hex`一致。测试还覆盖全部截断位置、预算不足、乱序与重复、非法标量、伪造计数、嵌套上限和未知版本。
 
-版本1内的布局变化属于兼容破坏，须同时升级版本号。确认变化后，设置环境变量`TORSE_BLESS_FIXTURES=1`运行格式测试即可重写样例。
+同一版本内的布局变化属于兼容破坏，须同时升级版本号。确认变化后，设置环境变量`TORSE_BLESS_FIXTURES=1`运行格式测试即可重写样例。

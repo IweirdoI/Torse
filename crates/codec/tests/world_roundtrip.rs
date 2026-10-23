@@ -83,6 +83,69 @@ fn fixture() -> Fixture {
     }
 }
 
+#[test]
+fn deleted_identities_are_not_reissued_after_codec_and_world_restore() {
+    for delete_all in [false, true] {
+        let mut world = fixture();
+        let handles: Vec<_> = world.entities.iter().map(|(handle, _)| handle).collect();
+        for handle in handles.into_iter().filter(|h| delete_all || h.slot == 1) {
+            world.entities.despawn(handle).unwrap();
+        }
+        let watermark = world.entities.next_entity_id();
+        let snapshot =
+            Snapshot::capture(meta(), &world.store, &world.entities, &world.registry).unwrap();
+        let decoded = decode_snapshot(&encode_snapshot(&snapshot).unwrap()).unwrap();
+        assert_eq!(decoded.next_entity_id, watermark);
+        let mut restored = decoded.restore(&world.registry, &world.schemas).unwrap();
+        let handle = restored
+            .entities
+            .spawn(Position::new(1.0, 1.0, 1.0))
+            .unwrap();
+        assert_eq!(restored.entities.get(handle).unwrap().id.0, watermark);
+        assert_eq!(restored.entities.next_entity_id(), watermark + 1);
+    }
+}
+
+#[test]
+fn allocator_rewind_and_exhaustion_are_preserved_at_recovery_boundaries() {
+    let world = fixture();
+    let snapshot =
+        Snapshot::capture(meta(), &world.store, &world.entities, &world.registry).unwrap();
+    for invalid in [0, 1, 2] {
+        let mut bad = snapshot.clone();
+        bad.next_entity_id = invalid;
+        assert!(bad.restore(&world.registry, &world.schemas).is_err());
+        let codec = codec();
+        let mut out = Vec::new();
+        use torse_codec::StorageCodec;
+        assert!(
+            codec
+                .encode_snapshot(
+                    &torse_types::WorldSnapshot {
+                        meta: bad.meta,
+                        state: bad
+                    },
+                    &mut out,
+                    BUDGET
+                )
+                .is_err()
+        );
+        assert!(out.is_empty());
+    }
+    let mut exhausted = snapshot;
+    exhausted.next_entity_id = u128::MAX;
+    let decoded = decode_snapshot(&encode_snapshot(&exhausted).unwrap()).unwrap();
+    let mut restored = decoded.restore(&world.registry, &world.schemas).unwrap();
+    assert!(
+        restored
+            .entities
+            .spawn(Position::new(0.0, 0.0, 0.0))
+            .is_err()
+    );
+    assert_eq!(restored.entities.next_entity_id(), u128::MAX);
+    assert!(restored.entities.restore_next_entity_id(3).is_err());
+}
+
 fn meta() -> SnapshotMeta {
     SnapshotMeta {
         cursor: CommitCursor {

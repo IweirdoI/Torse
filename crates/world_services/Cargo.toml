@@ -3,3 +3,7 @@ name = "torse-world-services"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+torse-types = { path = "../types" }
+torse-world = { path = "../world" }

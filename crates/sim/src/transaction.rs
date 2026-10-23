@@ -9,8 +9,9 @@
 //! for full totality, by transaction identity. None of those fields depends on a
 //! thread number or on the order in which results happened to be produced.
 
+use std::collections::BTreeMap;
 use torse_types::{BlockPos, ContentKey, EntityHandle, EntityId, TransactionId};
-use torse_world::{ComponentEdit, Position};
+use torse_world::{ComponentEdit, ComponentFields, Entity, EntityState, Position};
 
 use crate::phase::Phase;
 
@@ -55,6 +56,20 @@ pub struct Movement {
     pub half_bits: [u64; 3],
 }
 
+/// Creation request without a persistent identity; preparation proposes the next ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Spawn {
+    pub position_bits: [u64; 3],
+    pub components: BTreeMap<ContentKey, ComponentFields>,
+}
+
+/// Removal request with both runtime generation and the full observed stable state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Despawn {
+    pub handle: EntityHandle,
+    pub previous: EntityState,
+}
+
 /// Stable ordering key of one transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct OrderingKey {
@@ -85,6 +100,10 @@ pub struct Transaction {
     pub movements: Vec<Movement>,
     /// Schema-validated protected fields; only the schema owner may write them.
     pub components: Vec<ComponentEdit>,
+    /// Creations in deterministic allocation order.
+    pub spawns: Vec<Spawn>,
+    /// Removals compare the complete observed state before publication.
+    pub despawns: Vec<Despawn>,
 }
 
 impl Transaction {
@@ -98,6 +117,8 @@ impl Transaction {
             mutations: Vec::new(),
             movements: Vec::new(),
             components: Vec::new(),
+            spawns: Vec::new(),
+            despawns: Vec::new(),
         }
     }
 
@@ -110,6 +131,28 @@ impl Transaction {
     /// Record a write.
     pub fn write_block(&mut self, pos: BlockPos, state: torse_world::BlockStateId) -> &mut Self {
         self.mutations.push(Mutation { pos, state });
+        self
+    }
+
+    /// Request creation; component ownership is checked against the transaction source.
+    pub fn spawn_entity(
+        &mut self,
+        position: Position,
+        components: BTreeMap<ContentKey, ComponentFields>,
+    ) -> &mut Self {
+        self.spawns.push(Spawn {
+            position_bits: position.to_bits(),
+            components,
+        });
+        self
+    }
+
+    /// Request removal from a read-only entity observation.
+    pub fn despawn_entity(&mut self, handle: EntityHandle, previous: &Entity) -> &mut Self {
+        self.despawns.push(Despawn {
+            handle,
+            previous: EntityState::capture(previous),
+        });
         self
     }
 

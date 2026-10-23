@@ -14,6 +14,7 @@ mod decoder;
 mod encoder;
 pub mod frame;
 mod journal;
+mod lifecycle;
 pub mod metadata;
 pub mod record;
 mod registry;

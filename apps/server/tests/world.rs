@@ -219,6 +219,335 @@ fn capture(world: &WorldAuthority) -> Snapshot {
         .unwrap()
 }
 
+fn lifecycle_plan(world: &WorldAuthority, id: u128) -> Transaction {
+    let mut tx = block(world, id, 5);
+    let old = world.entities().handle_of(EntityId(1)).unwrap();
+    let entity = world.entities().get(old).unwrap();
+    tx.despawn_entity(old, entity).spawn_entity(
+        Position::new(-0.5, 2.0, 2.0),
+        [(
+            torse_inventory::schema(),
+            entity
+                .components
+                .component(&torse_inventory::schema())
+                .unwrap()
+                .clone(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let survivor = world.entities().handle_of(EntityId(2)).unwrap();
+    let entity = world.entities().get(survivor).unwrap();
+    tx.move_entity(
+        survivor,
+        entity.id,
+        entity.position,
+        [0.5, 0.0, 0.0],
+        [0.3, 0.9, 0.3],
+    );
+    tx
+}
+
+#[test]
+fn lifecycle_preparation_drop_staging_rejection_and_restart_preserve_allocation() {
+    let directory = Directory::new();
+    let mut config = policy();
+    config.journal.codec_budget.max_bytes = 1;
+    let mut server = create(&directory, config);
+    let live = server.authority().unwrap().world();
+    let before = capture(live);
+    let tx = lifecycle_plan(live, 1);
+    let prepared = live.prepare(&tx).unwrap();
+    assert_eq!(
+        prepared.entity_lifecycle().unwrap().spawned[0].id,
+        EntityId(5)
+    );
+    drop(prepared);
+    assert_eq!(capture(server.authority().unwrap().world()), before);
+    for _ in 0..2 {
+        assert!(matches!(
+            server.commit_transaction(&tx).unwrap(),
+            LocalCommit::Blocked(StageError::TooLarge)
+        ));
+        assert_eq!(capture(server.authority().unwrap().world()), before);
+    }
+    drop(server);
+    let mut server = open(&directory).unwrap();
+    let old_handle = server
+        .authority()
+        .unwrap()
+        .world()
+        .entities()
+        .handle_of(EntityId(1))
+        .unwrap();
+    assert!(matches!(
+        server.commit_transaction(&tx).unwrap(),
+        LocalCommit::Durable(_)
+    ));
+    let live = server.authority().unwrap().world();
+    assert!(live.entities().get(old_handle).is_none());
+    assert!(live.entities().handle_of(EntityId(1)).is_none());
+    let created = live.entities().handle_of(EntityId(5)).unwrap();
+    assert_eq!(live.entities().get(created).unwrap().position.x, -0.5);
+    assert_eq!(live.entities().next_entity_id(), 6);
+    let expected = capture(live);
+    drop(server);
+    let mut server = open(&directory).unwrap();
+    assert_eq!(capture(server.authority().unwrap().world()), expected);
+    server.checkpoint().unwrap();
+    let live = server.authority().unwrap().world();
+    let handle = live.entities().handle_of(EntityId(5)).unwrap();
+    let mut remove = transaction(2);
+    remove.despawn_entity(handle, live.entities().get(handle).unwrap());
+    assert!(matches!(
+        server.commit_transaction(&remove).unwrap(),
+        LocalCommit::Durable(_)
+    ));
+    drop(server);
+    let mut server = open(&directory).unwrap();
+    assert_eq!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id(),
+        6
+    );
+    let mut create = transaction(3);
+    create.spawn_entity(Position::new(1.0, 2.0, 2.0), Default::default());
+    assert!(matches!(
+        server.commit_transaction(&create).unwrap(),
+        LocalCommit::Durable(_)
+    ));
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .handle_of(EntityId(6))
+            .is_some()
+    );
+}
+
+#[test]
+fn lifecycle_rejections_and_stale_publication_never_partially_edit_the_world() {
+    let mut world = world();
+    let tx = lifecycle_plan(&world, 1);
+    let before = capture(&world);
+    for variant in 0..9 {
+        let mut bad = tx.clone();
+        let expected = match variant {
+            0 => {
+                bad.source = key("base:intruder");
+                RejectCode::PermissionDenied
+            }
+            1 => {
+                bad.despawns[0].previous.position_bits[0] = 1.0f64.to_bits();
+                RejectCode::Conflict
+            }
+            2 => {
+                bad.despawns[0].previous.components.clear();
+                RejectCode::Conflict
+            }
+            3 => {
+                bad.despawns.push(bad.despawns[0].clone());
+                RejectCode::InvalidData
+            }
+            4 => {
+                bad.spawns[0].position_bits[0] = f64::NAN.to_bits();
+                RejectCode::InvalidData
+            }
+            5 => {
+                bad.spawns[0].position_bits[0] = 128.0f64.to_bits();
+                RejectCode::InvalidData
+            }
+            6 => {
+                bad.spawns
+                    .resize(torse_world::MAX_ENTITY_LIFECYCLE + 1, bad.spawns[0].clone());
+                RejectCode::QuotaExceeded
+            }
+            7 => {
+                bad.movements[0].id = EntityId(1);
+                RejectCode::InvalidData
+            }
+            _ => {
+                bad.despawns[0].handle.generation += 1;
+                RejectCode::MissingTarget
+            }
+        };
+        assert_eq!(
+            world.prepare(&bad).unwrap_err(),
+            torse_sim::PrepareError::Rejected(expected)
+        );
+        assert_eq!(capture(&world), before);
+    }
+    let prepared = world.prepare(&tx).unwrap();
+    let handle = world.entities().handle_of(EntityId(1)).unwrap();
+    world
+        .entities_mut()
+        .move_to(handle, Position::new(1.0, 2.0, 2.0))
+        .unwrap();
+    let changed = capture(&world);
+    assert!(world.publish(prepared).is_err());
+    assert_eq!(capture(&world), changed);
+    let prepared = world
+        .prepare(&{
+            let mut create = transaction(2);
+            create.spawn_entity(Position::new(1.0, 2.0, 2.0), Default::default());
+            create
+        })
+        .unwrap();
+    let unrelated = world
+        .entities_mut()
+        .spawn(Position::new(2.0, 2.0, 2.0))
+        .unwrap();
+    assert!(world.entities().get(unrelated).is_some());
+    let changed = capture(&world);
+    assert!(world.publish(prepared).is_err());
+    assert_eq!(capture(&world), changed);
+}
+
+#[test]
+fn invalid_lifecycle_tail_never_applies_valid_terrain_or_survivor_movement() {
+    let mut world = world();
+    let prepared = world.prepare(&lifecycle_plan(&world, 1)).unwrap();
+    let original = torse_sim::changes_from_prepared(world.registry(), &prepared).unwrap();
+    let snapshot = capture(&world);
+    for variant in 0..6 {
+        let mut bad = original.clone();
+        let change = bad.entity_lifecycle.as_mut().unwrap();
+        match variant {
+            0 => change.next_id += 1,
+            1 => change.previous_next_id -= 1,
+            2 => change.spawned[0].id = EntityId(1),
+            3 => change.despawned[0].position_bits[0] = 2.0f64.to_bits(),
+            4 => {
+                change.spawned[0]
+                    .components
+                    .insert(key("base:missing"), Default::default());
+            }
+            _ => change.spawned[0].position_bits[1] = 64.0f64.to_bits(),
+        }
+        let mut restored = snapshot.restore(world.registry(), world.schemas()).unwrap();
+        assert!(
+            bad.apply_with_components(
+                &mut restored.store,
+                &mut restored.entities,
+                world.registry(),
+                world.schemas(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            Snapshot::capture(
+                snapshot.meta,
+                &restored.store,
+                &restored.entities,
+                world.registry()
+            )
+            .unwrap(),
+            snapshot
+        );
+    }
+    world.publish(prepared).unwrap();
+    assert_eq!(world.entities().next_entity_id(), 6);
+}
+
+#[test]
+fn legacy_paths_reject_lifecycle_and_committed_payload_keeps_the_complete_change() {
+    let mut world = world();
+    let tx = lifecycle_plan(&world, 1);
+    assert!(world.coordinator().prepare(world.store(), &tx).is_err());
+    assert!(
+        world
+            .coordinator()
+            .prepare_with_entities(world.store(), world.entities(), world.registry(), &tx,)
+            .is_err()
+    );
+    let prepared = world.prepare(&tx).unwrap();
+    let changes = torse_sim::changes_from_prepared(world.registry(), &prepared).unwrap();
+    let snapshot = capture(&world);
+    let mut restored = snapshot.restore(world.registry(), world.schemas()).unwrap();
+    assert!(
+        changes
+            .apply(&mut restored.store, world.registry())
+            .is_err()
+    );
+    assert!(
+        changes
+            .apply_with_entities(
+                &mut restored.store,
+                &mut restored.entities,
+                world.registry(),
+            )
+            .is_err()
+    );
+    assert_eq!(
+        Snapshot::capture(
+            snapshot.meta,
+            &restored.store,
+            &restored.entities,
+            world.registry()
+        )
+        .unwrap(),
+        snapshot
+    );
+    let result = world.commit(&tx).unwrap();
+    let TransactionOutcome::Committed { value, .. } = result.outcome else {
+        panic!("expected commit")
+    };
+    assert_eq!(
+        torse_sim::changes_from_committed(world.registry(), &value).unwrap(),
+        changes
+    );
+}
+
+#[test]
+fn allocator_exhaustion_rejects_creation_but_allows_removal() {
+    let mut world = world();
+    world
+        .entities_mut()
+        .restore_next_entity_id(u128::MAX - 1)
+        .unwrap();
+    let mut create = transaction(1);
+    create.spawn_entity(Position::new(1.0, 2.0, 2.0), Default::default());
+    world.commit(&create).unwrap();
+    assert_eq!(world.entities().next_entity_id(), u128::MAX);
+    let before = capture(&world);
+    assert_eq!(
+        world.prepare(&create).unwrap_err(),
+        torse_sim::PrepareError::Rejected(RejectCode::QuotaExceeded)
+    );
+    assert_eq!(capture(&world), before);
+    let handle = world.entities().handle_of(EntityId(u128::MAX - 1)).unwrap();
+    let mut remove = transaction(2);
+    remove.despawn_entity(handle, world.entities().get(handle).unwrap());
+    world.commit(&remove).unwrap();
+    assert_eq!(world.entities().next_entity_id(), u128::MAX);
+    assert!(
+        world
+            .entities()
+            .handle_of(EntityId(u128::MAX - 1))
+            .is_none()
+    );
+    // Earlier restore APIs also permit the maximum identity itself. It can still be
+    // removed even though the allocator sentinel forbids creating any further identity.
+    let handle = world
+        .entities_mut()
+        .insert_restored(
+            EntityId(u128::MAX),
+            Position::new(1.0, 2.0, 2.0),
+            ComponentSet::new(),
+        )
+        .unwrap();
+    let mut remove = transaction(3);
+    remove.despawn_entity(handle, world.entities().get(handle).unwrap());
+    world.commit(&remove).unwrap();
+    assert!(world.entities().get(handle).is_none());
+}
+
 #[test]
 fn mixed_commit_checkpoint_tail_recovery_and_shutdown_preserve_the_complete_world() {
     let directory = Directory::new();
@@ -388,8 +717,8 @@ fn failed_real_world_barrier_stops_reads_and_further_commits() {
         config.server,
     )
     .unwrap();
-    let tx = mixed(server.authority().unwrap().world(), EntityId(2));
     fail.set(true);
+    let tx = lifecycle_plan(server.authority().unwrap().world(), 1);
     assert!(server.commit_transaction(&tx).is_err());
     assert_eq!(server.state(), ServerState::Faulted);
     assert!(server.authority().is_err());
@@ -452,13 +781,19 @@ fn crash_child() {
     let lease = WorldDirectory::acquire(&root, WORLD, 8192).unwrap();
     let config = policy();
     let codec = Codec::new(config.journal.codec_limits).unwrap();
-    if std::env::var("TORSE_WORLD_CRASH_MODE").unwrap() == "durable" {
+    let mode = std::env::var("TORSE_WORLD_CRASH_MODE").unwrap();
+    let lifecycle = mode.ends_with("lifecycle");
+    if mode.starts_with("durable") {
         let mut server =
             Files::create_file(lease, support::compatibility(), codec, config, |binding| {
                 WorldHost::new(binding, world())
             })
             .unwrap();
-        let tx = mixed(server.authority().unwrap().world(), EntityId(2));
+        let tx = if lifecycle {
+            lifecycle_plan(server.authority().unwrap().world(), 1)
+        } else {
+            mixed(server.authority().unwrap().world(), EntityId(2))
+        };
         assert!(matches!(
             server.commit_transaction(&tx).unwrap(),
             LocalCommit::Durable(_)
@@ -491,14 +826,23 @@ fn crash_child() {
         config.server,
     )
     .unwrap();
-    let tx = mixed(server.authority().unwrap().world(), EntityId(2));
+    let tx = if lifecycle {
+        lifecycle_plan(server.authority().unwrap().world(), 1)
+    } else {
+        mixed(server.authority().unwrap().world(), EntityId(2))
+    };
     let _ = server.commit_transaction(&tx);
     panic!("expected exit between publication and journal acceptance");
 }
 
 #[test]
 fn process_exit_recovers_only_the_durable_world_prefix() {
-    for (mode, exit, sequence) in [("before_accept", 73, 0), ("durable", 74, 1)] {
+    for (mode, exit, sequence) in [
+        ("before_accept", 73, 0),
+        ("durable", 74, 1),
+        ("before_accept_lifecycle", 73, 0),
+        ("durable_lifecycle", 74, 1),
+    ] {
         let directory = Directory::new();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "crash_child", "--nocapture"])
@@ -515,7 +859,11 @@ fn process_exit_recovers_only_the_durable_world_prefix() {
         let server = open(&directory).unwrap();
         let mut expected = world();
         if sequence == 1 {
-            let tx = mixed(&expected, EntityId(2));
+            let tx = if mode.ends_with("lifecycle") {
+                lifecycle_plan(&expected, 1)
+            } else {
+                mixed(&expected, EntityId(2))
+            };
             expected.commit(&tx).unwrap();
         }
         assert_eq!(

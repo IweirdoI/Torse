@@ -23,7 +23,8 @@ use torse_types::{
 };
 use torse_world::{
     BlockEdit, BlockStateRegistry, ComponentBatch, ComponentEdit, ComponentSchemas, EntityError,
-    EntityMove, EntityStore, SectionStore, StoreError, TerrainQuery,
+    EntityLifecycle, EntityMove, EntityStore, LifecycleBatch, SectionStore, StoreError,
+    TerrainQuery,
 };
 
 use crate::phase::Phase;
@@ -46,9 +47,14 @@ pub struct PreparedChange {
     movement_handles: Vec<(EntityHandle, EntityId)>,
     component_edits: Vec<ComponentEdit>,
     component_batch: ComponentBatch,
+    lifecycle_batch: Option<LifecycleBatch>,
 }
 
 impl PreparedChange {
+    /// Complete creation/removal records and proposed allocator state, before publication.
+    pub fn entity_lifecycle(&self) -> Option<&EntityLifecycle> {
+        self.lifecycle_batch.as_ref().map(LifecycleBatch::change)
+    }
     /// Exact component replacements available before journal reservation.
     pub fn component_edits(&self) -> &[ComponentEdit] {
         &self.component_edits
@@ -113,6 +119,8 @@ pub struct Committed {
     pub entity_moves: Vec<EntityMove>,
     /// Protected component replacements with stable identity and expected fields.
     pub component_edits: Vec<ComponentEdit>,
+    /// Complete creation/removal effects and the committed allocation watermark.
+    pub entity_lifecycle: Option<EntityLifecycle>,
     /// Sections touched by the commit, in coordinate order.
     pub touched: Vec<(SectionPos, Revision)>,
 }
@@ -224,7 +232,11 @@ impl CommitCoordinator {
         store: &SectionStore,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
-        if !transaction.movements.is_empty() || !transaction.components.is_empty() {
+        if !transaction.movements.is_empty()
+            || !transaction.components.is_empty()
+            || !transaction.spawns.is_empty()
+            || !transaction.despawns.is_empty()
+        {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
         self.prepare_blocks(store, transaction)
@@ -238,7 +250,10 @@ impl CommitCoordinator {
         registry: &BlockStateRegistry,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
-        if !transaction.components.is_empty() {
+        if !transaction.components.is_empty()
+            || !transaction.spawns.is_empty()
+            || !transaction.despawns.is_empty()
+        {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
         self.prepare_world(store, entities, registry, transaction)
@@ -256,6 +271,8 @@ impl CommitCoordinator {
         schemas: &ComponentSchemas,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
+        let lifecycle = crate::lifecycle::prepare_lifecycle(store, entities, schemas, transaction)
+            .map_err(PrepareError::Rejected)?;
         if transaction.components.len() > torse_world::MAX_COMPONENT_EDITS {
             return Err(PrepareError::Rejected(RejectCode::QuotaExceeded));
         }
@@ -279,6 +296,7 @@ impl CommitCoordinator {
         let mut prepared = self.prepare_world(store, entities, registry, transaction)?;
         prepared.component_edits = transaction.components.clone();
         prepared.component_batch = batch;
+        prepared.lifecycle_batch = lifecycle;
         Ok(prepared)
     }
 
@@ -315,7 +333,9 @@ impl CommitCoordinator {
     ) -> Result<PreparedChange, PrepareError> {
         if (transaction.mutations.is_empty()
             && transaction.movements.is_empty()
-            && transaction.components.is_empty())
+            && transaction.components.is_empty()
+            && transaction.spawns.is_empty()
+            && transaction.despawns.is_empty())
             || has_duplicate_targets(transaction)
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
@@ -372,6 +392,7 @@ impl CommitCoordinator {
             movement_handles: Vec::new(),
             component_edits: Vec::new(),
             component_batch: ComponentBatch::default(),
+            lifecycle_batch: None,
         })
     }
 
@@ -385,7 +406,10 @@ impl CommitCoordinator {
         store: &mut SectionStore,
         prepared: PreparedChange,
     ) -> Result<Publication, CommitFault> {
-        if !prepared.entity_moves.is_empty() || !prepared.component_edits.is_empty() {
+        if !prepared.entity_moves.is_empty()
+            || !prepared.component_edits.is_empty()
+            || prepared.lifecycle_batch.is_some()
+        {
             return Err(CommitFault::Invariant(
                 "entity movements require entity-aware publication",
             ));
@@ -403,6 +427,15 @@ impl CommitCoordinator {
         entities: &mut EntityStore,
         prepared: PreparedChange,
     ) -> Result<Publication, CommitFault> {
+        if let Some(batch) = &prepared.lifecycle_batch {
+            batch
+                .validate(entities)
+                .map_err(|_| CommitFault::Invariant("prepared lifecycle observations changed"))?;
+            batch
+                .change()
+                .validate_world(store)
+                .map_err(|_| CommitFault::Invariant("prepared creation terrain changed"))?;
+        }
         prepared
             .component_batch
             .validate(entities)
@@ -430,6 +463,7 @@ impl CommitCoordinator {
             .map(|edit| (edit.id, edit.schema.clone()))
             .collect();
         let component_batch = prepared.component_batch.clone();
+        let lifecycle_batch = prepared.lifecycle_batch.clone();
         let mut publication = self.publish_blocks(store, prepared)?;
         entities
             .apply_moves(&entity_moves)
@@ -439,6 +473,11 @@ impl CommitCoordinator {
             CommitFault::Invariant("prevalidated component group no longer applies")
         })?;
         publication.components = components;
+        if let Some(batch) = lifecycle_batch {
+            entities.publish_lifecycle(batch).map_err(|_| {
+                CommitFault::Invariant("prevalidated entity lifecycle no longer applies")
+            })?;
+        }
         Ok(publication)
     }
 
@@ -493,6 +532,7 @@ impl CommitCoordinator {
                     edits,
                     entity_moves: Vec::new(),
                     component_edits: Vec::new(),
+                    entity_lifecycle: None,
                     touched: publication.touched,
                 },
             },
@@ -541,6 +581,7 @@ impl CommitCoordinator {
         let edits = prepared.edits.clone();
         let entity_moves = prepared.entity_moves.clone();
         let component_edits = prepared.component_edits.clone();
+        let entity_lifecycle = prepared.entity_lifecycle().cloned();
         let publication = self.publish_with_entities(store, entities, prepared)?;
         Ok(TransactionResult {
             transaction,
@@ -551,6 +592,7 @@ impl CommitCoordinator {
                     edits,
                     entity_moves,
                     component_edits,
+                    entity_lifecycle,
                     touched: publication.touched,
                 },
             },

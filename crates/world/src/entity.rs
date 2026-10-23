@@ -184,6 +184,22 @@ pub struct EntityStore {
 }
 
 impl EntityStore {
+    pub(crate) fn validate_lifecycle_capacity(
+        &self,
+        removed: &[EntityHandle],
+        spawned: usize,
+    ) -> Result<(), EntityError> {
+        let reusable = self.free.len()
+            + removed
+                .iter()
+                .filter(|handle| handle.generation < u32::MAX)
+                .count();
+        let needed = spawned.saturating_sub(reusable) as u64;
+        if self.slots.len() as u64 + needed > u64::from(u32::MAX) + 1 {
+            return Err(EntityError::IdExhausted);
+        }
+        Ok(())
+    }
     /// Resolve and validate a bounded component group without changing storage.
     pub fn prepare_components(
         &self,
@@ -563,6 +579,10 @@ impl EntityStore {
 /// Failure produced by entity storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntityError {
+    /// Lifecycle structure, allocation arithmetic, or target overlap is invalid.
+    InvalidLifecycle,
+    /// The allocation watermark or a complete removal observation has changed.
+    LifecycleConflict,
     /// A component observed by the transaction has changed.
     ComponentConflict,
     /// Component fields, schema, duplicates, or group size are invalid.
@@ -592,6 +612,8 @@ pub enum EntityError {
 impl std::fmt::Display for EntityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidLifecycle => write!(f, "entity lifecycle group is invalid"),
+            Self::LifecycleConflict => write!(f, "entity lifecycle observation changed"),
             Self::ComponentConflict => write!(f, "entity component no longer matches the record"),
             Self::InvalidComponents => write!(f, "entity component group is invalid"),
             Self::PositionConflict => write!(f, "entity position no longer matches the record"),

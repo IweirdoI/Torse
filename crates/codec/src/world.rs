@@ -5,8 +5,9 @@
 //! independently of the outer record envelope and of `Compatibility::authority_schema`, which
 //! the host derives from compiled content.
 //!
-//! Version 2 adds the persisted entity allocator watermark. Version 1 is rejected rather
-//! than guessing allocation history from live entities. This M1 interim format has no
+//! Version 3 adds entity creation/removal records with allocator preconditions. Readers
+//! also accept version 2 snapshots and change sets, which have no lifecycle suffix.
+//! Version 1 is rejected because it lacks allocation history. This interim format has no
 //! compatibility promise; the outer record envelope remains unchanged.
 //! The complete byte layout is documented in `WORLD.md` next to this crate's manifest.
 
@@ -23,7 +24,7 @@ use crate::value::invalid;
 use crate::{CodecLimits, Decoder, EncodeResult, Encoder, StorageCodec};
 
 /// Domain format version written at the start of every world payload.
-pub const WORLD_FORMAT_VERSION: u16 = 2;
+pub const WORLD_FORMAT_VERSION: u16 = 3;
 
 /// Smallest `CodecLimits::max_depth` that can carry every component the world accepts.
 ///
@@ -87,14 +88,14 @@ impl<M> WorldCodec<M> {
     }
 }
 
-fn read_version(input: &mut Decoder<'_>) -> EncodeResult<()> {
+fn read_version(input: &mut Decoder<'_>) -> EncodeResult<u16> {
     let version = input.read_u16()?;
-    if version != WORLD_FORMAT_VERSION {
+    if version != 2 && version != WORLD_FORMAT_VERSION {
         return Err(Fault::incompatible(format!(
             "unsupported world format version {version}"
         )));
     }
-    Ok(())
+    Ok(version)
 }
 
 /// A decoded payload must account for every input byte; trailing data means the record was
@@ -171,8 +172,8 @@ where
         let mut decoder = Decoder::new(input, budget, self.limits);
         decoder.charge_items(1)?;
         decoder.charge_bytes(size_of::<ModelCommit<M>>() as u64)?;
-        read_version(&mut decoder)?;
-        let changes = read_changes(&mut decoder)?;
+        let version = read_version(&mut decoder)?;
+        let changes = read_changes(&mut decoder, version)?;
         finish_decode(&decoder, "commit")?;
         Ok(CommitRecord {
             meta: changes.meta,

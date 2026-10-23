@@ -158,6 +158,8 @@ pub struct ChangeSet {
     pub entity_moves: Vec<EntityMove>,
     /// Protected component replacements in transaction order.
     pub component_edits: Vec<ComponentEdit>,
+    /// Creations, removals and allocator preconditions, when this record has lifecycle work.
+    pub entity_lifecycle: Option<crate::EntityLifecycle>,
 }
 
 /// World rebuilt from a snapshot.
@@ -497,6 +499,7 @@ impl ChangeSet {
             edits: changes,
             entity_moves: Vec::new(),
             component_edits: Vec::new(),
+            entity_lifecycle: None,
         })
     }
 
@@ -509,7 +512,10 @@ impl ChangeSet {
         store: &mut SectionStore,
         registry: &BlockStateRegistry,
     ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
-        if !self.entity_moves.is_empty() || !self.component_edits.is_empty() {
+        if !self.entity_moves.is_empty()
+            || !self.component_edits.is_empty()
+            || self.entity_lifecycle.is_some()
+        {
             return Err(ExchangeError::Store {
                 detail: "entity movements require the entity-aware replay path".to_owned(),
             });
@@ -529,12 +535,12 @@ impl ChangeSet {
         entities: &mut EntityStore,
         registry: &BlockStateRegistry,
     ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
-        if !self.component_edits.is_empty() {
+        if !self.component_edits.is_empty() || self.entity_lifecycle.is_some() {
             return Err(ExchangeError::Store {
                 detail: "component edits require schema-aware replay".to_owned(),
             });
         }
-        self.apply_group(store, entities, registry, ComponentBatch::default())
+        self.apply_group(store, entities, registry, ComponentBatch::default(), None)
     }
 
     /// Replay terrain, movement, and protected components after full validation.
@@ -545,12 +551,34 @@ impl ChangeSet {
         registry: &BlockStateRegistry,
         schemas: &ComponentSchemas,
     ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
+        let lifecycle = self
+            .entity_lifecycle
+            .as_ref()
+            .map(|change| {
+                change.validate_world(store)?;
+                if self
+                    .entity_moves
+                    .iter()
+                    .any(|movement| change.conflicts_with(movement.id))
+                    || self
+                        .component_edits
+                        .iter()
+                        .any(|edit| change.conflicts_with(edit.id))
+                {
+                    return Err(crate::EntityError::InvalidLifecycle);
+                }
+                entities.prepare_lifecycle(change, schemas)
+            })
+            .transpose()
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
         let batch = entities
             .prepare_components(&self.component_edits, schemas)
             .map_err(|error| ExchangeError::Store {
                 detail: error.to_string(),
             })?;
-        self.apply_group(store, entities, registry, batch)
+        self.apply_group(store, entities, registry, batch, lifecycle)
     }
 
     fn apply_group(
@@ -559,6 +587,7 @@ impl ChangeSet {
         entities: &mut EntityStore,
         registry: &BlockStateRegistry,
         components: ComponentBatch,
+        lifecycle: Option<crate::LifecycleBatch>,
     ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
         let edits = self.resolve_edits(registry)?;
         entities
@@ -578,6 +607,13 @@ impl ChangeSet {
             .map_err(|error| ExchangeError::Store {
                 detail: error.to_string(),
             })?;
+        if let Some(batch) = lifecycle {
+            entities
+                .publish_lifecycle(batch)
+                .map_err(|error| ExchangeError::Store {
+                    detail: error.to_string(),
+                })?;
+        }
         Ok(touched)
     }
 
@@ -880,6 +916,7 @@ mod tests {
             .restore(&registry, &schemas())
             .expect("restore works");
         let changes = ChangeSet {
+            entity_lifecycle: None,
             component_edits: Vec::new(),
             entity_moves: Vec::new(),
             meta: torse_types::CommitMeta {

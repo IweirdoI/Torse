@@ -1,6 +1,6 @@
-# world change set, format version 2
+# world change set, format version 3
 # version
-0200
+0300
 # meta.cursor
 010000000000000000000000000000000200000000000000
 # meta.previous
@@ -46,4 +46,6 @@ fcffffffffffffff0000000000000000000000000000000000
 # remove.previous
 01010000000c626173653a6669656c642f6605020000006f6b
 # remove.fields
+00
+# lifecycle
 00

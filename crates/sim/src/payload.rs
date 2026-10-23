@@ -21,6 +21,7 @@ pub fn changes_from_prepared(
     let mut changes = ChangeSet::from_edits(prepared.meta(), registry, prepared.edits())?;
     changes.entity_moves = prepared.entity_moves().to_vec();
     changes.component_edits = prepared.component_edits().to_vec();
+    changes.entity_lifecycle = prepared.entity_lifecycle().cloned();
     Ok(changes)
 }
 
@@ -32,6 +33,7 @@ pub fn changes_from_committed(
     let mut changes = ChangeSet::from_edits(committed.meta, registry, &committed.edits)?;
     changes.entity_moves = committed.entity_moves.clone();
     changes.component_edits = committed.component_edits.clone();
+    changes.entity_lifecycle = committed.entity_lifecycle.clone();
     Ok(changes)
 }
 

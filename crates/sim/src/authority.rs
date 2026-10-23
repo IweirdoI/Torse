@@ -569,6 +569,7 @@ mod tests {
             .restore_snapshot(&snapshot)
             .expect("snapshot applies");
         let change = ChangeSet {
+            entity_lifecycle: None,
             component_edits: Vec::new(),
             entity_moves: Vec::new(),
             meta: torse_types::CommitMeta {

@@ -47,27 +47,59 @@ const MIN_COMPONENT_EDIT_BYTES: usize = 16 + 1 + 1 + 1; // id, key length, two a
 pub(crate) fn write_changes(out: &mut Encoder<'_>, value: &ChangeSet) -> EncodeResult<()> {
     unique_moves(&value.entity_moves)?;
     unique_component_edits(&value.component_edits)?;
+    validate_lifecycle_overlap(value)?;
     out.ensure(COMMIT_META_BYTES as u64)?;
     // Rejects gaps, duplicates, and sequence overflow before anything else is written.
     write_commit_meta(out, value.meta)?;
     write_edits(out, &value.edits)?;
     write_moves(out, &value.entity_moves)?;
-    write_component_edits(out, &value.component_edits)
+    write_component_edits(out, &value.component_edits)?;
+    crate::lifecycle::write_lifecycle(out, value.entity_lifecycle.as_ref())
 }
 
-pub(crate) fn read_changes(input: &mut Decoder<'_>) -> EncodeResult<ChangeSet> {
+pub(crate) fn read_changes(input: &mut Decoder<'_>, version: u16) -> EncodeResult<ChangeSet> {
     let meta = read_commit_meta(input)?;
     let edits = read_edits(input)?;
     let entity_moves = read_moves(input)?;
     let component_edits = read_component_edits(input)?;
+    let entity_lifecycle = if version >= 3 {
+        crate::lifecycle::read_lifecycle(input)?
+    } else {
+        None
+    };
     unique_moves(&entity_moves)?;
     unique_component_edits(&component_edits)?;
-    Ok(ChangeSet {
+    let changes = ChangeSet {
         meta,
         edits,
         entity_moves,
         component_edits,
-    })
+        entity_lifecycle,
+    };
+    validate_lifecycle_overlap(&changes)?;
+    Ok(changes)
+}
+
+fn validate_lifecycle_overlap(changes: &ChangeSet) -> EncodeResult<()> {
+    if let Some(change) = &changes.entity_lifecycle {
+        change
+            .validate_structure()
+            .map_err(|error| invalid(error.to_string()))?;
+        if changes
+            .entity_moves
+            .iter()
+            .any(|movement| change.conflicts_with(movement.id))
+            || changes
+                .component_edits
+                .iter()
+                .any(|edit| change.conflicts_with(edit.id))
+        {
+            return Err(invalid(
+                "entity lifecycle overlaps a movement or component edit",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn unique_moves(moves: &[EntityMove]) -> EncodeResult<()> {

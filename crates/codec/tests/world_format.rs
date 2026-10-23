@@ -1,4 +1,4 @@
-//! Byte-level checks of world format version 2 against an independent specification.
+//! Byte-level checks of world format version 3 against an independent specification.
 //!
 //! The expected bytes below are assembled field by field from `WORLD.md`, without calling
 //! the encoder. The encoder output, the stored fixture, and this specification must all
@@ -7,7 +7,7 @@
 //!
 //! Regenerate the fixtures after an intentional layout change with
 //! `TORSE_BLESS_FIXTURES=1 cargo test -p torse-codec --test world_format`; a layout change
-//! inside version 2 is a compatibility break and must also bump `WORLD_FORMAT_VERSION`.
+//! inside version 3 is a compatibility break and must also bump `WORLD_FORMAT_VERSION`.
 
 mod world_support;
 
@@ -120,7 +120,7 @@ fn compatibility_lines() -> Vec<(&'static str, Vec<u8>)> {
 fn snapshot_spec() -> Spec {
     let dense: Vec<Vec<u8>> = [0u16, 1, 3, 0, 0, 0, 0, 1].map(u16s).to_vec();
     let mut lines = vec![
-        ("version", u16s(2)),
+        ("version", u16s(3)),
         ("meta.cursor", join(&[u128s(1), u64s(2)])),
     ];
     lines.extend(compatibility_lines());
@@ -169,7 +169,7 @@ fn snapshot_spec() -> Spec {
 
 fn changes_spec() -> Spec {
     let mut lines = vec![
-        ("version", u16s(2)),
+        ("version", u16s(3)),
         ("meta.cursor", join(&[u128s(1), u64s(2)])),
         ("meta.previous", u64s(1)),
     ];
@@ -225,6 +225,7 @@ fn changes_spec() -> Spec {
             ]),
         ),
         ("remove.fields", u8s(0)),
+        ("lifecycle", u8s(0)),
     ]);
     Spec(lines)
 }
@@ -317,7 +318,7 @@ fn snapshot_matches_specification_and_fixture() {
     check_fixture(
         "world_snapshot.hex",
         &spec,
-        "world snapshot, format version 2",
+        "world snapshot, format version 3",
     );
     let expected = spec.bytes();
     assert_eq!(encode_snapshot(&sample_snapshot()).unwrap(), expected);
@@ -333,7 +334,7 @@ fn changes_match_specification_and_fixture() {
     check_fixture(
         "world_changes.hex",
         &spec,
-        "world change set, format version 2",
+        "world change set, format version 3",
     );
     let expected = spec.bytes();
     assert_eq!(encode_changes(&sample_changes()).unwrap(), expected);

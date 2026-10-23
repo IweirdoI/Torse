@@ -245,7 +245,7 @@ impl ActionHandler for WrongMutation {
             req.ordering,
         );
         tx.write_block(BlockPos::new(12, 2, 2), torse_world::BlockStateId::EMPTY);
-        Ok(ActionOutput::Mutation(tx))
+        Ok(ActionOutput::Mutation(Box::new(tx)))
     }
 }
 
@@ -272,6 +272,39 @@ fn native_output_cannot_change_owner_or_write_ungranted_objects() {
             })
         );
     }
+}
+
+struct LifecycleMutation;
+
+impl ActionHandler for LifecycleMutation {
+    fn plan(&self, _: &ActionView<'_>, req: &ActionRequest) -> Result<ActionOutput, RejectCode> {
+        let mut tx = Transaction::new(req.transaction, torse_inventory::owner(), req.ordering);
+        tx.spawn_entity(
+            torse_world::Position::new(2.0, 2.0, 2.0),
+            Default::default(),
+        );
+        Ok(ActionOutput::Mutation(Box::new(tx)))
+    }
+}
+
+#[test]
+fn native_actions_cannot_emit_lifecycle_without_declared_creation_grants() {
+    let (world, _, catalog, ids) = setup();
+    let mut handlers = torse_inventory::handlers(catalog);
+    handlers[1].implementation = Box::new(LifecycleMutation);
+    let service =
+        ActionService::bind(torse_inventory::descriptors(), handlers, world.schemas()).unwrap();
+    assert_eq!(
+        service.plan(
+            &world,
+            &actor(&ids),
+            Phase::Interaction,
+            &request(ids[0], ids[1], 1)
+        ),
+        Err(RejectCode::PermissionDenied)
+    );
+    assert_eq!(world.entities().next_entity_id(), 4);
+    assert_eq!(world.seq().0, 0);
 }
 
 #[test]

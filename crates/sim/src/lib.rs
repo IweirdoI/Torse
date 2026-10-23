@@ -16,6 +16,7 @@ pub mod authority;
 pub mod block_actions;
 pub mod clock;
 pub mod coordinator;
+mod lifecycle;
 pub mod movement;
 pub mod payload;
 pub mod phase;
@@ -34,4 +35,6 @@ pub use simulation::{
     DEFAULT_PHASE_TRANSACTION_LIMIT, Simulation, SimulationError, SimulationLimits, TickOutcome,
 };
 pub use system::{System, SystemContext};
-pub use transaction::{BlockPrecondition, Movement, Mutation, OrderingKey, Transaction};
+pub use transaction::{
+    BlockPrecondition, Despawn, Movement, Mutation, OrderingKey, Spawn, Transaction,
+};

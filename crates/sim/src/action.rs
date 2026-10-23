@@ -162,7 +162,7 @@ pub struct ActionRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionOutput {
     Query(ComponentFields),
-    Mutation(Transaction),
+    Mutation(Box<Transaction>),
 }
 
 /// Read-only authority access restricted to host-granted objects.
@@ -388,6 +388,11 @@ impl ActionService {
                 }
             }
             ActionOutput::Mutation(tx) if action.kind == ActionKind::Mutation => {
+                // Lifecycle actions need their own target and creation grants. Until those
+                // are declared, native handlers cannot emit trusted-host lifecycle work.
+                if !tx.spawns.is_empty() || !tx.despawns.is_empty() {
+                    return Err(RejectCode::PermissionDenied);
+                }
                 if tx.source != handler.owner
                     || tx.id != request.transaction
                     || tx.ordering != request.ordering

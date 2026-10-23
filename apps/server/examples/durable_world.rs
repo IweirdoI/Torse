@@ -15,7 +15,8 @@ use torse_types::{
     BlockPos, Compatibility, ContentKey, OutputBudget, SectionPos, Tick, TransactionId, WorldId,
 };
 use torse_world::{
-    BlockStateId, BlockStateRegistry, ComponentSchemas, Section, TerrainQuery, WorldBounds,
+    BlockStateId, BlockStateRegistry, ComponentSchemas, Position, Section, TerrainQuery,
+    WorldBounds,
 };
 
 const WORLD: WorldId = WorldId(7);
@@ -89,14 +90,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     );
     transaction.read_block(pos, previous).write_block(pos, next);
+    if next.is_empty() {
+        for (handle, entity) in world.entities().iter() {
+            transaction.despawn_entity(handle, entity);
+        }
+    } else {
+        transaction.spawn_entity(Position::new(2.5, 2.0, 2.5), Default::default());
+    }
     match server.commit_transaction(&transaction)? {
         LocalCommit::Durable(result) => println!(
-            "epoch={} commit_seq={} durable_seq={} previous={} current={}",
+            concat!(
+                "epoch={} commit_seq={} durable_seq={} previous={} current={}",
+                " entities={} next_entity_id={}",
+            ),
             server.binding().epoch.0,
             result.publication.at.seq.0,
             result.durability.through.0,
             previous.0,
             next.0,
+            server.authority()?.world().entities().len(),
+            server.authority()?.world().entities().next_entity_id(),
         ),
         other => return Err(format!("local transaction did not commit: {other:?}").into()),
     }

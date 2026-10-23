@@ -166,6 +166,7 @@ fn fields(entries: &[(&str, ComponentValue)]) -> torse_world::ComponentFields {
 /// Two block edits, one move, and a replace, a create, and a remove of components.
 pub fn sample_changes() -> ChangeSet {
     ChangeSet {
+        entity_lifecycle: None,
         meta: commit_meta(),
         edits: vec![
             ChangeEdit {

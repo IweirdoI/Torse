@@ -87,7 +87,7 @@ impl ActionHandler for PortHandler {
             request.transaction,
             request.ordering,
         )
-        .map(ActionOutput::Mutation)
+        .map(|tx| ActionOutput::Mutation(Box::new(tx)))
     }
 }
 

@@ -20,6 +20,7 @@ mod component;
 mod entity;
 mod exchange;
 mod handles;
+mod lifecycle;
 mod registry;
 mod section;
 mod snapshot_budget;
@@ -39,6 +40,10 @@ pub use exchange::{
     SnapshotComponent, SnapshotEntity, SnapshotSection, SnapshotValue, StateEntry,
 };
 pub use handles::HandleTable;
+pub use lifecycle::{
+    EntityLifecycle, EntityState, LifecycleBatch, MAX_ENTITY_LIFECYCLE, MAX_ENTITY_LIFECYCLE_BYTES,
+    MAX_SPAWN_COORDINATE,
+};
 pub use registry::{BlockStateId, BlockStateRegistry, EMPTY_BLOCK_KEY, RegistryError};
 pub use section::{
     DEFAULT_SECTION_SIDE, MAX_SECTION_SIDE, Section, SectionError, SectionStorage, linear_index,

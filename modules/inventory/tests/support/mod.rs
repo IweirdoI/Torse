@@ -138,7 +138,7 @@ pub fn plan(
         .plan(world, &actor(ids), Phase::Interaction, request)
         .expect("plan")
     {
-        ActionOutput::Mutation(tx) => tx,
+        ActionOutput::Mutation(tx) => *tx,
         _ => panic!("expected mutation plan"),
     }
 }

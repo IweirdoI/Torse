@@ -18,4 +18,4 @@ pub use collision::{
     Aabb, CONTACT_EPSILON, CollisionCell, CollisionSource, LocalBox, MAX_SUBSTEP, SweepResult,
     collides, sweep,
 };
-pub use generation::{FlatTerrain, GenerationParams, HillTerrain};
+pub use generation::{FlatTerrain, GenerationParams, HillTerrain, SectionGenerator};

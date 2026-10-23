@@ -25,6 +25,26 @@ pub struct GenerationParams {
     pub ground: BlockStateId,
     /// Block used for open space.
     pub air: BlockStateId,
+    /// Rules version recorded by the world and carried into regeneration.
+    pub generation_version: u32,
+}
+
+/// Pluggable terrain source.
+///
+/// The core does not know how terrain is produced. An application assembles a
+/// generator through this interface, so alternative algorithms can be swapped
+/// without touching storage, lifecycle, or simulation code. The generator must
+/// be a pure function of the world coordinate, the seed it captured, and
+/// [`GenerationParams::generation_version`].
+pub trait SectionGenerator {
+    /// Section side length the generator produces.
+    fn side(&self) -> u32;
+
+    /// Rules version recorded with the generated terrain.
+    fn generation_version(&self) -> u32;
+
+    /// Produce one section. The result must not depend on generation order.
+    fn generate(&self, section: SectionPos) -> Result<Section, SectionError>;
 }
 
 impl GenerationParams {
@@ -41,7 +61,14 @@ impl GenerationParams {
             bounds,
             ground,
             air,
+            generation_version: 1,
         })
+    }
+
+    /// Set the rules version recorded with the terrain.
+    pub const fn with_version(mut self, version: u32) -> Self {
+        self.generation_version = version;
+        self
     }
 }
 
@@ -71,6 +98,20 @@ impl FlatTerrain {
     /// Generate one section.
     pub fn generate(&self, section: SectionPos) -> Result<Section, SectionError> {
         fill_section(&self.params, section, |x, z| self.height_at(x, z))
+    }
+}
+
+impl SectionGenerator for FlatTerrain {
+    fn side(&self) -> u32 {
+        self.params.side
+    }
+
+    fn generation_version(&self) -> u32 {
+        self.params.generation_version
+    }
+
+    fn generate(&self, section: SectionPos) -> Result<Section, SectionError> {
+        FlatTerrain::generate(self, section)
     }
 }
 
@@ -117,6 +158,20 @@ impl HillTerrain {
     /// Generate one section.
     pub fn generate(&self, section: SectionPos) -> Result<Section, SectionError> {
         fill_section(&self.params, section, |x, z| self.height_at(x, z))
+    }
+}
+
+impl SectionGenerator for HillTerrain {
+    fn side(&self) -> u32 {
+        self.params.side
+    }
+
+    fn generation_version(&self) -> u32 {
+        self.params.generation_version
+    }
+
+    fn generate(&self, section: SectionPos) -> Result<Section, SectionError> {
+        HillTerrain::generate(self, section)
     }
 }
 
@@ -210,6 +265,23 @@ mod tests {
             BlockStateId::EMPTY,
         )
         .expect("side is valid")
+    }
+
+    #[test]
+    fn generators_are_interchangeable_behind_the_trait() {
+        let params = params().with_version(3);
+        let generators: Vec<Box<dyn SectionGenerator>> = vec![
+            Box::new(FlatTerrain::new(params, 4)),
+            Box::new(HillTerrain::new(params, 9, 4, 3)),
+        ];
+        for generator in &generators {
+            assert_eq!(generator.side(), 16);
+            assert_eq!(generator.generation_version(), 3);
+            let section = generator
+                .generate(SectionPos::ZERO)
+                .expect("generation succeeds");
+            assert_eq!(section.side(), 16);
+        }
     }
 
     #[test]

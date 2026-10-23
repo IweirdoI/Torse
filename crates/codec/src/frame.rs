@@ -1,34 +1,15 @@
-//! Frame encoding utilities for structured binary data.
-//!
-//! Frames provide length-prefixed encoding for variable-sized data.
+//! Length-prefixed frames that wrap one complete record.
 
 use crate::{Decoder, EncodeResult, Encoder};
 
-/// Maximum frame size to prevent unbounded allocations (16 MB).
-pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
-
-/// Write a length-prefixed frame.
-pub fn write_frame(encoder: &mut Encoder, data: &[u8]) -> EncodeResult<()> {
-    let len = data.len();
-    if len > MAX_FRAME_SIZE as usize {
-        return Err(torse_types::Fault::resource_limit(format!(
-            "frame size {} exceeds maximum {}",
-            len, MAX_FRAME_SIZE
-        )));
-    }
-    encoder.write_u32(len as u32)?;
-    encoder.write(data)?;
-    Ok(())
+/// Write a frame bounded by the configured frame limit. Nothing is appended on failure.
+pub fn write_frame(encoder: &mut Encoder, payload: &[u8]) -> EncodeResult<()> {
+    let max = encoder.limits().max_frame_bytes;
+    encoder.write_prefixed(payload, max, "frame")
 }
 
-/// Read a length-prefixed frame.
+/// Read a frame, rejecting declared lengths above the configured frame limit.
 pub fn read_frame<'a>(decoder: &mut Decoder<'a>) -> EncodeResult<&'a [u8]> {
-    let len = decoder.read_u32()?;
-    if len > MAX_FRAME_SIZE {
-        return Err(torse_types::Fault::invalid_data(format!(
-            "frame size {} exceeds maximum {}",
-            len, MAX_FRAME_SIZE
-        )));
-    }
-    decoder.read(len as usize)
+    let max = decoder.limits().max_frame_bytes;
+    decoder.read_prefixed(max, "frame")
 }

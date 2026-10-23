@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+use core::fmt;
+
 mod validation;
 
 #[cfg(test)]
@@ -339,13 +341,13 @@ impl CommitSeq {
 
     /// Check if this sequence immediately follows the previous one.
     pub fn follows(self, previous: Self) -> Result<(), ValidationError> {
-        if self.0 == previous.0.wrapping_add(1) {
-            Ok(())
-        } else {
-            Err(ValidationError::NonConsecutiveCommit {
+        match previous.next() {
+            Some(expected) if expected == self => Ok(()),
+            Some(_) => Err(ValidationError::NonConsecutiveCommit {
                 previous: previous.0,
                 current: self.0,
-            })
+            }),
+            None => Err(ValidationError::CommitSeqOverflow),
         }
     }
 
@@ -427,9 +429,9 @@ impl OutputBudget {
         }
     }
 
-    /// Check if adding an item would exceed the budget.
-    pub fn can_add(&self, current_items: u32, additional_bytes: u64) -> bool {
-        current_items < self.max_items && additional_bytes <= self.max_bytes
+    /// Check whether the given total usage stays within the budget.
+    pub fn allows(&self, items: u32, bytes: u64) -> bool {
+        items <= self.max_items && bytes <= self.max_bytes
     }
 }
 
@@ -457,6 +459,14 @@ impl Fault {
         Self::new(FaultCode::ResourceLimit, context)
     }
 }
+
+impl fmt::Display for Fault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.context)
+    }
+}
+
+impl std::error::Error for Fault {}
 
 impl From<ValidationError> for Fault {
     fn from(err: ValidationError) -> Self {

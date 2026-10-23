@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authority;
 pub mod clock;
 pub mod coordinator;
 pub mod payload;
@@ -19,6 +20,7 @@ pub mod simulation;
 pub mod system;
 pub mod transaction;
 
+pub use authority::{AuthorityError, Recovery, RecoveryError, WorldAuthority};
 pub use clock::{TickClock, TickReport};
 pub use coordinator::{
     CommitCoordinator, CommitFault, Committed, PrepareError, PreparedChange, Publication,

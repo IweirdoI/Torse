@@ -157,6 +157,15 @@ impl CommitCoordinator {
         self.seq
     }
 
+    /// Move the coordinator to a recovered position.
+    ///
+    /// Recovery uses this to continue numbering after a journal tail; the next
+    /// prepared change must receive `seq + 1`.
+    pub const fn resumed_at(mut self, seq: CommitSeq) -> Self {
+        self.seq = seq;
+        self
+    }
+
     /// World identity used in commit cursors.
     pub const fn world(&self) -> WorldId {
         self.world

@@ -4,6 +4,8 @@ use super::*;
 
 #[test]
 fn content_key_parses_namespaced_value() {
+    // The accessors must preserve the namespace/path split rather than only
+    // validating the combined display form.
     let key = ContentKey::parse("base:blocks/stone").unwrap();
     assert_eq!(key.namespace(), "base");
     assert_eq!(key.path(), "blocks/stone");
@@ -12,6 +14,8 @@ fn content_key_parses_namespaced_value() {
 
 #[test]
 fn content_key_rejects_invalid_names() {
+    // Uppercase names and path normalization hazards must be rejected at the
+    // boundary, not silently interpreted by later filesystems or registries.
     assert_eq!(
         ContentKey::parse("Base:stone"),
         Err(ContentKeyError::InvalidNamespace)
@@ -28,6 +32,8 @@ fn content_key_rejects_invalid_names() {
 
 #[test]
 fn content_key_enforces_lengths() {
+    // Length checks are part of the persistent identity contract, so the exact
+    // failing component is reported by a dedicated error.
     let long_namespace = format!("{}:stone", "a".repeat(65));
     assert!(matches!(
         ContentKey::parse(&long_namespace),
@@ -37,6 +43,8 @@ fn content_key_enforces_lengths() {
 
 #[test]
 fn negative_coordinates_use_floor_sections_and_nonnegative_local_values() {
+    // This locks down the negative-coordinate convention shared by all systems:
+    // floor section indices plus non-negative local coordinates.
     let (section, local) = BlockPos::new(-1, -32, 31).to_section(32).unwrap();
     assert_eq!(section, SectionPos::new(-1, -1, 0));
     assert_eq!(local, LocalPos { x: 31, y: 0, z: 31 });
@@ -44,6 +52,8 @@ fn negative_coordinates_use_floor_sections_and_nonnegative_local_values() {
 
 #[test]
 fn negative_coordinate_chunks_survive_roundtrip() {
+    // Round-tripping across section boundaries catches a common off-by-one bug
+    // caused by truncating division or signed remainders.
     for position in [
         BlockPos::new(-1, -1, -1),
         BlockPos::new(-32, -33, -64),
@@ -57,6 +67,8 @@ fn negative_coordinate_chunks_survive_roundtrip() {
 
 #[test]
 fn coordinate_arithmetic_rejects_overflow() {
+    // Wrapped coordinates could alias unrelated world locations, so overflow is
+    // a hard error rather than a debug-only assertion.
     assert_eq!(
         BlockPos::new(i64::MAX, 0, 0).checked_add(1, 0, 0),
         Err(SpatialError::CoordinateOverflow)
@@ -65,6 +77,7 @@ fn coordinate_arithmetic_rejects_overflow() {
 
 #[test]
 fn local_coordinate_must_be_inside_section() {
+    // Local indices are unsigned but still need an explicit upper bound.
     assert_eq!(
         SectionPos::ZERO.to_block(LocalPos { x: 32, y: 0, z: 0 }, 32),
         Err(SpatialError::LocalCoordinateOutOfRange { side: 32 })
@@ -73,6 +86,8 @@ fn local_coordinate_must_be_inside_section() {
 
 #[test]
 fn revisions_and_ids_enforce_nonzero_start() {
+    // Zero is reserved by the ID contracts; revisions advance monotonically and
+    // do not wrap when exhausted.
     assert_eq!(Revision::INITIAL.next(), Some(Revision(1)));
     assert!(EntityId(1).validate().is_ok());
     assert!(EntityId(0).validate().is_err());
@@ -82,6 +97,8 @@ fn revisions_and_ids_enforce_nonzero_start() {
 
 #[test]
 fn transaction_and_event_results_carry_stable_results() {
+    // Results retain their transaction/event identity and include the commit
+    // cursor or target tick needed by replay and diagnostics.
     let transaction = TransactionId(7);
     let result = TransactionResult {
         transaction,

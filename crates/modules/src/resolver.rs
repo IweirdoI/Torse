@@ -1,4 +1,10 @@
 //! Deterministic module graph resolution.
+//!
+//! Resolution validates the complete module set before any lifecycle step runs.
+//! Missing dependencies, cycles, duplicate registration, and ambiguous service
+//! providers fail at startup rather than depending on package or filesystem
+//! order. M0 models single-provider services; multi-provider merge semantics are
+//! intentionally deferred until a concrete use case exists.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -6,10 +12,14 @@ use std::fmt;
 use torse_content::ModuleDescriptor;
 use torse_types::ContentKey;
 
+/// A module graph error associated with a module and declaration field.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ModuleError {
+    /// Module that owns the invalid declaration, when known.
     pub module: Option<ContentKey>,
+    /// Declaration field or graph rule that failed.
     pub field: String,
+    /// Human-readable explanation suitable for startup diagnostics.
     pub message: String,
 }
 
@@ -22,6 +32,7 @@ impl fmt::Display for ModuleError {
     }
 }
 
+/// Validated module graph with a dependency-first deterministic order.
 #[derive(Clone, Debug)]
 pub struct ResolvedModules {
     modules: BTreeMap<ContentKey, ModuleDescriptor>,
@@ -29,15 +40,23 @@ pub struct ResolvedModules {
 }
 
 impl ResolvedModules {
+    /// Return the frozen module registry keyed by stable module identity.
     pub fn modules(&self) -> &BTreeMap<ContentKey, ModuleDescriptor> {
         &self.modules
     }
 
+    /// Return dependency providers before their dependants.
     pub fn order(&self) -> &[ContentKey] {
         &self.order
     }
 }
 
+/// Validate and freeze a module graph.
+///
+/// All checks are aggregated before returning so a game definition can report
+/// several setup issues at once. A successful result has no missing required
+/// modules, no cycles, no duplicate single-provider services, and no duplicate
+/// content registrations.
 pub fn resolve_modules(
     modules: Vec<ModuleDescriptor>,
 ) -> Result<ResolvedModules, Vec<ModuleError>> {
@@ -69,6 +88,8 @@ fn validate_service_providers(
     modules: &BTreeMap<ContentKey, ModuleDescriptor>,
     errors: &mut Vec<ModuleError>,
 ) {
+    // Track the owner of every provided service. M0 has no ambiguity policy for
+    // multiple providers, so a second provider is always a startup error.
     let mut providers = BTreeMap::<ContentKey, (ContentKey, u32)>::new();
     for module in modules.values() {
         for service in &module.provided_services {
@@ -117,6 +138,8 @@ fn validate_registered_content(
     modules: &BTreeMap<ContentKey, ModuleDescriptor>,
     errors: &mut Vec<ModuleError>,
 ) {
+    // A schema, capability, or action may have only one registering module in
+    // M0. This keeps ownership unambiguous during later transaction routing.
     let mut schemas = BTreeMap::<ContentKey, ContentKey>::new();
     let mut capabilities = BTreeMap::<ContentKey, ContentKey>::new();
     let mut actions = BTreeMap::<ContentKey, ContentKey>::new();
@@ -160,6 +183,8 @@ fn validate_dependencies(
     modules: &BTreeMap<ContentKey, ModuleDescriptor>,
     errors: &mut Vec<ModuleError>,
 ) {
+    // Missing modules are reported here. Cycles are detected separately by the
+    // depth-first traversal that also produces the final order.
     for module in modules.values() {
         for dependency in &module.required_modules {
             if !modules.contains_key(dependency) {
@@ -178,6 +203,8 @@ fn topological_order(
     modules: &BTreeMap<ContentKey, ModuleDescriptor>,
     errors: &mut Vec<ModuleError>,
 ) -> Vec<ContentKey> {
+    // BTreeMap iteration provides a stable root order. Both traversal sets use
+    // stable module identities rather than source enumeration order.
     let mut visiting = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut order = Vec::new();
@@ -195,6 +222,8 @@ fn visit(
     order: &mut Vec<ContentKey>,
     errors: &mut Vec<ModuleError>,
 ) {
+    // Finding a node on the active recursion stack identifies a cycle. Seeing a
+    // visited node is safe and avoids duplicate order entries.
     if visited.contains(id) {
         return;
     }
@@ -220,6 +249,7 @@ fn visit(
     }
 }
 
+/// Append a graph error without interrupting the remaining validation passes.
 fn error(
     errors: &mut Vec<ModuleError>,
     module: Option<ContentKey>,
@@ -240,6 +270,7 @@ mod tests {
 
     #[test]
     fn dependencies_are_ordered_before_dependants() {
+        // Startup order must place the service provider before its consumer.
         let modules = resolve_modules(vec![
             module("base:dependent", &["base:core"]),
             module("base:core", &[]),
@@ -250,6 +281,7 @@ mod tests {
 
     #[test]
     fn dependency_cycle_is_rejected() {
+        // A cycle has no valid lifecycle order and must not be broken arbitrarily.
         let errors = resolve_modules(vec![
             module("base:left", &["base:right"]),
             module("base:right", &["base:left"]),
@@ -260,6 +292,8 @@ mod tests {
 
     #[test]
     fn missing_required_module_is_rejected() {
+        // Required dependencies are startup contracts; optional dependencies are
+        // allowed to be absent and are therefore not part of this check.
         let errors =
             resolve_modules(vec![module("base:dependent", &["base:missing"])]).unwrap_err();
         assert!(
@@ -271,6 +305,8 @@ mod tests {
 
     #[test]
     fn duplicate_service_provider_is_rejected() {
+        // M0 supports one provider per service. Accepting two would make behavior
+        // depend on load order, which is exactly what this resolver prevents.
         let mut left = module("base:left", &[]);
         let mut right = module("base:right", &[]);
         let service = ServiceDescriptor {
@@ -288,6 +324,7 @@ mod tests {
     }
 
     fn module(id: &str, required: &[&str]) -> ModuleDescriptor {
+        // Build the smallest valid module so each test isolates one graph rule.
         ModuleDescriptor {
             id: key(id),
             module_version: 1,

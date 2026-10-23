@@ -1,4 +1,8 @@
 //! Reproducible developer probes for the M0 contracts.
+//!
+//! The default build only exposes dependency-free content validation. Expensive
+//! ECS, Wasmtime, and graphics integrations are feature-gated so ordinary code
+//! checks and CI do not download or initialize those runtimes by accident.
 
 use std::process::ExitCode;
 
@@ -29,6 +33,8 @@ fn main() -> ExitCode {
 
 #[cfg(feature = "ecs-probe")]
 fn ecs_probe() -> ExitCode {
+    // This workload is large enough to exercise query traversal and scheduling,
+    // but it is a correctness/smoke probe rather than a benchmark.
     let report = torse_runtime::run_ecs_probe(10_000, 100);
     println!("entities={}", report.entities);
     println!("ticks={}", report.ticks);
@@ -39,11 +45,15 @@ fn ecs_probe() -> ExitCode {
 
 #[cfg(not(feature = "ecs-probe"))]
 fn ecs_probe() -> ExitCode {
+    // A missing feature is an explicit configuration error. Returning success
+    // would make an automated experiment think the probe actually ran.
     missing_feature("ecs-probe")
 }
 
 #[cfg(feature = "wasm-probe")]
 fn wasm_probe() -> ExitCode {
+    // Time compilation separately from calls so the recorded duration reflects
+    // guest execution plus host-call overhead.
     match torse_mod_host::run_wasm_probe(10_000, 100) {
         Ok(report) => {
             println!("calls={}", report.calls);
@@ -66,6 +76,8 @@ fn wasm_probe() -> ExitCode {
 
 #[cfg(feature = "gpu-probe")]
 fn gpu_probe() -> ExitCode {
+    // The graphics probe is fully feature-gated; a headless/default build must
+    // not request an adapter or create a native window.
     match torse_render::run_gpu_probe() {
         Ok(report) => {
             println!("adapter={}", report.adapter_name);
@@ -93,11 +105,14 @@ fn gpu_probe() -> ExitCode {
     not(feature = "gpu-probe")
 ))]
 fn missing_feature(feature: &str) -> ExitCode {
+    // Keep the message directly actionable for a developer using the tool.
     eprintln!("experiment disabled; rebuild torse-tools with --features {feature}");
     ExitCode::FAILURE
 }
 
 fn content_fixture() -> ExitCode {
+    // Compile the same fixture used by tests and print deterministic summaries.
+    // The tool exits non-zero on diagnostics so it can be used in CI.
     match compile(m0_fixture_pack()) {
         Ok(content) => {
             println!("blocks={}", content.blocks.len());
@@ -137,6 +152,8 @@ fn content_fixture() -> ExitCode {
 }
 
 fn hex(digest: &Digest) -> String {
+    // Digest is intentionally a byte array at the shared boundary; this helper
+    // only converts it for human-readable probe output.
     let mut output = String::with_capacity(64);
     for byte in digest.0 {
         use std::fmt::Write as _;

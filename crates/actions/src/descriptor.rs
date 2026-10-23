@@ -1,30 +1,49 @@
 //! Action contracts shared by commands, UI, network input, and Mods.
+//!
+//! All external access paths eventually describe the same typed action. Keeping
+//! the declaration independent of a text parser or UI event lets the authority
+//! apply one authorization and execution policy regardless of where a request
+//! originated. This module only validates and freezes declarations; it does not
+//! execute actions or grant permissions.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use torse_types::ContentKey;
 
+/// Maximum command path length accepted by the registration boundary.
 const MAX_COMMAND_NAME_BYTES: usize = 64;
+/// Maximum usage metadata length accepted by the registration boundary.
 const MAX_USAGE_BYTES: usize = 512;
 
+/// Whether an action observes state or requests a mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActionKind {
+    /// Read-only query evaluated against an authorized view.
     Query,
+    /// Mutation that must pass the normal transaction path.
     Mutation,
 }
 
+/// Simulation phase in which an action is allowed to execute.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ActionPhase {
+    /// Admission and request validation phase.
     Input,
+    /// Lifecycle and loading phase.
     Lifecycle,
+    /// Gameplay interaction phase.
     Interaction,
+    /// Simulation phase for scheduled systems.
     Simulation,
+    /// Follow-up rule phase for events produced by earlier work.
     Followup,
+    /// Publication phase for committed visible changes.
     Publish,
 }
 
 impl ActionPhase {
+    /// Numeric phase used by external declarations and diagnostics.
     pub const fn index(self) -> u8 {
         match self {
             Self::Input => 0,
@@ -37,44 +56,82 @@ impl ActionPhase {
     }
 }
 
+/// Permission requirement checked before an action handler is invoked.
+///
+/// `None` means no additional permission is requested by the declaration; it
+/// does not bypass target ownership, reach, or other authority checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PermissionRule {
+    /// Permission key required by the declaration, if any.
     pub permission: Option<ContentKey>,
 }
 
+/// Module-owned handler selected for an action.
+///
+/// `owner_module` is recorded separately from the handler name so a later
+/// loader can verify that a module is allowed to provide the binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HandlerBinding {
+    /// Stable handler identity implemented by the owner module.
     pub handler: ContentKey,
+    /// Module that owns and registers the handler implementation.
     pub owner_module: ContentKey,
 }
 
+/// Optional textual command aliases for a typed action.
+///
+/// Commands are adapters only. Parsing must produce the same typed action and
+/// authorization context as UI, network, or direct Mod calls.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandBinding {
+    /// Fully namespaced primary command identity.
     pub name: ContentKey,
+    /// Additional fully namespaced aliases with the same target action.
     pub aliases: Vec<ContentKey>,
+    /// Localized usage/help resource key.
     pub usage_key: ContentKey,
 }
 
+/// Versioned, typed declaration for one externally invokable action.
+///
+/// Output limits apply to the action's result, not to arbitrary internal work.
+/// The authority may impose stricter limits at execution time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionDescriptor {
+    /// Stable action identity and request discriminator.
     pub id: ContentKey,
+    /// API version used for compatibility negotiation and encoding.
     pub api_version: u32,
+    /// Query or mutation classification.
     pub kind: ActionKind,
+    /// Schema identity for the action input payload.
     pub parameter_schema: ContentKey,
+    /// Schema identity for the action result payload.
     pub result_schema: ContentKey,
+    /// Additional authorization requirement for this action.
     pub permission: PermissionRule,
+    /// Object/content schemas this action may target.
     pub target_constraints: Vec<ContentKey>,
+    /// Simulation phase in which the action is eligible to execute.
     pub phase: ActionPhase,
+    /// Maximum logical result entries allowed for this action.
     pub max_items: u32,
+    /// Maximum encoded result bytes allowed for this action.
     pub max_bytes: u64,
+    /// Module-owned implementation selected during assembly.
     pub handler: HandlerBinding,
+    /// Optional textual adapters that resolve to this action.
     pub commands: Vec<CommandBinding>,
 }
 
+/// Registration-time error tied to a specific action and field.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ActionDiagnostic {
+    /// Action whose declaration failed validation.
     pub action: ContentKey,
+    /// Declaration field that produced the error.
     pub field: String,
+    /// Human-readable explanation suitable for startup diagnostics.
     pub message: String,
 }
 
@@ -84,6 +141,11 @@ impl fmt::Display for ActionDiagnostic {
     }
 }
 
+/// Immutable action and command lookup created after validation succeeds.
+///
+/// The registry stores complete command keys rather than bare aliases. This
+/// avoids collisions where two namespaces independently define an `inspect`
+/// command and makes diagnostics unambiguous.
 #[derive(Clone, Debug, Default)]
 pub struct ActionRegistry {
     actions: BTreeMap<ContentKey, ActionDescriptor>,
@@ -91,10 +153,12 @@ pub struct ActionRegistry {
 }
 
 impl ActionRegistry {
+    /// Return all validated actions in deterministic key order.
     pub fn actions(&self) -> &BTreeMap<ContentKey, ActionDescriptor> {
         &self.actions
     }
 
+    /// Resolve a full command key such as `base:command.inspect`.
     pub fn command(&self, name: &str) -> Option<&ActionDescriptor> {
         self.commands
             .get(name)
@@ -103,6 +167,11 @@ impl ActionRegistry {
 }
 
 /// Validate and freeze a set of action descriptors.
+///
+/// Validation is deliberately aggregate: all independently detectable issues
+/// are returned together so a content author can fix a registry in one pass.
+/// No partially valid registry is returned. Command ownership is tracked across
+/// actions, while duplicate command names inside one action are also rejected.
 pub fn validate_actions(
     actions: Vec<ActionDescriptor>,
 ) -> Result<ActionRegistry, Vec<ActionDiagnostic>> {
@@ -127,6 +196,8 @@ pub fn validate_actions(
                 "action output limits must be greater than zero",
             );
         }
+        // Collect both primary command names and aliases into one namespace so
+        // aliases cannot silently shadow another action.
         let mut commands = Vec::new();
         for command in &action.commands {
             let name = command.name.path();
@@ -161,6 +232,8 @@ pub fn validate_actions(
                 commands.push(alias.to_string());
             }
         }
+        // Track local names first. This reports a duplicate even when both
+        // entries belong to the same action and therefore have the same owner.
         let mut local_commands = BTreeSet::new();
         for command in commands {
             if !local_commands.insert(command.clone()) {
@@ -198,10 +271,12 @@ pub fn validate_actions(
     }
 }
 
+/// Restrict command path segments to portable lowercase ASCII tokens.
 fn is_command_byte(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
 }
 
+/// Append a diagnostic without interrupting validation of later actions.
 fn push(
     diagnostics: &mut Vec<ActionDiagnostic>,
     action: &ContentKey,
@@ -221,6 +296,8 @@ mod tests {
 
     #[test]
     fn action_registry_rejects_duplicate_command_names() {
+        // A command adapter must have exactly one typed target. Global ownership
+        // prevents load order from deciding which behavior a command invokes.
         let actions = vec![
             action("base:action/inspect", "inspect"),
             action("base:action/probe", "inspect"),
@@ -235,12 +312,16 @@ mod tests {
 
     #[test]
     fn action_registry_freezes_commands() {
+        // Successful validation returns a lookup table that resolves the full
+        // namespaced command key and rejects unregistered names.
         let registry = validate_actions(vec![action("base:action/inspect", "inspect")]).unwrap();
         assert!(registry.command("base:command.inspect").is_some());
         assert!(registry.command("missing").is_none());
     }
 
     fn action(id: &str, command: &str) -> ActionDescriptor {
+        // Keep the fixture semantically valid so failures in these tests point
+        // at command ownership rather than unrelated declaration fields.
         ActionDescriptor {
             id: key(id),
             api_version: 1,

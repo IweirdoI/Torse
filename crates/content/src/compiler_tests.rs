@@ -2,6 +2,8 @@ use crate::{BoxBounds, Shape, SourceRef, Sourced, compile, m0_fixture_pack};
 
 #[test]
 fn builtin_fixture_compiles() {
+    // The fixture is the minimum proof that all four contracts can coexist and
+    // that authority and presentation summaries are independent values.
     let compiled = compile(m0_fixture_pack()).unwrap();
     assert_eq!(compiled.blocks.len(), 3);
     assert!(compiled.blocks.contains_key(&key("base:stone")));
@@ -10,6 +12,9 @@ fn builtin_fixture_compiles() {
 
 #[test]
 fn pack_order_does_not_change_digest() {
+    // Reversing top-level vectors and reordering legal finite values must not
+    // affect compiled identity. This protects content hashes from filesystem and
+    // loader enumeration order.
     let mut first = m0_fixture_pack();
     let mut second = m0_fixture_pack();
     first.state_schemas[1].value.finite_fields[0]
@@ -30,6 +35,8 @@ fn pack_order_does_not_change_digest() {
 
 #[test]
 fn invalid_shape_is_reported_with_content_location() {
+    // Geometry failures must identify the owning content and field so an author
+    // can fix the source without searching the entire pack.
     let mut pack = m0_fixture_pack();
     let block = pack
         .blocks
@@ -54,6 +61,8 @@ fn invalid_shape_is_reported_with_content_location() {
 
 #[test]
 fn duplicate_definition_is_rejected() {
+    // Duplicate stable IDs are never resolved by load order; the second source
+    // location must be reported explicitly.
     let mut pack = m0_fixture_pack();
     let duplicate = pack.blocks[0].clone();
     pack.blocks.push(Sourced::new(
@@ -70,6 +79,7 @@ fn duplicate_definition_is_rejected() {
 
 #[test]
 fn missing_state_schema_is_rejected() {
+    // A block cannot compile against an undeclared state model.
     let mut pack = m0_fixture_pack();
     pack.blocks[0].value.state_schema = key("missing:state");
     let errors = compile(pack).unwrap_err();
@@ -82,6 +92,8 @@ fn missing_state_schema_is_rejected() {
 
 #[test]
 fn finite_state_explosion_is_rejected() {
+    // Two individually small fields can produce a large Cartesian product, so
+    // the compiler must enforce the combined state limit.
     let mut pack = m0_fixture_pack();
     let schema = pack
         .state_schemas
@@ -104,6 +116,7 @@ fn finite_state_explosion_is_rejected() {
 
 #[test]
 fn module_action_references_are_resolved() {
+    // Module registration cannot claim an action that is absent from the pack.
     let mut pack = m0_fixture_pack();
     pack.modules[0]
         .value
@@ -117,6 +130,8 @@ fn module_action_references_are_resolved() {
 
 #[test]
 fn capability_binding_and_host_permission_are_independent() {
+    // Binding a capability to an object proves only that the interface exists;
+    // the module's requested host permission remains a separate declaration.
     let mut pack = m0_fixture_pack();
     pack.blocks[0]
         .value

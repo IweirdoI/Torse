@@ -1,4 +1,8 @@
 //! M0 action fixtures used by compiler and tooling integration tests.
+//!
+//! These descriptors cover read-only and mutation actions. They are not gameplay
+//! implementations; their purpose is to exercise registry validation, command
+//! ownership, versioning, phases, and output limits without a running world.
 
 use torse_types::ContentKey;
 
@@ -6,6 +10,10 @@ use crate::{
     ActionDescriptor, ActionKind, ActionPhase, CommandBinding, HandlerBinding, PermissionRule,
 };
 
+/// Build the deterministic action set used by the M0 content fixture.
+///
+/// The fixture is intentionally dependency-free so tooling can compile and
+/// validate the action boundary before the authority simulation exists.
 pub fn m0_fixture_actions() -> Vec<ActionDescriptor> {
     vec![
         action(
@@ -30,6 +38,8 @@ pub fn m0_fixture_actions() -> Vec<ActionDescriptor> {
 }
 
 fn action(id: &str, kind: ActionKind, command: &str, phase: ActionPhase) -> ActionDescriptor {
+    // The handler identity follows the action path. It remains a namespaced
+    // key so the later module loader can verify the declaring owner.
     let id = key(id);
     ActionDescriptor {
         id: id.clone(),

@@ -1,4 +1,9 @@
 //! Deterministic validation and compilation for the M0 content fixture.
+//!
+//! Compilation validates names, references, finite-state bounds, geometry,
+//! actions, and modules, then normalizes unordered collections before producing
+//! stable digests. Invalid packs return all independently detectable diagnostics
+//! and never expose a partially compiled registry.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,16 +17,32 @@ use crate::descriptor::{
     ExecutionContract, ModuleDescriptor, ModuleSide, PersistencePolicy, Shape, StateSchema,
 };
 
+/// Version of the canonical content model that participates in every digest.
+///
+/// Changing the meaning or byte encoding of an existing field requires bumping
+/// this value so consumers cannot confuse old and new summaries.
 pub const CONTENT_FORMAT_VERSION: u32 = 1;
+
+/// Upper bound on the Cartesian product of finite state fields.
+///
+/// The limit prevents a small source description from expanding into an
+/// unbounded registry. It is a safety boundary, not a gameplay tuning value.
 pub const MAX_FINITE_STATES: u64 = 4096;
 
+/// Source location retained for diagnostics.
+///
+/// M0 consumes structured fixture data rather than parsed files, but preserving
+/// a source label here lets a future parser reuse the same diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SourceRef {
+    /// Human-readable source identifier, usually a relative asset path.
     pub source: String,
+    /// One-based line number, or zero for generated/compiled diagnostics.
     pub line: u32,
 }
 
 impl SourceRef {
+    /// Construct a diagnostic location. `line` may be zero for generated data.
     pub fn new(source: impl Into<String>, line: u32) -> Self {
         Self {
             source: source.into(),
@@ -30,43 +51,74 @@ impl SourceRef {
     }
 }
 
+/// A definition paired with the location that produced it.
 #[derive(Clone, Debug)]
 pub struct Sourced<T> {
+    /// Origin used when the wrapped value produces a diagnostic.
     pub source: SourceRef,
+    /// Definition value supplied by the source.
     pub value: T,
 }
 
 impl<T> Sourced<T> {
+    /// Wrap a value and its diagnostic origin.
     pub fn new(source: SourceRef, value: T) -> Self {
         Self { source, value }
     }
 }
 
+/// Uncompiled content input.
+///
+/// The vectors are treated as unordered source collections. Compilation sorts
+/// semantically unordered nested data before digesting it, so loader or file
+/// enumeration order cannot change the resulting summaries.
 #[derive(Clone, Debug, Default)]
 pub struct ContentPack {
+    /// State and component schema declarations.
     pub state_schemas: Vec<Sourced<StateSchema>>,
+    /// Gameplay capability declarations.
     pub capabilities: Vec<Sourced<CapabilityDescriptor>>,
+    /// Typed action declarations.
     pub actions: Vec<Sourced<ActionDescriptor>>,
+    /// Module dependency and registration declarations.
     pub modules: Vec<Sourced<ModuleDescriptor>>,
+    /// Static block definitions.
     pub blocks: Vec<Sourced<BlockDefinition>>,
 }
 
+/// Frozen content registry produced only after every validation succeeds.
+///
+/// The authority digest covers simulation meaning. The presentation digest
+/// covers visual resources and may change independently when only appearance
+/// changes.
 #[derive(Clone, Debug, Default)]
 pub struct CompiledContent {
+    /// Validated schemas keyed by stable identity.
     pub state_schemas: BTreeMap<ContentKey, StateSchema>,
+    /// Validated capabilities keyed by stable identity.
     pub capabilities: BTreeMap<ContentKey, CapabilityDescriptor>,
+    /// Validated actions keyed by stable identity.
     pub actions: BTreeMap<ContentKey, ActionDescriptor>,
+    /// Validated modules keyed by stable identity.
     pub modules: BTreeMap<ContentKey, ModuleDescriptor>,
+    /// Validated blocks keyed by stable identity.
     pub blocks: BTreeMap<ContentKey, BlockDefinition>,
+    /// Digest of authoritative simulation behavior and compatibility data.
     pub authority_digest: Digest,
+    /// Digest of client-visible presentation resources.
     pub presentation_digest: Digest,
 }
 
+/// One validation failure with source, content ID, and field context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentDiagnostic {
+    /// Source location that produced the failure.
     pub source: SourceRef,
+    /// Content identity associated with the failure, when one exists.
     pub content_id: Option<ContentKey>,
+    /// Field path within the content declaration.
     pub field: String,
+    /// Human-readable explanation and expected constraint.
     pub message: String,
 }
 
@@ -99,7 +151,14 @@ impl PartialOrd for ContentDiagnostic {
 
 /// Validate and compile a content pack.
 ///
-/// The returned registry and digests are independent of source enumeration order.
+/// Validation continues after individual failures so callers receive as many
+/// actionable diagnostics as possible. Only a fully valid pack is converted
+/// into [`CompiledContent`].
+///
+/// The returned registry and digests are independent of source enumeration
+/// order. Definitions are keyed by [`ContentKey`], unordered nested lists are
+/// normalized, and digest encoding uses explicit lengths and fixed-width
+/// little-endian primitives.
 pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnostic>> {
     let mut diagnostics = Vec::new();
     let mut state_schemas = collect_unique(pack.state_schemas, |value| &value.id, &mut diagnostics);
@@ -107,6 +166,9 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
     let mut actions = collect_unique(pack.actions, |value| &value.id, &mut diagnostics);
     let mut modules = collect_unique(pack.modules, |value| &value.id, &mut diagnostics);
 
+    // Validate definitions before cross-references. A malformed schema should
+    // be reported as malformed rather than only as an unknown reference from
+    // every block that uses it.
     for sourced in state_schemas.values() {
         validate_state_schema(&sourced.source, &sourced.value, &mut diagnostics);
     }
@@ -116,6 +178,9 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
     for sourced in modules.values() {
         validate_module(&sourced.source, &sourced.value, &mut diagnostics);
     }
+    // Action validation also checks command ownership across the whole pack.
+    // Reattach source locations because the action registry deliberately has no
+    // dependency on content-file diagnostics.
     match validate_actions(
         actions
             .values()
@@ -134,6 +199,9 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
         }
     }
 
+    // Components are declared inside schemas but referenced globally. Preserve
+    // the declaring schema so duplicate ownership can be diagnosed even when it
+    // appears in two different source files.
     let mut component_ids = BTreeMap::<ContentKey, ContentKey>::new();
     for sourced in state_schemas.values() {
         for component in &sourced.value.component_schemas {
@@ -158,6 +226,8 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
         &mut diagnostics,
     );
 
+    // Normalize each block before insertion. Validation is order-insensitive,
+    // and digest encoding must not depend on the order of source vectors.
     let mut blocks = BTreeMap::new();
     for sourced in pack.blocks {
         let mut block = sourced.value;
@@ -186,6 +256,9 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
         return Err(diagnostics);
     }
 
+    // Normalize only after validation succeeds. These operations change
+    // representation order, not meaning, and make digest output independent of
+    // JSON object iteration, filesystem enumeration, or parallel loading.
     for sourced in state_schemas.values_mut() {
         normalize_state_schema(&mut sourced.value);
     }
@@ -222,6 +295,11 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
     })
 }
 
+/// Collect definitions by key while retaining their original source location.
+///
+/// A duplicate is retained only to keep the in-memory operation deterministic;
+/// the emitted diagnostic still prevents the map from being returned as
+/// compiled content.
 fn collect_unique<T>(
     values: Vec<Sourced<T>>,
     key: impl Fn(&T) -> &ContentKey,
@@ -242,6 +320,7 @@ fn collect_unique<T>(
     output
 }
 
+/// Strip diagnostic-only source wrappers after validation succeeds.
 fn into_plain<T>(values: BTreeMap<ContentKey, Sourced<T>>) -> BTreeMap<ContentKey, T> {
     values
         .into_iter()
@@ -249,6 +328,10 @@ fn into_plain<T>(values: BTreeMap<ContentKey, Sourced<T>>) -> BTreeMap<ContentKe
         .collect()
 }
 
+/// Validate finite-state fields and component declarations in one schema.
+///
+/// State cardinality is checked as a product, not per field, because individually
+/// small fields can still create an impractically large registry together.
 fn validate_state_schema(
     source: &SourceRef,
     schema: &StateSchema,
@@ -291,6 +374,8 @@ fn validate_state_schema(
                 format!("{} default is not in its legal values", field.id),
             ));
         }
+        // Duplicates are diagnosed before normalization. Sorting the values for
+        // digest stability must not hide a malformed source declaration.
         let unique_values: BTreeSet<_> = field.values.iter().copied().collect();
         if unique_values.len() != field.values.len() {
             diagnostics.push(diagnostic(
@@ -300,6 +385,8 @@ fn validate_state_schema(
                 format!("{} contains duplicate values", field.id),
             ));
         }
+        // Saturating multiplication makes overflow fail closed as "over limit"
+        // rather than wrapping to a small and apparently valid state count.
         states = states.saturating_mul(unique_values.len() as u64);
     }
     if states > MAX_FINITE_STATES {
@@ -316,6 +403,7 @@ fn validate_state_schema(
     }
 }
 
+/// Validate versioning, duplicate field IDs, and bounded container fields.
 fn validate_component(
     source: &SourceRef,
     schema: &StateSchema,
@@ -353,6 +441,7 @@ fn validate_component(
     }
 }
 
+/// Validate a capability API version and the uniqueness of its method IDs.
 fn validate_capability(
     source: &SourceRef,
     capability: &CapabilityDescriptor,
@@ -383,6 +472,10 @@ fn validate_capability(
     }
 }
 
+/// Validate module versions and the module-local service declarations.
+///
+/// Cross-module service resolution is intentionally deferred to the module
+/// resolver so this function stays independent of the complete dependency graph.
 fn validate_module(
     source: &SourceRef,
     module: &ModuleDescriptor,
@@ -417,6 +510,11 @@ fn validate_module(
     }
 }
 
+/// Resolve module registrations against the compiled content registry.
+///
+/// Registered schemas may refer either to a top-level state schema or to a
+/// component schema nested inside one. Capabilities and actions are resolved
+/// from their own global registries.
 fn validate_module_references(
     modules: &BTreeMap<ContentKey, Sourced<ModuleDescriptor>>,
     schemas: &BTreeMap<ContentKey, Sourced<StateSchema>>,
@@ -468,6 +566,10 @@ fn validate_module_references(
     }
 }
 
+/// Validate a block and resolve all references that must exist in the pack.
+///
+/// Shape validation is repeated for render, collision, and selection because
+/// these concerns are allowed to differ but each one must still be well formed.
 fn validate_block(
     block: &BlockDefinition,
     source: &SourceRef,
@@ -571,6 +673,7 @@ fn validate_block(
     }
 }
 
+/// Report a shape validation failure with the caller's field context.
 fn validate_shape(
     shape: &Shape,
     source: &SourceRef,
@@ -588,6 +691,7 @@ fn validate_shape(
     }
 }
 
+/// Put semantically unordered block collections into canonical order.
 fn normalize_block(block: &mut BlockDefinition) {
     block.component_defaults.sort();
     block
@@ -597,6 +701,10 @@ fn normalize_block(block: &mut BlockDefinition) {
     block.tags.sort();
 }
 
+/// Canonicalize finite fields, component schemas, and nested component fields.
+///
+/// Legal finite values are treated as a set for digest purposes. Their order has
+/// no behavioral meaning after validation.
 fn normalize_state_schema(schema: &mut StateSchema) {
     schema
         .finite_fields
@@ -614,6 +722,7 @@ fn normalize_state_schema(schema: &mut StateSchema) {
     }
 }
 
+/// Canonicalize method and target-constraint order within a capability.
 fn normalize_capability(capability: &mut CapabilityDescriptor) {
     capability
         .query_methods
@@ -624,6 +733,7 @@ fn normalize_capability(capability: &mut CapabilityDescriptor) {
     capability.target_schema_constraints.sort();
 }
 
+/// Canonicalize action targets, commands, and command aliases.
 fn normalize_action(action: &mut ActionDescriptor) {
     action.target_constraints.sort();
     action
@@ -634,6 +744,10 @@ fn normalize_action(action: &mut ActionDescriptor) {
     }
 }
 
+/// Canonicalize every module collection whose order is not semantic.
+///
+/// Required-module ordering is resolved later, but sorting here ensures the
+/// declaration digest remains stable before graph resolution occurs.
 fn normalize_module(module: &mut ModuleDescriptor) {
     module.required_modules.sort();
     module.optional_modules.sort();
@@ -654,6 +768,11 @@ fn normalize_module(module: &mut ModuleDescriptor) {
         .sort_by(|left, right| left.id.cmp(&right.id));
 }
 
+/// Hash all fields that can affect authoritative simulation behavior.
+///
+/// Presentation-only material choices, alpha mode, and tags are excluded so a
+/// texture-only change does not invalidate a server's authority compatibility
+/// digest.
 fn authority_digest(
     schemas: &BTreeMap<ContentKey, StateSchema>,
     capabilities: &BTreeMap<ContentKey, CapabilityDescriptor>,
@@ -662,6 +781,8 @@ fn authority_digest(
     blocks: &BTreeMap<ContentKey, BlockDefinition>,
 ) -> Digest {
     let mut writer = CanonicalWriter::new();
+    // Every digest starts with an explicit schema version. Length-prefixed keys
+    // prevent ambiguous concatenations such as `a` + `bc` versus `ab` + `c`.
     writer.u32(CONTENT_FORMAT_VERSION);
     writer.u32(schemas.len() as u32);
     for schema in schemas.values() {
@@ -692,6 +813,8 @@ fn authority_digest(
                 PersistencePolicy::Always => 1,
                 PersistencePolicy::OwnerDefined => 2,
             });
+            // Persistence and replication policy are authority concerns because
+            // they change what survives restart and what may be disclosed.
             writer.replication(component.replication);
             writer.optional_key(component.migration_binding.as_ref());
         }
@@ -717,6 +840,8 @@ fn authority_digest(
             writer.key(constraint);
         }
     }
+    // Action schemas and handlers affect what the authority may execute, even
+    // though the handler implementation itself lives in another crate.
     writer.u32(actions.len() as u32);
     for action in actions.values() {
         writer.key(&action.id);
@@ -747,6 +872,8 @@ fn authority_digest(
             }
         }
     }
+    // Module registrations affect service ownership and content composition, so
+    // they belong in the authority summary rather than only in a lock file.
     writer.u32(modules.len() as u32);
     for module in modules.values() {
         writer.key(&module.id);
@@ -816,6 +943,10 @@ fn authority_digest(
     writer.finish()
 }
 
+/// Hash visual material, alpha, render geometry, and presentation-only tags.
+///
+/// A client may reject or renegotiate a visual mismatch without changing the
+/// server's authoritative block behavior.
 fn presentation_digest(blocks: &BTreeMap<ContentKey, BlockDefinition>) -> Digest {
     let mut writer = CanonicalWriter::new();
     writer.u32(CONTENT_FORMAT_VERSION);
@@ -837,11 +968,17 @@ fn presentation_digest(blocks: &BTreeMap<ContentKey, BlockDefinition>) -> Digest
     writer.finish()
 }
 
+/// Minimal append-only writer for a platform-independent canonical byte stream.
+///
+/// All integers use little-endian encoding and all variable-length values carry
+/// an explicit length prefix. The writer is not a save format; it exists only to
+/// feed a deterministic hash.
 struct CanonicalWriter {
     bytes: Vec<u8>,
 }
 
 impl CanonicalWriter {
+    /// Start an empty canonical byte stream.
     fn new() -> Self {
         Self { bytes: Vec::new() }
     }
@@ -873,6 +1010,7 @@ impl CanonicalWriter {
         self.bytes.extend_from_slice(value.path().as_bytes());
     }
 
+    /// Encode an optional key without colliding with an empty-key sentinel.
     fn optional_key(&mut self, value: Option<&ContentKey>) {
         self.bool(value.is_some());
         if let Some(value) = value {
@@ -880,6 +1018,7 @@ impl CanonicalWriter {
         }
     }
 
+    /// Encode a sorted key collection with a count prefix.
     fn keys(&mut self, values: &[ContentKey]) {
         self.u32(values.len() as u32);
         for value in values {
@@ -887,6 +1026,7 @@ impl CanonicalWriter {
         }
     }
 
+    /// Encode a component field tag plus any type-specific bound.
     fn component_field_type(&mut self, field_type: ComponentFieldType) {
         let tag = component_field_tag(field_type);
         self.u8(tag);
@@ -897,6 +1037,7 @@ impl CanonicalWriter {
         }
     }
 
+    /// Encode all four dimensions of a replication declaration.
     fn replication(&mut self, declaration: torse_types::ReplicationDeclaration) {
         self.u8(match declaration.authority {
             torse_types::AuthorityMode::Server => 0,
@@ -934,6 +1075,7 @@ impl CanonicalWriter {
         }
     }
 
+    /// Encode an optional shape using a presence byte before the shape payload.
     fn optional_shape(&mut self, shape: Option<&Shape>) {
         self.bool(shape.is_some());
         if let Some(shape) = shape {
@@ -941,11 +1083,13 @@ impl CanonicalWriter {
         }
     }
 
+    /// Finish the stream and return its SHA-256 digest.
     fn finish(self) -> Digest {
         Digest(Sha256::digest(self.bytes).into())
     }
 }
 
+/// Stable numeric tag for a component field kind in the canonical stream.
 fn component_field_tag(field_type: ComponentFieldType) -> u8 {
     match field_type {
         ComponentFieldType::Bool => 0,
@@ -959,6 +1103,7 @@ fn component_field_tag(field_type: ComponentFieldType) -> u8 {
     }
 }
 
+/// Stable numeric tag for a capability execution contract.
 fn execution_tag(contract: ExecutionContract) -> u8 {
     match contract {
         ExecutionContract::NoRuntimeCode => 0,
@@ -967,6 +1112,7 @@ fn execution_tag(contract: ExecutionContract) -> u8 {
     }
 }
 
+/// Stable numeric tag for a module side.
 fn module_side_tag(side: ModuleSide) -> u8 {
     match side {
         ModuleSide::Server => 0,
@@ -975,6 +1121,7 @@ fn module_side_tag(side: ModuleSide) -> u8 {
     }
 }
 
+/// Build a diagnostic while keeping its content ID optional at the type level.
 fn diagnostic(
     source: SourceRef,
     content_id: ContentKey,

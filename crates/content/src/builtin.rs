@@ -1,4 +1,10 @@
 //! Dependency-free M0 fixture content.
+//!
+//! The fixture intentionally exercises independent shape properties: stone is a
+//! full cube, glass is a transparent lower slab, and a plant has visual and
+//! selection geometry but no collision. Component, capability, permission, and
+//! action declarations are included to validate references across all four
+//! content contracts without requiring a running world.
 
 use torse_types::{ContentKey, ReplicationDeclaration};
 
@@ -10,9 +16,13 @@ use crate::{
     Shape, SourceRef, Sourced, StateSchema,
 };
 
+/// Build the deterministic content pack used by M0 tests and tooling.
 pub fn m0_fixture_pack() -> ContentPack {
     let simple_state = key("base:state/simple");
     let plant_state = key("base:state/plant_growth");
+    // The inventory schema is declared but not attached to one of the three
+    // blocks. This keeps the built-in block models visually realistic while
+    // still exercising component and capability reference resolution.
     let inventory_schema = key("base:schema/inventory_content");
     let inventory_capability = key("base:capability/item_port");
     let inspect_action = key("base:action/inspect");
@@ -166,6 +176,9 @@ fn block(
     alpha_mode: AlphaMode,
     action: ContentKey,
 ) -> BlockDefinition {
+    // A helper keeps the fixture focused on deliberately different profiles.
+    // Render, collision, selection, occlusion, and light are still populated as
+    // separate fields so no hidden inference is introduced.
     BlockDefinition {
         id: key(id),
         definition_version: 1,
@@ -197,9 +210,13 @@ fn block(
 }
 
 fn sourced<T>(source: &str, value: T) -> Sourced<T> {
+    // Fixture sources point at plausible future file names even though M0
+    // constructs the descriptors in memory.
     Sourced::new(SourceRef::new(source, 1), value)
 }
 
 fn key(value: &str) -> ContentKey {
+    // Built-in keys are constants verified by tests; an invalid literal here is
+    // a programming error, not user input that should be recoverable at runtime.
     ContentKey::parse(value).expect("built-in content key is valid")
 }

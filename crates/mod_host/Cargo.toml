@@ -3,3 +3,9 @@ name = "torse-mod-host"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[features]
+wasm-probe = ["dep:wasmtime"]
+
+[dependencies]
+wasmtime = { version = "=45.0.0", default-features = false, features = ["cranelift", "runtime", "std", "wat"], optional = true }

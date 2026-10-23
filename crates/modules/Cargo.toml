@@ -3,3 +3,7 @@ name = "torse-modules"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+torse-content = { path = "../content" }
+torse-types = { path = "../types" }

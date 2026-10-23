@@ -1,10 +1,10 @@
 # 存档编码
 
-包名：`torse-codec`。当前各模块仅预留文件，尚无编码格式或公共接口。
+包名：`torse-codec`。已定义`StorageCodec`接口、显式长度字段、预算守卫、事务性`Encoder`、有界`Decoder`和长度前缀帧。尚无具体领域载荷编码或正式文件格式。
 
 | 文件 | 预留职责 |
 |---|---|
-| [frame.rs](src/frame.rs) | 存储记录的版本、长度与完整性检查 |
+| [frame.rs](src/frame.rs) | 单记录长度边界检查 |
 | [journal.rs](src/journal.rs) | 完整提交记录的编码与解码 |
 | [registry.rs](src/registry.rs) | 稳定内容映射与未知载荷保留 |
 | [snapshot.rs](src/snapshot.rs) | 一致世界快照的编码与解码 |

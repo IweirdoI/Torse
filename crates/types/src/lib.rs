@@ -7,11 +7,24 @@
 
 use core::fmt;
 
+mod identity;
+mod lifecycle;
+mod replication;
+mod spatial;
 mod validation;
 
 #[cfg(test)]
 mod tests;
 
+pub use identity::{ContentKey, ContentKeyError, EntityHandle, EntityId, EntityIdError};
+pub use lifecycle::{
+    EventId, EventIdError, Revision, ScheduledEvent, TransactionId, TransactionIdError,
+    TransactionOutcome, TransactionResult,
+};
+pub use replication::{
+    AuthorityMode, PresentationHint, ReplicationDeclaration, ReplicationVisibility, UpdateMode,
+};
+pub use spatial::{BlockPos, LocalPos, SectionPos, SpatialError};
 pub use validation::ValidationError;
 
 // ================================================================================================
@@ -94,7 +107,7 @@ pub struct RequestId {
 // ================================================================================================
 
 /// Content digest, currently SHA-256 (32 bytes).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Digest(pub [u8; 32]);
 
 /// Compatibility record for authority schema, rules, and content.

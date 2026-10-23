@@ -2,7 +2,20 @@
 
 Torse使用Rust构建开放方块世界的通用内核与开发框架，并以基础游戏验证。
 
-本仓库由项目成员共享。目录按架构总览建立完整骨架，覆盖应用、框架、标准玩法模块、基础游戏、Mod示例、场景验证与性能测试。当前Rust模块仅包含职责说明，各应用入口暂为空，尚无游戏、存档或网络功能。
+## 当前状态
+
+项目已完成M0公共契约与实验框架原型：
+
+- 有符号块坐标、Section转换、内容命名空间和运行时句柄失效。
+- 提交序号、持久序号、对象与事件身份、事务结果和复制声明。
+- `BlockDefinition`、`StateSchema`、`CapabilityDescriptor`和`ModuleDescriptor`四项内容契约。
+- 最小内容编译器和模块解析器，包含顺序无关摘要及可定位错误。
+- 石头、玻璃半砖和植物内容夹具。
+- 统一动作声明、命令冲突检查和模块服务注册校验。
+- codec预算、事务性编码回滚和场景指标框架。
+- 可复跑的ECS、Wasmtime和wgpu/winit技术实验。
+
+M0不包含可编辑世界、正式存档格式、网络或Mod平台。这些能力从后续里程碑开始实现。
 
 ## 目录
 
@@ -30,48 +43,43 @@ crates/
     assets/
     diagnostics/
 modules/
-    inventory/
-    crafting/
-    energy/
 games/
-    base/
 examples/
-    mods/
 tests/
-    scenarios/
-    fixtures/
 benchmarks/
 ```
 
 | 位置 | 职责 |
 |---|---|
-| [apps](apps/README.md) | 客户端、服务端与工具入口 |
-| [crates](crates/README.md) | 框架库与B部分的编码库 |
+| [apps](apps/README.md) | 客户端、服务端与开发工具入口 |
+| [crates](crates/README.md) | 框架库与B部分编码库 |
 | [modules](modules/README.md) | 库存、配方与能量等可选标准玩法模块 |
 | [games/base](games/base/README.md) | 基础游戏的模块、内容与规则组合 |
 | [examples/mods](examples/mods/README.md) | 仅依赖公开SDK的Mod示例 |
 | [tests](tests/README.md) | 跨模块场景、故障注入与测试数据 |
-| [benchmarks](benchmarks/README.md) | 可复现工作负载与性能测量 |
-
-apps、crates与标准玩法模块已注册为Cargo工作区成员。游戏定义、Mod示例和性能测试暂以README保留目录，具体格式与运行入口待对应契约确定。codec保留上一轮建立的存档编码职责，是总览中storage职责的细分；fixtures是测试数据的补充目录。
-
-## 协作边界
-
-A负责权威世界数据、模拟、生命周期和原子提交，保留最终写入权。B负责世界与磁盘、连接之间的数据交换，解码后的加载数据和外部请求通过A提供的入口接纳。
-
-公共契约由用户指定。当前不定义世界类型、提交记录字段、恢复接口、动作接口或复制权限规则。各crate暂不声明彼此依赖，也不引入第三方库。
-
-本轮补齐全部目录后，此聊天后续实现范围保持为B部分：apps/server、crates/codec、crates/storage、crates/protocol、crates/net，以及对应测试。A部分及其他模块的骨架供负责成员继续开发。公共契约、根工作区配置和跨模块接入变更需要与相关成员协调。
-
-存档记录与网络消息分别编码。持久化确认、请求接纳和状态复制的具体接入方式在契约确定后实现。正式需求和架构材料在独立的[TorseDesign仓库](https://github.com/invefa/TorseDesign)维护。
+| [benchmarks](benchmarks/README.md) | 工作负载、性能测量与[M0实验记录](benchmarks/M0-experiments.md) |
 
 ## 检查
 
-需要支持Rust2024 Edition的Rust工具链。当前骨架可使用以下命令检查：
+工作区固定使用Rust 1.93.1，依赖版本记录在`Cargo.lock`。
 
-```powershell
-cargo fmt --all --check
-cargo check --workspace --all-targets
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo run -p torse-tools -- content-fixture
 ```
 
-这些检查仅验证骨架的格式和编译，不代表功能验收通过。工作区尚未锁定正式工具链版本。
+技术实验需要显式开启组件：
+
+```sh
+cargo run -p torse-tools --features experiments -- ecs-probe
+cargo run -p torse-tools --features experiments -- wasm-probe
+cargo run -p torse-tools --features experiments -- gpu-probe
+```
+
+## 协作边界
+
+A负责权威世界、模拟、生命周期和原子提交。B负责世界与磁盘、连接之间的数据交换，包括codec、storage、protocol、net和server装配。公共契约变更需要同步修改设计、类型、测试和受影响模块，不能在单个crate内悄悄改变语义。
+
+正式需求与架构材料在独立的设计材料目录中维护。M0实验结果是功能证据，不是性能承诺。

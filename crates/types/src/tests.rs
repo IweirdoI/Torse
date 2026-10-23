@@ -2,6 +2,104 @@
 
 use super::*;
 
+#[test]
+fn content_key_parses_namespaced_value() {
+    let key = ContentKey::parse("base:blocks/stone").unwrap();
+    assert_eq!(key.namespace(), "base");
+    assert_eq!(key.path(), "blocks/stone");
+    assert_eq!(key.to_string(), "base:blocks/stone");
+}
+
+#[test]
+fn content_key_rejects_invalid_names() {
+    assert_eq!(
+        ContentKey::parse("Base:stone"),
+        Err(ContentKeyError::InvalidNamespace)
+    );
+    assert_eq!(
+        ContentKey::parse("base:stone//rough"),
+        Err(ContentKeyError::InvalidPath)
+    );
+    assert_eq!(
+        ContentKey::parse("stone"),
+        Err(ContentKeyError::MissingNamespace)
+    );
+}
+
+#[test]
+fn content_key_enforces_lengths() {
+    let long_namespace = format!("{}:stone", "a".repeat(65));
+    assert!(matches!(
+        ContentKey::parse(&long_namespace),
+        Err(ContentKeyError::NamespaceTooLong { .. })
+    ));
+}
+
+#[test]
+fn negative_coordinates_use_floor_sections_and_nonnegative_local_values() {
+    let (section, local) = BlockPos::new(-1, -32, 31).to_section(32).unwrap();
+    assert_eq!(section, SectionPos::new(-1, -1, 0));
+    assert_eq!(local, LocalPos { x: 31, y: 0, z: 31 });
+}
+
+#[test]
+fn negative_coordinate_chunks_survive_roundtrip() {
+    for position in [
+        BlockPos::new(-1, -1, -1),
+        BlockPos::new(-32, -33, -64),
+        BlockPos::new(0, 31, 32),
+        BlockPos::new(1_000_000, -2_000_000, 3_000_000),
+    ] {
+        let (section, local) = position.to_section(32).unwrap();
+        assert_eq!(section.to_block(local, 32).unwrap(), position);
+    }
+}
+
+#[test]
+fn coordinate_arithmetic_rejects_overflow() {
+    assert_eq!(
+        BlockPos::new(i64::MAX, 0, 0).checked_add(1, 0, 0),
+        Err(SpatialError::CoordinateOverflow)
+    );
+}
+
+#[test]
+fn local_coordinate_must_be_inside_section() {
+    assert_eq!(
+        SectionPos::ZERO.to_block(LocalPos { x: 32, y: 0, z: 0 }, 32),
+        Err(SpatialError::LocalCoordinateOutOfRange { side: 32 })
+    );
+}
+
+#[test]
+fn revisions_and_ids_enforce_nonzero_start() {
+    assert_eq!(Revision::INITIAL.next(), Some(Revision(1)));
+    assert!(EntityId(1).validate().is_ok());
+    assert!(EntityId(0).validate().is_err());
+    assert!(EventId(0).validate().is_err());
+    assert!(TransactionId(0).validate().is_err());
+}
+
+#[test]
+fn transaction_and_event_results_carry_stable_results() {
+    let transaction = TransactionId(7);
+    let result = TransactionResult {
+        transaction,
+        outcome: TransactionOutcome::Committed {
+            at: CommitCursor::initial(WorldId(3)),
+            value: "ok",
+        },
+    };
+    assert_eq!(result.transaction, transaction);
+
+    let event = ScheduledEvent {
+        id: EventId(9),
+        target_tick: Tick(42),
+        input: "work",
+    };
+    assert_eq!(event.target_tick, Tick(42));
+}
+
 // ============================================================================================
 // CommitSeq Tests
 // ============================================================================================

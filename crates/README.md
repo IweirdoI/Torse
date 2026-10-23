@@ -1,24 +1,24 @@
 # 框架库
 
-下表对应架构总览的模块职责。当前各库仅有骨架，公共类型与依赖接入待契约确定。
+下表对应架构总览的模块职责。M0已实现公共类型、内容契约、内容与模块编译、动作声明、codec原语和三组技术探针；世界、模拟、正式存储、协议和网络仍为骨架。
 
 | 目录 | 职责 |
 |---|---|
 | [types](types/src/lib.rs) | 身份、坐标、时间与通用错误等公共基础类型 |
-| [runtime](runtime/src/lib.rs) | CPU任务、I/O与执行预算 |
-| [content](content/src/lib.rs) | 内容模式、注册、编译与不可变描述 |
-| [world](world/src/lib.rs) | 地形、实体、索引、生命周期与受控访问 |
+| [runtime](runtime/src/lib.rs) | CPU任务、I/O、执行预算与ECS探针 |
+| [content](content/src/lib.rs) | 内容契约、编译、摘要与M0夹具 |
+| [world](world/src/lib.rs) | 世代句柄；地形与生命周期待实现 |
 | [sim](sim/src/lib.rs) | Tick阶段、模拟任务、事务与事件 |
-| [actions](actions/src/lib.rs) | 类型化动作、授权入口与结果 |
-| [modules](modules/src/lib.rs) | 模块依赖解析与生命周期 |
+| [actions](actions/src/lib.rs) | 动作声明、命令冲突与注册检查 |
+| [modules](modules/src/lib.rs) | 模块依赖、服务与注册解析 |
 | [world_services](world_services/src/lib.rs) | 碰撞、光照、生成与寻路等世界服务 |
 | [mod_api](mod_api/src/lib.rs) | SDK契约、可传输类型与接口描述 |
-| [mod_host](mod_host/src/lib.rs) | Mod加载、执行、权限与配额 |
+| [mod_host](mod_host/src/lib.rs) | Mod宿主骨架与Wasmtime探针 |
 | [codec](codec/README.md) | 存档快照、记录与内容映射的显式编码，B部分 |
 | [storage](storage/README.md) | 日志、检查点、恢复与迁移，B部分 |
 | [protocol](protocol/README.md) | 网络消息、协商与编码约束，B部分 |
 | [net](net/README.md) | 会话、输入、复制与背压，B部分 |
-| [render](render/src/lib.rs) | 可视状态、网格、材质与GPU资源 |
+| [render](render/src/lib.rs) | 图形骨架与wgpu/winit初始化探针 |
 | [assets](assets/src/lib.rs) | 资源定位、解码与格式适配 |
 | [diagnostics](diagnostics/src/lib.rs) | 指标、跟踪与故障关联 |
 

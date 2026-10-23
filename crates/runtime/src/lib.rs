@@ -1,1 +1,9 @@
-//! CPU task execution, I/O, and budget scaffolding. No runtime is implemented yet.
+//! CPU task execution, I/O, and bounded experiments.
+
+#![forbid(unsafe_code)]
+
+#[cfg(feature = "ecs-probe")]
+mod ecs_probe;
+
+#[cfg(feature = "ecs-probe")]
+pub use ecs_probe::{EcsProbeReport, run_ecs_probe};

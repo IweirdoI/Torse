@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets
+      - name: Content fixture
+        run: cargo run -p torse-tools -- content-fixture
+
+  experiments:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Check optional experiments
+        run: cargo check -p torse-tools --features experiments --all-targets
+      - name: Test runtime probes
+        run: |
+          cargo test -p torse-runtime --features ecs-probe
+          cargo test -p torse-mod-host --features wasm-probe

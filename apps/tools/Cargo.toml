@@ -3,3 +3,18 @@ name = "torse-tools"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[features]
+default = []
+ecs-probe = ["torse-runtime/ecs-probe"]
+gpu-probe = ["torse-render/gpu-probe"]
+wasm-probe = ["torse-mod-host/wasm-probe"]
+experiments = ["ecs-probe", "gpu-probe", "wasm-probe"]
+
+[dependencies]
+torse-content = { path = "../../crates/content" }
+torse-modules = { path = "../../crates/modules" }
+torse-mod-host = { path = "../../crates/mod_host" }
+torse-render = { path = "../../crates/render" }
+torse-runtime = { path = "../../crates/runtime" }
+torse-types = { path = "../../crates/types" }

@@ -156,6 +156,7 @@ struct WindowApp {
     net: Option<crate::net::Connection<torse_net::TcpTransport>>,
     session: Option<u128>,
     grabbed: bool,
+    last_cursor: Option<(f64, f64)>,
     probe_sent: bool,
     batches: u32,
     requests_sent: u32,
@@ -217,6 +218,7 @@ impl WindowApp {
             net: None,
             session: None,
             grabbed: false,
+            last_cursor: None,
             probe_sent: false,
             batches: 0,
             requests_sent: 0,
@@ -766,19 +768,14 @@ impl WindowApp {
 
     /// Capture or release the mouse.
     ///
-    /// Captured means locked to the window centre and hidden: motion deltas
-    /// drive the camera directly. Any modal needs the real cursor back.
+    /// Captured means hidden and re-centred after every motion event: the
+    /// deltas drive the camera directly, and any modal needs the real cursor
+    /// back. winit's own grab is deliberately not used on Windows because
+    /// both of its modes clip the cursor to a one-pixel rect there, which
+    /// freezes the reported positions and with them the camera.
     fn set_grab(&mut self, grab: bool) {
         self.grabbed = grab;
         if let Some(gpu) = self.gpu.as_ref() {
-            let mode = if grab {
-                winit::window::CursorGrabMode::Locked
-            } else {
-                winit::window::CursorGrabMode::None
-            };
-            if let Err(error) = gpu.window.set_cursor_grab(mode) {
-                eprintln!("cursor grab unavailable: {error}");
-            }
             gpu.window.set_cursor_visible(!grab);
             if grab {
                 let center = winit::dpi::Position::Physical(winit::dpi::PhysicalPosition::new(
@@ -786,6 +783,14 @@ impl WindowApp {
                     gpu.config.height as i32 / 2,
                 ));
                 let _ = gpu.window.set_cursor_position(center);
+                // Deltas are measured from this baseline until real motion
+                // or the drift allowance moves the cursor.
+                self.last_cursor = Some((
+                    f64::from(gpu.config.width / 2),
+                    f64::from(gpu.config.height / 2),
+                ));
+            } else {
+                self.last_cursor = None;
             }
         }
     }
@@ -1147,15 +1152,34 @@ impl ApplicationHandler for WindowApp {
                 self.ui.cursor = [position.x, position.y];
                 if self.grabbed && !self.ui.modal() {
                     if let Some(gpu) = self.gpu.as_ref() {
-                        let dx = position.x - f64::from(gpu.config.width / 2);
-                        let dy = position.y - f64::from(gpu.config.height / 2);
-                        self.input.mouse_look(dx, dy);
-                        let center =
-                            winit::dpi::Position::Physical(winit::dpi::PhysicalPosition::new(
-                                gpu.config.width as i32 / 2,
-                                gpu.config.height as i32 / 2,
-                            ));
-                        let _ = gpu.window.set_cursor_position(center);
+                        let center = (
+                            f64::from(gpu.config.width / 2),
+                            f64::from(gpu.config.height / 2),
+                        );
+                        // Deltas come from the previous delivered position:
+                        // per-event re-centring would feed rounding jitter
+                        // into the camera every event.
+                        let (last_x, last_y) = self.last_cursor.unwrap_or(center);
+                        let dx = position.x - last_x;
+                        let dy = position.y - last_y;
+                        if dx.abs() + dy.abs() > 0.0 {
+                            self.input.mouse_look(dx, dy);
+                        }
+                        // Recentre only on real drift; the hidden cursor may
+                        // wander a little without anyone noticing.
+                        if (position.x - center.0).abs() > 24.0
+                            || (position.y - center.1).abs() > 24.0
+                        {
+                            let point =
+                                winit::dpi::Position::Physical(winit::dpi::PhysicalPosition::new(
+                                    gpu.config.width as i32 / 2,
+                                    gpu.config.height as i32 / 2,
+                                ));
+                            let _ = gpu.window.set_cursor_position(point);
+                            self.last_cursor = Some(center);
+                        } else {
+                            self.last_cursor = Some((position.x, position.y));
+                        }
                     }
                 } else if !self.ui.modal() {
                     self.input.cursor(position);

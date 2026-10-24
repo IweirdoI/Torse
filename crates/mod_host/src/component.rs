@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use exports::torse::behavior::invoke::Event;
 pub use exports::torse::behavior::invoke::{
-    Event as InvokeEvent, Invocation, ObjectRef, OwnedState, Plan,
+    Event as InvokeEvent, Invocation, ObjectRef, OwnedState, Plan, WakeupTarget,
 };
 use torse::behavior::diagnostics::LogLevel;
 use torse::behavior::query::{
     CellSample, ComponentSnapshot, ComponentTarget, EntityPage, PortEstimate, QueryError,
 };
 use torse::behavior::schedule::WakeupSlot;
+pub use torse::behavior::types::EntityId;
 use torse::behavior::types::{Atom, Bbox, BlockRef, Cell, Field, Vec3i};
 use wasmtime::component::bindgen;
 use wasmtime::{Config, Engine, Store};
@@ -76,7 +77,7 @@ pub struct FixtureHost {
     symbol_names: Vec<String>,
     blocks: HashMap<(i64, i64, i64), Cell>,
     pub committed_count: u32,
-    pub wakeups: Vec<(u64, String)>,
+    pub wakeups: Vec<(u64, u64, String)>,
     pub meters: Meters,
     budget: CallBudget,
 }
@@ -138,7 +139,8 @@ impl FixtureHost {
             }
         }
         for wakeup in &plan.wakeups {
-            self.wakeups.push((wakeup.tick, wakeup.key.clone()));
+            self.wakeups
+                .push((wakeup.tick, wakeup.entity.low, wakeup.key.clone()));
         }
     }
 
@@ -205,7 +207,7 @@ impl torse::behavior::query::Host for FixtureHost {
         Ok(Vec::new())
     }
 
-    fn probe_item_port(&mut self, _pos: Vec3i, _port: String) -> Option<PortEstimate> {
+    fn probe_item_port(&mut self, _entity: EntityId, _port: String) -> Option<PortEstimate> {
         None
     }
 }
@@ -225,12 +227,16 @@ impl torse::behavior::schedule::Host for FixtureHost {
     fn pending_wakeups(&mut self, key_prefix: Option<String>) -> Vec<WakeupSlot> {
         self.wakeups
             .iter()
-            .filter(|(_, key)| {
+            .filter(|(_, _, key)| {
                 key_prefix
                     .as_ref()
                     .is_none_or(|prefix| key.starts_with(prefix.as_str()))
             })
-            .map(|(tick, key)| WakeupSlot {
+            .map(|(tick, entity, key)| WakeupSlot {
+                entity: EntityId {
+                    low: *entity,
+                    high: 0,
+                },
                 tick: *tick,
                 key: key.clone(),
             })
@@ -300,6 +306,7 @@ pub fn machine_invocation(store: &Store<FixtureHost>, tick: u64, event: Event) -
         event,
         tick,
         self_: Some(ObjectRef {
+            entity: EntityId { low: 1, high: 0 },
             pos: Vec3i { x: 0, y: 64, z: 0 },
             block: 1,
             owned: vec![OwnedState {
@@ -334,7 +341,14 @@ pub fn run_roundtrip(
         store
             .set_fuel(budget.fuel)
             .map_err(|error| format!("fuel reset failed: {error}"))?;
-        let invocation = machine_invocation(&store, tick, Event::Wakeup("roundtrip:tick".into()));
+        let invocation = machine_invocation(
+            &store,
+            tick,
+            Event::Wakeup(WakeupTarget {
+                entity: EntityId { low: 1, high: 0 },
+                key: "roundtrip:tick".to_string(),
+            }),
+        );
         let plan = invoke
             .call_handle_event(&mut store, &invocation)
             .map_err(|error| format!("call at tick {tick} failed: {error}"))?;

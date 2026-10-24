@@ -15,6 +15,7 @@ members = [
     "crates/mod_host",
     "crates/mod_sdk",
     "examples/mods/roundtrip",
+    "examples/mods/machine",
     "crates/codec",
     "crates/storage",
     "crates/protocol",

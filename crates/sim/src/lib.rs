@@ -20,6 +20,7 @@ mod lifecycle;
 pub mod movement;
 pub mod payload;
 pub mod phase;
+pub mod replica;
 pub mod simulation;
 pub mod system;
 pub mod transaction;

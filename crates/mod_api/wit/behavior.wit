@@ -1,4 +1,4 @@
-package torse:behavior@0.1.0-draft;
+package torse:behavior@0.2.0-draft;
 
 interface types {
     record vec3i {
@@ -50,6 +50,9 @@ interface types {
         budget-exceeded,
         not-authorized,
         invalid-cursor,
+        // The requested representation cannot cross this boundary yet, for
+        // example a nested component value; see the design log before use.
+        unsupported,
     }
 }
 
@@ -80,12 +83,12 @@ interface query {
         -> result<entity-page, query-error>;
 
     record component-target {
-        pos: vec3i,
+        entity: entity-id,
         schema: u32,
     }
 
     record component-snapshot {
-        pos: vec3i,
+        entity: entity-id,
         fields: option<list<field>>,
     }
 
@@ -97,7 +100,7 @@ interface query {
         free-estimate: u32,
     }
 
-    probe-item-port: func(pos: vec3i, port: string) -> option<port-estimate>;
+    probe-item-port: func(entity: entity-id, port: string) -> option<port-estimate>;
 }
 
 interface diagnostics {
@@ -112,7 +115,10 @@ interface diagnostics {
 }
 
 interface schedule {
+    use types.{entity-id};
+
     record wakeup-slot {
+        entity: entity-id,
         tick: u64,
         key: string,
     }
@@ -121,7 +127,7 @@ interface schedule {
 }
 
 interface invoke {
-    use types.{vec3i, cell, field};
+    use types.{vec3i, cell, entity-id, field};
 
     record owned-state {
         schema: u32,
@@ -129,14 +135,20 @@ interface invoke {
     }
 
     record object-ref {
+        entity: entity-id,
         pos: vec3i,
         block: u32,
         owned: list<owned-state>,
     }
 
+    record wakeup-target {
+        entity: entity-id,
+        key: string,
+    }
+
     variant event {
         init,
-        wakeup(string),
+        wakeup(wakeup-target),
         block-placed,
         block-broken(cell),
     }
@@ -148,15 +160,13 @@ interface invoke {
         rng-seed: u64,
     }
 
-    record transfer-endpoint {
-        pos: vec3i,
-        port: string,
-    }
-
+    // Slots identify inventory positions directly in P2; the port abstraction
+    // stays an open design item until the inventory module exposes it.
     record transfer-request {
-        %from: transfer-endpoint,
-        to: transfer-endpoint,
-        item: u32,
+        source: entity-id,
+        source-slot: u32,
+        destination: entity-id,
+        destination-slot: u32,
         count: u32,
     }
 
@@ -167,13 +177,14 @@ interface invoke {
     }
 
     record component-edit {
-        pos: vec3i,
+        entity: entity-id,
         schema: u32,
         previous: option<list<field>>,
         fields: option<list<field>>,
     }
 
     record wakeup-request {
+        entity: entity-id,
         tick: u64,
         key: string,
     }

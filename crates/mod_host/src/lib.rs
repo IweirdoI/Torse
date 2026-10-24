@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "authority")]
+pub mod authority;
+
 #[cfg(feature = "component")]
 pub mod component;
 

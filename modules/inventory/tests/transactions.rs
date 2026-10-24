@@ -1,5 +1,6 @@
 //! Conservation, concurrency, recovery, and generic protected-component checks.
 mod actions;
+mod replica;
 mod support;
 use support::*;
 use torse_inventory::{Inventory, ItemStack};

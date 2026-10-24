@@ -19,8 +19,8 @@ use std::time::Duration;
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 use torse_mod_host::component::{
-    CallBudget, InvokeEvent, encode_component, engine_with, instantiate, invoke,
-    machine_invocation, run_native, run_roundtrip,
+    CallBudget, EntityId, InvokeEvent, WakeupTarget, encode_component, engine_with, instantiate,
+    invoke, machine_invocation, run_native, run_roundtrip,
 };
 use wasmtime::Engine;
 use wasmtime::component::Component;
@@ -74,7 +74,10 @@ fn error_chain_contains(error: &wasmtime::Error, needle: &str) -> bool {
 }
 
 fn wakeup_event() -> InvokeEvent {
-    InvokeEvent::Wakeup("roundtrip:tick".to_string())
+    InvokeEvent::Wakeup(WakeupTarget {
+        entity: EntityId { low: 1, high: 0 },
+        key: "roundtrip:tick".to_string(),
+    })
 }
 
 fn component_from(engine: &Engine, core: &[u8]) -> Component {

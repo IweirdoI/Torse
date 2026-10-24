@@ -2763,8 +2763,21 @@ version = "0.1.0"
 name = "torse-mod-host"
 version = "0.1.0"
 dependencies = [
+ "torse-content",
+ "torse-inventory",
+ "torse-sim",
+ "torse-types",
+ "torse-world",
  "wasmtime",
  "wit-component",
+]
+
+[[package]]
+name = "torse-mod-machine"
+version = "0.1.0"
+dependencies = [
+ "torse-mod-sdk",
+ "wit-bindgen 0.63.0",
 ]
 
 [[package]]

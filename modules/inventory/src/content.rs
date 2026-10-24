@@ -8,7 +8,7 @@ use torse_content::{
     ExecutionContract, MethodDescriptor, PersistencePolicy,
 };
 use torse_sim::action::register_action_module;
-use torse_types::{ContentKey, ReplicationDeclaration};
+use torse_types::{ContentKey, ReplicationDeclaration, ReplicationVisibility};
 
 use crate::{MAX_SLOTS, key};
 
@@ -95,7 +95,16 @@ pub fn register_content(pack: &mut ContentPack) {
             } else {
                 PersistencePolicy::Never
             },
-            replication: ReplicationDeclaration::SERVER_PRIVATE,
+            replication: ReplicationDeclaration {
+                // Contents are only projected to host-approved object readers.
+                // Request parameter schemas remain entirely server-private.
+                visibility: if name == "container" {
+                    ReplicationVisibility::Authorized
+                } else {
+                    ReplicationVisibility::Private
+                },
+                ..ReplicationDeclaration::SERVER_PRIVATE
+            },
             migration_binding: None,
         });
     }

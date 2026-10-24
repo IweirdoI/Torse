@@ -5,7 +5,7 @@
 use bindings::exports::torse::behavior::invoke::{
     BlockEdit, ComponentEdit, Guest, Invocation, Plan, WakeupRequest,
 };
-use bindings::torse::behavior::types::{Atom, Bbox, BlockRef, Cell, Field, Vec3i};
+use bindings::torse::behavior::types::{Atom, Bbox, BlockRef, Cell, EntityId, Field, Vec3i};
 use torse_mod_sdk::Rng;
 
 mod bindings {
@@ -130,11 +130,7 @@ impl Guest for Component {
             Some(Plan {
                 edits,
                 component_edits: vec![ComponentEdit {
-                    pos: Vec3i {
-                        x: cx,
-                        y: cy,
-                        z: cz,
-                    },
+                    entity: EntityId { low: 1, high: 0 },
                     schema,
                     previous: Some(vec![Field {
                         key: "count".to_string(),
@@ -147,6 +143,7 @@ impl Guest for Component {
                 }],
                 transfers: Vec::new(),
                 wakeups: vec![WakeupRequest {
+                    entity: EntityId { low: 1, high: 0 },
                     tick: tick + 1,
                     key: WORK_KEY.to_string(),
                 }],

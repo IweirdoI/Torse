@@ -99,6 +99,8 @@ impl PreparedChange {
 /// Result of a successful publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Publication {
+    /// Subscriptions whose queued data must be discarded before any further send.
+    pub invalidated_replicas: Vec<torse_types::SubscriptionId>,
     /// Commit position that became visible.
     pub cursor: CommitCursor,
     /// Sections whose revisions changed, in coordinate order.
@@ -537,6 +539,7 @@ impl CommitCoordinator {
         self.seq = prepared.meta.cursor.seq;
         self.resume = prepared.meta.resume_at;
         Ok(Publication {
+            invalidated_replicas: Vec::new(),
             cursor: prepared.meta.cursor,
             touched,
             moved: Vec::new(),

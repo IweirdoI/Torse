@@ -1,0 +1,18 @@
+[package]
+name = "torse-mod-machine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+torse-mod-sdk = { path = "../../../crates/mod_sdk" }
+wit-bindgen = "=0.63.0"
+
+[features]
+# Replaces the handler with a busy loop for trap-rebuild tests.
+spin = []
+# Adds a component edit against a foreign schema for rejection tests.
+intrude = []

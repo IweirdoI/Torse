@@ -7,7 +7,20 @@ publish.workspace = true
 [features]
 wasm-probe = ["dep:wasmtime"]
 component = ["dep:wasmtime", "dep:wit-component"]
+authority = [
+    "component",
+    "dep:torse-content",
+    "dep:torse-inventory",
+    "dep:torse-sim",
+    "dep:torse-types",
+    "dep:torse-world",
+]
 
 [dependencies]
+torse-content = { path = "../content", optional = true }
+torse-inventory = { path = "../../modules/inventory", optional = true }
+torse-sim = { path = "../sim", optional = true }
+torse-types = { path = "../types", optional = true }
+torse-world = { path = "../world", optional = true }
 wasmtime = { version = "=45.0.0", default-features = false, features = ["cranelift", "runtime", "std", "wat", "component-model"], optional = true }
 wit-component = { version = "=0.262.0", optional = true }

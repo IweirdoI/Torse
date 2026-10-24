@@ -15,8 +15,8 @@ use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget
 use torse_sim::replica::{ReplicaChanges, ReplicaEntity, ReplicaSnapshot};
 use torse_sim::{OrderingKey, Phase, Transaction, block_actions};
 use torse_types::{
-    BlockPos, Compatibility, ContentKey, EntityHandle, LocalPos, Revision, SectionPos,
-    TransactionId, TransactionOutcome, WorldId,
+    BlockPos, Compatibility, ContentKey, EntityHandle, LocalPos, SectionPos, TransactionId,
+    TransactionOutcome, WorldId,
 };
 use torse_world::{
     BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentSet,
@@ -81,7 +81,9 @@ pub struct Scene {
     generator: Option<HillTerrain>,
     side: u32,
     radius: i64,
-    meshes: BTreeMap<SectionPos, (Revision, MeshData)>,
+    /// Cached mesh plus the dependency revisions it was built against;
+    /// a neighbour edit is detected by validating this stored job.
+    meshes: BTreeMap<SectionPos, (MeshJob, MeshData)>,
     sections: Vec<SectionPos>,
 }
 
@@ -581,6 +583,11 @@ impl Scene {
 
     /// Rebuild meshes whose section or neighbour revision changed.
     ///
+    /// The cache holds the dependency job captured at build time; validating
+    /// that stored job against the live store detects neighbour edits too.
+    /// Capturing a fresh job here instead would compare the world with itself
+    /// and never notice a neighbour change.
+    ///
     /// Returns how many meshes were rebuilt, so callers can skip a GPU upload
     /// when nothing changed.
     pub fn refresh_meshes(&mut self) -> usize {
@@ -588,23 +595,28 @@ impl Scene {
         let registry = self.authority.registry();
         let mut rebuilt = 0usize;
         for pos in &self.sections {
-            let job = MeshJob::capture(self.side, *pos, |query| store.revision(query));
-            let Some(revision) = job.section_revision else {
-                continue;
-            };
             let unchanged = self
                 .meshes
                 .get(pos)
-                .is_some_and(|(cached, _)| *cached == revision)
-                && job.validate(|query| store.revision(query));
+                .is_some_and(|(job, _)| job.validate(|query| store.revision(query)));
             if unchanged {
                 continue;
             }
+            let job = MeshJob::capture(self.side, *pos, |query| store.revision(query));
+            let Some(_revision) = job.section_revision else {
+                continue;
+            };
             let mesh = build_mesh(self.side, *pos, |query| sample(store, registry, query));
-            self.meshes.insert(*pos, (revision, mesh));
+            self.meshes.insert(*pos, (job, mesh));
             rebuilt += 1;
         }
         rebuilt
+    }
+
+    /// Face count of one cached mesh, for tests.
+    #[cfg(test)]
+    pub fn mesh_face_count(&self, pos: SectionPos) -> Option<usize> {
+        self.meshes.get(&pos).map(|(_, mesh)| mesh.face_count())
     }
 
     /// Section containing a world-space position on the section layer.
@@ -826,6 +838,35 @@ mod tests {
         assert!(!indices.is_empty());
         assert!(faces > 0);
         assert_eq!(indices.len() % 3, 0);
+    }
+
+    #[test]
+    fn neighbour_edit_invalidates_the_border_mesh() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene.refresh_meshes();
+        let stone = key("base:stone");
+        // X sits in section (0,0,0) against the border, exposing a +x face
+        // into neighbour (1,0,0).
+        scene
+            .apply_edit(true, &stone, BlockPos::new(15, 15, 1))
+            .expect("place X");
+        scene.refresh_meshes();
+        let faces_before = scene.mesh_face_count(SectionPos::ZERO).expect("cached");
+
+        // Y lands in the neighbour and occludes that face; the border
+        // section's own revision does not change.
+        scene
+            .apply_edit(true, &stone, BlockPos::new(16, 15, 1))
+            .expect("place Y");
+        let rebuilt = scene.refresh_meshes();
+        assert!(rebuilt >= 2, "neighbour and border section must rebuild");
+
+        let faces_after = scene.mesh_face_count(SectionPos::ZERO).expect("cached");
+        assert_eq!(
+            faces_before - faces_after,
+            1,
+            "the occluded border face is gone"
+        );
     }
 
     #[test]
@@ -1069,8 +1110,9 @@ mod tests {
         scene.apply_changes(&changes).expect("apply");
         assert!(!query(&scene, BlockPos::new(3, 0, 4)));
         assert!(query(&scene, BlockPos::new(5, 0, 5)));
-        // The invalidated mesh rebuilds despite matching revision numbers.
-        assert_eq!(scene.refresh_meshes(), 1);
+        // The replaced section rebuilds despite matching revision numbers,
+        // and the neighbour rebuilds because it observed the old revision.
+        assert_eq!(scene.refresh_meshes(), 2);
     }
 
     #[test]

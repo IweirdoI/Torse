@@ -196,7 +196,12 @@ impl Text {
                 let (width, height) = (bounds.width() as u32, bounds.height() as u32);
                 let mut pixels = vec![0; (width * height) as usize];
                 outline.draw(|x, y, coverage| {
-                    pixels[(y * width + x) as usize] = (coverage * 255.0) as u8
+                    // Steepen the coverage ramp: anti-aliased edges at
+                    // small CJK sizes turn to mush once the logical canvas
+                    // is magnified, so keep only firm pixels and one thin
+                    // transition step.
+                    let sharpened = ((coverage - 0.35) / 0.30).clamp(0.0, 1.0);
+                    pixels[(y * width + x) as usize] = (sharpened * 255.0) as u8
                 });
                 Raster {
                     pixels,

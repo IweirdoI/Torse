@@ -155,6 +155,7 @@ struct WindowApp {
     autoplay_break: bool,
     net: Option<crate::net::Connection<torse_net::TcpTransport>>,
     session: Option<u128>,
+    grabbed: bool,
     probe_sent: bool,
     batches: u32,
     requests_sent: u32,
@@ -215,6 +216,7 @@ impl WindowApp {
             autoplay_break: false,
             net: None,
             session: None,
+            grabbed: false,
             probe_sent: false,
             batches: 0,
             requests_sent: 0,
@@ -762,6 +764,32 @@ impl WindowApp {
         Ok(())
     }
 
+    /// Capture or release the mouse.
+    ///
+    /// Captured means locked to the window centre and hidden: motion deltas
+    /// drive the camera directly. Any modal needs the real cursor back.
+    fn set_grab(&mut self, grab: bool) {
+        self.grabbed = grab;
+        if let Some(gpu) = self.gpu.as_ref() {
+            let mode = if grab {
+                winit::window::CursorGrabMode::Locked
+            } else {
+                winit::window::CursorGrabMode::None
+            };
+            if let Err(error) = gpu.window.set_cursor_grab(mode) {
+                eprintln!("cursor grab unavailable: {error}");
+            }
+            gpu.window.set_cursor_visible(!grab);
+            if grab {
+                let center = winit::dpi::Position::Physical(winit::dpi::PhysicalPosition::new(
+                    gpu.config.width as i32 / 2,
+                    gpu.config.height as i32 / 2,
+                ));
+                let _ = gpu.window.set_cursor_position(center);
+            }
+        }
+    }
+
     /// Switch to walk mode by spawning the player entity under the camera.
     ///
     /// `Scene::eye` sits 1.4 blocks above the surface cell's top, and the
@@ -1008,6 +1036,9 @@ impl ApplicationHandler for WindowApp {
         }
         self.started = Some(Instant::now());
         self.fps_origin = Instant::now();
+        // Capture the mouse right away; Esc opens the pause menu with the
+        // real cursor back.
+        self.set_grab(true);
         // Prime one frame immediately instead of waiting for the first event.
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.request_redraw();
@@ -1051,6 +1082,7 @@ impl ApplicationHandler for WindowApp {
                             };
                             self.ui.set_mode(mode);
                             self.input.reset();
+                            self.set_grab(!self.ui.modal());
                             return;
                         }
                         KeyCode::KeyE if !event.repeat => {
@@ -1061,6 +1093,7 @@ impl ApplicationHandler for WindowApp {
                             };
                             self.ui.set_mode(mode);
                             self.input.reset();
+                            self.set_grab(!self.ui.modal());
                             return;
                         }
                         KeyCode::F12 => {
@@ -1098,7 +1131,13 @@ impl ApplicationHandler for WindowApp {
                                 }
                             }
                             self.input.reset();
+                            self.set_grab(!self.ui.modal());
                         }
+                    }
+                } else if self.grabbed {
+                    // Captured mouse: a press is a click, motion is look.
+                    if state == ElementState::Pressed {
+                        self.input.queue_click(button);
                     }
                 } else {
                     self.input.mouse(button, state);
@@ -1106,7 +1145,19 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.cursor = [position.x, position.y];
-                if !self.ui.modal() {
+                if self.grabbed && !self.ui.modal() {
+                    if let Some(gpu) = self.gpu.as_ref() {
+                        let dx = position.x - f64::from(gpu.config.width / 2);
+                        let dy = position.y - f64::from(gpu.config.height / 2);
+                        self.input.mouse_look(dx, dy);
+                        let center =
+                            winit::dpi::Position::Physical(winit::dpi::PhysicalPosition::new(
+                                gpu.config.width as i32 / 2,
+                                gpu.config.height as i32 / 2,
+                            ));
+                        let _ = gpu.window.set_cursor_position(center);
+                    }
+                } else if !self.ui.modal() {
                     self.input.cursor(position);
                 }
             }
@@ -1117,7 +1168,12 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::Focused(false) => {
                 self.input.reset();
-                self.ui.set_mode(self.ui.mode);
+                self.set_grab(false);
+            }
+            WindowEvent::Focused(true) => {
+                if !self.ui.modal() {
+                    self.set_grab(true);
+                }
             }
             WindowEvent::RedrawRequested => {
                 if self.gpu.is_some() && self.camera.is_some() {

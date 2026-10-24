@@ -136,6 +136,22 @@ impl InputState {
         self.held.contains(&KeyCode::Space)
     }
 
+    /// Feed one captured-mouse motion step.
+    ///
+    /// Sign convention differs from drag look: mouse right turns right and
+    /// mouse up looks up, the first-person expectation while the cursor is
+    /// captured.
+    pub fn mouse_look(&mut self, dx: f64, dy: f64) {
+        self.look_delta.x -= dx;
+        self.look_delta.y += dy;
+    }
+
+    /// Queue a click that fired while the cursor was captured; there is no
+    /// drag distance to distinguish it from a look motion.
+    pub fn queue_click(&mut self, button: MouseButton) {
+        self.pending_click = Some(button);
+    }
+
     /// Consume the pending click, if the last press qualified as one.
     pub fn take_click(&mut self) -> Option<MouseButton> {
         self.pending_click.take()
@@ -273,6 +289,21 @@ mod tests {
         let (_, speed) = state.take_input(speed);
         assert_eq!(speed, SPEED_RANGE.1);
         assert_eq!(state.take_input(speed).1, SPEED_RANGE.1);
+    }
+
+    #[test]
+    fn captured_mouse_uses_first_person_signs() {
+        let mut state = InputState::new();
+        state.mouse_look(10.0, 0.0);
+        let (motion, _) = state.take_input(12.0);
+        // Mouse right turns right: positive yaw delta.
+        assert!(motion.yaw_delta > 0.0);
+        state.mouse_look(0.0, -8.0);
+        let (motion, _) = state.take_input(12.0);
+        // Mouse up looks up: positive pitch delta.
+        assert!(motion.pitch_delta > 0.0);
+        state.queue_click(MouseButton::Right);
+        assert_eq!(state.take_click(), Some(MouseButton::Right));
     }
 
     #[test]

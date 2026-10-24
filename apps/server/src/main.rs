@@ -14,12 +14,14 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen 127.0.0.1:7777] [--ticks N; 0=continuous] [--fill] [--editors]"
+            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators]"
         );
         return Ok(());
     };
     if path == "--help" {
-        println!("torse-server <world-directory> [--listen ADDRESS] [--ticks N]");
+        println!(
+            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators]"
+        );
         return Ok(());
     }
     let path = PathBuf::from(path);
@@ -28,8 +30,15 @@ fn run() -> Result<(), Fault> {
     let mut fill = false;
     let mut editors = false;
     let mut revoke_after = 0u64;
+    let mut mod_dirs = Vec::new();
+    let mut machine_operators = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--mod" => mod_dirs
+                .push(PathBuf::from(args.next().ok_or_else(|| {
+                    Fault::invalid_data("missing mod directory")
+                })?)),
+            "--machine-operators" => machine_operators = true,
             "--listen" => {
                 address = args
                     .next()
@@ -53,7 +62,32 @@ fn run() -> Result<(), Fault> {
         }
     }
     std::fs::create_dir_all(&path).map_err(|e| Fault::invalid_data(e.to_string()))?;
-    let (mut world, actions) = base::world()?;
+    if machine_operators && mod_dirs.is_empty() {
+        return Err(Fault::invalid_data("--machine-operators requires --mod"));
+    }
+    let (mut world, actions, rules, machine_targets) = if mod_dirs.is_empty() {
+        let (world, actions) = base::world()?;
+        (
+            world,
+            actions,
+            Vec::new(),
+            Vec::<torse_types::EntityId>::new(),
+        )
+    } else {
+        #[cfg(feature = "mods")]
+        {
+            let game = torse_server::mods::mod_world(&mod_dirs, true, &[])?;
+            let targets = game
+                .machines
+                .iter()
+                .map(|(_, id)| *id)
+                .chain([game.input, game.output])
+                .collect();
+            (game.world, game.actions, game.rules, targets)
+        }
+        #[cfg(not(feature = "mods"))]
+        return Err(Fault::invalid_data("--mod requires the mods feature"));
+    };
     if fill && path.join("checkpoints/manifest.log").exists() {
         return Err(Fault::invalid_data("--fill only applies to a fresh world"));
     }
@@ -72,13 +106,13 @@ fn run() -> Result<(), Fault> {
                 world.registry(),
                 world.schemas(),
                 actions,
-                Vec::new(),
+                rules,
                 limits,
             ))
         })?
     } else {
         base::Files::create_file(directory, compatibility, codec, policy, |binding| {
-            ExecutionHost::new(binding, world, actions, Vec::new(), limits)
+            ExecutionHost::new(binding, world, actions, rules, limits)
         })?
     };
     let listener = TcpListener::bind(&address).map_err(|e| Fault::invalid_data(e.to_string()))?;
@@ -123,6 +157,18 @@ fn run() -> Result<(), Fault> {
                             .fold(base_actor, |actor, section| actor.section(*section))
                     } else {
                         ActorContext::new(base::key("base:guest"))
+                    };
+                    let actor = if machine_operators {
+                        // Explicit local demo policy; production hosts must
+                        // map authenticated identities to their own grants.
+                        let actor = actor
+                            .permission(base::key("inventory:permission/read"))
+                            .permission(base::key("inventory:permission/transfer"));
+                        machine_targets.iter().fold(actor, |actor, id| {
+                            actor.target(torse_sim::action::ActionTarget::Entity(*id))
+                        })
+                    } else {
+                        actor
                     };
                     let policy = PeerPolicy { actor, scope };
                     if let Ok(id) = hub.add(stream, policy, server.authority()?.resume_point().tick)

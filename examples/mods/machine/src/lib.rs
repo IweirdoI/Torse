@@ -1,5 +1,5 @@
 //! Machine mod: the P2 processing-machine example. Every wakeup advances a
-//! private progress counter; at the fourth step it moves one stone from the
+//! persistent progress counter; at the fourth step it moves one stone from the
 //! input chest to the output chest and resets, all in one plan that either
 //! commits completely or not at all.
 

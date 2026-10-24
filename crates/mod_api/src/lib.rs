@@ -5,3 +5,5 @@
 //! mods implement. Guests generate bindings from this file; the host binds the
 //! same file through `wasmtime::component::bindgen!`, so there is exactly one
 //! description of the boundary.
+
+pub mod ui;

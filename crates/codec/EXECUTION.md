@@ -39,3 +39,9 @@ WorldSnapshot包裹先写SnapshotMeta，再写ExecutionSnapshot；CommitRecord�
 授权复制使用相同基础词汇，ReplicaSeed按binding、subscription、baseline、state，ReplicaBatch按binding、subscription、seq、through、changes。ReplicaSnapshot和ReplicaChanges字段顺序按A7登记；Dense在此使用带计数的符号列表，因此网络编码条目预算可能比A7内存预检更严格。客户端必须通过state表解析符号，不能直接使用远端运行编号。
 
 decode要求消耗完整输入，拒绝未知版本、标签、超额集合、非法内容键和尾随字节。StorageCodec执行包裹元数据核对，ExecutionRecovery执行规则、阶段、事件、结果和世界领域校验。不能把编码成功当作授权或持久确认。
+
+## 机器UI与方块通知
+
+B10沿用上述字段布局。UI只消费授权ReplicaSnapshot/ReplicaChanges，按钮发送既有Call：inventory:action/transfer、version=1、target为输入实体，parameters为source_slot=0、destination=输出实体、destination_slot=0、count=1。相同意图重发沿用原RequestId，不新建扣料请求。
+
+动作通知保存在FrozenTask.schedule，成功结算时才分配EventId并进入RuntimeState.events。payload使用包命名空间的event/kind（Text，block-placed或block-broken）、event/block（Content）、event/values（`List<U32>`，各项为u16范围）、event/x、event/y、event/z（I64）。定义和有限值记录发生变化的原状态，不保存进程BlockStateId；破坏后不从当前空单元反推旧状态。通知与世界修改、结果和任务位置共记录，拒绝不登记，恢复不重复产生。

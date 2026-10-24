@@ -3,7 +3,7 @@ id = "machine:schema/state"
 version = 1
 owner = "machine:module"
 persistence = "always"
-replication = "server-private"
+replication = "server-authorized"
 
 [[component.field]]
 id = "machine:field/progress"
@@ -26,3 +26,9 @@ version = 1
 
 [[state.component]]
 id = "machine:schema/state"
+
+[[block]]
+id = "machine:block/casing"
+version = 1
+schema = "machine:state/machine"
+behavior = true

@@ -66,6 +66,17 @@ impl ExecutionLimits {
 /// world. Freeze/retry may call a planner again before it has published any state.
 pub trait DurableRule {
     fn spec(&self) -> SystemSpec;
+    /// Derive bounded notifications from a planned action. They are frozen with
+    /// that action and registered only if its world transaction commits.
+    /// This callback must not invoke guests or change process-local state.
+    fn action_events(
+        &self,
+        _world: &WorldAuthority,
+        _tick: Tick,
+        _transaction: &Transaction,
+    ) -> Result<Vec<EventDraft>, Fault> {
+        Ok(Vec::new())
+    }
     fn plan(&self, _world: &WorldAuthority, _tick: Tick) -> Result<Vec<WorkPlan>, Fault> {
         Ok(Vec::new())
     }
@@ -512,6 +523,16 @@ impl ExecutionHost {
                 };
                 match output {
                     Ok(ActionOutput::Mutation(tx)) => {
+                        for rule in &self.rules {
+                            task.schedule.extend(rule.action_events(
+                                self.world(),
+                                point.tick,
+                                &tx,
+                            )?);
+                            if task.schedule.len() > self.limits.events {
+                                return Err(Fault::resource_limit("action event budget"));
+                            }
+                        }
                         task.transaction = Some(StoredTransactionGroup::single(self.world(), &tx)?)
                     }
                     Ok(ActionOutput::Query(fields)) => {

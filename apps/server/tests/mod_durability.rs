@@ -899,3 +899,526 @@ fn journal_rejection_preserves_the_group_and_flush_failure_stops_visibility() {
         );
     }
 }
+
+// B10: consume the public UI contract through the real message and replica path.
+use torse_codec::wire;
+use torse_mod_api::ui::{MachineView, machine as machine_ui};
+use torse_net::{MemoryTransport, ReplicaMirror, Transport, TransportLimits};
+use torse_server::network::{ClientMessage, NetworkHub, PeerPolicy, ServerMessage};
+use torse_sim::action::{ActionTarget, ActorContext};
+use torse_sim::durable::{Call, ReplyStatus};
+
+fn ui_actor(machine: EntityId, input: EntityId, output: EntityId) -> ActorContext {
+    ActorContext::new(base::key("test:operator"))
+        .permission(base::key("inventory:permission/read"))
+        .permission(base::key("inventory:permission/transfer"))
+        .permission(base::key("world:permission/edit"))
+        .target(ActionTarget::Entity(machine))
+        .target(ActionTarget::Entity(input))
+        .target(ActionTarget::Entity(output))
+        .section(SectionPos { x: 0, y: 0, z: 0 })
+}
+fn ui_send(client: &mut MemoryTransport, message: ClientMessage) {
+    let mut bytes = Vec::new();
+    wire::encode(&message, &mut bytes, base::budget(), base::codec_limits()).unwrap();
+    client.send(bytes).unwrap();
+}
+fn ui_receive(client: &mut MemoryTransport) -> Vec<ServerMessage> {
+    let mut messages = Vec::new();
+    while let Some(bytes) = client.receive().unwrap() {
+        messages.push(wire::decode(&bytes, base::budget(), base::codec_limits()).unwrap());
+    }
+    messages
+}
+fn ui_connect(
+    server: &mut base::Files,
+    hub: &mut NetworkHub<MemoryTransport>,
+    actor: ActorContext,
+) -> (u128, MemoryTransport, ReplicaMirror) {
+    let (host, mut client) = MemoryTransport::pair(TransportLimits {
+        frame: 8_388_608,
+        queued_frames: 32,
+        queued_bytes: 16_777_216,
+        poll_bytes: 262_144,
+    })
+    .unwrap();
+    let id = hub
+        .add(
+            host,
+            PeerPolicy {
+                actor,
+                scope: base::scope(),
+            },
+            server.authority().unwrap().resume_point().tick,
+        )
+        .unwrap();
+    ui_send(
+        &mut client,
+        ClientMessage::Hello {
+            version: torse_protocol::PROTOCOL_VERSION,
+            compatibility: server.binding().compatibility,
+        },
+    );
+    hub.poll(server).unwrap();
+    ui_receive(&mut client);
+    ui_send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.into_iter().collect(),
+        },
+    );
+    hub.poll(server).unwrap();
+    let mirror = ui_receive(&mut client)
+        .into_iter()
+        .find_map(|message| match message {
+            ServerMessage::Seed(seed) => Some(ReplicaMirror::from_seed(seed).unwrap()),
+            _ => None,
+        })
+        .expect("new authorized seed");
+    (id, client, mirror)
+}
+fn ui_view(mirror: &ReplicaMirror, machine: EntityId) -> Option<MachineView> {
+    MachineView::rebuild(&machine_ui(), machine, |id, schema| {
+        mirror
+            .state
+            .entities
+            .iter()
+            .find(|entity| entity.id == id)?
+            .components
+            .get(schema)
+    })
+}
+fn ui_apply(client: &mut MemoryTransport, mirror: &mut ReplicaMirror) -> Vec<ReplyStatus> {
+    let mut statuses = Vec::new();
+    for message in ui_receive(client) {
+        match message {
+            ServerMessage::Batch(batch) => mirror.apply(batch).unwrap(),
+            ServerMessage::Result { reply, .. } => statuses.push(reply.status),
+            _ => {}
+        }
+    }
+    statuses
+}
+
+#[test]
+fn machine_ui_two_clients_authorization_dedup_and_new_baseline() {
+    let dir = Directory::new();
+    let (world, _) = assemble(&[machine_dir()], true, &[]);
+    let (machine, input, output) = (world.machines[0].1, world.input, world.output);
+    let mut server = create(&dir, world);
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    let actor = ui_actor(machine, input, output);
+    let (owner_id, mut owner, mut first) = ui_connect(&mut server, &mut hub, actor.clone());
+    let (_, mut second_client, mut second) = ui_connect(&mut server, &mut hub, actor.clone());
+    let (_, mut guest, mut private) = ui_connect(
+        &mut server,
+        &mut hub,
+        ActorContext::new(base::key("test:visitor")),
+    );
+    let partial_actor =
+        ActorContext::new(base::key("test:partial")).target(ActionTarget::Entity(machine));
+    let (_, _, partial) = ui_connect(&mut server, &mut hub, partial_actor);
+    let partial = ui_view(&partial, machine).unwrap();
+    assert!(partial.input.is_none() && partial.output.is_none());
+    assert!(partial.transfer_one().is_none());
+    assert!(ui_view(&private, machine).is_none());
+    assert!(
+        private
+            .state
+            .entities
+            .iter()
+            .all(|entity| entity.components.is_empty())
+    );
+    assert_eq!(ui_view(&first, machine), ui_view(&second, machine));
+    let reader_actor = ActorContext::new(base::key("test:reader"))
+        .target(ActionTarget::Entity(machine))
+        .target(ActionTarget::Entity(input))
+        .target(ActionTarget::Entity(output));
+    let (_, mut reader, mut reader_mirror) = ui_connect(&mut server, &mut hub, reader_actor);
+    assert_eq!(ui_view(&reader_mirror, machine), ui_view(&first, machine));
+    let intent = ui_view(&first, machine).unwrap().transfer_one().unwrap();
+    let call = Call {
+        action: intent.action,
+        version: intent.version,
+        target: ActionTarget::Entity(intent.target),
+        parameters: intent.parameters,
+    };
+    ui_send(
+        &mut reader,
+        ClientMessage::Request {
+            seq: RequestSeq(1),
+            call: call.clone(),
+        },
+    );
+    for _ in 0..2 {
+        ui_send(
+            &mut owner,
+            ClientMessage::Request {
+                seq: RequestSeq(1),
+                call: call.clone(),
+            },
+        );
+    }
+    ui_send(
+        &mut guest,
+        ClientMessage::Request {
+            seq: RequestSeq(1),
+            call: call.clone(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    server.drive_tick(&mut hub, 1024).unwrap();
+    hub.poll(&mut server).unwrap();
+    assert_eq!(
+        ui_apply(&mut owner, &mut first),
+        vec![ReplyStatus::Committed]
+    );
+    ui_apply(&mut second_client, &mut second);
+    assert_eq!(
+        ui_apply(&mut guest, &mut private),
+        vec![ReplyStatus::Rejected(RejectCode::PermissionDenied)]
+    );
+    assert_eq!(ui_view(&first, machine), ui_view(&second, machine));
+    assert_eq!(
+        ui_apply(&mut reader, &mut reader_mirror),
+        vec![ReplyStatus::Rejected(RejectCode::PermissionDenied)]
+    );
+    let view = ui_view(&first, machine).unwrap();
+    assert!(view.input.unwrap().items.is_empty());
+    assert_eq!(view.output.unwrap().items[&base::key("base:stone")], 1);
+    let position = server.durability().through;
+    ui_send(
+        &mut owner,
+        ClientMessage::Request {
+            seq: RequestSeq(1),
+            call,
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    assert!(ui_receive(&mut owner).iter().any(|message| matches!(
+        message,
+        ServerMessage::Admission {
+            admission: Admission::Duplicate,
+            ..
+        }
+    )));
+    assert_eq!(position, server.durability().through);
+    server.drive_tick(&mut hub, 1024).unwrap();
+    hub.poll(&mut server).unwrap();
+    ui_apply(&mut owner, &mut first);
+    ui_apply(&mut second_client, &mut second);
+    ui_apply(&mut guest, &mut private);
+    assert_eq!(ui_view(&first, machine).unwrap().progress, 1);
+    assert_eq!(ui_view(&first, machine), ui_view(&second, machine));
+    assert!(ui_view(&private, machine).is_none());
+    hub.revoke(&mut server, owner_id).unwrap();
+    assert!(owner.receive().is_err());
+    let (_, _, fresh) = ui_connect(&mut server, &mut hub, actor);
+    assert_ne!(first.subscription, fresh.subscription);
+    assert_eq!(ui_view(&fresh, machine), ui_view(&second, machine));
+    let (_, _, revoked) = ui_connect(
+        &mut server,
+        &mut hub,
+        ActorContext::new(base::key("test:revoked")),
+    );
+    assert!(ui_view(&revoked, machine).is_none());
+    drop(server);
+    let (mut server, stats) = reopen(&dir, &[machine_dir()], true);
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    let (_, _, recovered) = ui_connect(&mut server, &mut hub, ui_actor(machine, input, output));
+    assert_ne!(fresh.binding.epoch, recovered.binding.epoch);
+    assert_eq!(ui_view(&fresh, machine), ui_view(&recovered, machine));
+    assert!(stats.borrow().guest_dispatches.is_empty());
+}
+
+fn block_call(place: bool, block: &str) -> Call {
+    Call {
+        action: base::key(if place {
+            "world:action/place"
+        } else {
+            "world:action/break"
+        }),
+        version: 1,
+        target: ActionTarget::Block(BlockPos::new(8, 1, 1)),
+        parameters: if place {
+            [(
+                base::key("world:field/block"),
+                ComponentValue::Content(base::key(block)),
+            )]
+            .into()
+        } else {
+            Default::default()
+        },
+    }
+}
+fn block_session(server: &mut base::Files) {
+    server
+        .register_session(
+            Viewer {
+                session: SessionId(1),
+                actor: ActorContextId(1),
+            },
+            ui_actor(EntityId(3), EntityId(1), EntityId(2)),
+            base::scope(),
+        )
+        .unwrap();
+}
+fn block_request(server: &base::Files, seq: u64, call: Call) -> WorldRequest<Call> {
+    WorldRequest {
+        id: RequestId {
+            world: base::WORLD,
+            epoch: server.binding().epoch,
+            session: SessionId(1),
+            seq: RequestSeq(seq),
+        },
+        actor: ActorContextId(1),
+        input: call,
+    }
+}
+fn block_event_count(host: &ExecutionHost) -> usize {
+    host.runtime()
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+        event.event.payload.get(&base::key("machine:event/kind")),
+        Some(ComponentValue::Text(kind)) if kind.starts_with("block-"))
+        })
+        .count()
+}
+
+#[test]
+fn block_notifications_commit_once_and_recover_without_guest_replay() {
+    let dir = Directory::new();
+    let (world, stats) = assemble(&[machine_dir()], true, &[]);
+    let mut server = create(&dir, world);
+    block_session(&mut server);
+    let place = block_request(&server, 1, block_call(true, "machine:block/casing"));
+    assert!(matches!(
+        server.submit(copy_request(&place)),
+        Admission::Queued { .. }
+    ));
+    assert_eq!(server.submit(copy_request(&place)), Admission::Duplicate);
+    // Both plans see air, but the losing commit must register no notification.
+    let conflict = block_request(&server, 2, block_call(true, "machine:block/casing"));
+    server.submit(copy_request(&conflict));
+    tick(&mut server);
+    assert_eq!(block_event_count(server.authority().unwrap()), 1);
+    assert_eq!(
+        server.receipt(conflict.id).unwrap().unwrap().reply.status,
+        ReplyStatus::Rejected(RejectCode::Conflict)
+    );
+    assert!(stats.borrow().guest_dispatches.is_empty());
+    drop(server);
+    let (mut server, stats) = reopen(&dir, &[machine_dir()], true);
+    assert!(stats.borrow().guest_dispatches.is_empty());
+    assert_eq!(block_event_count(server.authority().unwrap()), 1);
+    // Freeze simulation notifications, then restart before publishing them.
+    loop {
+        server.drive_one(&mut NoReplicas).unwrap();
+        if server
+            .authority()
+            .unwrap()
+            .runtime()
+            .work
+            .as_ref()
+            .is_some_and(|work| work.tasks.iter().any(|task| task.consume.is_some()))
+        {
+            break;
+        }
+    }
+    assert_eq!(stats.borrow().guest_dispatches.get("machine"), Some(&2));
+    drop(server);
+    let (mut server, stats) = reopen(&dir, &[machine_dir()], true);
+    tick(&mut server);
+    assert!(
+        stats.borrow().guest_dispatches.is_empty(),
+        "frozen tasks bypass guest"
+    );
+    assert_eq!(block_event_count(server.authority().unwrap()), 0);
+    block_session(&mut server);
+    let break_request = block_request(&server, 1, block_call(false, ""));
+    server.submit(copy_request(&break_request));
+    tick(&mut server);
+    assert_eq!(block_event_count(server.authority().unwrap()), 1);
+    let broken = server
+        .authority()
+        .unwrap()
+        .runtime()
+        .events
+        .iter()
+        .find(|event| {
+            event.event.payload.get(&base::key("machine:event/kind"))
+                == Some(&ComponentValue::Text("block-broken".into()))
+        })
+        .unwrap();
+    assert_eq!(
+        broken.event.payload[&base::key("machine:event/block")],
+        ComponentValue::Content(base::key("machine:block/casing"))
+    );
+    assert_eq!(
+        broken.event.payload[&base::key("machine:event/x")],
+        ComponentValue::I64(8)
+    );
+    assert_eq!(
+        broken.event.payload[&base::key("machine:event/values")],
+        ComponentValue::List(vec![])
+    );
+    assert!(
+        world_of(&server)
+            .store()
+            .query(BlockPos::new(8, 1, 1))
+            .ready()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(server.submit(break_request), Admission::Duplicate);
+    tick(&mut server);
+    assert_eq!(block_event_count(server.authority().unwrap()), 0);
+    drop(server);
+    let (server, stats) = reopen(&dir, &[machine_dir()], true);
+    assert_eq!(block_event_count(server.authority().unwrap()), 0);
+    assert!(stats.borrow().guest_dispatches.is_empty());
+}
+
+#[test]
+fn unbound_blocks_and_denied_actions_produce_no_mod_notification() {
+    let dir = Directory::new();
+    let (world, _) = assemble(&[machine_dir()], true, &[]);
+    let mut server = create(&dir, world);
+    block_session(&mut server);
+    let request = block_request(&server, 1, block_call(true, "base:stone"));
+    server.submit(request);
+    tick(&mut server);
+    assert_eq!(block_event_count(server.authority().unwrap()), 0);
+    server.disconnect(SessionId(1)).unwrap();
+    server
+        .register_session(
+            Viewer {
+                session: SessionId(2),
+                actor: ActorContextId(2),
+            },
+            ActorContext::new(base::key("test:visitor")),
+            base::scope(),
+        )
+        .unwrap();
+    let mut request = block_request(&server, 1, block_call(false, ""));
+    request.id.session = SessionId(2);
+    request.actor = ActorContextId(2);
+    server.submit(copy_request(&request));
+    tick(&mut server);
+    assert_eq!(
+        server.receipt(request.id).unwrap().unwrap().reply.status,
+        ReplyStatus::Rejected(RejectCode::PermissionDenied)
+    );
+    assert_eq!(block_event_count(server.authority().unwrap()), 0);
+}
+
+fn copy_request(request: &WorldRequest<Call>) -> WorldRequest<Call> {
+    WorldRequest {
+        id: request.id,
+        actor: request.actor,
+        input: request.input.clone(),
+    }
+}
+
+#[test]
+fn block_notification_crash_child() {
+    let Ok(path) = std::env::var("TORSE_B10_PATH") else {
+        return;
+    };
+    let mode = std::env::var("TORSE_B10_MODE").unwrap();
+    let (world, _) = assemble(&[machine_dir()], true, &[]);
+    let compatibility = world.world.coordinator().compatibility();
+    let mut server = base::Files::create_file(
+        WorldDirectory::acquire(path, base::WORLD, 8192).unwrap(),
+        compatibility,
+        base::Codec::new(base::codec_limits()).unwrap(),
+        base::file_policy(),
+        |binding| {
+            ExecutionHost::new(
+                binding,
+                world.world,
+                world.actions,
+                world.rules,
+                base::execution_limits(),
+            )
+        },
+    )
+    .unwrap();
+    block_session(&mut server);
+    let request = block_request(&server, 1, block_call(true, "machine:block/casing"));
+    assert!(matches!(server.submit(request), Admission::Queued { .. }));
+    for _ in 0..100 {
+        server.drive_one(&mut NoReplicas).unwrap();
+        let host = server.authority().unwrap();
+        let action_frozen = host.runtime().work.as_ref().is_some_and(|work| {
+            work.tasks
+                .iter()
+                .any(|task| task.request.is_some() && !task.schedule.is_empty())
+        });
+        let event_frozen = host
+            .runtime()
+            .work
+            .as_ref()
+            .is_some_and(|work| work.tasks.iter().any(|task| task.consume.is_some()));
+        if (mode == "action-frozen" && action_frozen)
+            || (mode == "committed" && block_event_count(host) == 1)
+            || (mode == "event-frozen" && event_frozen)
+            || (mode == "event-done" && host.resume_point().tick == Tick(2))
+        {
+            std::process::exit(71);
+        }
+    }
+    panic!("block crash point not reached");
+}
+
+#[test]
+fn process_exit_keeps_block_and_notification_in_one_durable_settlement() {
+    for mode in ["action-frozen", "committed", "event-frozen", "event-done"] {
+        let dir = Directory::new();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "block_notification_crash_child", "--nocapture"])
+            .env("TORSE_B10_PATH", &dir.0)
+            .env("TORSE_B10_MODE", mode)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(71), "{mode}");
+        let (mut server, stats) = reopen(&dir, &[machine_dir()], true);
+        assert!(stats.borrow().guest_dispatches.is_empty());
+        let block = world_of(&server)
+            .store()
+            .query(BlockPos::new(8, 1, 1))
+            .ready()
+            .unwrap();
+        assert_eq!(block.is_empty(), mode == "action-frozen");
+        assert_eq!(
+            block_event_count(server.authority().unwrap()),
+            usize::from(mode == "committed" || mode == "event-frozen")
+        );
+        while server.authority().unwrap().resume_point().tick < Tick(2) {
+            tick(&mut server);
+        }
+        assert_eq!(block_event_count(server.authority().unwrap()), 0);
+        assert!(
+            !world_of(&server)
+                .store()
+                .query(BlockPos::new(8, 1, 1))
+                .ready()
+                .unwrap()
+                .is_empty()
+        );
+        if mode == "event-frozen" || mode == "event-done" {
+            assert!(
+                stats.borrow().guest_dispatches.is_empty(),
+                "frozen/replayed guest: {mode}"
+            );
+        } else {
+            assert_eq!(
+                stats.borrow().guest_dispatches.get("machine"),
+                Some(&2),
+                "{mode}"
+            );
+        }
+    }
+}

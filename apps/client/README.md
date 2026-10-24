@@ -62,7 +62,7 @@ cargo run --release -p torse-client -- --window --walk --autoplay --frames 2400 
 
 窗口默认绘制准星、快捷栏、当前方块和连接状态。菜单提供返回、机器面板预览和退出。面板打开时停止本地移动与编辑输入，网络接收继续运行；联网世界不会因客户端菜单暂停。
 
-机器面板明确使用示例数据，目前不读取或修改真实机器与库存。机器状态的授权展示与图形客户端操作仍在开发中。截图及验证见[UI基础](../../benchmarks/M1-ui.md)。
+机器面板明确使用示例数据，目前不读取或修改真实机器与库存。服务端已有机器状态与动作模型，图形客户端对该模型的消费和操作仍待接入。截图及验证见[UI基础](../../benchmarks/M1-ui.md)。
 
 ```sh
 cargo run -p torse-client -- --window --ui-preview machine

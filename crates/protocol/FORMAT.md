@@ -26,3 +26,5 @@
 Queued不表示动作成功。Result、Seed、Batch都要求其观察/提交位置不超过DurableSeq。只有A7授权源产生复制载荷，不发送完整存档。ReplicaSeq按订阅连续，CommitSeq可跳过隐藏变化。失效控制清空未发队列并关闭连接，客户端丢弃该连接镜像后重建。
 
 首版只支持完整有界消息；没有压缩、任意大分片、登录协议或TLS消息。传输上限、速率、会话、订阅和输出队列策略在本地配置，未知字段或尾随字节不被忽略。
+
+机器UI复用Seed/Batch中的Authorized组件和Request中的Call，不新增消息标签。机器对象及两个端口分别授权，引用端口身份不扩大读取权限。UI描述版本1是客户端编译期模型版本，独立于协议版本1；未知描述版本清空视图。按钮ActionID与版本见[执行载荷](../codec/EXECUTION.md)，模型和场景见[机器UI验证](../../benchmarks/M4-machine-ui.md)。

@@ -2795,6 +2795,10 @@ dependencies = [
 [[package]]
 name = "torse-mod-api"
 version = "0.1.0"
+dependencies = [
+ "torse-types",
+ "torse-world",
+]
 
 [[package]]
 name = "torse-mod-host"
@@ -2884,6 +2888,7 @@ dependencies = [
  "torse-codec",
  "torse-content",
  "torse-inventory",
+ "torse-mod-api",
  "torse-mod-host",
  "torse-net",
  "torse-protocol",

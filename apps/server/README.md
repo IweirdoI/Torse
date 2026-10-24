@@ -125,12 +125,15 @@ shutdown消耗Server，先停止接纳，通知权威适配器按包含截止Tic
 
 当前日志从位置1完整保留，恢复会校验整个文件。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。分段回收、异步刷盘、脏区流送和硬件断电保证仍需单独验收，当前功能测试不代替性能或平台承诺。
 
-## Mod持久执行
+## Mod机器与UI模型
 
-启用`mods`特性后，服务端库可装配Mod规则，验证机器加工、跨模块原子提交、持久唤醒与恢复。运行现有集成测试：
+启用`mods`后可用`--mod DIRECTORY`重复加载包；创建和重开均须使用相同内容。显式`--machine-operators`演示策略对所有新连接授予机器及输入、输出端口读取和库存转移权限，默认不授予。图形客户端还需加载匹配内容并消费`torse_mod_api::ui`模型；双图形客户端的真实机器操作仍待接入。
 
-```sh
-cargo test -p torse-server --features mods --test mod_durability --locked
+```powershell
+cargo run -p torse-server --features mods -- .work/machine-ui-world --mod examples/mods/machine --machine-operators
+cargo run -p torse-server --features mods --example headless_client -- 127.0.0.1:7777 --mod examples/mods/machine
 ```
 
-测试需要`wasm32-unknown-unknown`目标。包检查与无界面场景见[Mod示例与工具](../../examples/mods/README.md)。当前主程序仍启动基础演示世界，命令行加载Mod包、机器状态的授权展示与真实图形操作尚待接入。
+以上两条命令分终端运行；首次使用前按[Mod说明](../../examples/mods/README.md)安装Wasm目标。重新打开同一世界时须保留相同包与内容。
+
+公共模型从授权镜像构建进度与库存摘要，按钮复用`inventory:action/transfer`。`DurableRule::action_events`在冻结动作时规划方块通知，通知与动作共同持久结算，冲突和重发不重复派发。绑定方式为包数据的`[[block]] behavior = true`。复现、真实进程退出验证及限制见[机器UI验证](../../benchmarks/M4-machine-ui.md)。

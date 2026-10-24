@@ -8,9 +8,18 @@ use torse_server::network::{ClientMessage, ServerMessage};
 use torse_types::Fault;
 
 fn run() -> Result<(), Fault> {
-    let address = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:7777".into());
+    let mut args = std::env::args().skip(1);
+    let address = args.next().unwrap_or_else(|| "127.0.0.1:7777".into());
+    let mut mod_dirs = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg != "--mod" {
+            return Err(Fault::invalid_data("unknown client argument"));
+        }
+        mod_dirs
+            .push(std::path::PathBuf::from(args.next().ok_or_else(|| {
+                Fault::invalid_data("missing mod directory")
+            })?));
+    }
     let stream =
         std::net::TcpStream::connect(address).map_err(|e| Fault::invalid_data(e.to_string()))?;
     let limits = TransportLimits {
@@ -20,11 +29,23 @@ fn run() -> Result<(), Fault> {
         poll_bytes: 262_144,
     };
     let mut transport = TcpTransport::new(stream, limits)?;
-    let (world, _) = base::world()?;
+    let compatibility = if mod_dirs.is_empty() {
+        base::world()?.0.coordinator().compatibility()
+    } else {
+        #[cfg(feature = "mods")]
+        {
+            torse_server::mods::mod_world(&mod_dirs, true, &[])?
+                .world
+                .coordinator()
+                .compatibility()
+        }
+        #[cfg(not(feature = "mods"))]
+        return Err(Fault::invalid_data("--mod requires the mods feature"));
+    };
     for message in [
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
-            compatibility: world.coordinator().compatibility(),
+            compatibility,
         },
         ClientMessage::Subscribe {
             sections: base::scope().sections.into_iter().collect(),
@@ -63,6 +84,26 @@ fn run() -> Result<(), Fault> {
                             .map(|e| e.components.len())
                             .sum::<usize>()
                     );
+                    for entity in &replica.state.entities {
+                        if let Some(view) = torse_mod_api::ui::MachineView::rebuild(
+                            &torse_mod_api::ui::machine(),
+                            entity.id,
+                            |id, schema| {
+                                replica
+                                    .state
+                                    .entities
+                                    .iter()
+                                    .find(|e| e.id == id)?
+                                    .components
+                                    .get(schema)
+                            },
+                        ) {
+                            println!(
+                                "machine={} progress={}/{} input={:?} output={:?}",
+                                view.entity.0, view.progress, view.steps, view.input, view.output
+                            );
+                        }
+                    }
                     return Ok(());
                 }
                 ServerMessage::Rejected(reason) => {

@@ -16,7 +16,7 @@ use crate::execution::WorkPlan;
 use torse_inventory::{ItemCatalog, ItemStack, Transfer, plan_transfer};
 use torse_mod_host::component::CallBudget;
 use torse_mod_host::durable_dispatch::{
-    DurableGuest, GuestOutcome, SymbolTable, TransferSpec, convert_plan,
+    BlockNotification, DurableGuest, GuestOutcome, SymbolTable, TransferSpec, convert_plan,
 };
 use torse_mod_host::package::{self, resolve};
 use torse_sim::action::{ActionTarget, ActorContext};
@@ -137,6 +137,23 @@ impl ModRule {
             }
             outcome
         };
+        self.settle_outcome(world, tick, entity, key, attempt, transaction_id, outcome)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "durable event settlement context"
+    )]
+    fn settle_outcome(
+        &self,
+        world: &WorldAuthority,
+        tick: Tick,
+        entity: EntityId,
+        key: &str,
+        attempt: u32,
+        transaction_id: TransactionId,
+        outcome: Result<GuestOutcome, String>,
+    ) -> WorkPlan {
         match outcome {
             Err(_setup) => {
                 // Structural dispatch failures are terminal for this event;
@@ -146,7 +163,7 @@ impl ModRule {
             }
             Ok(GuestOutcome::Trapped(_reason)) => {
                 bump(&mut self.stats.borrow_mut().traps, &self.package_id);
-                if attempt + 1 >= MAX_ATTEMPTS {
+                if entity == EntityId(0) || attempt + 1 >= MAX_ATTEMPTS {
                     bump(&mut self.stats.borrow_mut().parks, &self.package_id);
                     return empty_plan();
                 }
@@ -352,6 +369,87 @@ impl DurableRule for ModRule {
         }
     }
 
+    fn action_events(
+        &self,
+        world: &WorldAuthority,
+        tick: Tick,
+        transaction: &torse_sim::Transaction,
+    ) -> Result<Vec<EventDraft>, Fault> {
+        let mut events = Vec::new();
+        for mutation in &transaction.mutations {
+            let previous = transaction
+                .preconditions
+                .iter()
+                .find(|read| read.pos == mutation.pos)
+                .map(|read| read.expected);
+            let Some(previous) = previous else { continue };
+            let (state, placed) = if previous.is_empty() && !mutation.state.is_empty() {
+                (mutation.state, true)
+            } else if !previous.is_empty() && mutation.state.is_empty() {
+                (previous, false)
+            } else {
+                continue;
+            };
+            let Some(definition) = world.registry().definition(state) else {
+                continue;
+            };
+            if !definition.behavior_bindings.contains(&self.rule) {
+                continue;
+            }
+            let tick = tick
+                .0
+                .checked_add(1)
+                .ok_or_else(|| Fault::resource_limit("block event tick exhausted"))?;
+            let pos = mutation.pos;
+            events.push(EventDraft {
+                tick: Tick(tick),
+                rule: self.rule.clone(),
+                payload: ComponentFields::from([
+                    (
+                        payload_key(&self.package_id, "kind"),
+                        ComponentValue::Text(
+                            if placed {
+                                "block-placed"
+                            } else {
+                                "block-broken"
+                            }
+                            .into(),
+                        ),
+                    ),
+                    (
+                        payload_key(&self.package_id, "block"),
+                        ComponentValue::Content(definition.id.clone()),
+                    ),
+                    (
+                        payload_key(&self.package_id, "values"),
+                        ComponentValue::List(
+                            world
+                                .registry()
+                                .state_values(state)
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|value| ComponentValue::U32(u32::from(*value)))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        payload_key(&self.package_id, "x"),
+                        ComponentValue::I64(pos.x),
+                    ),
+                    (
+                        payload_key(&self.package_id, "y"),
+                        ComponentValue::I64(pos.y),
+                    ),
+                    (
+                        payload_key(&self.package_id, "z"),
+                        ComponentValue::I64(pos.z),
+                    ),
+                ]),
+            });
+        }
+        Ok(events)
+    }
+
     fn plan(&self, world: &WorldAuthority, tick: Tick) -> Result<Vec<WorkPlan>, Fault> {
         if tick != Tick(0) {
             return Ok(Vec::new());
@@ -395,12 +493,73 @@ impl DurableRule for ModRule {
         let Some((kind, entity, key, attempt, transfer)) = self.decode_payload(event) else {
             return Ok(empty_plan());
         };
+        if kind == "block-placed" || kind == "block-broken" {
+            let payload = &event.event.payload;
+            let field = |name| payload.get(&payload_key(&self.package_id, name));
+            let Some(ComponentValue::Content(definition)) = field("block") else {
+                return Err(Fault::invalid_data("block notification definition"));
+            };
+            let coordinate = |name| match field(name) {
+                Some(ComponentValue::I64(value)) => Ok(*value),
+                _ => Err(Fault::invalid_data("block notification coordinate")),
+            };
+            let Some(ComponentValue::List(values)) = field("values") else {
+                return Err(Fault::invalid_data("block notification state"));
+            };
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    ComponentValue::U32(value) => u16::try_from(*value)
+                        .map_err(|_| Fault::invalid_data("block notification state value")),
+                    _ => Err(Fault::invalid_data("block notification state value")),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let notification = BlockNotification {
+                pos: torse_types::BlockPos::new(
+                    coordinate("x")?,
+                    coordinate("y")?,
+                    coordinate("z")?,
+                ),
+                definition: definition.clone(),
+                values,
+                placed: kind == "block-placed",
+            };
+            // Recheck the frozen package binding without consulting the current cell.
+            let state = world
+                .registry()
+                .default_state(definition)
+                .and_then(|state| world.registry().definition(state));
+            if !state.is_some_and(|block| block.behavior_bindings.contains(&self.rule)) {
+                return Ok(empty_plan());
+            }
+            let outcome = self.inner.borrow_mut().guest.dispatch_block(
+                world,
+                tick.0,
+                &notification,
+                &self.owned_schemas,
+            );
+            if outcome.is_ok() {
+                bump(
+                    &mut self.stats.borrow_mut().guest_dispatches,
+                    &self.package_id,
+                );
+            }
+            return Ok(self.settle_outcome(
+                world,
+                tick,
+                EntityId(0),
+                "",
+                0,
+                TransactionId(event.id.0),
+                outcome,
+            ));
+        }
         let plan = match kind.as_str() {
             "transfer" => match transfer {
                 Some(transfer) => self.settle_transfer(world, &transfer, TransactionId(event.id.0)),
                 None => empty_plan(),
             },
-            _ => self.settle_wakeup(
+            "wakeup" => self.settle_wakeup(
                 world,
                 tick,
                 entity,
@@ -408,6 +567,7 @@ impl DurableRule for ModRule {
                 attempt,
                 TransactionId(event.id.0),
             ),
+            _ => empty_plan(),
         };
         Ok(plan)
     }

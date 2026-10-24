@@ -551,12 +551,16 @@ fn parse_component(
         }
     };
     let replication = match str_field(entry, "replication").ok().flatten().as_deref() {
+        Some("server-authorized") => ReplicationDeclaration {
+            visibility: torse_types::ReplicationVisibility::Authorized,
+            ..ReplicationDeclaration::SERVER_PRIVATE
+        },
         None | Some("server-private") => ReplicationDeclaration::SERVER_PRIVATE,
         Some(other) => {
             errors.push(PackageError::new(
                 package,
                 "component",
-                format!("unknown replication `{other}` (only server-private is supported)"),
+                format!("unknown replication `{other}`"),
             ));
             ReplicationDeclaration::SERVER_PRIVATE
         }
@@ -827,6 +831,13 @@ fn parse_block(
     let Some(schema) = schema_text else {
         return Err(errors);
     };
+    if entry.get("behavior").is_some_and(|value| !value.is_bool()) {
+        errors.push(PackageError::new(
+            package,
+            "block.behavior",
+            "expected a boolean",
+        ));
+    }
     if id.namespace() != package {
         errors.push(PackageError::new(
             package,
@@ -856,7 +867,12 @@ fn parse_block(
             },
             component_defaults: Vec::new(),
             capability_bindings: Vec::new(),
-            behavior_bindings: Vec::new(),
+            behavior_bindings: if entry.get("behavior").and_then(toml::Value::as_bool) == Some(true)
+            {
+                vec![parse_key(&format!("{package}:rule/behavior")).expect("package key")]
+            } else {
+                Vec::new()
+            },
             tags,
         })
     } else {

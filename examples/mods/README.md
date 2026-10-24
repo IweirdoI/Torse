@@ -50,15 +50,23 @@ Remove-Item Env:TORSE_SDK_PATH, Env:TORSE_WIT_PATH
 
 随后按机器示例的方式执行`check`与`test`，将包目录和场景路径替换为新目录。提交贡献前补充包用途、授权需求与验证结果，要求见[贡献指南](../../CONTRIBUTING.md)。
 
-## 持久执行验证
+## 接入服务端
 
-服务端库已提供Mod规则装配。机器进度、库存计划与新唤醒在持久任务中共同结算，恢复时重放已结算结果，不重复执行Guest。现有集成测试覆盖该行为：
+启用`mods`特性后可加载机器包：
 
 ```sh
-cargo test -p torse-server --features mods --test mod_durability --locked
+cargo run -p torse-server --features mods -- .work/mod-demo --mod examples/mods/machine --machine-operators
 ```
 
-当前独立服务端主程序仍使用基础世界，尚未提供命令行Mod包加载或匹配内容的无GPU客户端接入。机器状态的授权展示、方块行为通知与真实图形机器面板仍在开发中。
+保持服务端运行，在另一终端连接匹配内容的无GPU客户端：
+
+```sh
+cargo run -p torse-server --features mods --example headless_client -- 127.0.0.1:7777 --mod examples/mods/machine
+```
+
+`--machine-operators`是显式演示策略，授予机器及输入、输出端口的读取和库存转移权限；默认不授予。创建与重开世界时需使用相同内容。现有图形客户端仍使用基础内容装配，尚未加载匹配Mod内容或接入真实机器面板。
+
+机器进度、库存计划与新唤醒在持久任务中共同结算。包可声明绑定方块行为；动作成功时，放置与破坏通知和世界修改共同持久化。机器UI公共模型位于[mod_api](../../crates/mod_api/src/lib.rs)，图形显示与操作仍待接入。
 
 ## 验证与限制
 

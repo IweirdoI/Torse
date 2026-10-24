@@ -102,6 +102,20 @@ pub enum GuestOutcome {
     Trapped(String),
 }
 
+/// Stable block notification captured with the successful action, including
+/// the affected state even when the block has since been removed or replaced.
+pub struct BlockNotification {
+    pub pos: BlockPos,
+    pub definition: ContentKey,
+    pub values: Vec<u16>,
+    pub placed: bool,
+}
+
+enum DispatchTarget<'a> {
+    Wakeup(EngineEntityId, &'a str),
+    Block(&'a BlockNotification),
+}
+
 /// A compiled behavior executor creating fresh instances over bounded snapshots.
 pub struct DurableGuest {
     engine: Engine,
@@ -260,21 +274,87 @@ impl DurableGuest {
         key: &str,
         owned_schemas: &[ContentKey],
     ) -> Result<GuestOutcome, String> {
+        self.dispatch_target(
+            world,
+            tick,
+            DispatchTarget::Wakeup(entity, key),
+            owned_schemas,
+        )
+    }
+
+    /// Dispatch a block event with entity zero as the reserved block-only
+    /// object identity. Such an object has no owned entity components.
+    pub fn dispatch_block(
+        &mut self,
+        world: &WorldAuthority,
+        tick: u64,
+        notification: &BlockNotification,
+        owned_schemas: &[ContentKey],
+    ) -> Result<GuestOutcome, String> {
+        self.dispatch_target(
+            world,
+            tick,
+            DispatchTarget::Block(notification),
+            owned_schemas,
+        )
+    }
+
+    fn dispatch_target(
+        &mut self,
+        world: &WorldAuthority,
+        tick: u64,
+        target: DispatchTarget<'_>,
+        owned_schemas: &[ContentKey],
+    ) -> Result<GuestOutcome, String> {
         self.rebuild()?;
         self.dispatches += 1;
         let symbols = Arc::clone(&self.store.data().symbols);
 
-        let handle = world
-            .entities()
-            .handle_of(entity)
-            .ok_or_else(|| format!("dispatch target {entity:?} does not exist"))?;
-        let position = world.entities().get(handle).expect("entity").position;
-        let center = (
-            position.x.floor() as i64,
-            position.y.floor() as i64,
-            position.z.floor() as i64,
-        );
+        let (entity, center, event, block) = match target {
+            DispatchTarget::Wakeup(entity, key) => {
+                let handle = world
+                    .entities()
+                    .handle_of(entity)
+                    .ok_or_else(|| format!("dispatch target {entity:?} does not exist"))?;
+                let position = world.entities().get(handle).expect("entity").position;
+                (
+                    entity,
+                    (
+                        position.x.floor() as i64,
+                        position.y.floor() as i64,
+                        position.z.floor() as i64,
+                    ),
+                    Event::Wakeup(WakeupTarget {
+                        entity: wit_entity(entity),
+                        key: key.to_string(),
+                    }),
+                    0,
+                )
+            }
+            DispatchTarget::Block(notification) => {
+                let definition = symbols
+                    .symbol_of(&notification.definition.to_string())
+                    .ok_or("unknown block notification symbol")?;
+                let event = if notification.placed {
+                    Event::BlockPlaced
+                } else {
+                    Event::BlockBroken(Cell::Occupied(BlockRef {
+                        definition,
+                        state_values: notification.values.clone(),
+                    }))
+                };
+                let pos = notification.pos;
+                (EngineEntityId(0), (pos.x, pos.y, pos.z), event, definition)
+            }
+        };
 
+        for coordinate in [center.0, center.1, center.2] {
+            if coordinate.checked_sub(VIEW_RADIUS).is_none()
+                || coordinate.checked_add(VIEW_RADIUS).is_none()
+            {
+                return Err("dispatch neighborhood exceeds coordinate range".into());
+            }
+        }
         let mut cells = BTreeMap::new();
         for y in center.1 - VIEW_RADIUS..=center.1 + VIEW_RADIUS {
             for z in center.2 - VIEW_RADIUS..=center.2 + VIEW_RADIUS {
@@ -285,9 +365,9 @@ impl DurableGuest {
             }
         }
         let in_box = |x: i64, y: i64, z: i64| {
-            (center.0 - x).abs() <= VIEW_RADIUS
-                && (center.1 - y).abs() <= VIEW_RADIUS
-                && (center.2 - z).abs() <= VIEW_RADIUS
+            center.0.abs_diff(x) <= VIEW_RADIUS as u64
+                && center.1.abs_diff(y) <= VIEW_RADIUS as u64
+                && center.2.abs_diff(z) <= VIEW_RADIUS as u64
         };
         let mut entities = Vec::new();
         let mut components = BTreeMap::new();
@@ -322,10 +402,7 @@ impl DurableGuest {
             })
             .collect::<Vec<_>>();
         let invocation = Invocation {
-            event: Event::Wakeup(WakeupTarget {
-                entity: wit_entity(entity),
-                key: key.to_string(),
-            }),
+            event,
             tick,
             self_: Some(ObjectRef {
                 entity: wit_entity(entity),
@@ -334,7 +411,7 @@ impl DurableGuest {
                     y: center.1,
                     z: center.2,
                 },
-                block: 0,
+                block,
                 owned,
             }),
             rng_seed: tick.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5eed_cafe,

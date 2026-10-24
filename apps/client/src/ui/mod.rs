@@ -29,6 +29,8 @@ pub enum Action {
     Resume,
     Preview,
     Quit,
+    SensDown,
+    SensUp,
 }
 
 #[derive(Default)]
@@ -72,7 +74,7 @@ impl Layout {
     }
     fn panel(&self, mode: Mode) -> Rect {
         let (w, h) = if mode == Mode::Pause {
-            (244, 168)
+            (244, 200)
         } else {
             (316, 186)
         };
@@ -104,6 +106,16 @@ impl Layout {
                     Action::Quit,
                     Rect::new(p.x + 24, p.y + 104, p.w.saturating_sub(48), 24),
                     "menu_quit",
+                ),
+                (
+                    Action::SensDown,
+                    Rect::new(p.x + 138, p.y + 140, 24, 20),
+                    "sens_down",
+                ),
+                (
+                    Action::SensUp,
+                    Rect::new(p.x + 194, p.y + 140, 24, 20),
+                    "sens_up",
                 ),
             ],
             Mode::MachinePreview => vec![(
@@ -185,6 +197,7 @@ struct View {
     network: bool,
     ready: bool,
     result: String,
+    sensitivity: u16,
     hover: Option<Action>,
     pressed: Option<Action>,
 }
@@ -201,6 +214,8 @@ pub struct Hud<'a> {
     pub network: bool,
     pub ready: bool,
     pub result: &'a str,
+    /// Captured-look sensitivity, shown and tuned in the pause menu.
+    pub sensitivity: f64,
 }
 const DARK: [u8; 4] = [34, 40, 48, 255];
 const MUTED: [u8; 4] = [78, 86, 96, 255];
@@ -238,10 +253,6 @@ impl Layer {
         hud: Hud<'_>,
     ) {
         let layout = Layout::new(size);
-        eprintln!(
-            "ui prepare: size={size:?} scale={} logical={}x{} mode={:?}",
-            layout.scale, layout.width, layout.height, state.mode
-        );
         let view = View {
             size,
             mode: state.mode,
@@ -249,6 +260,7 @@ impl Layer {
             network: hud.network,
             ready: hud.ready,
             result: hud.result.chars().take(120).collect(),
+            sensitivity: (hud.sensitivity * 100.0).round() as u16,
             hover: layout.hit(state.mode, state.cursor),
             pressed: state.armed,
         };
@@ -373,10 +385,21 @@ impl Layer {
         self.skin
             .draw(c, 10, Rect::new(close.x + 4, close.y + 4, 12, 12), 0);
         if v.mode == Mode::Pause {
+            // Settings row: captured-look sensitivity with stepping buttons.
+            self.label(
+                c,
+                "menu_sensitivity",
+                Rect::new(p.x + 24, p.y + 144, 110, 16),
+                11,
+                DARK,
+            );
+            let value = format!("{:.2}", f64::from(v.sensitivity) / 100.0);
+            self.text
+                .draw(c, &value, Rect::new(p.x + 168, p.y + 144, 44, 16), 11, DARK);
             self.label(
                 c,
                 "menu_note",
-                Rect::new(p.x + 16, p.y + 140, p.w.saturating_sub(32), 15),
+                Rect::new(p.x + 16, p.y + 172, p.w.saturating_sub(32), 15),
                 10,
                 MUTED,
             );

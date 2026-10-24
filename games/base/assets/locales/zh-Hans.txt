@@ -18,3 +18,6 @@ machine_status=状态：加工中
 machine_notice=以下是示例数据，不会修改世界
 empty=空
 close=关闭
+sens_down=<
+sens_up=>
+menu_sensitivity=鼠标灵敏度

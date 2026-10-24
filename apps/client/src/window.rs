@@ -312,6 +312,7 @@ impl WindowApp {
                                 network: self.net.is_some(),
                                 ready: false,
                                 result: &self.last_result,
+                                sensitivity: self.look_sensitivity,
                             },
                         );
                         gpu.ui.draw(&mut encoder, &view);
@@ -632,6 +633,7 @@ impl WindowApp {
                 network: self.net.is_some(),
                 ready: self.scene.is_some(),
                 result: &self.last_result,
+                sensitivity: self.look_sensitivity,
             },
         );
         gpu.ui.draw(&mut encoder, &view);
@@ -1139,6 +1141,16 @@ impl ApplicationHandler for WindowApp {
                                 }
                                 crate::ui::Action::Preview => {
                                     self.ui.set_mode(crate::ui::Mode::MachinePreview)
+                                }
+                                crate::ui::Action::SensDown => {
+                                    self.look_sensitivity =
+                                        (self.look_sensitivity - 0.25).clamp(0.2, 5.0);
+                                    self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                                }
+                                crate::ui::Action::SensUp => {
+                                    self.look_sensitivity =
+                                        (self.look_sensitivity + 0.25).clamp(0.2, 5.0);
+                                    self.last_result = format!("sens {:.2}", self.look_sensitivity);
                                 }
                             }
                             self.input.reset();

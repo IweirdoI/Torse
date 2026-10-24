@@ -473,6 +473,7 @@ impl Renderer {
                 network: false,
                 ready: true,
                 result: "",
+                sensitivity: 1.0,
             },
         );
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {

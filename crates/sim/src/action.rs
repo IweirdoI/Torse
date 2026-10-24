@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use torse_actions::{ActionDescriptor, ActionKind, ActionRegistry, validate_actions};
-use torse_types::{BlockPos, ContentKey, EntityId, RejectCode, TransactionId};
+use torse_types::{BlockPos, ContentKey, EntityId, RejectCode, SectionPos, TransactionId};
 use torse_world::{
     BlockStateId, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue, TerrainQuery,
     component_size,
@@ -95,6 +95,7 @@ pub struct ActorContext {
     principal: ContentKey,
     permissions: BTreeSet<ContentKey>,
     targets: BTreeSet<TargetKey>,
+    sections: BTreeSet<SectionPos>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -110,6 +111,7 @@ impl ActorContext {
             principal,
             permissions: BTreeSet::new(),
             targets: BTreeSet::new(),
+            sections: BTreeSet::new(),
         }
     }
     /// Add an independently verified permission.
@@ -125,6 +127,12 @@ impl ActorContext {
         });
         self
     }
+    /// Grant every cell of one section. Hosts use this for scope-wide access
+    /// such as editing a subscribed area; it never widens entity access.
+    pub fn section(mut self, pos: SectionPos) -> Self {
+        self.sections.insert(pos);
+        self
+    }
     /// Authenticated caller identity, available for module-specific policies.
     pub fn principal(&self) -> &ContentKey {
         &self.principal
@@ -137,12 +145,24 @@ impl ActorContext {
     pub fn view<'a>(&'a self, world: &'a WorldAuthority) -> ActionView<'a> {
         ActionView { world, actor: self }
     }
-    /// Whether the host granted access to this target.
+    /// Whether the host granted access to this exact target. Section grants
+    /// are not consulted; use [`ActorContext::allows_block`] for cells.
     pub fn allows(&self, target: ActionTarget) -> bool {
         self.targets.contains(&match target {
             ActionTarget::Block(pos) => TargetKey::Block(pos),
             ActionTarget::Entity(id) => TargetKey::Entity(id),
         })
+    }
+    /// Whether a block target is granted by exact cell or a covering
+    /// section grant. `side` is the world's section side.
+    pub fn allows_block(&self, pos: BlockPos, side: u32) -> bool {
+        if self.targets.contains(&TargetKey::Block(pos)) {
+            return true;
+        }
+        match pos.to_section(side) {
+            Ok((section, _)) => self.sections.contains(&section),
+            Err(_) => false,
+        }
     }
 }
 
@@ -179,7 +199,8 @@ impl ActionView<'_> {
         self.actor
     }
     pub fn terrain(&self, pos: BlockPos) -> Result<TerrainQuery, RejectCode> {
-        if !self.actor.allows(ActionTarget::Block(pos)) {
+        let side = self.world.store().side();
+        if !self.actor.allows_block(pos, side) {
             return Err(RejectCode::PermissionDenied);
         }
         Ok(self.world.store().query(pos))
@@ -329,7 +350,12 @@ impl ActionService {
         {
             return Err(RejectCode::InvalidData);
         }
-        if !actor.allows(request.target)
+        let side = world.store().side();
+        let target_allowed = match request.target {
+            ActionTarget::Block(pos) => actor.allows_block(pos, side),
+            ActionTarget::Entity(id) => actor.allows(ActionTarget::Entity(id)),
+        };
+        if !target_allowed
             || action
                 .permission
                 .permission
@@ -411,9 +437,7 @@ impl ActionService {
                     .iter()
                     .map(|read| read.pos)
                     .chain(tx.mutations.iter().map(|write| write.pos));
-                if blocks
-                    .into_iter()
-                    .any(|pos| !actor.allows(ActionTarget::Block(pos)))
+                if blocks.into_iter().any(|pos| !actor.allows_block(pos, side))
                     || tx
                         .movements
                         .iter()

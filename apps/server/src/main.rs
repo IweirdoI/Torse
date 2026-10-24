@@ -14,7 +14,7 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen 127.0.0.1:7777] [--ticks N; 0=continuous] [--fill]"
+            "usage: torse-server <world-directory> [--listen 127.0.0.1:7777] [--ticks N; 0=continuous] [--fill] [--editors]"
         );
         return Ok(());
     };
@@ -26,6 +26,7 @@ fn run() -> Result<(), Fault> {
     let mut address = "127.0.0.1:7777".to_owned();
     let mut ticks = 0u64;
     let mut fill = false;
+    let mut editors = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
@@ -40,6 +41,7 @@ fn run() -> Result<(), Fault> {
                     .ok_or_else(|| Fault::invalid_data("invalid tick count"))?
             }
             "--fill" => fill = true,
+            "--editors" => editors = true,
             _ => return Err(Fault::invalid_data("unknown server argument")),
         }
     }
@@ -99,10 +101,20 @@ fn run() -> Result<(), Fault> {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let stream = TcpTransport::new(stream, transport)?;
-                    let policy = PeerPolicy {
-                        actor: ActorContext::new(base::key("base:guest")),
-                        scope: base::scope(),
+                    let scope = base::scope();
+                    let actor = if editors {
+                        // Editors may edit inside the approved scope; the
+                        // grant is host-issued and follows the subscription.
+                        let base_actor = ActorContext::new(base::key("base:player"))
+                            .permission(base::key("world:permission/edit"));
+                        scope
+                            .sections
+                            .iter()
+                            .fold(base_actor, |actor, section| actor.section(*section))
+                    } else {
+                        ActorContext::new(base::key("base:guest"))
                     };
+                    let policy = PeerPolicy { actor, scope };
                     let _ = hub.add(stream, policy, server.authority()?.resume_point().tick);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,

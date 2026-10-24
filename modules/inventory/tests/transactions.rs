@@ -324,3 +324,131 @@ fn machine_tick_uses_the_same_component_conflict_boundary() {
         .sum();
     assert_eq!(total, 1);
 }
+
+#[test]
+fn harvest_task_breaks_the_block_and_moves_the_item_atomically() {
+    use torse_sim::OrderingKey;
+    use torse_sim::TransactionGroup;
+    use torse_sim::action::ActionOutput;
+
+    let (mut world, service, catalog, ids) = setup();
+    let actor = actor(&ids);
+
+    // Two stone blocks stand in the world module's cells; the source
+    // container holds one stone. Both task instances are planned once
+    // against this snapshot, like a frozen machine plan.
+    let stone = world
+        .registry()
+        .default_state(&key("base:stone"))
+        .expect("stone");
+    let mut place = Transaction::new(
+        torse_types::TransactionId(900),
+        torse_sim::block_actions::owner(),
+        OrderingKey {
+            phase: Phase::Interaction,
+            rule_priority: 0,
+            stable_task_key: 900,
+            local_sequence: 0,
+        },
+    );
+    for x in [8i64, 9] {
+        place
+            .read_block(BlockPos::new(x, 2, 2), BlockStateId::EMPTY)
+            .write_block(BlockPos::new(x, 2, 2), stone);
+    }
+    match world.commit(&place).expect("no fault").outcome {
+        TransactionOutcome::Committed { .. } => {}
+        outcome => panic!("placement committed: {outcome:?}"),
+    }
+
+    let break_member = |x: i64, id: u128| {
+        let mut member = Transaction::new(
+            torse_types::TransactionId(id),
+            torse_sim::block_actions::owner(),
+            OrderingKey {
+                phase: Phase::Interaction,
+                rule_priority: 0,
+                stable_task_key: id as u64,
+                local_sequence: 0,
+            },
+        );
+        member
+            .read_block(BlockPos::new(x, 2, 2), stone)
+            .write_block(BlockPos::new(x, 2, 2), BlockStateId::EMPTY);
+        member
+    };
+    let planned = service
+        .plan(
+            &world,
+            &actor,
+            Phase::Interaction,
+            &request(ids[0], ids[1], 901),
+        )
+        .expect("transfer plans");
+    let ActionOutput::Mutation(transfer_member) = planned else {
+        panic!("transfer is a mutation");
+    };
+    let group = |x: i64, id: u128| {
+        TransactionGroup::new(
+            torse_types::TransactionId(id),
+            OrderingKey {
+                phase: Phase::Interaction,
+                rule_priority: 0,
+                stable_task_key: 1000,
+                local_sequence: 0,
+            },
+            vec![break_member(x, id * 10), (*transfer_member).clone()],
+        )
+        .expect("group")
+    };
+
+    let before = world.seq().0;
+    match world
+        .commit_group(&group(8, 901))
+        .expect("no fault")
+        .outcome
+    {
+        TransactionOutcome::Committed { .. } => {}
+        outcome => panic!("harvest committed: {outcome:?}"),
+    }
+    assert_eq!(world.seq().0, before + 1, "one sequence for the task");
+    assert!(matches!(
+        world.store().query(BlockPos::new(8, 2, 2)),
+        TerrainQuery::Ready(state) if state.is_empty()
+    ));
+    let inventory_of = |id: torse_types::EntityId| {
+        let handle = world.entities().handle_of(id).expect("entity");
+        let fields = world
+            .entities()
+            .get(handle)
+            .expect("entity")
+            .components
+            .component(&torse_inventory::schema())
+            .expect("inventory");
+        Inventory::from_fields(fields, &catalog).expect("inventory")
+    };
+    assert!(inventory_of(ids[0]).slots()[0].is_none());
+    assert_eq!(
+        inventory_of(ids[1]).slots()[0],
+        Some(ItemStack {
+            item: key("base:stone"),
+            count: 1
+        })
+    );
+
+    // The frozen twin task still expects the consumed item; its block would
+    // break, but the stale inventory member rejects the whole group.
+    let stalled = world.seq().0;
+    assert_eq!(
+        world
+            .commit_group(&group(9, 902))
+            .expect("no fault")
+            .outcome,
+        TransactionOutcome::Rejected(RejectCode::Conflict)
+    );
+    assert_eq!(world.seq().0, stalled);
+    assert!(matches!(
+        world.store().query(BlockPos::new(9, 2, 2)),
+        TerrainQuery::Ready(state) if !state.is_empty()
+    ));
+}

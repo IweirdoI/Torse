@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+mods = ["torse-mod-host/package"]
+
 [dependencies]
 crc32c = "=0.6.8"
 torse-codec = { path = "../../crates/codec" }
@@ -16,3 +19,4 @@ torse-net = { path = "../../crates/net" }
 
 torse-content = { path = "../../crates/content" }
 torse-inventory = { path = "../../modules/inventory" }
+torse-mod-host = { path = "../../crates/mod_host", optional = true }

@@ -9,6 +9,9 @@ pub mod authority;
 pub mod package;
 
 #[cfg(feature = "package")]
+pub mod durable_dispatch;
+
+#[cfg(feature = "package")]
 pub mod scenario;
 
 #[cfg(feature = "component")]

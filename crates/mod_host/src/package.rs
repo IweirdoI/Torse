@@ -770,7 +770,7 @@ fn parse_block(
             .get(section)
             .and_then(toml::Value::as_table)
             .and_then(|table| str_field(table, "shape").ok().flatten())
-            .map(|text| match parse_shape(&text) {
+            .and_then(|text| match parse_shape(&text) {
                 Some(shape) => Some(shape),
                 None => {
                     errors.push(PackageError::new(
@@ -781,7 +781,6 @@ fn parse_block(
                     None
                 }
             })
-            .flatten()
     };
     let collision = optional_shape("collision");
     let selection = optional_shape("selection");

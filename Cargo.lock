@@ -2883,6 +2883,7 @@ dependencies = [
  "torse-codec",
  "torse-content",
  "torse-inventory",
+ "torse-mod-host",
  "torse-net",
  "torse-protocol",
  "torse-sim",

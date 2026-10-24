@@ -9,6 +9,8 @@ mod coordinator;
 mod directory;
 pub mod execution;
 mod lifecycle;
+#[cfg(feature = "mods")]
+pub mod mods;
 pub mod network;
 mod world;
 

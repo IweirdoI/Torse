@@ -38,5 +38,6 @@ pub use simulation::{
 };
 pub use system::{System, SystemContext};
 pub use transaction::{
-    BlockPrecondition, Despawn, Movement, Mutation, OrderingKey, Spawn, Transaction,
+    BlockPrecondition, Despawn, MAX_GROUP_MEMBERS, Movement, Mutation, OrderingKey, Spawn,
+    Transaction, TransactionGroup,
 };

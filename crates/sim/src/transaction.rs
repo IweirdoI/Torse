@@ -10,7 +10,7 @@
 //! thread number or on the order in which results happened to be produced.
 
 use std::collections::BTreeMap;
-use torse_types::{BlockPos, ContentKey, EntityHandle, EntityId, TransactionId};
+use torse_types::{BlockPos, ContentKey, EntityHandle, EntityId, RejectCode, TransactionId};
 use torse_world::{ComponentEdit, ComponentFields, Entity, EntityState, Position};
 
 use crate::phase::Phase;
@@ -104,6 +104,94 @@ pub struct Transaction {
     pub spawns: Vec<Spawn>,
     /// Removals compare the complete observed state before publication.
     pub despawns: Vec<Despawn>,
+}
+
+/// Upper bound on members in one atomic group.
+pub const MAX_GROUP_MEMBERS: usize = 4;
+
+/// One atomic task contributed by several module sources.
+///
+/// A group is the unit of preparation, publication, and persistence: one
+/// prepared record, one commit sequence number, one journal entry, one merged
+/// change set. Members keep their own `source` so component ownership stays
+/// per module; they share the task's ordering key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionGroup {
+    /// Stable identity of the whole task, for diagnostics.
+    pub id: TransactionId,
+    /// Arbitration order shared by every member.
+    pub ordering: OrderingKey,
+    /// Members sorted by source; sources are unique.
+    pub members: Vec<Transaction>,
+}
+
+impl TransactionGroup {
+    /// Sort members by source and enforce the group rules.
+    ///
+    /// Members adopt the group's ordering key. Rejected groups are not
+    /// partially constructed: `Err` leaves the caller's vector untouched.
+    pub fn new(
+        id: TransactionId,
+        ordering: OrderingKey,
+        mut members: Vec<Transaction>,
+    ) -> Result<Self, RejectCode> {
+        if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
+            return Err(RejectCode::QuotaExceeded);
+        }
+        members.sort_by(|left, right| left.source.cmp(&right.source));
+        for pair in members.windows(2) {
+            if pair[0].source == pair[1].source {
+                return Err(RejectCode::InvalidData);
+            }
+        }
+        // Parallel-read semantics need disjoint writes across members:
+        // one cell and one (entity, schema) may be written by one member only,
+        // and an entity may not cross lifecycle and movement or edits at all.
+        let mut cells = std::collections::BTreeSet::new();
+        let mut component_targets = std::collections::BTreeSet::new();
+        let mut lifecycle_entities = std::collections::BTreeSet::new();
+        let mut touched_entities = std::collections::BTreeSet::new();
+        let mut lifecycle_members = 0;
+        for member in &members {
+            for mutation in &member.mutations {
+                if !cells.insert(mutation.pos) {
+                    return Err(RejectCode::Conflict);
+                }
+            }
+            for edit in &member.components {
+                if !component_targets.insert((edit.id, edit.schema.clone())) {
+                    return Err(RejectCode::Conflict);
+                }
+                touched_entities.insert(edit.id);
+            }
+            for movement in &member.movements {
+                touched_entities.insert(movement.id);
+            }
+            if !member.spawns.is_empty() || !member.despawns.is_empty() {
+                lifecycle_members += 1;
+                for despawn in &member.despawns {
+                    lifecycle_entities.insert(despawn.previous.id);
+                }
+            }
+        }
+        if lifecycle_members > 1 {
+            return Err(RejectCode::InvalidData);
+        }
+        if lifecycle_entities
+            .iter()
+            .any(|id| touched_entities.contains(id))
+        {
+            return Err(RejectCode::Conflict);
+        }
+        for member in &mut members {
+            member.ordering = ordering;
+        }
+        Ok(Self {
+            id,
+            ordering,
+            members,
+        })
+    }
 }
 
 impl Transaction {

@@ -24,6 +24,8 @@
 
 [A8验收记录](A8-acceptance.md)覆盖next.md四条验收：双客户端同批更新、访客与越界拒绝、拒绝纯净性、撤权断连与重连新基线。
 
+[M4跨模块记录](M4-cross-module.md)覆盖A9的TransactionGroup实现：多来源原子提交、组规则与整组失败语义。
+
 [M3本地世界装配](M3-local-world.md)覆盖真实世界接入服务端协调器、有界快照和持久门槛；[M3实体生命周期](M3-entity-lifecycle.md)覆盖生成、销毁、分配水位、整组恢复及版本2数据读取。
 
 [M3阶段进度](M3-phase-progress.md)覆盖阶段推进日志、逐阶段恢复及有界关闭；[文件锁回归](M3-file-locks.md)记录Linux并发失败的修复和跨平台CI结果。

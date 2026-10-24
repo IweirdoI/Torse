@@ -348,6 +348,163 @@ impl CommitCoordinator {
         Ok(prepared)
     }
 
+    /// Validate every member against the same snapshot and merge them into one
+    /// prepared record with a single commit position, per the cross-module
+    /// commit contract.
+    ///
+    /// Members run the same checks as [`CommitCoordinator::prepare_with_components`]:
+    /// lifecycle, ownership, component shape, block preconditions, edit
+    /// targets, and per-member collision resolution over that member's own
+    /// writes. Any member rejection rejects the whole group without consuming
+    /// a sequence number.
+    pub fn prepare_group(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        group: &crate::TransactionGroup,
+    ) -> Result<PreparedChange, PrepareError> {
+        let mut edits: Vec<BlockEdit> = Vec::new();
+        let mut touched: Vec<SectionPos> = Vec::new();
+        let mut entity_moves = Vec::new();
+        let mut movement_reads = Vec::new();
+        let mut movement_handles = Vec::new();
+        let mut component_edits: Vec<ComponentEdit> = Vec::new();
+        let mut lifecycle_batch = None;
+        for member in &group.members {
+            if has_duplicate_targets(member) {
+                return Err(PrepareError::Rejected(RejectCode::InvalidData));
+            }
+            for precondition in &member.preconditions {
+                match store.query(precondition.pos) {
+                    TerrainQuery::Ready(current) if current == precondition.expected => {}
+                    TerrainQuery::Ready(_) => {
+                        return Err(PrepareError::Rejected(RejectCode::Conflict));
+                    }
+                    TerrainQuery::NotLoaded => {
+                        return Err(PrepareError::Rejected(RejectCode::NotLoaded));
+                    }
+                    TerrainQuery::OutOfBounds => {
+                        return Err(PrepareError::Rejected(RejectCode::MissingTarget));
+                    }
+                }
+            }
+            let member_edits: Vec<BlockEdit> = member
+                .mutations
+                .iter()
+                .map(|mutation| BlockEdit {
+                    pos: mutation.pos,
+                    state: mutation.state,
+                })
+                .collect();
+            touched.extend(
+                store
+                    .validate_edits(&member_edits)
+                    .map_err(|error| PrepareError::Rejected(code_for(&error)))?,
+            );
+
+            let lifecycle = crate::lifecycle::prepare_lifecycle(store, entities, schemas, member)
+                .map_err(PrepareError::Rejected)?;
+            if member.components.len() > torse_world::MAX_COMPONENT_EDITS {
+                return Err(PrepareError::Rejected(RejectCode::QuotaExceeded));
+            }
+            for edit in &member.components {
+                let schema = schemas
+                    .get(&edit.schema)
+                    .ok_or(PrepareError::Rejected(RejectCode::InvalidData))?;
+                if schema.owner_module != member.source {
+                    return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
+                }
+            }
+            // Shape-validate each member on its own; the merged batch is built
+            // once more from the concatenated edits below.
+            let _ = entities
+                .prepare_components(&member.components, schemas)
+                .map_err(|error| {
+                    PrepareError::Rejected(match error {
+                        torse_world::EntityError::StaleHandle => RejectCode::MissingTarget,
+                        torse_world::EntityError::ComponentConflict => RejectCode::Conflict,
+                        _ => RejectCode::InvalidData,
+                    })
+                })?;
+
+            let resolved = crate::movement::prepare_movements(
+                store,
+                entities,
+                registry,
+                &member_edits,
+                &member.movements,
+            )
+            .map_err(PrepareError::Rejected)?;
+            if lifecycle_batch.is_some() && lifecycle.is_some() {
+                return Err(PrepareError::Rejected(RejectCode::InvalidData));
+            }
+            if lifecycle.is_some() {
+                lifecycle_batch = lifecycle;
+            }
+            edits.extend(member_edits);
+            entity_moves.extend(resolved.moves);
+            movement_reads.extend(resolved.reads);
+            movement_handles.extend(
+                member
+                    .movements
+                    .iter()
+                    .map(|request| (request.handle, request.id)),
+            );
+            component_edits.extend(member.components.iter().cloned());
+        }
+        if edits.is_empty()
+            && entity_moves.is_empty()
+            && component_edits.is_empty()
+            && lifecycle_batch.is_none()
+        {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        let component_batch = entities
+            .prepare_components(&component_edits, schemas)
+            .map_err(|error| {
+                PrepareError::Rejected(match error {
+                    torse_world::EntityError::StaleHandle => RejectCode::MissingTarget,
+                    torse_world::EntityError::ComponentConflict => RejectCode::Conflict,
+                    _ => RejectCode::InvalidData,
+                })
+            })?;
+
+        let Some(next) = self.seq.next() else {
+            return Err(PrepareError::SequenceExhausted);
+        };
+        let cursor = CommitCursor {
+            world: self.world,
+            seq: next,
+        };
+        Ok(PreparedChange {
+            meta: CommitMeta {
+                cursor,
+                previous: self.seq,
+                compatibility: self.compatibility,
+                resume_at: self.resume,
+            },
+            observed_resume: self.resume,
+            transaction: group.id,
+            source: group
+                .members
+                .first()
+                .expect("group has members")
+                .source
+                .clone(),
+            phase: group.ordering.phase,
+            edits,
+            touched,
+            entity_moves,
+            movement_reads,
+            movement_handles,
+            component_edits,
+            component_batch,
+            lifecycle_batch,
+        })
+    }
+
     fn prepare_world(
         &self,
         store: &SectionStore,
@@ -616,6 +773,19 @@ impl CommitCoordinator {
         let prepared =
             self.prepare_with_components(store, entities, registry, schemas, transaction);
         self.finish_commit(store, entities, transaction.id, prepared)
+    }
+
+    /// One-hop prepare and publish for a multi-source group.
+    pub fn commit_group(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        group: &crate::TransactionGroup,
+    ) -> Result<TransactionResult<Committed>, CommitFault> {
+        let prepared = self.prepare_group(store, entities, registry, schemas, group);
+        self.finish_commit(store, entities, group.id, prepared)
     }
 
     fn finish_commit(

@@ -217,6 +217,20 @@ impl WorldAuthority {
         )
     }
 
+    /// Prepare one multi-source atomic group; see the cross-module contract.
+    pub fn prepare_group(
+        &self,
+        group: &crate::TransactionGroup,
+    ) -> Result<PreparedChange, PrepareError> {
+        self.coordinator.prepare_group(
+            &self.store,
+            &self.entities,
+            &self.registry,
+            &self.schemas,
+            group,
+        )
+    }
+
     /// Publish a prepared change.
     pub fn publish(&mut self, prepared: PreparedChange) -> Result<Publication, CommitFault> {
         self.coordinator
@@ -234,6 +248,21 @@ impl WorldAuthority {
             &self.registry,
             &self.schemas,
             transaction,
+        )
+    }
+
+    /// Prepare and publish one multi-source group in a single hop, for
+    /// journal-less hosts and tests.
+    pub fn commit_group(
+        &mut self,
+        group: &crate::TransactionGroup,
+    ) -> Result<TransactionResult<Committed>, CommitFault> {
+        self.coordinator.commit_group(
+            &mut self.store,
+            &mut self.entities,
+            &self.registry,
+            &self.schemas,
+            group,
         )
     }
 

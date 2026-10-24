@@ -1,23 +1,23 @@
-//! Headless wgpu renderer for the client.
+//! wgpu rendering for the client.
 //!
-//! The renderer owns a colour target, a depth target, one pipeline, and the
-//! uploaded terrain buffers. It draws into an offscreen texture so a frame can be
-//! captured without a window; the same pipeline is meant to drive the windowed
-//! surface once that path is wired.
+//! [`GpuContext`] owns the device-facing half: pipeline, camera uniform, and
+//! terrain buffers. Both targets reuse it: [`Renderer`] draws into an offscreen
+//! texture so a frame can be captured without a window, and the windowed app
+//! draws into a surface view. The pass is identical, only the target differs.
 
 use std::fs::File;
 
 use wgpu::{
     BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     BlendState, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, Color, ColorTargetState,
-    ColorWrites, CommandEncoderDescriptor, Device, DeviceDescriptor, Extent3d, FragmentState,
-    Instance, InstanceDescriptor, LoadOp, MapMode, MultisampleState, Operations, Origin3d,
-    PollType, PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    VertexState,
+    ColorWrites, CommandEncoder, CommandEncoderDescriptor, Device, DeviceDescriptor, Extent3d,
+    FragmentState, Instance, InstanceDescriptor, LoadOp, MapMode, MultisampleState, Operations,
+    Origin3d, PollType, PrimitiveState, Queue, RenderPassColorAttachment,
+    RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages, StoreOp, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
+    Texture, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    TextureView, TextureViewDescriptor, VertexState,
 };
 
 const SHADER: &str = r#"
@@ -58,8 +58,16 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Offscreen renderer.
-pub struct Renderer {
+/// Sky colour shared by both targets.
+pub const SKY: Color = Color {
+    r: 0.66,
+    g: 0.74,
+    b: 0.80,
+    a: 1.0,
+};
+
+/// Device, queue, pipeline, camera uniform, and terrain buffers.
+pub struct GpuContext {
     device: Device,
     queue: Queue,
     pipeline: RenderPipeline,
@@ -67,58 +75,18 @@ pub struct Renderer {
     bind_group: BindGroup,
     #[allow(dead_code)]
     layout: BindGroupLayout,
-    color: Texture,
-    color_view: TextureView,
-    depth_view: TextureView,
-    width: u32,
-    height: u32,
     vertex_buffer: Option<Buffer>,
     index_buffer: Option<Buffer>,
     index_count: u32,
 }
 
-impl Renderer {
-    /// Create a headless renderer.
-    pub fn new(width: u32, height: u32) -> Result<Self, String> {
-        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default()))
-                .map_err(|error| format!("adapter unavailable: {error}"))?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
-                .map_err(|error| format!("device unavailable: {error}"))?;
-
-        let color = device.create_texture(&TextureDescriptor {
-            label: Some("client color target"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let color_view = color.create_view(&TextureViewDescriptor::default());
-        let depth = device.create_texture(&TextureDescriptor {
-            label: Some("client depth target"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Depth32Float,
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let depth_view = depth.create_view(&TextureViewDescriptor::default());
-
+impl GpuContext {
+    /// Build the pipeline and camera binding on an already connected device.
+    ///
+    /// `color_format` is the format of the views the pass will draw into; the
+    /// offscreen target picks it itself while a surface inherits it from the
+    /// adapter.
+    pub fn new(device: Device, queue: Queue, color_format: TextureFormat) -> Self {
         let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("client camera layout"),
             entries: &[BindGroupLayoutEntry {
@@ -191,7 +159,7 @@ impl Renderer {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(ColorTargetState {
-                    format: TextureFormat::Rgba8UnormSrgb,
+                    format: color_format,
                     blend: Some(BlendState::REPLACE),
                     write_mask: ColorWrites::ALL,
                 })],
@@ -209,25 +177,25 @@ impl Renderer {
             cache: None,
         });
 
-        Ok(Self {
+        Self {
             device,
             queue,
             pipeline,
             uniform,
             bind_group,
             layout,
-            color,
-            color_view,
-            depth_view,
-            width,
-            height,
             vertex_buffer: None,
             index_buffer: None,
             index_count: 0,
-        })
+        }
     }
 
-    /// Upload terrain geometry.
+    /// Connected device and queue.
+    pub fn parts(&self) -> (&Device, &Queue) {
+        (&self.device, &self.queue)
+    }
+
+    /// Upload terrain geometry, replacing any previous buffers.
     pub fn upload(&mut self, vertex_bytes: &[u8], indices: &[u32]) {
         use wgpu::util::DeviceExt;
         let vertex_buffer = self
@@ -249,66 +217,146 @@ impl Renderer {
         self.index_count = indices.len() as u32;
     }
 
-    /// Render one frame into the offscreen target.
-    pub fn render(&mut self, view_projection: [f32; 16]) {
+    /// Stage the camera matrix for the next frame.
+    pub fn write_camera(&self, view_projection: [f32; 16]) {
         self.queue
             .write_buffer(&self.uniform, 0, &matrix_bytes(view_projection));
+    }
+
+    /// Encode the one terrain pass onto any colour and depth view pair.
+    pub fn encode_draw(
+        &self,
+        encoder: &mut CommandEncoder,
+        color: &TextureView,
+        depth: &TextureView,
+    ) {
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("client terrain pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: color,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(SKY),
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        if let (Some(vertices), Some(indices)) = (&self.vertex_buffer, &self.index_buffer) {
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.index_count, 0, 0..1);
+        }
+    }
+}
+
+/// Offscreen renderer.
+pub struct Renderer {
+    context: GpuContext,
+    color: Texture,
+    color_view: TextureView,
+    depth_view: TextureView,
+    width: u32,
+    height: u32,
+}
+
+impl Renderer {
+    /// Create a headless renderer.
+    pub fn new(width: u32, height: u32) -> Result<Self, String> {
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default()))
+                .map_err(|error| format!("adapter unavailable: {error}"))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
+                .map_err(|error| format!("device unavailable: {error}"))?;
+
+        let color = device.create_texture(&TextureDescriptor {
+            label: Some("client color target"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&TextureViewDescriptor::default());
+        let depth = device.create_texture(&TextureDescriptor {
+            label: Some("client depth target"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&TextureViewDescriptor::default());
+
+        let context = GpuContext::new(device, queue, TextureFormat::Rgba8UnormSrgb);
+        Ok(Self {
+            context,
+            color,
+            color_view,
+            depth_view,
+            width,
+            height,
+        })
+    }
+
+    /// Upload terrain geometry.
+    pub fn upload(&mut self, vertex_bytes: &[u8], indices: &[u32]) {
+        self.context.upload(vertex_bytes, indices);
+    }
+
+    /// Render one frame into the offscreen target.
+    pub fn render(&mut self, view_projection: [f32; 16]) {
+        self.context.write_camera(view_projection);
         let mut encoder = self
+            .context
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("client frame"),
             });
-        {
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("client terrain pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &self.color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(Color {
-                            r: 0.66,
-                            g: 0.74,
-                            b: 0.80,
-                            a: 1.0,
-                        }),
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(Operations {
-                        load: LoadOp::Clear(1.0),
-                        store: StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            if let (Some(vertices), Some(indices)) = (&self.vertex_buffer, &self.index_buffer) {
-                pass.set_vertex_buffer(0, vertices.slice(..));
-                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
-            }
-        }
-        self.queue.submit([encoder.finish()]);
+        self.context
+            .encode_draw(&mut encoder, &self.color_view, &self.depth_view);
+        self.context.queue.submit([encoder.finish()]);
     }
 
     /// Copy the rendered frame into a PNG file.
     pub fn save_png(&self, path: &str) -> Result<(), String> {
         let padded_row = align_256(self.width * 4);
         let buffer_size = u64::from(padded_row) * u64::from(self.height);
-        let readback = self.device.create_buffer(&BufferDescriptor {
+        let readback = self.context.device.create_buffer(&BufferDescriptor {
             label: Some("client readback"),
             size: buffer_size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let mut encoder = self
+            .context
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("client readback"),
@@ -334,11 +382,12 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit([encoder.finish()]);
+        self.context.queue.submit([encoder.finish()]);
 
         let slice = readback.slice(..);
         slice.map_async(MapMode::Read, |_| {});
-        self.device
+        self.context
+            .device
             .poll(PollType::wait_indefinitely())
             .map_err(|error| format!("device poll failed: {error}"))?;
         let view = slice
@@ -353,19 +402,24 @@ impl Renderer {
         drop(view);
         readback.unmap();
 
-        let file = File::create(path).map_err(|error| format!("create failed: {error}"))?;
-        let mut writer = std::io::BufWriter::new(file);
-        let mut encoder = png::Encoder::new(&mut writer, self.width, self.height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut png_writer = encoder
-            .write_header()
-            .map_err(|error| format!("png header failed: {error}"))?;
-        png_writer
-            .write_image_data(&pixels)
-            .map_err(|error| format!("png write failed: {error}"))?;
-        Ok(())
+        write_png(path, self.width, self.height, &pixels)
     }
+}
+
+/// Encode tight RGBA rows into a PNG file.
+pub fn write_png(path: &str, width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
+    let file = File::create(path).map_err(|error| format!("create failed: {error}"))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(&mut writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png_writer = encoder
+        .write_header()
+        .map_err(|error| format!("png header failed: {error}"))?;
+    png_writer
+        .write_image_data(pixels)
+        .map_err(|error| format!("png write failed: {error}"))?;
+    Ok(())
 }
 
 fn matrix_bytes(matrix: [f32; 16]) -> Vec<u8> {
@@ -386,4 +440,16 @@ fn by_index_bytes(indices: &[u32]) -> Vec<u8> {
 
 const fn align_256(value: u32) -> u32 {
     (value + 255) & !255
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_png_reports_file_errors() {
+        // A path with a missing directory must surface the OS error, not panic.
+        let result = write_png("no-such-dir/frame.png", 1, 1, &[0, 0, 0, 255]);
+        assert!(result.is_err());
+    }
 }

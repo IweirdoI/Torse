@@ -41,6 +41,116 @@ impl Camera {
     }
 }
 
+/// One frame of movement intent, normalized to -1..1 per axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MoveInput {
+    /// Forward when positive, backward when negative.
+    pub forward: f32,
+    /// Right when positive, left when negative.
+    pub strafe: f32,
+    /// World up when positive, down when negative.
+    pub vertical: f32,
+    /// Look yaw delta in radians, positive turns right.
+    pub yaw_delta: f32,
+    /// Look pitch delta in radians, positive looks up.
+    pub pitch_delta: f32,
+}
+
+/// Free-flying camera driven by yaw and pitch instead of a look-at target.
+///
+/// Yaw zero faces negative z; positive yaw turns right. Pitch is clamped
+/// below the poles so the up vector in `look_at` never degenerates.
+#[derive(Clone, Copy, Debug)]
+pub struct FlyCamera {
+    /// Eye position in world space.
+    pub eye: [f32; 3],
+    /// Yaw around the world up axis in radians.
+    pub yaw: f32,
+    /// Pitch from the horizon in radians.
+    pub pitch: f32,
+    /// Movement speed in blocks per second.
+    pub speed: f32,
+    /// Vertical field of view in degrees.
+    pub fov_y_deg: f32,
+    /// Near plane.
+    pub near: f32,
+    /// Far plane.
+    pub far: f32,
+    /// Lowest eye position the camera may descend to.
+    pub min_y: f32,
+    /// Highest eye position the camera may rise to.
+    pub max_y: f32,
+}
+
+impl FlyCamera {
+    /// Build a camera at `eye` with default flight parameters.
+    pub fn new(eye: [f32; 3]) -> Self {
+        Self {
+            eye,
+            yaw: 0.0,
+            pitch: -0.25,
+            speed: 12.0,
+            fov_y_deg: 55.0,
+            near: 0.1,
+            far: 400.0,
+            min_y: 1.0,
+            max_y: 256.0,
+        }
+    }
+
+    /// Unit forward vector derived from yaw and pitch.
+    pub fn forward(&self) -> [f32; 3] {
+        let cos_pitch = self.pitch.cos();
+        [
+            -self.yaw.sin() * cos_pitch,
+            self.pitch.sin(),
+            -self.yaw.cos() * cos_pitch,
+        ]
+    }
+
+    /// Unit right vector on the horizontal plane.
+    pub fn right(&self) -> [f32; 3] {
+        [self.yaw.cos(), 0.0, -self.yaw.sin()]
+    }
+
+    /// Apply look deltas with pitch clamped just inside the poles.
+    pub fn look(&mut self, yaw_delta: f32, pitch_delta: f32) {
+        self.yaw += yaw_delta;
+        let limit = 89.0f32.to_radians();
+        self.pitch = (self.pitch + pitch_delta).clamp(-limit, limit);
+    }
+
+    /// Integrate one frame of movement in seconds.
+    pub fn advance(&mut self, input: MoveInput, delta_seconds: f32) {
+        self.look(input.yaw_delta, input.pitch_delta);
+        let forward = [self.forward()[0], 0.0, self.forward()[2]];
+        let forward = normalize(forward);
+        let mut motion = [0.0f32; 3];
+        for (component, (ahead, side)) in motion.iter_mut().zip(forward.iter().zip(self.right())) {
+            *component = ahead * input.forward + side * input.strafe;
+        }
+        motion[1] += input.vertical;
+        let motion = normalize(motion);
+        let step = self.speed * delta_seconds;
+        for (eye, drift) in self.eye.iter_mut().zip(motion) {
+            *eye += drift * step;
+        }
+        self.eye[1] = self.eye[1].clamp(self.min_y, self.max_y);
+    }
+
+    /// Column-major view-projection matrix.
+    pub fn view_projection(&self, aspect: f32) -> [f32; 16] {
+        let target = [
+            self.eye[0] + self.forward()[0],
+            self.eye[1] + self.forward()[1],
+            self.eye[2] + self.forward()[2],
+        ];
+        let projection = perspective(self.fov_y_deg, aspect, self.near, self.far);
+        let view = look_at(self.eye, target, [0.0, 1.0, 0.0]);
+        multiply(projection, view)
+    }
+}
+
 fn perspective(fov_y_deg: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let f = 1.0 / (fov_y_deg.to_radians() / 2.0).tan();
     let mut matrix = [0.0f32; 16];
@@ -143,5 +253,71 @@ mod tests {
         assert!(w > 0.0);
         assert!(x.abs() < 1e-5 && y.abs() < 1e-5);
         assert!(z / w > 0.0 && z / w < 1.0);
+    }
+
+    #[test]
+    fn fly_camera_starts_facing_negative_z() {
+        let mut camera = FlyCamera::new([0.0, 10.0, 0.0]);
+        // The constructor pitches slightly down; level out first.
+        camera.pitch = 0.0;
+        assert!((camera.forward()[0]).abs() < 1e-6);
+        assert!((camera.forward()[1]).abs() < 1e-6);
+        assert!((camera.forward()[2] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fly_camera_clamps_pitch_inside_the_poles() {
+        let mut camera = FlyCamera::new([0.0, 10.0, 0.0]);
+        camera.look(0.0, 2.0);
+        assert!(camera.pitch < 89.5f32.to_radians());
+        camera.look(0.0, -4.0);
+        assert!(camera.pitch > -89.5f32.to_radians());
+    }
+
+    #[test]
+    fn fly_camera_moves_along_input_axes() {
+        let mut camera = FlyCamera::new([0.0, 10.0, 0.0]);
+        camera.advance(
+            MoveInput {
+                forward: 1.0,
+                ..MoveInput::default()
+            },
+            1.0,
+        );
+        assert!(camera.eye[2] < -0.9);
+        assert!((camera.eye[1] - 10.0).abs() < 1e-3);
+
+        let mut camera = FlyCamera::new([0.0, 10.0, 0.0]);
+        camera.advance(
+            MoveInput {
+                strafe: 1.0,
+                ..MoveInput::default()
+            },
+            1.0,
+        );
+        assert!(camera.eye[0] > 0.9);
+
+        let mut camera = FlyCamera::new([0.0, 10.0, 0.0]);
+        camera.advance(
+            MoveInput {
+                vertical: -1.0,
+                ..MoveInput::default()
+            },
+            0.5,
+        );
+        assert!((camera.eye[1] - 4.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fly_camera_stops_at_its_vertical_bounds() {
+        let mut camera = FlyCamera::new([0.0, 10.0, 0.0]);
+        camera.advance(
+            MoveInput {
+                vertical: -1.0,
+                ..MoveInput::default()
+            },
+            60.0,
+        );
+        assert!((camera.eye[1] - camera.min_y).abs() < 1e-3);
     }
 }

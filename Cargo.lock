@@ -2711,6 +2711,7 @@ dependencies = [
  "torse-world",
  "torse-world-services",
  "wgpu",
+ "winit",
 ]
 
 [[package]]

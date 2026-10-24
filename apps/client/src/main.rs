@@ -1,13 +1,15 @@
 //! Torse client.
 //!
-//! Current scope: build the authoritative scene, mesh it, and render one frame
-//! into a PNG from a fixed camera. The windowed surface, input, and continuous
-//! loop come next; the pipeline and buffers here are the same ones they will
-//! drive.
+//! Two modes share the scene, mesher, and pipeline. `--capture` renders one
+//! frame offscreen into a PNG without a window; `--window` opens an interactive
+//! winit window with a fly camera, streaming sections, and continuous
+//! rendering.
 
 mod camera;
+mod input;
 mod renderer;
 mod scene;
+mod window;
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -15,52 +17,60 @@ use std::time::Instant;
 use camera::Camera;
 use renderer::Renderer;
 use scene::Scene;
+use window::{WindowConfig, run_window};
+
+const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
+       torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
+                        [--screenshot <png>] [--autoplay]";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let mut capture = None;
+    let mut capture: Option<String> = None;
+    let mut window = false;
     let mut width = 960u32;
     let mut height = 540u32;
     let mut radius = 2i64;
+    let mut radius_set = false;
     let mut view = String::from("overview");
+    let mut frames: Option<u32> = None;
+    let mut screenshot: Option<String> = None;
+    let mut autoplay = false;
     let mut index = 0;
     while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--capture" => {
-                index += 1;
-                capture = arguments.get(index).cloned();
-            }
+        let argument = arguments[index].clone();
+        let mut value = || -> Option<String> {
+            index += 1;
+            arguments.get(index).cloned()
+        };
+        match argument.as_str() {
+            "--capture" => capture = value(),
+            "--window" => window = true,
             "--width" => {
-                index += 1;
-                width = arguments
-                    .get(index)
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(width);
-            }
-            "--height" => {
-                index += 1;
-                height = arguments
-                    .get(index)
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(height);
-            }
-            "--radius" => {
-                index += 1;
-                radius = arguments
-                    .get(index)
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(radius);
-            }
-            "--view" => {
-                index += 1;
-                if let Some(value) = arguments.get(index) {
-                    view = value.clone();
+                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
+                    width = parsed;
                 }
             }
+            "--height" => {
+                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
+                    height = parsed;
+                }
+            }
+            "--radius" => {
+                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
+                    radius = parsed;
+                    radius_set = true;
+                }
+            }
+            "--view" => view = value().unwrap_or(view),
+            "--frames" => {
+                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
+                    frames = Some(parsed);
+                }
+            }
+            "--screenshot" => screenshot = value(),
+            "--autoplay" => autoplay = true,
             "--help" | "-h" => {
-                println!(
-                    "usage: torse-client --capture <png> [--width N] [--height N] [--radius N]"
-                );
+                println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -70,20 +80,57 @@ fn main() -> ExitCode {
         }
         index += 1;
     }
-    let Some(path) = capture else {
-        println!("usage: torse-client --capture <png> [--width N] [--height N] [--radius N]");
-        return ExitCode::SUCCESS;
-    };
 
-    match run(&path, width, height, radius, &view) {
-        Ok(summary) => {
-            println!("{summary}");
-            ExitCode::SUCCESS
+    if window {
+        let config = WindowConfig {
+            radius: if radius_set { radius } else { 4 },
+            width,
+            height,
+            frames,
+            screenshot,
+            autoplay,
+        };
+        match run_window(config) {
+            Ok(summary) => {
+                println!(
+                    "adapter={} backend={} format={} frames={} streams={} rebuilds={} \
+                     uploads={} screenshots={} sections={} meshes={} vertices={} faces={} \
+                     elapsed_ms={}",
+                    summary.adapter,
+                    summary.backend,
+                    summary.format,
+                    summary.frames,
+                    summary.streams,
+                    summary.rebuilds,
+                    summary.uploads,
+                    summary.screenshots,
+                    summary.sections,
+                    summary.meshes,
+                    summary.vertices,
+                    summary.faces,
+                    summary.elapsed_ms,
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("client failed: {error}");
+                ExitCode::FAILURE
+            }
         }
-        Err(error) => {
-            eprintln!("client failed: {error}");
-            ExitCode::FAILURE
+    } else if let Some(path) = capture {
+        match run(&path, width, height, radius, &view) {
+            Ok(summary) => {
+                println!("{summary}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("client failed: {error}");
+                ExitCode::FAILURE
+            }
         }
+    } else {
+        println!("{USAGE}");
+        ExitCode::SUCCESS
     }
 }
 

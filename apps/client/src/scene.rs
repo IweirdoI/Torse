@@ -145,9 +145,13 @@ impl Scene {
     }
 
     /// Rebuild meshes whose section or neighbour revision changed.
-    pub fn refresh_meshes(&mut self) {
+    ///
+    /// Returns how many meshes were rebuilt, so callers can skip a GPU upload
+    /// when nothing changed.
+    pub fn refresh_meshes(&mut self) -> usize {
         let store = self.authority.store();
         let registry = self.authority.registry();
+        let mut rebuilt = 0usize;
         for pos in &self.sections {
             let job = MeshJob::capture(self.side, *pos, |query| store.revision(query));
             let Some(revision) = job.section_revision else {
@@ -163,7 +167,18 @@ impl Scene {
             }
             let mesh = build_mesh(self.side, *pos, |query| sample(store, registry, query));
             self.meshes.insert(*pos, (revision, mesh));
+            rebuilt += 1;
         }
+        rebuilt
+    }
+
+    /// Section containing a world-space position on the section layer.
+    pub fn center_section(&self, position: [f32; 3]) -> SectionPos {
+        SectionPos::new(
+            (position[0] as i64).div_euclid(self.side as i64),
+            0,
+            (position[2] as i64).div_euclid(self.side as i64),
+        )
     }
 
     /// Flatten every cached mesh into one interleaved vertex and index buffer.
@@ -298,13 +313,52 @@ mod tests {
     fn scene_generates_and_meshes_its_radius() {
         let mut scene = Scene::new(1).expect("scene builds");
         assert_eq!(scene.sections().len(), 9);
-        scene.refresh_meshes();
+        assert_eq!(scene.refresh_meshes(), 9);
         assert_eq!(scene.mesh_count(), 9);
+        // Nothing changed, so the second pass rebuilds nothing.
+        assert_eq!(scene.refresh_meshes(), 0);
         let (vertices, indices, faces) = scene.geometry();
         assert!(!vertices.is_empty());
         assert!(!indices.is_empty());
         assert!(faces > 0);
         assert_eq!(indices.len() % 3, 0);
+    }
+
+    #[test]
+    fn streaming_recenters_without_leaking_sections() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene.refresh_meshes();
+        let before = scene.geometry();
+        assert!(!before.0.is_empty());
+
+        scene.load_around(SectionPos::new(3, 0, 0)).expect("load");
+        assert_eq!(scene.sections().len(), 9);
+        // The unloaded column's meshes are gone; the new ones are built.
+        assert!(scene.refresh_meshes() > 0);
+        assert_eq!(scene.mesh_count(), 9);
+        let after = scene.geometry();
+        assert!(!after.0.is_empty());
+
+        // Returning to the origin reloads the same deterministic terrain.
+        scene.load_around(SectionPos::ZERO).expect("load back");
+        scene.refresh_meshes();
+        assert_eq!(scene.sections().len(), 9);
+        assert_eq!(scene.mesh_count(), 9);
+        assert_eq!(scene.geometry().0.len(), before.0.len());
+    }
+
+    #[test]
+    fn center_section_maps_positions_including_negatives() {
+        let scene = Scene::new(0).expect("scene builds");
+        assert_eq!(scene.center_section([0.0, 5.0, 0.0]), SectionPos::ZERO);
+        assert_eq!(
+            scene.center_section([17.5, 5.0, -1.0]),
+            SectionPos::new(1, 0, -1)
+        );
+        assert_eq!(
+            scene.center_section([-16.0, 5.0, -17.0]),
+            SectionPos::new(-1, 0, -2)
+        );
     }
 
     #[test]

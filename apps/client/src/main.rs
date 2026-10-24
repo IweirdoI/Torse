@@ -7,6 +7,7 @@
 
 mod camera;
 mod input;
+mod pick;
 mod renderer;
 mod scene;
 mod window;
@@ -94,8 +95,8 @@ fn main() -> ExitCode {
             Ok(summary) => {
                 println!(
                     "adapter={} backend={} format={} frames={} streams={} rebuilds={} \
-                     uploads={} screenshots={} sections={} meshes={} vertices={} faces={} \
-                     elapsed_ms={}",
+                     uploads={} screenshots={} actions_ok={} actions_rejected={} sections={} \
+                     meshes={} vertices={} faces={} elapsed_ms={}",
                     summary.adapter,
                     summary.backend,
                     summary.format,
@@ -104,6 +105,8 @@ fn main() -> ExitCode {
                     summary.rebuilds,
                     summary.uploads,
                     summary.screenshots,
+                    summary.actions_ok,
+                    summary.actions_rejected,
                     summary.sections,
                     summary.meshes,
                     summary.vertices,

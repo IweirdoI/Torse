@@ -18,6 +18,8 @@ const LOOK_PER_PIXEL: f32 = 0.005;
 const SPEED_STEP: f32 = 1.25;
 /// Fastest and slowest fly speed in blocks per second.
 const SPEED_RANGE: (f32, f32) = (1.0, 300.0);
+/// A press whose cursor wanders less than this many pixels is a click.
+const CLICK_SLOP: f64 = 4.0;
 
 /// Aggregated input state between frames.
 #[derive(Debug, Default)]
@@ -25,6 +27,9 @@ pub struct InputState {
     held: BTreeSet<KeyCode>,
     look_delta: PhysicalPosition<f64>,
     dragging: bool,
+    last_cursor: Option<PhysicalPosition<f64>>,
+    drag_distance: f64,
+    pending_click: Option<MouseButton>,
     speed_factor: f32,
     screenshot: bool,
 }
@@ -56,19 +61,38 @@ impl InputState {
         }
     }
 
-    /// Dragging with any button rotates the view; the button itself is unused.
+    /// Left and right presses arm a drag; a release that barely moved is a
+    /// click and is reported through [`InputState::take_click`].
     pub fn mouse(&mut self, button: MouseButton, state: ElementState) {
-        let pressed = state == ElementState::Pressed;
-        if button == MouseButton::Left || button == MouseButton::Right {
-            self.dragging = pressed;
+        if !matches!(button, MouseButton::Left | MouseButton::Right) {
+            return;
+        }
+        match state {
+            ElementState::Pressed => {
+                self.dragging = true;
+                self.last_cursor = None;
+                self.drag_distance = 0.0;
+            }
+            ElementState::Released => {
+                if self.drag_distance < CLICK_SLOP {
+                    self.pending_click = Some(button);
+                }
+                self.dragging = false;
+                self.last_cursor = None;
+            }
         }
     }
 
-    /// Accumulate cursor motion; only meaningful while dragging.
+    /// Accumulate cursor motion since the previous event. The first move after
+    /// a press only establishes the baseline, so a click never rotates the view.
     pub fn cursor(&mut self, position: PhysicalPosition<f64>) {
-        if self.dragging {
-            self.look_delta.x += position.x;
-            self.look_delta.y += position.y;
+        if let Some(last) = self.last_cursor.replace(position) {
+            let delta = PhysicalPosition::new(position.x - last.x, position.y - last.y);
+            self.drag_distance += (delta.x * delta.x + delta.y * delta.y).sqrt();
+            if self.dragging {
+                self.look_delta.x += delta.x;
+                self.look_delta.y += delta.y;
+            }
         }
     }
 
@@ -101,6 +125,11 @@ impl InputState {
             pitch_delta,
         };
         (input, base_speed * self.speed_factor)
+    }
+
+    /// Consume the pending click, if the last press qualified as one.
+    pub fn take_click(&mut self) -> Option<MouseButton> {
+        self.pending_click.take()
     }
 
     /// Consume the screenshot edge.
@@ -142,18 +171,44 @@ mod tests {
     fn drag_deltas_accumulate_and_clear() {
         let mut state = InputState::new();
         state.mouse(MouseButton::Left, ElementState::Pressed);
+        // The first move after a press is only the baseline.
         state.cursor(PhysicalPosition::new(10.0, 4.0));
-        state.cursor(PhysicalPosition::new(-4.0, 6.0));
+        state.cursor(PhysicalPosition::new(16.0, 14.0));
+        state.cursor(PhysicalPosition::new(22.0, 14.0));
         let (input, _) = state.take_input(12.0);
-        assert!((input.yaw_delta - (-6.0 * LOOK_PER_PIXEL)).abs() < 1e-6);
+        // Deltas are (6, 10) then (6, 0), so the camera turns by their sum.
+        assert!((input.yaw_delta - (-12.0 * LOOK_PER_PIXEL)).abs() < 1e-6);
         assert!((input.pitch_delta - (-10.0 * LOOK_PER_PIXEL)).abs() < 1e-6);
         let (input, _) = state.take_input(12.0);
         assert_eq!(input.yaw_delta, 0.0);
-        // Without a held button the cursor does not rotate the view.
+        // A long drag is not a click.
         state.mouse(MouseButton::Left, ElementState::Released);
-        state.cursor(PhysicalPosition::new(100.0, 100.0));
+        assert_eq!(state.take_click(), None);
+        // Without a held button the cursor does not rotate the view.
+        state.cursor(PhysicalPosition::new(500.0, 500.0));
+        state.cursor(PhysicalPosition::new(510.0, 510.0));
         let (input, _) = state.take_input(12.0);
         assert_eq!(input.yaw_delta, 0.0);
+    }
+
+    #[test]
+    fn short_presses_report_clicks_by_button() {
+        let mut state = InputState::new();
+        state.mouse(MouseButton::Left, ElementState::Pressed);
+        state.cursor(PhysicalPosition::new(50.0, 50.0));
+        state.cursor(PhysicalPosition::new(52.0, 51.0));
+        state.mouse(MouseButton::Left, ElementState::Released);
+        assert_eq!(state.take_click(), Some(MouseButton::Left));
+        assert_eq!(state.take_click(), None);
+
+        state.mouse(MouseButton::Right, ElementState::Pressed);
+        state.cursor(PhysicalPosition::new(50.0, 50.0));
+        state.mouse(MouseButton::Right, ElementState::Released);
+        assert_eq!(state.take_click(), Some(MouseButton::Right));
+
+        // A release without a preceding press reports nothing and stays quiet.
+        state.mouse(MouseButton::Middle, ElementState::Released);
+        assert_eq!(state.take_click(), None);
     }
 
     #[test]

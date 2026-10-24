@@ -11,9 +11,18 @@ use std::collections::BTreeMap;
 use torse_content::{BlockDefinition, Shape, compile, m0_fixture_pack};
 use torse_render::{MeshData, MeshJob, MeshSample, RenderBlock, RenderBox, build_mesh};
 use torse_sim::WorldAuthority;
-use torse_types::{BlockPos, Compatibility, ContentKey, Digest, Revision, SectionPos, WorldId};
-use torse_world::{BlockStateId, BlockStateRegistry, ComponentSchemas, TerrainQuery, WorldBounds};
+use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
+use torse_sim::{OrderingKey, Phase, block_actions};
+use torse_types::{
+    BlockPos, Compatibility, ContentKey, Digest, Revision, SectionPos, TransactionId, WorldId,
+};
+use torse_world::{
+    BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentValue,
+    TerrainQuery, WorldBounds,
+};
 use torse_world_services::{GenerationParams, HillTerrain};
+
+use crate::pick::{PickOutcome, cast_ray};
 
 /// One vertex uploaded to the GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -45,6 +54,9 @@ impl Vertex {
 /// Terrain scene bound to one authoritative world.
 pub struct Scene {
     authority: WorldAuthority,
+    service: ActionService,
+    principal: ContentKey,
+    edit_counter: u64,
     generator: HillTerrain,
     side: u32,
     radius: i64,
@@ -55,8 +67,9 @@ pub struct Scene {
 impl Scene {
     /// Build a scene with a seeded hill terrain.
     pub fn new(radius: i64) -> Result<Self, String> {
-        let content =
-            compile(m0_fixture_pack()).map_err(|errors| format!("content failed: {errors:?}"))?;
+        let mut pack = m0_fixture_pack();
+        block_actions::register_content(&mut pack);
+        let content = compile(pack).map_err(|errors| format!("content failed: {errors:?}"))?;
         let registry = BlockStateRegistry::build(&content)
             .map_err(|error| format!("registry failed: {error}"))?;
         let schemas = ComponentSchemas::build(&content);
@@ -65,6 +78,12 @@ impl Scene {
             .ok_or_else(|| "missing base:stone".to_owned())?;
         let side = 16;
         let bounds = WorldBounds::new(0, 64).map_err(|error| error.to_string())?;
+        let service = ActionService::bind(
+            block_actions::descriptors(),
+            block_actions::handlers(),
+            &schemas,
+        )
+        .map_err(|error| format!("actions failed: {error}"))?;
         let authority = WorldAuthority::new(
             WorldId(1),
             registry,
@@ -83,6 +102,9 @@ impl Scene {
         let generator = HillTerrain::new(params, 7, 7, 9);
         let mut scene = Self {
             authority,
+            service,
+            principal: key("client:player"),
+            edit_counter: 0,
             generator,
             side,
             radius,
@@ -96,6 +118,75 @@ impl Scene {
     /// Authoritative world.
     pub const fn authority(&self) -> &WorldAuthority {
         &self.authority
+    }
+
+    /// Classify one cell for picking: solid, empty, or outside the loaded world.
+    fn solid_at(&self, pos: BlockPos) -> Option<bool> {
+        match self.authority.store().query(pos) {
+            TerrainQuery::Ready(state) => Some(!state.is_empty()),
+            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => None,
+        }
+    }
+
+    /// Cast a ray through loaded terrain and report the first solid cell.
+    pub fn pick(&self, origin: [f32; 3], direction: [f32; 3], max_distance: f32) -> PickOutcome {
+        cast_ray(|pos| self.solid_at(pos), origin, direction, max_distance)
+    }
+
+    /// Plan and commit one place or break action through the action service.
+    ///
+    /// The windowed client is a trusted local host: it grants the player the
+    /// edit permission and the single target cell for this request, then lets
+    /// the service authorize, validate, and commit like any other adapter.
+    /// The error string names the rejection, it is diagnostics only.
+    pub fn apply_edit(
+        &mut self,
+        place: bool,
+        block: &ContentKey,
+        target: BlockPos,
+    ) -> Result<(), String> {
+        self.edit_counter += 1;
+        let counter = self.edit_counter;
+        let action = if place {
+            key("world:action/place")
+        } else {
+            key("world:action/break")
+        };
+        let mut parameters = ComponentFields::new();
+        if place {
+            parameters.insert(
+                key("world:field/block"),
+                ComponentValue::Content(block.clone()),
+            );
+        }
+        let request = ActionRequest {
+            action,
+            api_version: 1,
+            origin: ActionOrigin::Ui,
+            target: ActionTarget::Block(target),
+            parameters,
+            transaction: TransactionId(u128::from(counter)),
+            ordering: OrderingKey {
+                phase: Phase::Interaction,
+                rule_priority: 0,
+                stable_task_key: counter,
+                local_sequence: 0,
+            },
+        };
+        let actor = ActorContext::new(self.principal.clone())
+            .permission(key("world:permission/edit"))
+            .target(ActionTarget::Block(target));
+        let output = self
+            .service
+            .plan(&self.authority, &actor, Phase::Interaction, &request)
+            .map_err(|code| format!("{code:?}"))?;
+        let torse_sim::action::ActionOutput::Mutation(transaction) = output else {
+            return Err("place and break must be mutations".to_owned());
+        };
+        self.authority
+            .commit(&transaction)
+            .map_err(|fault| format!("{fault:?}"))?;
+        Ok(())
     }
 
     /// Loaded section coordinates.
@@ -370,5 +461,101 @@ mod tests {
         }];
         let bytes = Scene::vertex_bytes(&vertices);
         assert_eq!(bytes.len(), Vertex::STRIDE);
+    }
+
+    fn query(scene: &Scene, pos: BlockPos) -> bool {
+        matches!(
+            scene.authority().store().query(pos),
+            TerrainQuery::Ready(state) if !state.is_empty()
+        )
+    }
+
+    /// Find a column whose surface leaves a loaded, empty cell above it.
+    /// Only the `y = 0` section layer is loaded, so test cells must stay below
+    /// 16.
+    fn air_above_surface(scene: &Scene) -> BlockPos {
+        for x in 0..12i64 {
+            for z in 0..12i64 {
+                for y in (0..14i64).rev() {
+                    let pos = BlockPos::new(x, y, z);
+                    if query(scene, pos) {
+                        return BlockPos::new(x, y + 1, z);
+                    }
+                }
+            }
+        }
+        panic!("no air cell found above the surface");
+    }
+
+    #[test]
+    fn apply_edit_places_and_breaks_through_the_action_service() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        let target = air_above_surface(&scene);
+        let surface = BlockPos::new(target.x, target.y - 1, target.z);
+        assert!(!query(&scene, target));
+        assert!(query(&scene, surface));
+
+        let stone = key("base:stone");
+        scene
+            .apply_edit(true, &stone, target)
+            .expect("place commits");
+        assert!(query(&scene, target));
+
+        // Placing into the now occupied cell is rejected without a commit.
+        let again = scene.apply_edit(true, &stone, target);
+        assert!(again.is_err());
+
+        scene
+            .apply_edit(false, &stone, target)
+            .expect("break commits");
+        assert!(!query(&scene, target));
+
+        // Breaking air is a conflict, not a silent no-op.
+        let empty = scene.apply_edit(false, &stone, target);
+        assert!(empty.is_err());
+    }
+
+    #[test]
+    fn apply_edit_rejects_out_of_bounds_targets() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        let stone = key("base:stone");
+        assert!(
+            scene
+                .apply_edit(true, &stone, BlockPos::new(0, 64, 0))
+                .is_err()
+        );
+        assert!(
+            scene
+                .apply_edit(true, &stone, BlockPos::new(0, -1, 0))
+                .is_err()
+        );
+        // Above the loaded layer the target is not loaded, which is also a
+        // rejection rather than a silent drop.
+        assert!(
+            scene
+                .apply_edit(true, &stone, BlockPos::new(0, 40, 0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pick_finds_the_surface_below_the_camera() {
+        let scene = Scene::new(1).expect("scene builds");
+        // Start inside the loaded layer so the ray can walk down to the hill.
+        let outcome = scene.pick([8.5, 15.5, 8.5], [0.0, -1.0, 0.0], 128.0);
+        let PickOutcome::Hit(hit) = outcome else {
+            panic!("expected the terrain surface");
+        };
+        assert_eq!((hit.block.x, hit.block.z), (8, 8));
+        assert!(hit.block.y < 16);
+        assert!(hit.distance < 16.0);
+    }
+
+    #[test]
+    fn pick_stops_at_unloaded_sections() {
+        let scene = Scene::new(1).expect("scene builds");
+        // Radius 1 leaves everything past 31 blocks unloaded on the x axis.
+        let outcome = scene.pick([30.5, 40.0, 8.5], [1.0, 0.0, 0.0], 256.0);
+        assert_eq!(outcome, PickOutcome::Miss);
     }
 }

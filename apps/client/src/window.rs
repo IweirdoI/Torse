@@ -18,15 +18,21 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::camera::FlyCamera;
 use crate::input::InputState;
+use crate::pick::{PickHit, PickOutcome};
 use crate::renderer::GpuContext;
-use crate::scene::Scene;
-use torse_types::SectionPos;
+use crate::scene::{Scene, Vertex};
+use torse_types::{BlockPos, ContentKey, SectionPos};
+
+/// How far the pick ray reaches, in blocks.
+const PICK_RANGE: f32 = 64.0;
+/// Autoplay fires one demonstration action every this many frames.
+const AUTOPLAY_PERIOD: u32 = 24;
 
 /// Startup parameters for the windowed run.
 #[derive(Clone, Debug)]
@@ -63,6 +69,10 @@ pub struct WindowSummary {
     pub uploads: usize,
     /// Screenshots written.
     pub screenshots: usize,
+    /// Actions planned and committed through the action service.
+    pub actions_ok: u32,
+    /// Actions rejected by the action service or the commit.
+    pub actions_rejected: u32,
     /// Resident sections at exit.
     pub sections: usize,
     /// Resident meshes at exit.
@@ -90,6 +100,8 @@ struct WindowApp {
     camera: Option<FlyCamera>,
     input: InputState,
     gpu: Option<Gpu>,
+    materials: Vec<ContentKey>,
+    material: usize,
     center: Option<SectionPos>,
     uploaded: bool,
     frames: u32,
@@ -97,6 +109,10 @@ struct WindowApp {
     rebuilds: usize,
     uploads: usize,
     screenshots: usize,
+    actions_ok: u32,
+    actions_rejected: u32,
+    autoplay_break: bool,
+    last_result: String,
     adapter: String,
     started: Option<Instant>,
     last_frame: Option<Instant>,
@@ -109,12 +125,18 @@ struct WindowApp {
 
 impl WindowApp {
     fn new(config: WindowConfig) -> Self {
+        let materials = ["base:stone", "base:glass_slab", "base:plant"]
+            .into_iter()
+            .map(|name| ContentKey::parse(name).expect("static material key"))
+            .collect();
         Self {
             config,
             scene: None,
             camera: None,
             input: InputState::new(),
             gpu: None,
+            materials,
+            material: 0,
             center: None,
             uploaded: false,
             frames: 0,
@@ -122,6 +144,10 @@ impl WindowApp {
             rebuilds: 0,
             uploads: 0,
             screenshots: 0,
+            actions_ok: 0,
+            actions_rejected: 0,
+            autoplay_break: false,
+            last_result: String::new(),
             adapter: String::new(),
             started: None,
             last_frame: None,
@@ -169,6 +195,67 @@ impl WindowApp {
             }
             self.center = Some(center);
             self.streams += 1;
+        }
+
+        // Resolve the aim from the fresh camera, translate clicks and the
+        // autoplay demo into place or break intents, and commit them before
+        // this frame's meshes are captured.
+        let aim = {
+            let Some(scene) = self.scene.as_ref() else {
+                return;
+            };
+            let Some(camera) = self.camera.as_ref() else {
+                return;
+            };
+            scene.pick(camera.eye, camera.forward(), PICK_RANGE)
+        };
+        let mut intent = self
+            .input
+            .take_click()
+            .and_then(|button| action_for(&aim, button));
+        if intent.is_none() && self.config.autoplay && self.frames.is_multiple_of(AUTOPLAY_PERIOD) {
+            let button = if self.autoplay_break {
+                MouseButton::Left
+            } else {
+                MouseButton::Right
+            };
+            intent = action_for(&aim, button);
+            self.autoplay_break = !self.autoplay_break;
+        }
+        if let Some((place, target)) = intent {
+            let material = self.materials[self.material].clone();
+            let result = match self.scene.as_mut() {
+                Some(scene) => scene.apply_edit(place, &material, target),
+                None => return,
+            };
+            match result {
+                Ok(()) => {
+                    self.actions_ok += 1;
+                    self.last_result.clear();
+                }
+                Err(reason) => {
+                    self.actions_rejected += 1;
+                    self.last_result = reason;
+                }
+            }
+        }
+
+        // Stage the selection outline from the post-edit aim so it matches
+        // what the next frame will show.
+        let outline = {
+            let Some(scene) = self.scene.as_ref() else {
+                return;
+            };
+            let Some(camera) = self.camera.as_ref() else {
+                return;
+            };
+            match scene.pick(camera.eye, camera.forward(), PICK_RANGE) {
+                PickOutcome::Hit(hit) => outline_bytes(&hit),
+                PickOutcome::Miss => Vec::new(),
+            }
+        };
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.context.write_lines(&outline);
         }
 
         let rebuilt = self
@@ -262,8 +349,14 @@ impl WindowApp {
         if title_span >= 0.5 {
             let fps = self.fps_frames as f32 / title_span;
             if let Some(scene) = self.scene.as_ref() {
+                let material = self.materials[self.material].path();
+                let status = if self.last_result.is_empty() {
+                    "ok".to_owned()
+                } else {
+                    self.last_result.clone()
+                };
                 gpu.window.set_title(&format!(
-                    "Torse client | {fps:.0} fps | sections {} | meshes {}",
+                    "Torse client | {fps:.0} fps | sections {} | meshes {} | {material} | {status}",
                     scene.sections().len(),
                     scene.mesh_count(),
                 ));
@@ -302,6 +395,8 @@ impl WindowApp {
                 rebuilds: self.rebuilds,
                 uploads: self.uploads,
                 screenshots: self.screenshots,
+                actions_ok: self.actions_ok,
+                actions_rejected: self.actions_rejected,
                 sections: scene.sections().len(),
                 meshes: scene.mesh_count(),
                 vertices: vertices.len(),
@@ -387,7 +482,11 @@ impl ApplicationHandler for WindowApp {
                 return;
             }
         };
-        let camera = FlyCamera::new(scene.eye());
+        let mut camera = FlyCamera::new(scene.eye());
+        // Only the y = 0 section layer is loaded, and picking terminates at the
+        // first unloaded cell. Keep the starting eye inside that layer so the
+        // aim works no matter how high the spawn surface is.
+        camera.eye[1] = camera.eye[1].min(14.0);
         self.adapter = info.name;
         self.gpu = Some(Gpu {
             backend_name: format!("{:?}", info.backend),
@@ -432,12 +531,20 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                use winit::keyboard::KeyCode;
                 if event.state == ElementState::Pressed
-                    && let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape) =
-                        event.physical_key
+                    && let winit::keyboard::PhysicalKey::Code(code) = event.physical_key
                 {
-                    self.finish(event_loop);
-                    return;
+                    match code {
+                        KeyCode::Escape => {
+                            self.finish(event_loop);
+                            return;
+                        }
+                        KeyCode::Digit1 => self.material = 0,
+                        KeyCode::Digit2 => self.material = 1,
+                        KeyCode::Digit3 => self.material = 2,
+                        _ => {}
+                    }
                 }
                 self.input.key(event.physical_key, event.state);
             }
@@ -464,6 +571,85 @@ impl ApplicationHandler for WindowApp {
             gpu.window.request_redraw();
         }
     }
+}
+
+/// Translate one aim and mouse button into a place or break intent.
+///
+/// Left breaks the hit cell; right places the selected material against the
+/// entered face. A hit inside a solid cell carries no face, so placement is
+/// dropped rather than guessed.
+fn action_for(outcome: &PickOutcome, button: MouseButton) -> Option<(bool, BlockPos)> {
+    let PickOutcome::Hit(hit) = outcome else {
+        return None;
+    };
+    match button {
+        MouseButton::Left => Some((false, hit.block)),
+        MouseButton::Right => {
+            let (face_x, face_y, face_z) = (hit.face[0], hit.face[1], hit.face[2]);
+            if (face_x, face_y, face_z) == (0, 0, 0) {
+                return None;
+            }
+            Some((
+                true,
+                BlockPos::new(
+                    hit.block.x + i64::from(face_x),
+                    hit.block.y + i64::from(face_y),
+                    hit.block.z + i64::from(face_z),
+                ),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Build the 12 outline edges of the targeted cell, inflated outward slightly
+/// so the wireframe does not z-fight with the block faces it sits on.
+fn outline_bytes(hit: &PickHit) -> Vec<u8> {
+    const INFLATE: f32 = 0.004;
+    let min = [
+        hit.block.x as f32 - INFLATE,
+        hit.block.y as f32 - INFLATE,
+        hit.block.z as f32 - INFLATE,
+    ];
+    let max = [
+        hit.block.x as f32 + 1.0 + INFLATE,
+        hit.block.y as f32 + 1.0 + INFLATE,
+        hit.block.z as f32 + 1.0 + INFLATE,
+    ];
+    // Corner bits: x, y, z select the min or max end per axis.
+    let corner = |bits: u32| {
+        [
+            if bits & 1 != 0 { max[0] } else { min[0] },
+            if bits & 2 != 0 { max[1] } else { min[1] },
+            if bits & 4 != 0 { max[2] } else { min[2] },
+        ]
+    };
+    // 12 edges of the cube as corner-index pairs.
+    const EDGES: [(u32, u32); 12] = [
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    let mut vertices = Vec::with_capacity(EDGES.len() * 2);
+    for (from, to) in EDGES {
+        for position in [corner(from), corner(to)] {
+            vertices.push(Vertex {
+                position,
+                normal: [0.0, 1.0, 0.0],
+                color: [0.05, 0.05, 0.05],
+            });
+        }
+    }
+    Scene::vertex_bytes(&vertices)
 }
 
 fn create_depth(device: &Device, width: u32, height: u32) -> Texture {

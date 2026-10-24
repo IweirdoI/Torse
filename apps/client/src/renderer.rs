@@ -66,11 +66,15 @@ pub const SKY: Color = Color {
     a: 1.0,
 };
 
+/// Selection outline capacity: 12 cube edges of 2 vertices each.
+const MAX_LINE_VERTICES: usize = 24;
+
 /// Device, queue, pipeline, camera uniform, and terrain buffers.
 pub struct GpuContext {
     device: Device,
     queue: Queue,
     pipeline: RenderPipeline,
+    line_pipeline: RenderPipeline,
     uniform: Buffer,
     bind_group: BindGroup,
     #[allow(dead_code)]
@@ -78,6 +82,8 @@ pub struct GpuContext {
     vertex_buffer: Option<Buffer>,
     index_buffer: Option<Buffer>,
     index_count: u32,
+    line_buffer: Buffer,
+    line_count: u32,
 }
 
 impl GpuContext {
@@ -176,17 +182,67 @@ impl GpuContext {
             multiview_mask: None,
             cache: None,
         });
+        // The outline reuses the terrain shader with a line topology; it only
+        // reads depth, so the outline never occludes the terrain it marks.
+        let line_descriptor = RenderPipelineDescriptor {
+            label: Some("client outline pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 36,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &attributes,
+                })],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..PrimitiveState::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        };
+        let line_pipeline = device.create_render_pipeline(&line_descriptor);
+        let line_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("client outline vertices"),
+            size: (MAX_LINE_VERTICES * 36) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             device,
             queue,
             pipeline,
+            line_pipeline,
             uniform,
             bind_group,
             layout,
             vertex_buffer: None,
             index_buffer: None,
             index_count: 0,
+            line_buffer,
+            line_count: 0,
         }
     }
 
@@ -221,6 +277,16 @@ impl GpuContext {
     pub fn write_camera(&self, view_projection: [f32; 16]) {
         self.queue
             .write_buffer(&self.uniform, 0, &matrix_bytes(view_projection));
+    }
+
+    /// Replace the selection outline. `vertex_bytes` uses the terrain layout
+    /// and is truncated to the outline capacity.
+    pub fn write_lines(&mut self, vertex_bytes: &[u8]) {
+        let stride = 36;
+        let limit = vertex_bytes.len().min(MAX_LINE_VERTICES * stride);
+        self.queue
+            .write_buffer(&self.line_buffer, 0, &vertex_bytes[..limit]);
+        self.line_count = (limit / stride) as u32;
     }
 
     /// Encode the one terrain pass onto any colour and depth view pair.
@@ -259,6 +325,11 @@ impl GpuContext {
             pass.set_vertex_buffer(0, vertices.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.index_count, 0, 0..1);
+        }
+        if self.line_count > 0 {
+            pass.set_pipeline(&self.line_pipeline);
+            pass.set_vertex_buffer(0, self.line_buffer.slice(..));
+            pass.draw(0..self.line_count, 0..1);
         }
     }
 }

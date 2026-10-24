@@ -1,5 +1,72 @@
-# Mod示例
+# Mod示例与工具
 
-此目录预留仅通过公开SDK开发的Mod示例。包格式与SDK契约确定后再建立具体示例，当前没有Mod实现或可执行入口。
+Torse通过Wasm组件执行行为Mod。Mod返回世界修改、组件更新、库存转移和唤醒计划，由宿主检查权限、准备并提交。包清单与内容使用TOML，行为边界定义于[behavior.wit](../../crates/mod_api/wit/behavior.wit)。
 
-初始验证目标包括具有容器、配方、UI和联网状态的加工机器。示例应验证权限、事务、持久状态与故障行为，并避免依赖引擎私有接口。
+| 示例 | 用途 |
+|---|---|
+| [roundtrip](roundtrip/src/lib.rs) | 验证WIT查询、计划返回和组件调用边界 |
+| [machine](machine/mod.toml) | 可装载的机器包，包含内容定义、四步加工逻辑与无界面场景 |
+
+SDK与工具尚未提供独立发布安装布局，以下命令使用本仓库的Cargo工作区。SDK和示例遵循仓库的[GPL-3.0-only许可](../../LICENSE)。
+
+## 运行机器示例
+
+先在仓库根目录安装Wasm目标：
+
+```sh
+rustup target add wasm32-unknown-unknown
+```
+
+检查包，再构建行为代码并运行场景：
+
+```sh
+cargo run -p torse-mod-host --features package --bin torse-mod -- check examples/mods/machine
+cargo run -p torse-mod-host --features package --bin torse-mod -- test examples/mods/machine --scenario examples/mods/machine/scenario.toml
+```
+
+成功时会输出各包的派发、提交、拒绝与陷阱统计，并以`scenario passed`结束。场景读取[scenario.toml](machine/scenario.toml)中的世界、实体、初始库存、唤醒和断言。测试模式授予清单申请的权限，实际服务端仍由宿主策略决定授权。
+
+生成目录内容锁文件并验证：
+
+```sh
+cargo run -p torse-mod-host --features package --bin torse-mod -- pack examples/mods/machine -o .work/machine.lock
+cargo run -p torse-mod-host --features package --bin torse-mod -- check examples/mods/machine --lock .work/machine.lock
+```
+
+`pack`当前生成锁文件，记录目录文件摘要，不生成安装压缩包。包检查与锁定工具的实现见[torse_mod.rs](../../crates/mod_host/src/bin/torse_mod.rs)。
+
+## 创建自己的包
+
+`new`可生成清单、组件内容、行为代码和场景。当前模板需要显式设置SDK与WIT的路径；将包放在`examples/mods/my-machine`时，PowerShell示例如下：
+
+```powershell
+$env:TORSE_SDK_PATH = "../../../crates/mod_sdk"
+$env:TORSE_WIT_PATH = "../../../crates/mod_api/wit"
+cargo run -p torse-mod-host --features package --bin torse-mod -- new examples/mods/my-machine
+Remove-Item Env:TORSE_SDK_PATH, Env:TORSE_WIT_PATH
+```
+
+其他Shell设置同名环境变量即可，路径相对于生成的Cargo.toml与源码所在crate解释。生成后将`examples/mods/my-machine`加入根Cargo.toml的`workspace.members`；清单中的`build.workspace = "../../../"`指向仓库根目录。使用其他目录时，需同步调整这些路径。
+
+随后按机器示例的方式执行`check`与`test`，将包目录和场景路径替换为新目录。提交贡献前补充包用途、授权需求与验证结果，要求见[贡献指南](../../CONTRIBUTING.md)。
+
+## 持久执行验证
+
+服务端库已提供Mod规则装配。机器进度、库存计划与新唤醒在持久任务中共同结算，恢复时重放已结算结果，不重复执行Guest。现有集成测试覆盖该行为：
+
+```sh
+cargo test -p torse-server --features mods --test mod_durability --locked
+```
+
+当前独立服务端主程序仍使用基础世界，尚未提供命令行Mod包加载或匹配内容的无GPU客户端接入。机器状态的授权展示、方块行为通知与真实图形机器面板仍在开发中。
+
+## 验证与限制
+
+```sh
+cargo test -p torse-mod-host --features package --all-targets --locked
+cargo test -p torse-server --features mods --all-targets --locked
+```
+
+包格式、跨包依赖、Merkle锁与工具验证见[包工具记录](../../benchmarks/M4-mod-package.md)；持久唤醒与恢复见[持久Mod执行](../../benchmarks/M4-mod-durable.md)，跨模块共同提交见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。这些记录描述各次验证时的范围，当前实现以代码和本说明为准。
+
+包API、WIT与内容格式仍在演进，没有通用兼容承诺。依赖包需要一同提供给装载器，尚无远程包发现或注册表。SDK通过仓库路径引用，模板暂不能直接作为独立安装包使用。

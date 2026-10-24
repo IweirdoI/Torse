@@ -1,6 +1,6 @@
 # 连接与状态复制
 
-包名：`torse-net`。B7已实现有界内存传输、非阻塞TCP、会话序号/速率和原子客户端镜像；应用层NetworkHub接入真实权威与持久门槛。
+包名：`torse-net`。提供有界内存传输、非阻塞TCP、会话序号/速率和原子客户端镜像；应用层NetworkHub接入真实权威与持久门槛。
 
 | 文件 | 职责 |
 |---|---|
@@ -15,4 +15,4 @@ MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据
 
 ReplicaMirror先校验完整新状态再替换，拒绝错误Binding、重复/缺失ReplicaSeq、无效字典、Section尺寸或实体位置。连接关闭后应用应丢弃镜像并重新获取基线，不能继续使用旧权限状态。
 
-端到端验证见[执行/网络记录](../../benchmarks/B6-B7-execution-network.md)。这是固定内容和有限范围的串行实现，不包含UDP、多通道、客户端预测或互联网认证。
+端到端验证见[执行与网络记录](../../benchmarks/B6-B7-execution-network.md)。当前验证使用固定内容与有限范围。该传输库不包含UDP、多通道、移动预测或互联网认证；客户端的本地行走不代表已接入服务端移动结算。

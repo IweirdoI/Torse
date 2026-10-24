@@ -8,7 +8,7 @@ Torse是一个用Rust编写的开放方块世界内核与开发框架，提供�
 
 项目将通用框架与具体玩法分开：内核负责世界状态和执行规则，玩法由内容定义、可选模块与Mod组合。客户端和服务端共用领域模型，世界修改经过统一授权与事务提交，再交给存储和网络层处理。
 
-[快速开始](#快速开始) | [项目结构](#项目结构) | [开发与验证](#开发与验证)
+[快速开始](#快速开始) | [项目结构](#项目结构) | [开发与验证](#开发与验证) | [参与贡献](CONTRIBUTING.md) | [许可证](LICENSE)
 
 ## 开发状态
 
@@ -90,7 +90,7 @@ cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 | [apps](apps/README.md) | 图形客户端、独立服务端与开发工具 |
 | [crates](crates/README.md) | 世界、模拟、渲染、编码、存储、协议与网络等框架库 |
 | [crates/mod_sdk](crates/mod_sdk/src/lib.rs) | 面向Mod开发者的SDK |
-| [modules](modules/README.md) | 库存、合成与能量等标准玩法模块 |
+| [modules](modules/README.md) | 库存标准模块，以及预留的合成与能量模块 |
 | [games/base](games/base/README.md) | 基础游戏的内容、规则与素材 |
 | [examples/mods](examples/mods/README.md) | 通过公开SDK实现的Mod示例 |
 | [tests](tests/README.md) | 跨模块场景、故障注入与测试夹具 |
@@ -127,3 +127,14 @@ cargo run -p torse-tools --features experiments -- gpu-probe
 ```
 
 CI配置见[ci.yml](.github/workflows/ci.yml)。窗口交互与实际GPU画面需在本地验证；各项功能的复现命令、结果和未覆盖范围记录在[benchmarks](benchmarks/README.md)中。
+
+
+## 参与贡献
+
+问题反馈、文档修订、测试和代码改进均可通过Issue或Pull Request提交。新功能、公共接口以及存档或网络格式的调整，请先开Issue讨论。环境准备、验证命令与审核要求见[贡献指南](CONTRIBUTING.md)，Mod开发从[示例与工具说明](examples/mods/README.md)开始。
+
+## 许可证
+
+Torse采用GNU General Public License v3.0，仅限第3版（`GPL-3.0-only`）。除文件中另有说明外，该许可适用于仓库中的原创代码、文档、示例和素材；第三方依赖与材料保留各自的许可声明。
+
+GPL-3.0允许商业使用和收费分发。分发受该许可覆盖的软件时，需要遵守相应源码提供、许可声明和再分发要求。完整条款见[LICENSE](LICENSE)，版权归各自贡献者所有。

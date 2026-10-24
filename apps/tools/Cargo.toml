@@ -3,6 +3,7 @@ name = "torse-tools"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [features]
 default = []
@@ -24,5 +25,3 @@ torse-storage = { path = "../../crates/storage" }
 torse-types = { path = "../../crates/types" }
 torse-world = { path = "../../crates/world" }
 torse-world-services = { path = "../../crates/world_services" }
-
-

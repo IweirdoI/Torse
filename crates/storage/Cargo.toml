@@ -3,6 +3,7 @@ name = "torse-storage"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 crc32c = "=0.6.8"

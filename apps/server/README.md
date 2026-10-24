@@ -1,6 +1,6 @@
-# 服务端协调
+# 服务端
 
-包名：`torse-server`。B4提供串行协调器、世界目录锁和文件生命周期；原WorldHost继续服务可信本地事务。B6新增ExecutionHost、ExecutionRecovery与完整持久阶段驱动，B7新增NetworkHub、授权复制和内存/非阻塞TCP接入，主程序已可启动。范围与证据见[执行/网络验收](../../benchmarks/B6-B7-execution-network.md)。
+包名：`torse-server`。提供有限世界的持久执行、文件恢复、授权网络和可选Mod装配，可在无GPU环境中运行。主程序通过ExecutionHost驱动阶段任务，WorldHost保留可信本地事务示例。范围与证据见[执行与网络验证](../../benchmarks/B6-B7-execution-network.md)。
 
 | 文件 | 职责 |
 |---|---|
@@ -15,24 +15,24 @@
 | [bootstrap.rs](src/bootstrap.rs) | 有限演示世界及显式容量配置 |
 | [main.rs](src/main.rs) | 非阻塞监听、固定逻辑Tick和有界关闭 |
 
-## B6/B7执行世界
+## 启动与连接
 
 ```sh
-cargo run -p torse-server -- .work/execution-world --listen 127.0.0.1:7777 --ticks 60
+cargo run -p torse-server -- .work/execution-world --listen 127.0.0.1:7777
 cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 ```
 
-第二条在另一终端执行。--ticks 0持续运行，有限Tick结束后保存并关闭；同目录再次启动恢复Tick、事件、结果和任务位置，使用新epoch。演示创建两个Section及两个容器，对新连接使用只读访客PeerPolicy，因而headless_client看到实体但看不到库存组件。`--fill`仅用于新世界，把两个演示分区铺一层石头地面，方便图形客户端连上后有地形可见；已有存档的世界使用该参数会报错。`--editors`对新连接授予订阅分区内的编辑权限（ActorContext分区授权），配合图形客户端可完成经服务端提交的放置与破坏。`--revoke-after N`以首个连接为锚点，N个Tick后撤销全部会话并关闭传输，用于验收撤权与重连；语义见设计仓库contracts/06-section-grants.md。
+第二条在另一终端执行，需保持服务端运行。默认或`--ticks 0`持续运行，指定`--ticks 60`会在60个Tick后保存并关闭；同目录再次启动恢复Tick、事件、结果和任务位置，使用新epoch。演示创建两个Section及两个容器，对新连接使用只读访客PeerPolicy，因而headless_client看到实体但看不到库存组件。`--fill`仅用于新世界，把两个演示分区铺一层石头地面，方便图形客户端连上后有地形可见；已有存档的世界使用该参数会报错。`--editors`对新连接授予订阅分区内的编辑权限（ActorContext分区授权），配合图形客户端可完成经服务端提交的放置与破坏。`--revoke-after N`以首个连接为锚点，N个Tick后撤销全部会话并关闭传输，用于验收撤权与重连；行为与验证见[授权验收](../../benchmarks/A8-acceptance.md)。
 
-ExecutionHost独占A7 ReplicaSource，使用纯DurableRule规划系统和事件。阶段先写完整冻结任务，再逐项原子记录世界变化、任务进度、事件和结果，最后推进一个阶段。未来输入的关闭拒绝可以使用独立Stopping记录，不越过截止边界执行下一Tick。旧Simulation保留参考用途，不能在日志外直接执行后再补写进度。
+ExecutionHost独占ReplicaSource，使用纯DurableRule规划系统和事件。阶段先写完整冻结任务，再逐项原子记录世界变化、任务进度、事件和结果，最后推进一个阶段。未来输入的关闭拒绝可以使用独立Stopping记录，不越过截止边界执行下一Tick。旧Simulation保留参考用途，不能在日志外直接执行后再补写进度。
 
-B9支持WorkPlan携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。
+WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。
 
 持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。这是新执行目录，原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。完整状态每条日志替换、有限世界驻留、同步刷盘是本轮边界，未进行吞吐或硬件断电验收。
 
-NetworkHub通过泛型协议接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线和增量都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。真实用户认证、TLS、窗口和移动预测由应用后续集成。
+NetworkHub通过泛型协议接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线和增量都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权世界与编辑请求；真实用户认证、TLS，以及服务端移动结算和客户端校正尚未接入。
 
-## 原本地世界工具
+## 本地世界示例
 
 WorldHost消耗一个初始化完成的WorldAuthority，后续只提供只读world访问。Server::commit_transaction接收借用的可信本地事务，准备时生成完整ChangeSet，仍由通用协调器执行预留、发布、接纳和刷盘。LocalCommit分别表示业务拒绝、存储预留受阻或持久提交。预留受阻时世界、序号、实体分配水位和调用方事务均保持原状，可重新调用。
 
@@ -42,7 +42,7 @@ WorldHost消耗一个初始化完成的WorldAuthority，后续只提供只读wor
 
 Server::advance_phase在可信调用方完成当前阶段工作后，经相同日志门槛持久推进一个完整阶段。阶段0到5顺序推进，发布阶段完成后进入下一Tick的输入阶段，next_step保持0。进度记录使用空ChangeSet；普通世界事务保持当前恢复位置。预留受阻不改变进度，刷盘失败停止实例并禁止读取。该接口不调用Simulation或玩法系统，调用方仍负责确认阶段工作已完成。
 
-WorldHostRecovery允许从日志恢复到Tick中间的完整阶段边界，拒绝跳阶段、倒退、非零步骤及同条记录同时推进和修改世界。检查点仍只在Tick起点捕获，关闭时把当前Tick剩余阶段依次写入日志，再保存下一Tick起点。LocalWorldModel的网络输入、输出和复制载荷使用Infallible，网络接纳入口无法构造请求。TransactionId只供诊断，不提供请求去重语义。待执行事件、会话、动作结果和复制订阅继续由后续阶段接入。
+WorldHostRecovery允许从日志恢复到Tick中间的完整阶段边界，拒绝跳阶段、倒退、非零步骤及同条记录同时推进和修改世界。检查点仍只在Tick起点捕获，关闭时把当前Tick剩余阶段依次写入日志，再保存下一Tick起点。LocalWorldModel的网络输入、输出和复制载荷使用Infallible，网络接纳入口无法构造请求。TransactionId只供诊断，不提供请求去重语义。待执行事件、动作结果与请求去重由独立的ExecutionHost处理，会话与订阅由NetworkHub管理；此本地模型不接入网络。
 
 capture_snapshot_with_budget先借用世界检查条目和字节预算，再捕获完整快照。条目包括根、状态、分区、实体、组件、字段和嵌套集合项；字节包括结构、集合元素、字符串和稠密格值，宿主另计封装元数据。预算不包含分配器开销和临时捕获索引，编码预算与文件容量继续单独检查。世界全部驻留，运行期没有可变存储或卸载入口。
 
@@ -58,7 +58,7 @@ cargo run -p torse-server --example durable_world -- .work/local-world
 
 ## 提交与访问
 
-Server拥有权威实例、日志、检查点和目录锁。HostAuthority是应用层适配接口，未替换A的WorldAuthority、Recovery或共同契约。准备项必须拥有完整ModelCommit，丢弃后保留输入、事件、序号与持久身份，不能只提供CommitMeta。
+Server拥有权威实例、日志、检查点和目录锁。HostAuthority是应用层适配接口，通过WorldAuthority、Recovery及公共契约接入领域实现。准备项必须拥有完整ModelCommit，丢弃后保留输入、事件、序号与持久身份，不能只提供CommitMeta。
 
 drive_one依次准备、预留日志、发布、立即接纳日志、处理订阅失效、刷盘，最后返回DurablePublication。日志预留的Busy、TooLarge、InvalidRecord发生在发布前，返回Blocked，调用方可以处理背压或拒绝原因后重新准备。Stopped、发布不变量故障、接纳失败、失效处理失败和刷盘失败停止实例，不再次发布，也不返回持久确认。
 
@@ -123,4 +123,14 @@ shutdown消耗Server，先停止接纳，通知权威适配器按包含截止Tic
 
 [协调器测试](tests/coordinator.rs)检查调用次序、预留拒绝后的重试、失败后的持久门槛、输入身份、订阅失效、快照与有界关闭。[目录测试](tests/directory.rs)检查跨进程互斥、退出后解锁、逐字节截断与位翻转、代数递增和容量。[文件生命周期测试](tests/lifecycle.rs)覆盖恢复后续号、尾部保留、整条后缀缺失、初始化拒绝，以及发布后、接纳前突然退出。
 
-当前B2日志从位置1完整保留，恢复会校验整个文件。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。分段回收、异步刷盘、脏区流送和硬件断电保证仍需单独验收，当前功能测试不代替性能或平台承诺。
+当前日志从位置1完整保留，恢复会校验整个文件。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。分段回收、异步刷盘、脏区流送和硬件断电保证仍需单独验收，当前功能测试不代替性能或平台承诺。
+
+## Mod持久执行
+
+启用`mods`特性后，服务端库可装配Mod规则，验证机器加工、跨模块原子提交、持久唤醒与恢复。运行现有集成测试：
+
+```sh
+cargo test -p torse-server --features mods --test mod_durability --locked
+```
+
+测试需要`wasm32-unknown-unknown`目标。包检查与无界面场景见[Mod示例与工具](../../examples/mods/README.md)。当前主程序仍启动基础演示世界，命令行加载Mod包、机器状态的授权展示与真实图形操作尚待接入。

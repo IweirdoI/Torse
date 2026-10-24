@@ -2,7 +2,7 @@
 
 本页记录B8历史实现。B9已将机器修改和库存转移改为同一任务的一条持久记录，当前行为与验收见[Mod原子执行](M4-mod-atomic.md)。下文的单来源拆分、下一Tick转移和旧测试输出仅用于说明当时的实现。
 
-日期:2026-10-24。范围:Mod平台持久化接线,非M4验收。维护:Mod平台侧(T05)。前置:[M4-mod-package.md](M4-mod-package.md)。契约依据:[B6持久执行与B7联网接入](../TorseDesign/contracts/05-durable-execution-network.md)。
+日期:2026-10-24。范围:Mod平台持久化接线,非M4验收。维护:Mod平台侧(T05)。前置:[M4-mod-package.md](M4-mod-package.md)。执行宿主说明见[服务端文档](../apps/server/README.md)。
 
 ## 问题
 

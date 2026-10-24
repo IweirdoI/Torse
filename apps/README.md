@@ -1,11 +1,16 @@
 # 应用入口
 
-| 目录 | 职责 | 当前状态 |
+| 目录 | 职责 | 运行方式 |
 |---|---|---|
-| [client](client/README.md) | 世界装配、网格上传、离屏渲染与交互窗口 | `capture`输出PNG；`window`连续渲染、飞行输入与分区流式，见[说明](client/README.md) |
-| [server](server/README.md) | 持久权威、事件、请求与授权网络装配 | 主程序支持创建/恢复、非阻塞TCP和有限Tick关闭，含headless_client示例 |
-| [tools](tools/src/main.rs) | 内容检查、世界与提交场景、技术实验 | `content-fixture`、`m1-scenario`、`commit-scenario`、`tick-scenario`、`exchange-scenario`、`recovery-scenario`、`movement-scenario`、`persistence-scenario`、`ecs-probe`、`wasm-probe`和`gpu-probe` |
+| [client](client/README.md) | 图形渲染、本地交互、联网镜像与编辑请求 | `--window`打开窗口，`--capture`输出PNG，`--connect`连接服务端 |
+| [server](server/README.md) | 持久世界、阶段执行、授权网络与可选Mod装配 | 指定世界目录启动；支持恢复、有限Tick运行及无GPU客户端示例 |
+| [tools](tools/src/main.rs) | 内容检查、世界场景、提交与恢复验证、技术实验 | 使用`content-fixture`、`m1-scenario`等子命令 |
 
-各应用由组合入口连接服务，底层库不反向依赖应用。无界面服务端不得依赖客户端窗口、GPU或纹理解码初始化。
+底层库不依赖应用入口。客户端负责窗口、GPU与输入，服务端可在无图形环境中运行，两者通过领域模型和公共接口装配。
 
+开发工具还提供`commit-scenario`、`tick-scenario`、`exchange-scenario`、`recovery-scenario`、`movement-scenario`与`persistence-scenario`。`ecs-probe`、`wasm-probe`和`gpu-probe`需要显式启用`experiments`特性。
 
+```sh
+cargo run -p torse-tools -- m1-scenario
+cargo run -p torse-tools --features experiments -- wasm-probe
+```

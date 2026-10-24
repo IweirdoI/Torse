@@ -3,6 +3,7 @@ name = "torse-inventory"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 torse-actions = { path = "../../crates/actions" }

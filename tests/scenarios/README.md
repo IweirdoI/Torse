@@ -1,12 +1,23 @@
 # 验证场景
 
-预留以下场景，具体断言与执行入口随公共契约实现。
+现有场景分布在工作区测试与开发工具中。本目录不包含独立测试程序，下表列出主要入口。
 
-- 编码往返、长度越界与未知载荷保留。
-- 完整提交保存、关闭与恢复。
-- 日志写入和检查点发布期间的进程中止。
-- 两台机器竞争同一原料，恢复后无重复产物或事件。
-- 两客户端快照与增量衔接、重复请求和断线重连。
-- 慢连接、日志积压和磁盘错误下的有界处理。
+| 场景 | 执行入口 |
+|---|---|
+| 编码往返、版本与固定字节 | `cargo test -p torse-codec --all-targets --locked` |
+| 日志、检查点、损坏与恢复 | `cargo test -p torse-storage --all-targets --locked` |
+| 跨模块事务、移动与授权复制 | `cargo test -p torse-sim --all-targets --locked` |
+| 库存争用与物品守恒 | `cargo run -p torse-inventory --example competition --locked` |
+| 持久执行、重复请求、两客户端与进程退出 | `cargo test -p torse-server --all-targets --locked` |
+| Mod组件、包工具与场景 | `cargo test -p torse-mod-host --features package --all-targets --locked` |
+| 持久Mod任务与恢复 | `cargo test -p torse-server --features mods --all-targets --locked` |
 
-测试运行产生的数据放入工作区的工作目录，避免覆盖人工存档。
+开发工具提供`m1-scenario`、`commit-scenario`、`tick-scenario`、`exchange-scenario`、`movement-scenario`、`recovery-scenario`和`persistence-scenario`。例如：
+
+```sh
+cargo run -p torse-tools -- recovery-scenario
+```
+
+Mod测试需要`wasm32-unknown-unknown`目标。窗口编辑、行走、UI与联机画面见[客户端运行说明](../../apps/client/README.md)和[验证记录](../../benchmarks/README.md)。未知内容原始载荷保留仍未实现，不列入已通过的能力。
+
+运行产生的数据放入`.work/`，复现存档问题时使用副本，避免覆盖人工存档。

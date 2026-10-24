@@ -3,6 +3,7 @@ name = "torse-client"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 ab_glyph = "=0.2.32"

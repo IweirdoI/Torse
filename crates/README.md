@@ -1,31 +1,36 @@
 # 框架库
 
-2026-10-24补充：B6已接入真实世界本地持久事务与阶段恢复；A7已交付`sim::replica::ReplicaSource`及授权复制载荷，B6持久执行与B7协议、会话、内存/TCP传输已接线。客户端已有离屏单帧、交互窗口连续渲染与联网镜像编辑：飞行与行走输入、分区流式装载、窗口内放置破坏、A4行走事务、TCP消费A7投影及范围授权下的服务端提交回投已接通。下面的模块划分继续适用。
+本目录保存Torse的通用库。世界、模拟与数据交换已有可运行实现；部分资源管理和诊断接口仍为预留入口。图形窗口与GPU绘制装配位于[客户端](../apps/client/README.md)，持久执行与网络会话装配位于[服务端](../apps/server/README.md)。
 
-下表对应架构总览的模块职责。M0已实现公共类型、内容契约、内容与模块编译、动作声明、codec原语和三组技术探针。M1补上块状态编号、Section存储与生命周期、确定性生成、AABB碰撞和CPU网格，客户端已接入离屏绘制与交互窗口。M2已有固定步长时钟、阶段排序、类型化事务与单协调器提交、实体和基础动作/库存。B1到B5补上有界日志、检查点、恢复扫描与世界载荷编码，B6已接入真实世界本地持久事务；ExecutionHost已提供持久阶段循环，NetworkHub提供授权协议和连接。
-
-| 目录 | 职责 |
+| 目录 | 职责与当前范围 |
 |---|---|
-| [types](types/src/lib.rs) | 身份、坐标、时间与通用错误等公共基础类型 |
-| [runtime](runtime/src/lib.rs) | CPU任务、I/O、执行预算与ECS探针 |
-| [content](content/src/lib.rs) | 内容契约、编译、摘要与M0夹具 |
-| [world](world/src/lib.rs) | 块状态注册、Section存储、分区生命周期与票据、实体存储与空间索引、有界组件、交换载荷 |
-| [sim](sim/src/lib.rs) | 固定步长时钟、阶段与系统排序、事务、Tick驱动、变更载荷、权威装配与恢复、有界授权复制源 |
+| [types](types/src/lib.rs) | 身份、坐标、时间、结果、持久位置与复制等公共类型 |
+| [runtime](runtime/src/lib.rs) | 运行时接口入口与可选ECS实验；通用任务调度尚未实现 |
+| [content](content/src/lib.rs) | 内容契约、编译、摘要与基础内容夹具 |
+| [world](world/src/lib.rs) | 方块状态、分区、实体、组件与快照、变更载荷 |
+| [sim](sim/src/lib.rs) | 固定步长、阶段排序、事务仲裁、动作授权、持久任务、授权复制与行走领域逻辑 |
 | [actions](actions/src/lib.rs) | 动作声明、命令冲突与注册检查 |
 | [modules](modules/src/lib.rs) | 模块依赖、服务与注册解析 |
-| [world_services](world_services/src/lib.rs) | 确定性地形生成与AABB碰撞；光照与寻路待实现 |
-| [mod_api](mod_api/src/lib.rs) | SDK契约、可传输类型与接口描述 |
-| [mod_host](mod_host/src/lib.rs) | Mod宿主骨架与Wasmtime探针 |
-| [codec](codec/README.md) | 存档快照、记录与内容映射的显式编码，B部分 |
-| [storage](storage/README.md) | 日志、检查点、恢复与迁移，B部分 |
-| [protocol](protocol/README.md) | 泛型消息版本1、兼容握手、输入/结果和授权复制表示 |
-| [net](net/README.md) | 会话与速率、内存/非阻塞TCP、有界队列及原子客户端镜像 |
-| [render](render/src/lib.rs) | CPU网格生成、遮挡剔除与网格缓存；wgpu探针仍为初始化骨架 |
-| [assets](assets/src/lib.rs) | 资源定位、解码与格式适配 |
-| [diagnostics](diagnostics/src/lib.rs) | 指标、跟踪与故障关联 |
+| [world_services](world_services/src/lib.rs) | 确定性地形生成与AABB碰撞；光照和寻路尚未实现 |
+| [mod_api](mod_api/src/lib.rs) | 公共Mod接口，行为边界定义于[behavior.wit](mod_api/wit/behavior.wit) |
+| [mod_sdk](mod_sdk/src/lib.rs) | Guest端绑定与确定性随机数辅助，供Mod代码依赖 |
+| [mod_host](mod_host/src/lib.rs) | Wasm组件宿主、权威桥、包解析、场景运行与持久派发，按特性启用 |
+| [codec](codec/README.md) | 记录包裹、世界载荷、执行状态与网络载荷的显式编码 |
+| [storage](storage/README.md) | 有界日志、检查点、文件恢复扫描与故障处理 |
+| [protocol](protocol/README.md) | 兼容握手、请求、结果、订阅和授权复制消息 |
+| [net](net/README.md) | 会话、速率、有界内存与TCP传输、原子客户端镜像 |
+| [render](render/src/lib.rs) | CPU网格、遮挡剔除、依赖修订校验与网格缓存，另含可选GPU初始化实验 |
+| [assets](assets/src/lib.rs) | 资源管理的预留入口；当前UI资源加载位于客户端 |
+| [diagnostics](diagnostics/src/lib.rs) | 统一诊断库的预留入口；现有指标由各实现提供 |
 
-crates/modules负责通用装配，根目录modules中的库负责具体可选玩法。codec细分总览中storage的编码职责。
+## 依赖与执行
 
-依赖方向遵循架构总览，后续按实际接口添加依赖。world不得调用render或net，render不得直接修改权威world。提交记录通过公共契约交付，避免sim与storage互相依赖。
+`world`保存领域状态，`sim`负责动作规划、事务准备和提交。准备项在发布前可以被拒绝或丢弃，世界状态与提交序号在成功发布后才推进。
 
+服务端协调日志预留、发布、接纳和刷盘，达到持久位置后才释放相应结果与复制输出。存储层检查记录结构与连续性，恢复构建器检查世界语义。网络层传输授权投影，客户端接收完整基线或增量后更新镜像。
 
+`world`不依赖渲染和网络，渲染层通过动作接口发起编辑。`crates/modules`负责通用模块装配，根目录[modules](../modules/README.md)负责可选玩法。新增跨层行为时，请明确状态归属和提交边界，避免产生另一条未经授权或无法恢复的写入路径。
+
+## 可选特性
+
+Mod宿主的`component`启用Wasm组件调用，`authority`增加权威世界桥，`package`进一步启用包工具与场景运行器。服务端的`mods`特性启用完整Mod接入。具体命令见[Mod示例](../examples/mods/README.md)，提交要求见[贡献指南](../CONTRIBUTING.md)。

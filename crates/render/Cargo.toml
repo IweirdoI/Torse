@@ -3,6 +3,7 @@ name = "torse-render"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [features]
 gpu-probe = ["dep:pollster", "dep:wgpu", "dep:winit"]

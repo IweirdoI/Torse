@@ -3,6 +3,7 @@ name = "torse-mod-sdk"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 wit-bindgen = "=0.63.0"

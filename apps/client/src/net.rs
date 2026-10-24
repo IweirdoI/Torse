@@ -22,6 +22,7 @@ pub type ServerMessage =
     torse_protocol::ServerMessage<torse_sim::durable::Reply, ReplicaSnapshot, ReplicaChanges>;
 
 /// One decoded server message the window acts on.
+#[derive(Debug)]
 pub enum NetEvent {
     /// Handshake finished; the session is live.
     Welcomed { session: SessionId },
@@ -135,8 +136,10 @@ impl<T: Transport> Connection<T> {
             }
             ServerMessage::Result { seq, reply } => {
                 // A rejected reply is a completed request the caller must see
-                // as denied, not silently dropped.
-                let committed = matches!(reply.status, torse_sim::durable::ReplyStatus::Committed);
+                // as denied, not silently dropped. ReadOnly results are a
+                // legitimate query outcome, not a rejection.
+                use torse_sim::durable::ReplyStatus;
+                let committed = !matches!(reply.status, ReplyStatus::Rejected(_));
                 Ok(Some(NetEvent::Finished { seq, committed }))
             }
             ServerMessage::Rejected(reason) => {
@@ -213,6 +216,49 @@ mod tests {
         let second = connection.request(call).expect("send");
         assert_eq!(first.0, 1);
         assert_eq!(second.0, 2);
+    }
+
+    #[test]
+    fn read_only_results_are_not_rejections() {
+        use torse_sim::durable::{Reply, ReplyStatus};
+        use torse_types::{CommitCursor, CommitSeq, OutputBudget, WorldId};
+
+        let (client, mut server) = MemoryTransport::pair(default_limits()).expect("pair");
+        let mut connection = Connection::new(client);
+        let reply = Reply {
+            status: ReplyStatus::ReadOnly,
+            fields: Default::default(),
+            at: CommitCursor {
+                world: WorldId(1),
+                seq: CommitSeq(1),
+            },
+        };
+        let frame = {
+            let mut bytes = Vec::new();
+            wire::encode(
+                &ServerMessage::Result {
+                    seq: RequestSeq(1),
+                    reply,
+                },
+                &mut bytes,
+                OutputBudget {
+                    max_items: 1000,
+                    max_bytes: 65_536,
+                },
+                codec_limits(),
+            )
+            .expect("encode");
+            bytes
+        };
+        server.send(frame).expect("send");
+        let events = connection.poll().expect("poll");
+        match &events[..] {
+            [NetEvent::Finished { seq, committed }] => {
+                assert_eq!(seq.0, 1);
+                assert!(committed, "read-only is a legitimate outcome");
+            }
+            other => panic!("unexpected events {other:?}"),
+        }
     }
 
     fn default_limits() -> TransportLimits {

@@ -614,11 +614,11 @@ impl Scene {
 
     /// Section containing a world-space position on the section layer.
     pub fn center_section(&self, position: [f32; 3]) -> SectionPos {
-        SectionPos::new(
-            (position[0] as i64).div_euclid(self.side as i64),
-            0,
-            (position[2] as i64).div_euclid(self.side as i64),
-        )
+        // Floor before the cast: `as i64` truncates toward zero, which would
+        // put a camera at -16.5 into section -1 instead of -2.
+        let x = (position[0].floor() as i64).div_euclid(i64::from(self.side));
+        let z = (position[2].floor() as i64).div_euclid(i64::from(self.side));
+        SectionPos::new(x, 0, z)
     }
 
     /// Flatten every cached mesh into one interleaved vertex and index buffer,
@@ -944,6 +944,15 @@ mod tests {
         assert_eq!(
             scene.center_section([-16.0, 5.0, -17.0]),
             SectionPos::new(-1, 0, -2)
+        );
+        // Non-integer negatives must floor, not truncate toward zero.
+        assert_eq!(
+            scene.center_section([-16.5, 5.0, -0.5]),
+            SectionPos::new(-2, 0, -1)
+        );
+        assert_eq!(
+            scene.center_section([-0.5, 5.0, 15.5]),
+            SectionPos::new(-1, 0, 0)
         );
     }
 

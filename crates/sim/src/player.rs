@@ -161,16 +161,15 @@ pub struct MoveInput {
 impl MoveInput {
     /// Normalized world-space wish direction for [`walker_step`].
     pub fn direction(&self) -> [f64; 3] {
-        let raw = [
-            f64::from(self.wish[0]),
-            f64::from(self.wish[1]),
-            f64::from(self.wish[2]),
-        ];
-        let length = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+        // Horizontal only: vertical motion comes from gravity and jumps,
+        // never from network input. A client sending a nonzero wish y gains
+        // nothing.
+        let raw = [f64::from(self.wish[0]), 0.0, f64::from(self.wish[2])];
+        let length = (raw[0] * raw[0] + raw[2] * raw[2]).sqrt();
         if length == 0.0 {
             return [0.0; 3];
         }
-        [raw[0] / length, raw[1] / length, raw[2] / length]
+        [raw[0] / length, 0.0, raw[2] / length]
     }
 }
 

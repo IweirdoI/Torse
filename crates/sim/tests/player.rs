@@ -176,6 +176,13 @@ fn quantized_directions_normalize() {
         jump: false,
     };
     assert_eq!(idle.direction(), [0.0, 0.0, 0.0]);
+    // The vertical component is ignored: network input cannot drift upward.
+    let climbing = MoveInput {
+        seq: 4,
+        wish: [0, 1, 0],
+        jump: false,
+    };
+    assert_eq!(climbing.direction(), [0.0, 0.0, 0.0]);
 }
 
 #[test]

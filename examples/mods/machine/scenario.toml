@@ -1,0 +1,53 @@
+[world]
+side = 16
+min-y = 0
+max-y = 32
+
+[[entity]]
+id = "machine"
+at = [2.0, 2.0, 2.0]
+
+[entity.components."machine:schema/state"]
+"machine:field/progress" = 0
+"machine:field/input" = "@input"
+"machine:field/output" = "@output"
+
+[[entity]]
+id = "input"
+at = [3.0, 2.0, 2.0]
+
+[entity.inventory]
+slots = 2
+stock = ["base:stone"]
+
+[[entity]]
+id = "output"
+at = [4.0, 2.0, 2.0]
+
+[entity.inventory]
+slots = 2
+
+[[wakeup]]
+tick = 1
+package = "machine"
+entity = "machine"
+key = "machine:tick"
+
+[[step]]
+ticks = 6
+
+[[assert]]
+entity = "machine"
+component = "machine:schema/state"
+field = "machine:field/progress"
+equals = 2
+
+[[assert]]
+entity = "input"
+slot = 0
+
+[[assert]]
+entity = "output"
+slot = 0
+item = "base:stone"
+count = 1

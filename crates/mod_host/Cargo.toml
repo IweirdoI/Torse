@@ -15,8 +15,16 @@ authority = [
     "dep:torse-types",
     "dep:torse-world",
 ]
+package = ["authority", "dep:sha2", "dep:toml"]
+
+[[bin]]
+name = "torse-mod"
+path = "src/bin/torse_mod.rs"
+required-features = ["package"]
 
 [dependencies]
+sha2 = { version = "=0.10.9", optional = true }
+toml = { version = "=1.1.8", optional = true }
 torse-content = { path = "../content", optional = true }
 torse-inventory = { path = "../../modules/inventory", optional = true }
 torse-sim = { path = "../sim", optional = true }

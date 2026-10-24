@@ -1,0 +1,28 @@
+[[component]]
+id = "machine:schema/state"
+version = 1
+owner = "machine:module"
+persistence = "always"
+replication = "server-private"
+
+[[component.field]]
+id = "machine:field/progress"
+type = "u32"
+required = true
+
+[[component.field]]
+id = "machine:field/input"
+type = "entity"
+required = true
+
+[[component.field]]
+id = "machine:field/output"
+type = "entity"
+required = true
+
+[[state]]
+id = "machine:state/machine"
+version = 1
+
+[[state.component]]
+id = "machine:schema/state"

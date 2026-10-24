@@ -1,0 +1,14 @@
+id = "machine"
+version = "0.1.0"
+api = "0.2"
+side = "server"
+permissions = ["inventory:permission/transfer", "inventory:permission/read"]
+
+[server]
+entry = "logic.wasm"
+
+[build]
+crate = "torse-mod-machine"
+workspace = "../../../"
+
+[dependencies]

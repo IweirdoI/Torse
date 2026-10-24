@@ -10,8 +10,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use exports::torse::behavior::invoke::{
-    Event, Invocation, ObjectRef, OwnedState, Plan, WakeupTarget,
+use exports::torse::behavior::invoke::Event;
+pub use exports::torse::behavior::invoke::{
+    Event as InvokeEvent, Invocation, ObjectRef, OwnedState, Plan, WakeupTarget,
 };
 use torse::behavior::diagnostics::LogLevel;
 use torse::behavior::query::{
@@ -19,7 +20,8 @@ use torse::behavior::query::{
     QueryError,
 };
 use torse::behavior::schedule::WakeupSlot;
-use torse::behavior::types::{Atom, Bbox, BlockRef, Cell, EntityId as WitEntityId, Field, Vec3i};
+pub use torse::behavior::types::EntityId as WitEntityId;
+use torse::behavior::types::{Atom, Bbox, BlockRef, Cell, Field, Vec3i};
 use torse_content::{
     ComponentField, ComponentFieldType, ComponentSchema as ContentSchema, ContentPack,
     PersistencePolicy, compile, m0_fixture_pack,
@@ -91,25 +93,75 @@ fn key(value: &str) -> ContentKey {
     ContentKey::parse(value).expect("scenario key parses")
 }
 
-/// The host side of one behavior package bound to a real authority.
+/// Per-package grant assembled at load time: the actor identity the host
+/// vouches for and the schemas this package owns.
+pub struct PackageGrant {
+    pub actor: ActorContext,
+    pub owned_schemas: Vec<ContentKey>,
+}
+
+/// The host side of one or more behavior packages bound to a real authority.
+/// All packages share one world; symbols are global, grants are per package.
 pub struct AuthorityHost {
     authority: WorldAuthority,
     catalog: ItemCatalog,
     symbols: BTreeMap<String, u32>,
     symbol_keys: Vec<String>,
-    owned_schemas: Vec<ContentKey>,
-    package: ContentKey,
-    actor: ActorContext,
-    wakeups: Vec<(u64, EntityId, String)>,
+    packages: BTreeMap<ContentKey, PackageGrant>,
+    // Wakeup entries remember the package that scheduled them so dispatch
+    // returns to the right instance.
+    wakeups: Vec<(u64, EntityId, String, ContentKey)>,
     pub meters: Meters,
     read_positions: BTreeSet<BlockPos>,
-    consecutive_failures: u32,
-    deactivated: bool,
+    consecutive_failures: BTreeMap<ContentKey, u32>,
+    deactivated: BTreeSet<ContentKey>,
     transaction_counter: u128,
     dispatch_local: u32,
 }
 
 impl AuthorityHost {
+    /// Registers one package's grant; principal doubles as transaction source.
+    pub fn register_package(
+        &mut self,
+        principal: ContentKey,
+        actor: ActorContext,
+        owned_schemas: Vec<ContentKey>,
+    ) {
+        self.packages.insert(
+            principal,
+            PackageGrant {
+                actor,
+                owned_schemas,
+            },
+        );
+    }
+}
+
+impl AuthorityHost {
+    /// Assembles a host around a live authority; symbols are interned by the
+    /// caller from the compiled content.
+    pub fn new(
+        authority: WorldAuthority,
+        catalog: ItemCatalog,
+        symbols: BTreeMap<String, u32>,
+        symbol_keys: Vec<String>,
+    ) -> Self {
+        Self {
+            authority,
+            catalog,
+            symbols,
+            symbol_keys,
+            packages: BTreeMap::new(),
+            wakeups: Vec::new(),
+            meters: Meters::default(),
+            read_positions: BTreeSet::new(),
+            consecutive_failures: BTreeMap::new(),
+            deactivated: BTreeSet::new(),
+            transaction_counter: 0,
+            dispatch_local: 0,
+        }
+    }
+
     /// Read-only access to the wrapped authority.
     pub fn authority(&self) -> &WorldAuthority {
         &self.authority
@@ -125,19 +177,19 @@ impl AuthorityHost {
         self.authority.seq()
     }
 
-    /// Whether the handler has been deactivated by repeated failures.
-    pub fn is_deactivated(&self) -> bool {
-        self.deactivated
+    /// Whether the package handler has been deactivated by repeated failures.
+    pub fn is_deactivated(&self, package: &ContentKey) -> bool {
+        self.deactivated.contains(package)
     }
 
-    /// Consecutive failure count since the last committed plan.
-    pub fn consecutive_failures(&self) -> u32 {
-        self.consecutive_failures
+    /// Consecutive failure count for a package since its last committed plan.
+    pub fn consecutive_failures(&self, package: &ContentKey) -> u32 {
+        self.consecutive_failures.get(package).copied().unwrap_or(0)
     }
 
     /// Registers a wakeup directly; used to seed the first machine tick.
-    pub fn seed_wakeup(&mut self, tick: u64, entity: EntityId, key: &str) {
-        self.wakeups.push((tick, entity, key.to_string()));
+    pub fn seed_wakeup(&mut self, tick: u64, entity: EntityId, key: &str, package: ContentKey) {
+        self.wakeups.push((tick, entity, key.to_string(), package));
     }
 
     fn symbol_of(&self, key: &ContentKey) -> Option<u32> {
@@ -150,27 +202,27 @@ impl AuthorityHost {
         ContentKey::parse(stored).ok()
     }
 
-    fn begin_invocation(&mut self) {
+    pub fn begin_invocation(&mut self) {
         self.read_positions.clear();
     }
 
-    fn drain_due_wakeups(&mut self, tick: u64) -> Vec<(EntityId, String)> {
+    pub fn drain_due_wakeups(&mut self, tick: u64) -> Vec<(EntityId, String, ContentKey)> {
         let mut due = Vec::new();
         let mut remaining = Vec::new();
-        for (at, entity, key) in std::mem::take(&mut self.wakeups) {
+        for (at, entity, key, package) in std::mem::take(&mut self.wakeups) {
             if at <= tick {
-                due.push((entity, key));
+                due.push((entity, key, package));
             } else {
-                remaining.push((at, entity, key));
+                remaining.push((at, entity, key, package));
             }
         }
         self.wakeups = remaining;
         due
     }
 
-    fn build_invocation(&self, tick: u64, event: &Event) -> Invocation {
+    pub fn build_invocation(&self, tick: u64, event: &Event, package: &ContentKey) -> Invocation {
         let self_ = match event {
-            Event::Wakeup(target) => self.build_object_ref(&target.entity),
+            Event::Wakeup(target) => self.build_object_ref(&target.entity, package),
             _ => None,
         };
         Invocation {
@@ -181,7 +233,11 @@ impl AuthorityHost {
         }
     }
 
-    fn build_object_ref(&self, wit_entity: &WitEntityId) -> Option<ObjectRef> {
+    fn build_object_ref(
+        &self,
+        wit_entity: &WitEntityId,
+        package: &ContentKey,
+    ) -> Option<ObjectRef> {
         let entity = wit_entity.to_entity_id();
         let handle = self.authority.entities().handle_of(entity)?;
         let stored = self.authority.entities().get(handle)?;
@@ -204,8 +260,13 @@ impl AuthorityHost {
                 .unwrap_or(0),
             _ => 0,
         };
+        let owned_schemas = self
+            .packages
+            .get(package)
+            .map(|grant| grant.owned_schemas.clone())
+            .unwrap_or_default();
         let mut owned = Vec::new();
-        for schema in &self.owned_schemas {
+        for schema in &owned_schemas {
             if let Some(fields) = stored.components.component(schema)
                 && let Some(flat) = self.fields_to_flat(fields)
             {
@@ -306,11 +367,15 @@ impl AuthorityHost {
     }
 
     /// Validates a returned plan and commits it through the coordinator.
-    fn apply_plan(&mut self, plan: &Plan) -> Result<DispatchOutcome, String> {
+    pub fn apply_plan(
+        &mut self,
+        plan: &Plan,
+        package: &ContentKey,
+    ) -> Result<DispatchOutcome, String> {
         let mut transactions: Vec<Transaction> = Vec::new();
         let mut machine_tx = Transaction::new(
             self.next_transaction_id(),
-            self.package.clone(),
+            package.clone(),
             self.ordering(0),
         );
         let mut has_machine_work = false;
@@ -347,7 +412,7 @@ impl AuthorityHost {
             has_machine_work = true;
             let schema = self.key_of(edit.schema).ok_or("unknown schema symbol")?;
             if let Some(declared) = self.authority.schemas().get(&schema) {
-                if declared.owner_module != self.package {
+                if declared.owner_module != *package {
                     return Ok(DispatchOutcome::Rejected {
                         reason: format!("schema {schema} is owned by {}", declared.owner_module),
                     });
@@ -396,12 +461,13 @@ impl AuthorityHost {
                 };
                 let transaction_id = self.next_transaction_id();
                 let ordering = self.ordering(source.0 as u64);
-                let AuthorityHost {
-                    authority,
-                    catalog,
-                    actor,
-                    ..
-                } = self;
+                let authority = &self.authority;
+                let catalog = &self.catalog;
+                let actor = &self
+                    .packages
+                    .get(package)
+                    .expect("dispatching package is registered")
+                    .actor;
                 let view = actor.view(authority);
                 let transfer_tx =
                     match plan_transfer(&view, catalog, transfer, transaction_id, ordering) {
@@ -426,7 +492,8 @@ impl AuthorityHost {
         if transactions.is_empty() {
             for wakeup in &plan.wakeups {
                 let entity = wakeup.entity.to_entity_id();
-                self.wakeups.push((wakeup.tick, entity, wakeup.key.clone()));
+                self.wakeups
+                    .push((wakeup.tick, entity, wakeup.key.clone(), package.clone()));
             }
             return Ok(DispatchOutcome::Committed {
                 transactions: 0,
@@ -471,10 +538,11 @@ impl AuthorityHost {
                 .publish(prepared)
                 .map_err(|fault| format!("invariant fault while publishing: {fault:?}"))?;
         }
-        self.consecutive_failures = 0;
+        self.consecutive_failures.insert(package.clone(), 0);
         for wakeup in &plan.wakeups {
             let entity = wakeup.entity.to_entity_id();
-            self.wakeups.push((wakeup.tick, entity, wakeup.key.clone()));
+            self.wakeups
+                .push((wakeup.tick, entity, wakeup.key.clone(), package.clone()));
         }
         Ok(DispatchOutcome::Committed {
             transactions: transaction_count,
@@ -482,13 +550,18 @@ impl AuthorityHost {
         })
     }
 
-    fn on_failure(&mut self, tick: u64, event: &Event) {
-        self.consecutive_failures += 1;
-        if self.consecutive_failures >= FAILURE_THRESHOLD {
-            self.deactivated = true;
+    pub fn on_failure(&mut self, tick: u64, event: &Event, package: &ContentKey) {
+        let failures = self
+            .consecutive_failures
+            .entry(package.clone())
+            .or_insert(0);
+        *failures += 1;
+        if *failures >= FAILURE_THRESHOLD {
+            self.deactivated.insert(package.clone());
         } else if let Event::Wakeup(target) = event {
             let entity = target.entity.to_entity_id();
-            self.wakeups.push((tick + 1, entity, target.key.clone()));
+            self.wakeups
+                .push((tick + 1, entity, target.key.clone(), package.clone()));
         }
     }
 }
@@ -498,7 +571,7 @@ impl WitEntityId {
         EntityId((self.high as u128) << 64 | self.low as u128)
     }
 
-    fn from_entity_id(entity: EntityId) -> Self {
+    pub fn from_entity_id(entity: EntityId) -> Self {
         Self {
             low: entity.0 as u64,
             high: (entity.0 >> 64) as u64,
@@ -684,12 +757,12 @@ impl torse::behavior::schedule::Host for AuthorityHost {
     fn pending_wakeups(&mut self, key_prefix: Option<String>) -> Vec<WakeupSlot> {
         self.wakeups
             .iter()
-            .filter(|(_, _, key)| {
+            .filter(|(_, _, key, _)| {
                 key_prefix
                     .as_ref()
                     .is_none_or(|prefix| key.starts_with(prefix.as_str()))
             })
-            .map(|(tick, entity, key)| WakeupSlot {
+            .map(|(tick, entity, key, _)| WakeupSlot {
                 entity: WitEntityId::from_entity_id(*entity),
                 tick: *tick,
                 key: key.clone(),
@@ -700,6 +773,7 @@ impl torse::behavior::schedule::Host for AuthorityHost {
 
 /// One component instance bound to an authority host.
 pub struct ModInstance {
+    package: ContentKey,
     engine: Engine,
     component: Component,
     bindings: ModBehavior,
@@ -711,6 +785,7 @@ pub struct ModInstance {
 
 impl ModInstance {
     pub fn new(
+        package: ContentKey,
         engine: &Engine,
         component: Component,
         host: AuthorityHost,
@@ -718,6 +793,7 @@ impl ModInstance {
     ) -> Result<Self, String> {
         let (bindings, store) = Self::build(engine, &component, host, budget)?;
         Ok(Self {
+            package,
             engine: engine.clone(),
             component,
             bindings,
@@ -777,7 +853,8 @@ impl ModInstance {
 
     /// Dispatches one event and applies the returned plan.
     pub fn dispatch(&mut self, tick: u64, event: Event) -> Result<DispatchOutcome, String> {
-        if self.host().is_deactivated() {
+        let package = self.package.clone();
+        if self.host().is_deactivated(&package) {
             return Ok(DispatchOutcome::Deactivated);
         }
         let fuel = self.budget.fuel;
@@ -788,7 +865,7 @@ impl ModInstance {
                 .map_err(|error| format!("fuel reset failed: {error}"))?;
             store.data_mut().begin_invocation();
         }
-        let invocation = self.host().build_invocation(tick, &event);
+        let invocation = self.host().build_invocation(tick, &event, &package);
         let result = {
             let store = self.store.as_mut().expect("store present");
             self.bindings
@@ -802,15 +879,15 @@ impl ModInstance {
                     .map(|cause| cause.to_string())
                     .collect::<Vec<_>>()
                     .join("; ");
-                self.host_mut().on_failure(tick, &event);
+                self.host_mut().on_failure(tick, &event, &package);
                 self.rebuild()?;
                 Ok(DispatchOutcome::Trapped { reason })
             }
             Ok(None) => Ok(DispatchOutcome::NoPlan),
             Ok(Some(plan)) => {
-                let outcome = self.host_mut().apply_plan(&plan)?;
+                let outcome = self.host_mut().apply_plan(&plan, &package)?;
                 if matches!(outcome, DispatchOutcome::Rejected { .. }) {
-                    self.host_mut().on_failure(tick, &event);
+                    self.host_mut().on_failure(tick, &event, &package);
                 }
                 Ok(outcome)
             }
@@ -822,7 +899,13 @@ impl ModInstance {
         let mut outcomes = Vec::new();
         for tick in from..from + count {
             let due = self.host_mut().drain_due_wakeups(tick);
-            for (entity, key) in due {
+            for (entity, key, package) in due {
+                if package != self.package {
+                    return Err(format!(
+                        "wakeup scheduled for package {package} but this instance serves {}",
+                        self.package
+                    ));
+                }
                 let event = Event::Wakeup(WakeupTarget {
                     entity: WitEntityId::from_entity_id(entity),
                     key,
@@ -989,22 +1072,8 @@ pub fn machine_scenario(config: &ScenarioConfig) -> Result<MachineWorld, String>
         }
     }
 
-    let host = AuthorityHost {
-        authority,
-        catalog: catalog.clone(),
-        symbols,
-        symbol_keys,
-        owned_schemas: vec![schema_key.clone()],
-        package,
-        actor,
-        wakeups: Vec::new(),
-        meters: Meters::default(),
-        read_positions: BTreeSet::new(),
-        consecutive_failures: 0,
-        deactivated: false,
-        transaction_counter: 0,
-        dispatch_local: 0,
-    };
+    let mut host = AuthorityHost::new(authority, catalog.clone(), symbols, symbol_keys);
+    host.register_package(package, actor, vec![schema_key.clone()]);
     Ok(MachineWorld {
         host,
         catalog,

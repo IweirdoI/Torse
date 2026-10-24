@@ -5,6 +5,12 @@
 #[cfg(feature = "authority")]
 pub mod authority;
 
+#[cfg(feature = "package")]
+pub mod package;
+
+#[cfg(feature = "package")]
+pub mod scenario;
+
 #[cfg(feature = "component")]
 pub mod component;
 

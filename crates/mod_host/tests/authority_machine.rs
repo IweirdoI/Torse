@@ -82,8 +82,14 @@ fn fixture(features: &[&str], stock_input: bool) -> Fixture {
     let input = world.input;
     let output = world.output;
     let catalog = world.catalog;
-    let instance = ModInstance::new(&engine, component, world.host, CallBudget::prototype())
-        .expect("instance builds");
+    let instance = ModInstance::new(
+        key("machine:module"),
+        &engine,
+        component,
+        world.host,
+        CallBudget::prototype(),
+    )
+    .expect("instance builds");
     let mut fixture = Fixture {
         instance,
         machine,
@@ -94,7 +100,7 @@ fn fixture(features: &[&str], stock_input: bool) -> Fixture {
     fixture
         .instance
         .host_mut()
-        .seed_wakeup(1, machine, "machine:tick");
+        .seed_wakeup(1, machine, "machine:tick", key("machine:module"));
     fixture
 }
 
@@ -181,7 +187,13 @@ fn failed_transfer_leaves_no_partial_processing() {
         "rejected plan must not advance progress"
     );
     assert_eq!(fixture.instance.host().seq().0, seq_before);
-    assert_eq!(fixture.instance.host().consecutive_failures(), 1);
+    assert_eq!(
+        fixture
+            .instance
+            .host()
+            .consecutive_failures(&key("machine:module")),
+        1
+    );
     assert_eq!(slot0(&fixture.instance, fixture.output), None);
 
     // Restock the input chest and let the rescheduled wakeup finish the job.
@@ -238,7 +250,13 @@ fn foreign_schema_ownership_is_rejected() {
         outcomes[0]
     );
     assert_eq!(fixture.instance.host().seq().0, 0, "nothing commits");
-    assert_eq!(fixture.instance.host().consecutive_failures(), 1);
+    assert_eq!(
+        fixture
+            .instance
+            .host()
+            .consecutive_failures(&key("machine:module")),
+        1
+    );
 }
 
 #[test]
@@ -247,23 +265,34 @@ fn consecutive_failures_deactivate_the_handler() {
     let outcomes = fixture.instance.run_ticks(1, 11).expect("ticks run");
     // Ticks 1-3 commit; ticks 4-11 are eight consecutive rejections, the last
     // of which reaches the deactivation threshold.
-    assert!(fixture.instance.host().is_deactivated(), "{outcomes:?}");
+    assert!(
+        fixture
+            .instance
+            .host()
+            .is_deactivated(&key("machine:module")),
+        "{outcomes:?}"
+    );
     let committed = outcomes
         .iter()
         .filter(|outcome| matches!(outcome, DispatchOutcome::Committed { .. }))
         .count();
     assert_eq!(committed, 3);
     assert_eq!(
-        fixture.instance.host().consecutive_failures(),
+        fixture
+            .instance
+            .host()
+            .consecutive_failures(&key("machine:module")),
         8,
         "{outcomes:?}"
     );
 
     // The eighth failure deactivated the handler; later dispatch is refused.
-    fixture
-        .instance
-        .host_mut()
-        .seed_wakeup(50, fixture.machine, "machine:tick");
+    fixture.instance.host_mut().seed_wakeup(
+        50,
+        fixture.machine,
+        "machine:tick",
+        key("machine:module"),
+    );
     let outcomes = fixture.instance.run_ticks(50, 1).expect("tick runs");
     assert_eq!(outcomes, vec![DispatchOutcome::Deactivated]);
 }
@@ -278,7 +307,13 @@ fn trap_rebuilds_the_instance_from_committed_state() {
         outcomes[0]
     );
     assert_eq!(fixture.instance.host().seq().0, 0);
-    assert_eq!(fixture.instance.host().consecutive_failures(), 1);
+    assert_eq!(
+        fixture
+            .instance
+            .host()
+            .consecutive_failures(&key("machine:module")),
+        1
+    );
     assert_eq!(machine_progress(&fixture.instance, fixture.machine), 0);
 
     // The rebuilt instance still executes (and traps again on the spin guest),
@@ -289,5 +324,11 @@ fn trap_rebuilds_the_instance_from_committed_state() {
         "unexpected outcome: {:?}",
         outcomes[0]
     );
-    assert_eq!(fixture.instance.host().consecutive_failures(), 2);
+    assert_eq!(
+        fixture
+            .instance
+            .host()
+            .consecutive_failures(&key("machine:module")),
+        2
+    );
 }

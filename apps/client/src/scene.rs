@@ -13,10 +13,9 @@ use torse_render::{MeshData, MeshJob, MeshSample, RenderBlock, RenderBox, build_
 use torse_sim::WorldAuthority;
 use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
 use torse_sim::replica::{ReplicaChanges, ReplicaEntity, ReplicaSnapshot};
-use torse_sim::{OrderingKey, Phase, Transaction, block_actions};
+use torse_sim::{OrderingKey, Phase, block_actions};
 use torse_types::{
-    BlockPos, Compatibility, ContentKey, EntityHandle, LocalPos, SectionPos, TransactionId,
-    TransactionOutcome, WorldId,
+    BlockPos, Compatibility, ContentKey, LocalPos, SectionPos, TransactionId, WorldId,
 };
 use torse_world::{
     BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentSet,
@@ -26,23 +25,6 @@ use torse_world::{
 use torse_world_services::{GenerationParams, HillTerrain};
 
 use crate::pick::{PickOutcome, cast_ray};
-
-/// Walk speed in blocks per second.
-const WALK_SPEED: f64 = 4.3;
-/// Gravity in blocks per second squared.
-const GRAVITY: f64 = 28.0;
-/// Jump launch speed in blocks per second.
-const JUMP_SPEED: f64 = 8.4;
-/// Player collider half extents: 0.6 wide, 1.8 tall, centre at body middle.
-const WALKER_HALF: [f64; 3] = [0.3, 0.9, 0.3];
-
-/// Client-side walk state for the player entity.
-#[derive(Clone, Copy)]
-struct Walker {
-    handle: EntityHandle,
-    velocity: [f64; 3],
-    grounded: bool,
-}
 
 /// One vertex uploaded to the GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -77,7 +59,7 @@ pub struct Scene {
     service: ActionService,
     principal: ContentKey,
     edit_counter: u64,
-    walker: Option<Walker>,
+    walker: Option<torse_sim::player::WalkerState>,
     generator: Option<HillTerrain>,
     side: u32,
     radius: i64,
@@ -356,11 +338,7 @@ impl Scene {
             .entities_mut()
             .spawn(at)
             .map_err(|error| format!("spawn failed: {error}"))?;
-        self.walker = Some(Walker {
-            handle,
-            velocity: [0.0; 3],
-            grounded: false,
-        });
+        self.walker = Some(torse_sim::player::WalkerState::new(handle));
         Ok(())
     }
 
@@ -373,13 +351,9 @@ impl Scene {
             .map(|entity| entity.position)
     }
 
-    /// Integrate one walk tick and commit the displacement as an A4 movement
-    /// transaction; the authority resolves terrain collision in `prepare`.
-    ///
-    /// `wish` is a normalized horizontal direction in world units, `jump`
-    /// requests a jump while grounded, and `dt` is the fixed tick length.
-    /// Rejections (a stale observation, for instance) drop the tick and keep
-    /// the entity where it is; the caller sees the unchanged position.
+    /// Integrate one walk tick through the shared player domain; see the
+    /// movement contract. Rejections drop the tick and keep the entity at
+    /// its committed position.
     pub fn step_walker(
         &mut self,
         wish: [f64; 3],
@@ -389,86 +363,27 @@ impl Scene {
         let Some(mut walker) = self.walker else {
             return Err("walk mode has no entity".to_owned());
         };
-        let Some(entity) = self.authority.entities().get(walker.handle) else {
-            return Err("walker entity is gone".to_owned());
-        };
-        let (id, previous) = (entity.id, entity.position);
-
-        // Client-side integration in blocks per second: horizontal velocity
-        // follows the input directly, gravity integrates downward, and jumps
-        // are only possible while standing on something. The committed delta
-        // scales by the tick length.
-        walker.velocity[0] = wish[0] * WALK_SPEED;
-        walker.velocity[2] = wish[2] * WALK_SPEED;
-        walker.velocity[1] -= GRAVITY * f64::from(dt);
-        if walker.grounded && jump {
-            walker.velocity[1] = JUMP_SPEED;
-        }
-        let dt = f64::from(dt);
-        let requested = previous.translated([
-            walker.velocity[0] * dt,
-            walker.velocity[1] * dt,
-            walker.velocity[2] * dt,
-        ]);
-        self.walker = Some(walker);
-
         self.edit_counter += 1;
         let counter = self.edit_counter;
-        let mut tx = Transaction::new(
+        let outcome = torse_sim::player::walker_step(
+            &mut self.authority,
+            &mut walker,
+            wish,
+            jump,
+            dt,
+            &self.principal,
             TransactionId(u128::from(counter)),
-            key("client:motion"),
-            OrderingKey {
-                phase: Phase::Simulation,
-                rule_priority: 0,
-                stable_task_key: counter,
-                local_sequence: 0,
-            },
         );
-        tx.move_entity(
-            self.walker.as_ref().expect("walker stored").handle,
-            id,
-            previous,
-            [
-                requested.x - previous.x,
-                requested.y - previous.y,
-                requested.z - previous.z,
-            ],
-            WALKER_HALF,
-        );
-        let result = self.authority.commit(&tx);
-
-        let Some(walker) = self.walker.as_mut() else {
-            return Err("walker vanished mid step".to_owned());
-        };
-        let Some(entity) = self.authority.entities().get(walker.handle) else {
-            return Err("walker entity is gone".to_owned());
-        };
-        if let Ok(outcome) = &result
-            && let TransactionOutcome::Rejected(code) = outcome.outcome
-        {
-            // Drop this tick: keep the entity at its committed position with
-            // the horizontal velocity already reset for the next tick.
-            walker.velocity[1] = 0.0;
-            let _ = code;
-            return Ok((entity.position, walker.grounded));
+        self.walker = Some(walker);
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(torse_sim::player::StepError::EntityGone) => {
+                Err("walker entity is gone".to_owned())
+            }
+            Err(torse_sim::player::StepError::Fault(fault)) => {
+                Err(format!("commit fault: {fault:?}"))
+            }
         }
-        result.map_err(|fault| format!("commit fault: {fault:?}"))?;
-
-        // Compare the committed position against the request to recover the
-        // ground contact the collision sweep discovered. Resting above the
-        // request means the descent was blocked: that is the floor. Ending
-        // below the request means a ceiling stopped the rise.
-        let settled = entity.position;
-        if settled.y - requested.y > 1e-9 {
-            walker.grounded = true;
-            walker.velocity[1] = 0.0;
-        } else if requested.y - settled.y > 1e-9 {
-            walker.velocity[1] = 0.0;
-            walker.grounded = false;
-        } else {
-            walker.grounded = false;
-        }
-        Ok((settled, walker.grounded))
     }
 
     /// Plan and commit one place or break action through the action service.

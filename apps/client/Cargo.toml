@@ -3,3 +3,14 @@ name = "torse-client"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+pollster = "0.4.0"
+png = "0.17"
+torse-content = { path = "../../crates/content" }
+torse-render = { path = "../../crates/render" }
+torse-sim = { path = "../../crates/sim" }
+torse-types = { path = "../../crates/types" }
+torse-world = { path = "../../crates/world" }
+torse-world-services = { path = "../../crates/world_services" }
+wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl", "std"] }

@@ -262,12 +262,19 @@ impl GpuContext {
     }
 
     /// Replace one section's terrain buffers, keeping other sections as-is.
+    ///
+    /// Empty content removes the entry instead: wgpu forbids slicing a
+    /// zero-size buffer, and an empty mesh simply has nothing to draw.
     pub fn upload_section(
         &mut self,
         section: torse_types::SectionPos,
         vertex_bytes: &[u8],
         indices: &[u32],
     ) {
+        if vertex_bytes.is_empty() || indices.is_empty() {
+            self.terrain.remove(&section);
+            return;
+        }
         use wgpu::util::DeviceExt;
         let buffers = SectionBuffers {
             vertices: self
@@ -348,6 +355,9 @@ impl GpuContext {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         for section in self.terrain.values() {
+            if section.index_count == 0 {
+                continue;
+            }
             pass.set_vertex_buffer(0, section.vertices.slice(..));
             pass.set_index_buffer(section.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..section.index_count, 0, 0..1);

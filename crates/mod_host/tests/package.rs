@@ -78,7 +78,7 @@ fn manifest_and_content_validation() {
         "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.1\"\nside = \"server\"\npermissions = []\n",
         None,
     );
-    let errors = resolve(&[bad_api.clone()], &base).unwrap_err();
+    let errors = resolve(std::slice::from_ref(&bad_api), &base).unwrap_err();
     assert!(
         errors
             .iter()
@@ -107,7 +107,7 @@ id = "elsewhere:schema/state"
             .to_string(),
         ),
     );
-    let errors = resolve(&[foreign_namespace.clone()], &base).unwrap_err();
+    let errors = resolve(std::slice::from_ref(&foreign_namespace), &base).unwrap_err();
     assert!(
         errors
             .iter()
@@ -130,7 +130,7 @@ type = "u32"
             .to_string(),
         ),
     );
-    let errors = resolve(&[orphan.clone()], &base).unwrap_err();
+    let errors = resolve(std::slice::from_ref(&orphan), &base).unwrap_err();
     assert!(
         errors
             .iter()
@@ -190,7 +190,7 @@ id = "dep:schema/state"
         "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n\n[dependencies]\ndep = \"0.2\"\n",
         Some(VALID_CONTENT.to_string()),
     );
-    let errors = resolve(&[root_missing.clone()], &base).unwrap_err();
+    let errors = resolve(std::slice::from_ref(&root_missing), &base).unwrap_err();
     assert!(
         errors
             .iter()
@@ -223,7 +223,7 @@ id = "dep:schema/state"
     );
     std::fs::write(duplicated.join("content").join("again.toml"), VALID_CONTENT)
         .expect("second content file");
-    let errors = resolve(&[duplicated.clone()], &base).unwrap_err();
+    let errors = resolve(std::slice::from_ref(&duplicated), &base).unwrap_err();
     assert!(
         errors
             .iter()
@@ -248,13 +248,13 @@ id = "dep:schema/state"
 fn lock_roundtrip_detects_tampering() {
     let base = scenario::engine_base();
     let dir = temp_package("lock", VALID_MANIFEST, Some(VALID_CONTENT.to_string()));
-    let set = resolve(&[dir.clone()], &base).expect("resolves");
+    let set = resolve(std::slice::from_ref(&dir), &base).expect("resolves");
     let lock = write_lock(&set);
     verify_lock(&set, &lock).expect("lock verifies against itself");
 
     // Tamper with a file; the merkle digest must change.
     std::fs::write(dir.join("content").join("main.toml"), "# tampered\n").expect("tamper");
-    let tampered = resolve(&[dir.clone()], &base).expect("resolves again");
+    let tampered = resolve(std::slice::from_ref(&dir), &base).expect("resolves again");
     let errors = verify_lock(&tampered, &lock).unwrap_err();
     assert!(
         errors

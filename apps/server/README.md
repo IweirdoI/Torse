@@ -26,6 +26,8 @@ cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 
 ExecutionHost独占A7 ReplicaSource，使用纯DurableRule规划系统和事件。阶段先写完整冻结任务，再逐项原子记录世界变化、任务进度、事件和结果，最后推进一个阶段。未来输入的关闭拒绝可以使用独立Stopping记录，不越过截止边界执行下一Tick。旧Simulation保留参考用途，不能在日志外直接执行后再补写进度。
 
+B9支持WorkPlan携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。
+
 持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。这是新执行目录，原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。完整状态每条日志替换、有限世界驻留、同步刷盘是本轮边界，未进行吞吐或硬件断电验收。
 
 NetworkHub通过泛型协议接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线和增量都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。真实用户认证、TLS、窗口和移动预测由应用后续集成。

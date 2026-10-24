@@ -473,15 +473,70 @@ fields!(StoredTransaction {
     despawns
 });
 fields!(Accepted { id, input });
-fields!(FrozenTask {
-    transaction,
-    request,
-    consume,
-    schedule,
-    cancel,
-    status,
-    output
-});
+impl Wire for FrozenTask {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        match &self.transaction {
+            None => 0u8.write(e)?,
+            Some(group) => {
+                group.validate()?;
+                if group.members.len() == 1 && group.id == group.members[0].id {
+                    1u8.write(e)?;
+                    group.members[0].write(e)?;
+                } else {
+                    2u8.write(e)?;
+                    group.id.write(e)?;
+                    group.members.write(e)?;
+                }
+            }
+        }
+        self.request.write(e)?;
+        self.consume.write(e)?;
+        self.schedule.write(e)?;
+        self.cancel.write(e)?;
+        self.status.write(e)?;
+        self.output.write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        let transaction = match u8::read(d)? {
+            0 => None,
+            1 => {
+                charge_vec::<StoredTransaction>(d, 1)?;
+                let member = StoredTransaction::read(d)?;
+                Some(StoredTransactionGroup {
+                    id: member.id,
+                    members: vec![member],
+                })
+            }
+            2 => {
+                let id = TransactionId::read(d)?;
+                // Check the group bound before allocating its member vector.
+                let n = read_items(d, 1, "frozen group")?;
+                if n == 0 || n > torse_sim::transaction::MAX_GROUP_MEMBERS {
+                    return Err(invalid("invalid frozen group size"));
+                }
+                charge_vec::<StoredTransaction>(d, n)?;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push(StoredTransaction::read(d)?);
+                }
+                Some(StoredTransactionGroup { id, members })
+            }
+            _ => return Err(invalid("invalid frozen transaction tag")),
+        };
+        if let Some(group) = &transaction {
+            group.validate()?;
+        }
+        Ok(Self {
+            transaction,
+            request: Wire::read(d)?,
+            consume: Wire::read(d)?,
+            schedule: Wire::read(d)?,
+            cancel: Wire::read(d)?,
+            status: Wire::read(d)?,
+            output: Wire::read(d)?,
+        })
+    }
+}
 fields!(PhaseWork { tasks, next });
 fields!(RuntimeState {
     rules,

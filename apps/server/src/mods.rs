@@ -1,10 +1,9 @@
 //! Mod assembly for the durable execution host.
 //!
 //! Loads behavior packages from directories, spawns the demo machine world,
-//! and adapts each package into one `DurableRule`. Guest plans are decomposed
-//! into single-source settlements: this package's edits become one
-//! transaction, a transfer becomes its own future event, and guest wakeups
-//! become persistent event drafts. Traps settle as empty work with a bounded
+//! and adapts each package into one `DurableRule`. Machine edits and native
+//! inventory plans form one multi-source transaction group; wakeups share its
+//! durable settlement. Traps settle as empty work with a bounded
 //! retry; rejections settle terminally without touching the world.
 
 use std::cell::RefCell;
@@ -22,7 +21,7 @@ use torse_mod_host::durable_dispatch::{
 use torse_mod_host::package::{self, resolve};
 use torse_sim::action::{ActionTarget, ActorContext};
 use torse_sim::durable::{EventDraft, TimedEvent};
-use torse_sim::{OrderingKey, Phase, SystemSpec, WorldAuthority};
+use torse_sim::{OrderingKey, Phase, SystemSpec, TransactionGroup, WorldAuthority};
 use torse_types::{Compatibility, ContentKey, EntityId, Fault, Tick, TransactionId};
 use torse_world::{ComponentFields, ComponentValue, Position, Section, WorldBounds};
 
@@ -51,13 +50,11 @@ fn bump(map: &mut BTreeMap<String, u64>, key: &str) {
 const RETRY_TICKS: u64 = 8;
 const MAX_ATTEMPTS: u32 = 8;
 
-/// Mutable rule state: the reusable guest and id allocators. The rule trait
+/// Mutable rule state: the guest executor. The rule trait
 /// takes `&self`, so mutation lives behind a `RefCell`; the server is
 /// single-threaded and dispatches never recurse.
 struct RuleInner {
     guest: DurableGuest,
-    transaction_counter: u128,
-    local: u32,
 }
 
 /// One behavior package adapted to the durable execution host.
@@ -109,44 +106,6 @@ fn wakeup_draft(
     }
 }
 
-fn transfer_draft(
-    rule: &ContentKey,
-    package_id: &str,
-    tick: u64,
-    transfer: &TransferSpec,
-) -> EventDraft {
-    EventDraft {
-        tick: Tick(tick),
-        rule: rule.clone(),
-        payload: ComponentFields::from([
-            (
-                payload_key(package_id, "kind"),
-                ComponentValue::Text("transfer".into()),
-            ),
-            (
-                payload_key(package_id, "source"),
-                ComponentValue::Entity(transfer.source),
-            ),
-            (
-                payload_key(package_id, "source-slot"),
-                ComponentValue::U32(transfer.source_slot),
-            ),
-            (
-                payload_key(package_id, "destination"),
-                ComponentValue::Entity(transfer.destination),
-            ),
-            (
-                payload_key(package_id, "destination-slot"),
-                ComponentValue::U32(transfer.destination_slot),
-            ),
-            (
-                payload_key(package_id, "count"),
-                ComponentValue::U32(transfer.count),
-            ),
-        ]),
-    }
-}
-
 fn empty_plan() -> WorkPlan {
     WorkPlan {
         transaction: None,
@@ -163,6 +122,7 @@ impl ModRule {
         entity: EntityId,
         key: &str,
         attempt: u32,
+        transaction_id: TransactionId,
     ) -> WorkPlan {
         let outcome = {
             let mut inner = self.inner.borrow_mut();
@@ -206,13 +166,9 @@ impl ModRule {
             Ok(GuestOutcome::NoPlan) => empty_plan(),
             Ok(GuestOutcome::Plan(plan)) => {
                 let stable = entity.0 as u64;
-                let (transaction_id, local) = {
-                    let mut inner = self.inner.borrow_mut();
-                    inner.transaction_counter += 1;
-                    let local = inner.local;
-                    inner.local = inner.local.wrapping_add(1);
-                    (TransactionId(inner.transaction_counter), local)
-                };
+                // The caller derives the diagnostic identity from the durable
+                // event; retries consume no process-local allocation state.
+                let local = 0;
                 match convert_plan(
                     world,
                     &self.symbols,
@@ -224,13 +180,37 @@ impl ModRule {
                 ) {
                     Ok(parts) => {
                         let mut schedule = Vec::new();
+                        let ordering = OrderingKey {
+                            phase: Phase::Simulation,
+                            rule_priority: 0,
+                            stable_task_key: stable,
+                            local_sequence: local,
+                        };
+                        let mut members: Vec<_> = parts.machine.into_iter().collect();
                         if let Some(transfer) = &parts.transfer {
-                            schedule.push(transfer_draft(
-                                &self.rule,
-                                &self.package_id,
-                                tick.0 + 1,
-                                transfer,
-                            ));
+                            let request = Transfer {
+                                source: transfer.source,
+                                source_slot: transfer.source_slot as usize,
+                                destination: transfer.destination,
+                                destination_slot: transfer.destination_slot as usize,
+                                count: transfer.count,
+                            };
+                            match plan_transfer(
+                                &self.actor.view(world),
+                                &self.catalog,
+                                request,
+                                transaction_id,
+                                ordering,
+                            ) {
+                                Ok(transaction) => members.push(transaction),
+                                Err(_) => {
+                                    bump(
+                                        &mut self.stats.borrow_mut().transfer_rejections,
+                                        &self.package_id,
+                                    );
+                                    return empty_plan();
+                                }
+                            }
                         }
                         for (wakeup_tick, wakeup_entity, wakeup_key) in parts.wakeups {
                             schedule.push(wakeup_draft(
@@ -243,7 +223,20 @@ impl ModRule {
                             ));
                         }
                         WorkPlan {
-                            transaction: parts.machine,
+                            transaction: if members.is_empty() {
+                                None
+                            } else {
+                                match TransactionGroup::new(transaction_id, ordering, members) {
+                                    Ok(group) => Some(group),
+                                    Err(_) => {
+                                        bump(
+                                            &mut self.stats.borrow_mut().rejections,
+                                            &self.package_id,
+                                        );
+                                        return empty_plan();
+                                    }
+                                }
+                            },
                             schedule,
                             cancel: Vec::new(),
                         }
@@ -259,7 +252,12 @@ impl ModRule {
         }
     }
 
-    fn settle_transfer(&self, world: &WorldAuthority, transfer: &TransferSpec) -> WorkPlan {
+    fn settle_transfer(
+        &self,
+        world: &WorldAuthority,
+        transfer: &TransferSpec,
+        transaction_id: TransactionId,
+    ) -> WorkPlan {
         let source = transfer.source;
         let request = Transfer {
             source,
@@ -268,13 +266,8 @@ impl ModRule {
             destination_slot: transfer.destination_slot as usize,
             count: transfer.count,
         };
-        let (transaction_id, local) = {
-            let mut inner = self.inner.borrow_mut();
-            inner.transaction_counter += 1;
-            let local = inner.local;
-            inner.local = inner.local.wrapping_add(1);
-            (TransactionId(inner.transaction_counter), local)
-        };
+        // Retained only for pending transfer events from the B8 format.
+        let local = 0;
         let ordering = OrderingKey {
             phase: Phase::Simulation,
             rule_priority: 0,
@@ -404,10 +397,17 @@ impl DurableRule for ModRule {
         };
         let plan = match kind.as_str() {
             "transfer" => match transfer {
-                Some(transfer) => self.settle_transfer(world, &transfer),
+                Some(transfer) => self.settle_transfer(world, &transfer, TransactionId(event.id.0)),
                 None => empty_plan(),
             },
-            _ => self.settle_wakeup(world, tick, entity, &key, attempt),
+            _ => self.settle_wakeup(
+                world,
+                tick,
+                entity,
+                &key,
+                attempt,
+                TransactionId(event.id.0),
+            ),
         };
         Ok(plan)
     }
@@ -436,8 +436,16 @@ fn build_guest_bytes(package: &package::LoadedPackage, spin: bool) -> Result<Vec
         .map(|relative| package.dir.join(relative))
         .unwrap_or_else(|| package.dir.clone());
     let mut command = std::process::Command::new("cargo");
+    // Feature variants must not race over the same output file when several
+    // package tests build and read artifacts concurrently.
+    let target = workspace
+        .join(".work/mod-guests")
+        .join(if spin { "spin" } else { "normal" });
     command
         .arg("build")
+        .arg("--locked")
+        .arg("--target-dir")
+        .arg(&target)
         .arg("--release")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
@@ -453,8 +461,7 @@ fn build_guest_bytes(package: &package::LoadedPackage, spin: bool) -> Result<Vec
     if !status.success() {
         return Err(Fault::invalid_data("guest build failed"));
     }
-    let artifact = workspace
-        .join("target")
+    let artifact = target
         .join("wasm32-unknown-unknown")
         .join("release")
         .join(build_crate.replace('-', "_"))
@@ -629,11 +636,7 @@ pub fn mod_world(
             catalog: catalog.clone(),
             actor,
             stats: Rc::clone(&stats),
-            inner: RefCell::new(RuleInner {
-                guest,
-                transaction_counter: 0,
-                local: 0,
-            }),
+            inner: RefCell::new(RuleInner { guest }),
         }));
     }
 

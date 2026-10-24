@@ -5,8 +5,8 @@
 //! first copies a bounded neighborhood snapshot into the store data and the
 //! guest imports answer from the snapshot. Guests see a limited, read-only
 //! view; the returned plan is converted back into transactions by native
-//! code holding the real world reference. One instance is reused across
-//! dispatches and rebuilt from scratch after a trap.
+//! code holding the real world reference. Every dispatch starts with a fresh
+//! instance, so freeze retries and recovery cannot observe uncommitted guest state.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -102,7 +102,7 @@ pub enum GuestOutcome {
     Trapped(String),
 }
 
-/// A reusable behavior instance answering from bounded snapshots.
+/// A compiled behavior executor creating fresh instances over bounded snapshots.
 pub struct DurableGuest {
     engine: Engine,
     component: Component,
@@ -242,8 +242,7 @@ impl DurableGuest {
         self.dispatches
     }
 
-    /// Discards and rebuilds the instance after a trap so no half-call guest
-    /// state survives.
+    /// Discards all guest state before planning, and after a trap.
     fn rebuild(&mut self) -> Result<(), String> {
         let symbols = Arc::clone(&self.store.data().symbols);
         let (bindings, store) = Self::build(&self.engine, &self.component, symbols, self.budget)?;
@@ -261,6 +260,7 @@ impl DurableGuest {
         key: &str,
         owned_schemas: &[ContentKey],
     ) -> Result<GuestOutcome, String> {
+        self.rebuild()?;
         self.dispatches += 1;
         let symbols = Arc::clone(&self.store.data().symbols);
 
@@ -523,8 +523,8 @@ impl torse::behavior::schedule::Host for DispatchState {
     }
 }
 
-/// One transfer request decomposed out of a guest plan; the caller settles it
-/// as its own future event so each settlement stays single-source.
+/// One transfer request converted by the native inventory planner before the
+/// caller freezes the machine and inventory members as one atomic group.
 #[derive(Clone, Debug)]
 pub struct TransferSpec {
     pub source: EngineEntityId,
@@ -618,7 +618,7 @@ fn cell_to_state(
 ///
 /// Block edits and this package's component edits become one transaction
 /// sourced from `package`; a single transfer is returned separately so the
-/// caller can settle it as its own future event. This mirrors the authority
+/// caller can obtain an inventory member for the same group. This mirrors the authority
 /// bridge's ownership rules without committing anything.
 pub fn convert_plan(
     world: &WorldAuthority,

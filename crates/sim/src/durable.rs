@@ -88,13 +88,101 @@ pub struct Accepted {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrozenTask {
-    pub transaction: Option<StoredTransaction>,
+    pub transaction: Option<StoredTransactionGroup>,
     pub request: Option<Accepted>,
     pub consume: Option<EventId>,
     pub schedule: Vec<EventDraft>,
     pub cancel: Vec<EventId>,
     pub status: ReplyStatus,
     pub output: ComponentFields,
+}
+/// Stable members of one atomic task, in strictly increasing source order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredTransactionGroup {
+    pub id: TransactionId,
+    pub members: Vec<StoredTransaction>,
+}
+impl StoredTransactionGroup {
+    pub fn single(world: &WorldAuthority, tx: &Transaction) -> Result<Self, Fault> {
+        Ok(Self {
+            id: tx.id,
+            members: vec![StoredTransaction::capture(world, tx)?],
+        })
+    }
+    pub fn capture(world: &WorldAuthority, group: &crate::TransactionGroup) -> Result<Self, Fault> {
+        if group.members.iter().any(|m| m.ordering != group.ordering) {
+            return Err(Fault::invalid_data("frozen group ordering mismatch"));
+        }
+        let stored = Self {
+            id: group.id,
+            members: group
+                .members
+                .iter()
+                .map(|tx| StoredTransaction::capture(world, tx))
+                .collect::<Result<_, _>>()?,
+        };
+        stored.validate()?;
+        Ok(stored)
+    }
+    pub fn validate(&self) -> Result<(), Fault> {
+        if self.members.is_empty() || self.members.len() > crate::transaction::MAX_GROUP_MEMBERS {
+            return Err(Fault::invalid_data("invalid frozen group size"));
+        }
+        let first = &self.members[0];
+        if self.members.windows(2).any(|w| w[0].source >= w[1].source)
+            || self.members.iter().any(|m| {
+                (m.phase, m.priority, m.task_key, m.local)
+                    != (first.phase, first.priority, first.task_key, first.local)
+            })
+        {
+            return Err(Fault::invalid_data("noncanonical frozen group"));
+        }
+        if Phase::from_index(first.phase).is_none() {
+            return Err(Fault::invalid_data("unknown frozen group phase"));
+        }
+        // Validate stable targets directly, without resolving runtime handles
+        // or copying component payloads during decoding and recovery.
+        let mut cells = std::collections::BTreeSet::new();
+        let mut components = std::collections::BTreeSet::new();
+        let mut touched = std::collections::BTreeSet::new();
+        let mut despawned = std::collections::BTreeSet::new();
+        let mut lifecycle_members = 0;
+        for member in &self.members {
+            for write in &member.writes {
+                if !cells.insert(write.pos) {
+                    return Err(Fault::invalid_data("duplicate group block"));
+                }
+            }
+            for edit in &member.components {
+                if !components.insert((edit.id, &edit.schema)) {
+                    return Err(Fault::invalid_data("duplicate group component"));
+                }
+                touched.insert(edit.id);
+            }
+            touched.extend(member.moves.iter().map(|m| m.id));
+            if !member.spawns.is_empty() || !member.despawns.is_empty() {
+                lifecycle_members += 1;
+            }
+            for entity in &member.despawns {
+                if !despawned.insert(entity.id) {
+                    return Err(Fault::invalid_data("duplicate group despawn"));
+                }
+            }
+        }
+        if lifecycle_members > 1 || despawned.iter().any(|id| touched.contains(id)) {
+            return Err(Fault::invalid_data("overlapping group lifecycle"));
+        }
+        Ok(())
+    }
+    pub fn restore(&self, world: &WorldAuthority) -> Result<crate::TransactionGroup, RejectCode> {
+        self.validate().map_err(|_| RejectCode::InvalidData)?;
+        let members = self
+            .members
+            .iter()
+            .map(|m| m.restore(world))
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::TransactionGroup::new(self.id, members[0].ordering, members)
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhaseWork {

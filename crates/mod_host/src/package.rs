@@ -1367,7 +1367,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|error| error.detail.contains("side must be"))
+                .any(|error| error.detail.contains("`side` must be"))
         );
     }
 

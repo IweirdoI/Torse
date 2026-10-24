@@ -1,10 +1,12 @@
 //! `torse-mod`: the Mod platform toolchain (P3).
 //!
 //! Commands:
+//! ```text
 //!   torse-mod new <dir>                       scaffold a new package
 //!   torse-mod check <pkg-dir>... [--lock F]   validate packages and content
 //!   torse-mod pack <pkg-dir>... -o F          build entries and write a lock
 //!   torse-mod test <pkg-dir>... --scenario F  run a headless fixture scenario
+//! ```
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -213,10 +215,10 @@ fn command_new(args: &[String]) -> Result<(), Vec<String>> {
     };
     let files = [
         ("mod.toml", fill(TEMPLATE_MANIFEST)),
-        ("content/machine.toml".as_ref(), fill(TEMPLATE_CONTENT)),
-        ("scenario.toml".as_ref(), fill(TEMPLATE_SCENARIO)),
-        ("Cargo.toml".as_ref(), fill(TEMPLATE_CARGO)),
-        ("src/lib.rs".as_ref(), fill(TEMPLATE_LIB)),
+        ("content/machine.toml", fill(TEMPLATE_CONTENT)),
+        ("scenario.toml", fill(TEMPLATE_SCENARIO)),
+        ("Cargo.toml", fill(TEMPLATE_CARGO)),
+        ("src/lib.rs", fill(TEMPLATE_LIB)),
     ];
     for (path, text) in files {
         let path = dir.join(path);
@@ -269,7 +271,7 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn command_check(args: &[String]) -> Result<(), Vec<String>> {
-    let dirs = parse_dirs(args).map_err(|errors| errors)?;
+    let dirs = parse_dirs(args)?;
     let set = resolve(&dirs, &scenario::engine_base()).map_err(|errors: Vec<_>| {
         errors
             .iter()
@@ -300,7 +302,7 @@ fn command_check(args: &[String]) -> Result<(), Vec<String>> {
 }
 
 fn command_pack(args: &[String]) -> Result<(), Vec<String>> {
-    let dirs = parse_dirs(args).map_err(|errors| errors)?;
+    let dirs = parse_dirs(args)?;
     let out = flag_value(args, "-o")
         .ok_or_else(|| vec!["usage: torse-mod pack <pkg-dir>... -o <lock-file>".to_string()])?;
     let set = resolve(&dirs, &scenario::engine_base()).map_err(|errors: Vec<_>| {
@@ -316,7 +318,7 @@ fn command_pack(args: &[String]) -> Result<(), Vec<String>> {
 }
 
 fn command_test(args: &[String]) -> Result<(), Vec<String>> {
-    let dirs = parse_dirs(args).map_err(|errors| errors)?;
+    let dirs = parse_dirs(args)?;
     let scenario_path = flag_value(args, "--scenario")
         .ok_or_else(|| vec!["--scenario <file> is required".to_string()])?;
     let text = std::fs::read_to_string(&scenario_path)

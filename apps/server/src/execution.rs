@@ -79,14 +79,18 @@ pub trait DurableRule {
     }
 }
 pub struct WorkPlan {
-    pub transaction: Option<Transaction>,
+    pub transaction: Option<torse_sim::TransactionGroup>,
     pub schedule: Vec<EventDraft>,
     pub cancel: Vec<EventId>,
 }
 impl WorkPlan {
     pub fn transaction(transaction: Transaction) -> Self {
         Self {
-            transaction: Some(transaction),
+            transaction: Some(torse_sim::TransactionGroup {
+                id: transaction.id,
+                ordering: transaction.ordering,
+                members: vec![transaction],
+            }),
             schedule: Vec::new(),
             cancel: Vec::new(),
         }
@@ -213,7 +217,7 @@ fn checked_state(
             if task
                 .transaction
                 .as_ref()
-                .is_some_and(|t| t.phase != point.next_phase)
+                .is_some_and(|t| t.validate().is_err() || t.members[0].phase != point.next_phase)
                 || task.schedule.len() > limits.events
                 || task.cancel.len() > limits.events
                 || task.request.as_ref().is_some_and(|r| {
@@ -441,7 +445,7 @@ impl ExecutionHost {
             transaction: plan
                 .transaction
                 .as_ref()
-                .map(|t| StoredTransaction::capture(self.world(), t))
+                .map(|t| StoredTransactionGroup::capture(self.world(), t))
                 .transpose()?,
             request: None,
             consume,
@@ -508,7 +512,7 @@ impl ExecutionHost {
                 };
                 match output {
                     Ok(ActionOutput::Mutation(tx)) => {
-                        task.transaction = Some(StoredTransaction::capture(self.world(), &tx)?)
+                        task.transaction = Some(StoredTransactionGroup::single(self.world(), &tx)?)
                     }
                     Ok(ActionOutput::Query(fields)) => {
                         task.status = ReplyStatus::ReadOnly;
@@ -562,9 +566,10 @@ impl ExecutionHost {
         // for equal keys and tasks without mutations.
         tasks.sort_by(|a, b| {
             let key = |t: &FrozenTask| {
-                t.transaction
-                    .as_ref()
-                    .map(|p| (p.priority, p.task_key, p.local, p.id.0))
+                t.transaction.as_ref().map(|p| {
+                    let m = &p.members[0];
+                    (m.priority, m.task_key, m.local, p.id.0)
+                })
             };
             key(a).cmp(&key(b))
         });
@@ -603,7 +608,7 @@ impl ExecutionHost {
         let mut status = task.status.clone();
         let mut prepared = match &task.transaction {
             Some(stored) => match stored.restore(self.world()).and_then(|tx| {
-                self.source.prepare(&tx).map_err(|e| match e {
+                self.source.world().prepare_group(&tx).map_err(|e| match e {
                     PrepareError::Rejected(c) => c,
                     PrepareError::SequenceExhausted => RejectCode::QuotaExceeded,
                 })
@@ -659,6 +664,15 @@ fn matches_plan(task: &FrozenTask, status: &ReplyStatus, world: &torse_world::Ch
     let Some(plan) = &task.transaction else {
         return empty;
     };
+    let mut merged = plan.members[0].clone();
+    for member in &plan.members[1..] {
+        merged.writes.extend(member.writes.clone());
+        merged.moves.extend(member.moves.clone());
+        merged.components.extend(member.components.clone());
+        merged.spawns.extend(member.spawns.clone());
+        merged.despawns.extend(member.despawns.clone());
+    }
+    let plan = &merged;
     if world.edits.len() != plan.writes.len()
         || !world
             .edits

@@ -19,8 +19,9 @@ ContentKey、ComponentValue与嵌套组件字段沿用WORLD.md。位置和位移
 | StableMove | id、previous:[u64;3]、delta:[u64;3]、half:[u64;3] |
 | StableSpawn | position:[u64;3]、components:Map<ContentKey,ComponentFields> |
 | StoredTransaction | id、source、phase:u16、priority:i32、task_key:u64、local:u32、reads、writes、moves、components、spawns、despawns |
+| StoredTransactionGroup | id:TransactionId、members:`Vec<StoredTransaction>`，来源严格升序、数量1到4、排序键一致 |
 | Accepted | id:RequestId、input:Call |
-| FrozenTask | transaction:Option、request:Option、consume:Option<EventId>、schedule、cancel、status、output |
+| FrozenTask | transaction:任务标签、request:Option、consume:Option<EventId>、schedule、cancel、status、output |
 | PhaseWork | tasks、next:u32 |
 | SystemSpec | id、phase:u16、rule_priority:i32、before、after |
 | RuntimeState | rules、next_event:u128、events、windows、work:Option<PhaseWork> |
@@ -28,6 +29,10 @@ ContentKey、ComponentValue与嵌套组件字段沿用WORLD.md。位置和位移
 | ExecutionChanges | world:世界布局3的变更正文、runtime、outcome:Option<ReplyStatus>、cancelled:Option<Accepted> |
 
 组件替换ComponentEdit和销毁EntityState沿用世界领域字段顺序，字段值保留嵌套List/Record。运行句柄和进程状态编号不进入StoredTransaction，块前置条件也使用稳定内容。
+
+B9为FrozenTask的transaction字段增加标签2。标签0表示无事务，标签1沿用原StoredTransaction布局，读取时提升为单成员组；标签2随后写组id与成员列表。单成员且组id等于成员id时继续写标签1，保持原字节不变；多成员或独立组id写标签2。其他Option仍只接受0/1。顶层执行版本与外层日志版本保持1；旧读取器遇标签2明确拒绝，新读取器可以读取既有单事务日志。
+
+组成员数在解码分配前限制为1到4。编码、解码与领域恢复均检查来源严格有序、共同排序键、块和组件目标不重复、生命周期不交叠。冻结保存全部成员，恢复执行按原顺序还原后调用prepare_group；已经结算的日志只重放合并ChangeSet，不重跑Guest。组与事件、任务位置共同形成一条日志记录。此前B8排入的转移事件仍可结算，新机器计划不再生成这种延迟转移事件。
 
 WorldSnapshot包裹先写SnapshotMeta，再写ExecutionSnapshot；CommitRecord先写CommitMeta，再写ExecutionChanges。包裹与world子体元数据必须一致。世界子体没有再次添加世界版本前缀，执行版本1固定解释为布局3。
 

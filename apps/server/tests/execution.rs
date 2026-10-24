@@ -159,7 +159,7 @@ impl DurableRule for ClockRule {
         tx.read_block(pos, world.store().query(pos).ready().unwrap())
             .write_block(pos, state);
         Ok(WorkPlan {
-            transaction: Some(tx),
+            transaction: WorkPlan::transaction(tx).transaction,
             schedule: vec![EventDraft {
                 tick: Tick(tick.0 + 100),
                 rule: key("test:clock"),

@@ -53,18 +53,20 @@ fn main() -> ExitCode {
             "--capture" => capture = value(),
             "--window" => window = true,
             "--width" => {
-                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
-                    width = parsed;
+                // Zero-size targets panic in wgpu texture creation; clamp.
+                if let Some(parsed) = value().and_then(|v| v.parse::<u32>().ok()) {
+                    width = parsed.max(1);
                 }
             }
             "--height" => {
-                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
-                    height = parsed;
+                if let Some(parsed) = value().and_then(|v| v.parse::<u32>().ok()) {
+                    height = parsed.max(1);
                 }
             }
             "--radius" => {
-                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
-                    radius = parsed;
+                // A negative radius yields an empty window; treat it as 0.
+                if let Some(parsed) = value().and_then(|v| v.parse::<i64>().ok()) {
+                    radius = parsed.max(0);
                     radius_set = true;
                 }
             }

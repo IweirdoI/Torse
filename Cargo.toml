@@ -13,6 +13,8 @@ members = [
     "crates/world_services",
     "crates/mod_api",
     "crates/mod_host",
+    "crates/mod_sdk",
+    "examples/mods/roundtrip",
     "crates/codec",
     "crates/storage",
     "crates/protocol",

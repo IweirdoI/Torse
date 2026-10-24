@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "component")]
+pub mod component;
+
 #[cfg(feature = "wasm-probe")]
 mod wasm_probe;
 

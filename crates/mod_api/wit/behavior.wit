@@ -1,0 +1,197 @@
+package torse:behavior@0.1.0-draft;
+
+interface types {
+    record vec3i {
+        x: s64,
+        y: s64,
+        z: s64,
+    }
+
+    record bbox {
+        min: vec3i,
+        max: vec3i,
+    }
+
+    record entity-id {
+        low: u64,
+        high: u64,
+    }
+
+    // Bounded to flat field tables of atoms. Nested structures are not
+    // expressible on this boundary yet; see the mod-platform design log
+    // before extending.
+    variant atom {
+        %bool(bool),
+        %u32(u32),
+        %i64(s64),
+        content(u32),
+        entity(entity-id),
+        text(string),
+    }
+
+    record field {
+        key: string,
+        value: atom,
+    }
+
+    record block-ref {
+        definition: u32,
+        state-values: list<u16>,
+    }
+
+    variant cell {
+        not-loaded,
+        empty,
+        occupied(block-ref),
+    }
+
+    enum query-error {
+        out-of-range,
+        budget-exceeded,
+        not-authorized,
+        invalid-cursor,
+    }
+}
+
+interface query {
+    use types.{vec3i, bbox, entity-id, field, cell, query-error};
+
+    resolve-symbol: func(key: string) -> option<u32>;
+    symbol-key: func(symbol: u32) -> option<string>;
+
+    record cell-sample {
+        pos: vec3i,
+        cell: cell,
+    }
+
+    query-blocks: func(region: bbox) -> result<list<cell-sample>, query-error>;
+
+    record entity-sample {
+        id: entity-id,
+        position: vec3i,
+    }
+
+    record entity-page {
+        items: list<entity-sample>,
+        next: option<string>,
+    }
+
+    query-entities: func(region: bbox, cursor: option<string>, limit: u32)
+        -> result<entity-page, query-error>;
+
+    record component-target {
+        pos: vec3i,
+        schema: u32,
+    }
+
+    record component-snapshot {
+        pos: vec3i,
+        fields: option<list<field>>,
+    }
+
+    read-components: func(targets: list<component-target>)
+        -> result<list<component-snapshot>, query-error>;
+
+    record port-estimate {
+        accepts: list<u32>,
+        free-estimate: u32,
+    }
+
+    probe-item-port: func(pos: vec3i, port: string) -> option<port-estimate>;
+}
+
+interface diagnostics {
+    enum log-level {
+        trace,
+        info,
+        warn,
+        error,
+    }
+
+    log: func(level: log-level, message: string);
+}
+
+interface schedule {
+    record wakeup-slot {
+        tick: u64,
+        key: string,
+    }
+
+    pending-wakeups: func(key-prefix: option<string>) -> list<wakeup-slot>;
+}
+
+interface invoke {
+    use types.{vec3i, cell, field};
+
+    record owned-state {
+        schema: u32,
+        fields: option<list<field>>,
+    }
+
+    record object-ref {
+        pos: vec3i,
+        block: u32,
+        owned: list<owned-state>,
+    }
+
+    variant event {
+        init,
+        wakeup(string),
+        block-placed,
+        block-broken(cell),
+    }
+
+    record invocation {
+        event: event,
+        tick: u64,
+        self: option<object-ref>,
+        rng-seed: u64,
+    }
+
+    record transfer-endpoint {
+        pos: vec3i,
+        port: string,
+    }
+
+    record transfer-request {
+        %from: transfer-endpoint,
+        to: transfer-endpoint,
+        item: u32,
+        count: u32,
+    }
+
+    record block-edit {
+        pos: vec3i,
+        expected: option<cell>,
+        new: cell,
+    }
+
+    record component-edit {
+        pos: vec3i,
+        schema: u32,
+        previous: option<list<field>>,
+        fields: option<list<field>>,
+    }
+
+    record wakeup-request {
+        tick: u64,
+        key: string,
+    }
+
+    record plan {
+        edits: list<block-edit>,
+        component-edits: list<component-edit>,
+        transfers: list<transfer-request>,
+        wakeups: list<wakeup-request>,
+    }
+
+    handle-event: func(invocation: invocation) -> option<plan>;
+}
+
+world mod-behavior {
+    import query;
+    import diagnostics;
+    import schedule;
+
+    export invoke;
+}

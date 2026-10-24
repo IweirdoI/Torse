@@ -1,0 +1,17 @@
+[package]
+name = "torse-mod-roundtrip"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+torse-mod-sdk = { path = "../../../crates/mod_sdk" }
+wit-bindgen = "=0.63.0"
+
+[features]
+# Replaces the handler with a busy loop, used by host tests to prove that
+# epoch interruption kills runaway guests.
+spin = []

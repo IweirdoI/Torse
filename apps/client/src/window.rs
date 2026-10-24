@@ -28,11 +28,14 @@ use crate::pick::{PickHit, PickOutcome};
 use crate::renderer::GpuContext;
 use crate::scene::{Scene, Vertex};
 use torse_types::{BlockPos, ContentKey, SectionPos};
+use torse_world::Position;
 
 /// How far the pick ray reaches, in blocks.
 const PICK_RANGE: f32 = 64.0;
 /// Autoplay fires one demonstration action every this many frames.
 const AUTOPLAY_PERIOD: u32 = 24;
+/// Camera eye height above the walker's body centre.
+const WALKER_EYE_OFFSET: f64 = 0.7;
 
 /// Startup parameters for the windowed run.
 #[derive(Clone, Debug)]
@@ -48,6 +51,8 @@ pub struct WindowConfig {
     pub screenshot: Option<String>,
     /// Fly forward automatically instead of waiting for keys.
     pub autoplay: bool,
+    /// Start in walk mode with a player entity on the ground.
+    pub walk: bool,
 }
 
 /// Measurements reported when the window closes.
@@ -73,6 +78,10 @@ pub struct WindowSummary {
     pub actions_ok: u32,
     /// Actions rejected by the action service or the commit.
     pub actions_rejected: u32,
+    /// Walk ticks committed while in walk mode.
+    pub walk_ticks: u32,
+    /// Final walker position, when walk mode was entered.
+    pub walker: Option<[f64; 3]>,
     /// Resident sections at exit.
     pub sections: usize,
     /// Resident meshes at exit.
@@ -112,6 +121,11 @@ struct WindowApp {
     actions_ok: u32,
     actions_rejected: u32,
     autoplay_break: bool,
+    walk: bool,
+    tick_accumulator: f32,
+    walk_ticks: u32,
+    /// Autoplay sets this when the walker stopped against a terrain step.
+    walk_blocked: bool,
     last_result: String,
     adapter: String,
     started: Option<Instant>,
@@ -147,6 +161,10 @@ impl WindowApp {
             actions_ok: 0,
             actions_rejected: 0,
             autoplay_break: false,
+            walk: false,
+            tick_accumulator: 0.0,
+            walk_ticks: 0,
+            walk_blocked: false,
             last_result: String::new(),
             adapter: String::new(),
             started: None,
@@ -177,7 +195,60 @@ impl WindowApp {
         if self.config.autoplay {
             motion.forward = 1.0;
         }
-        camera.advance(motion, step);
+        if self.walk {
+            // Walk mode: look still follows the drag, but the position comes
+            // from the authoritative walker entity driven at a fixed tick.
+            camera.look(motion.yaw_delta, motion.pitch_delta);
+            self.tick_accumulator = (self.tick_accumulator + step).min(0.4);
+            const TICK: f32 = 1.0 / 20.0;
+            let mut ticks = 0;
+            while self.tick_accumulator >= TICK && ticks < 8 {
+                self.tick_accumulator -= TICK;
+                ticks += 1;
+                self.walk_ticks += 1;
+                let yaw = camera.yaw as f64;
+                let forward = [-yaw.sin(), 0.0, -yaw.cos()];
+                let right = [yaw.cos(), 0.0, -yaw.sin()];
+                let mut wish = [0.0f64; 3];
+                for axis in 0..3 {
+                    wish[axis] = forward[axis] * f64::from(motion.forward)
+                        + right[axis] * f64::from(motion.strafe);
+                }
+                let length = (wish[0] * wish[0] + wish[1] * wish[1] + wish[2] * wish[2]).sqrt();
+                if length > 0.0 {
+                    for value in &mut wish {
+                        *value /= length;
+                    }
+                }
+                // Autoplay jumps when the previous tick ran into a step.
+                let jump = self.input.jump_held() || (self.config.autoplay && self.walk_blocked);
+                // camera.eye still holds the previous walker position here.
+                let before = (f64::from(camera.eye[0]), f64::from(camera.eye[2]));
+                let Some(scene) = self.scene.as_mut() else {
+                    return;
+                };
+                match scene.step_walker(wish, jump, TICK) {
+                    Ok((position, _)) => {
+                        let wanted = wish[0].abs() + wish[2].abs() > 1e-9;
+                        let drifted =
+                            (position.x - before.0).abs() + (position.z - before.1).abs() > 0.02;
+                        self.walk_blocked = wanted && !drifted;
+                        camera.eye = [
+                            position.x as f32,
+                            (position.y + WALKER_EYE_OFFSET) as f32,
+                            position.z as f32,
+                        ];
+                    }
+                    Err(reason) => {
+                        self.failure = Some(reason);
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
+        } else {
+            camera.advance(motion, step);
+        }
 
         let center = self
             .scene
@@ -213,7 +284,13 @@ impl WindowApp {
             .input
             .take_click()
             .and_then(|button| action_for(&aim, button));
-        if intent.is_none() && self.config.autoplay && self.frames.is_multiple_of(AUTOPLAY_PERIOD) {
+        // The walk demo is about walking; firing place or break at the aim
+        // while walking would block the walker's own path.
+        if intent.is_none()
+            && self.config.autoplay
+            && !self.walk
+            && self.frames.is_multiple_of(AUTOPLAY_PERIOD)
+        {
             let button = if self.autoplay_break {
                 MouseButton::Left
             } else {
@@ -383,6 +460,43 @@ impl WindowApp {
         gpu.window.request_redraw();
     }
 
+    /// Switch to walk mode by spawning the player entity under the camera.
+    ///
+    /// `Scene::eye` sits 1.4 blocks above the surface cell's top, and the
+    /// walker's centre must stand 0.9 above that top for the collider to
+    /// clear the ground, hence the 0.5 drop. Movement preparation rejects any
+    /// entity that already overlaps terrain, so a low spawn point freezes the
+    /// walker until it is toggled again from higher up.
+    fn enter_walk(&mut self, eye: [f32; 3]) {
+        let under = Position::new(
+            f64::from(eye[0]),
+            f64::from(eye[1]) - 0.5,
+            f64::from(eye[2]),
+        );
+        match self.scene.as_mut() {
+            Some(scene) => {
+                if let Err(reason) = scene.spawn_walker(under) {
+                    self.last_result = reason;
+                    return;
+                }
+            }
+            None => return,
+        }
+        self.walk = true;
+        self.tick_accumulator = 0.0;
+    }
+
+    /// F5 flips between fly and walk; the walker entity stays in the world.
+    fn toggle_walk(&mut self) {
+        if self.walk {
+            self.walk = false;
+            return;
+        }
+        if let Some(camera) = self.camera.as_ref() {
+            self.enter_walk(camera.eye);
+        }
+    }
+
     fn finish(&mut self, event_loop: &ActiveEventLoop) {
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
             let (vertices, _, faces) = scene.geometry();
@@ -397,6 +511,12 @@ impl WindowApp {
                 screenshots: self.screenshots,
                 actions_ok: self.actions_ok,
                 actions_rejected: self.actions_rejected,
+                walk_ticks: self.walk_ticks,
+                walker: self
+                    .scene
+                    .as_ref()
+                    .and_then(Scene::walker_position)
+                    .map(|position| [position.x, position.y, position.z]),
                 sections: scene.sections().len(),
                 meshes: scene.mesh_count(),
                 vertices: vertices.len(),
@@ -499,6 +619,12 @@ impl ApplicationHandler for WindowApp {
         });
         self.scene = Some(scene);
         self.camera = Some(camera);
+        // Enter walk mode only after the scene exists; enter_walk spawns the
+        // walker through it.
+        if self.config.walk {
+            let eye = self.camera.as_ref().expect("camera was just installed").eye;
+            self.enter_walk(eye);
+        }
         self.started = Some(Instant::now());
         self.fps_origin = Instant::now();
         // Prime one frame immediately instead of waiting for the first event.
@@ -543,6 +669,7 @@ impl ApplicationHandler for WindowApp {
                         KeyCode::Digit1 => self.material = 0,
                         KeyCode::Digit2 => self.material = 1,
                         KeyCode::Digit3 => self.material = 2,
+                        KeyCode::F5 => self.toggle_walk(),
                         _ => {}
                     }
                 }

@@ -12,17 +12,35 @@ use torse_content::{BlockDefinition, Shape, compile, m0_fixture_pack};
 use torse_render::{MeshData, MeshJob, MeshSample, RenderBlock, RenderBox, build_mesh};
 use torse_sim::WorldAuthority;
 use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
-use torse_sim::{OrderingKey, Phase, block_actions};
+use torse_sim::{OrderingKey, Phase, Transaction, block_actions};
 use torse_types::{
-    BlockPos, Compatibility, ContentKey, Digest, Revision, SectionPos, TransactionId, WorldId,
+    BlockPos, Compatibility, ContentKey, Digest, EntityHandle, Revision, SectionPos, TransactionId,
+    TransactionOutcome, WorldId,
 };
 use torse_world::{
-    BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentValue,
+    BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentValue, Position,
     TerrainQuery, WorldBounds,
 };
 use torse_world_services::{GenerationParams, HillTerrain};
 
 use crate::pick::{PickOutcome, cast_ray};
+
+/// Walk speed in blocks per second.
+const WALK_SPEED: f64 = 4.3;
+/// Gravity in blocks per second squared.
+const GRAVITY: f64 = 28.0;
+/// Jump launch speed in blocks per second.
+const JUMP_SPEED: f64 = 8.4;
+/// Player collider half extents: 0.6 wide, 1.8 tall, centre at body middle.
+const WALKER_HALF: [f64; 3] = [0.3, 0.9, 0.3];
+
+/// Client-side walk state for the player entity.
+#[derive(Clone, Copy)]
+struct Walker {
+    handle: EntityHandle,
+    velocity: [f64; 3],
+    grounded: bool,
+}
 
 /// One vertex uploaded to the GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -57,6 +75,7 @@ pub struct Scene {
     service: ActionService,
     principal: ContentKey,
     edit_counter: u64,
+    walker: Option<Walker>,
     generator: HillTerrain,
     side: u32,
     radius: i64,
@@ -105,6 +124,7 @@ impl Scene {
             service,
             principal: key("client:player"),
             edit_counter: 0,
+            walker: None,
             generator,
             side,
             radius,
@@ -131,6 +151,132 @@ impl Scene {
     /// Cast a ray through loaded terrain and report the first solid cell.
     pub fn pick(&self, origin: [f32; 3], direction: [f32; 3], max_distance: f32) -> PickOutcome {
         cast_ray(|pos| self.solid_at(pos), origin, direction, max_distance)
+    }
+
+    /// Spawn the walk-mode player entity at a world position.
+    ///
+    /// The windowed client is a trusted local host, so it installs the player
+    /// directly through the entity store the same way the server bootstrap
+    /// installs its fixtures; movement still goes through transactions.
+    pub fn spawn_walker(&mut self, at: Position) -> Result<(), String> {
+        let handle = self
+            .authority
+            .entities_mut()
+            .spawn(at)
+            .map_err(|error| format!("spawn failed: {error}"))?;
+        self.walker = Some(Walker {
+            handle,
+            velocity: [0.0; 3],
+            grounded: false,
+        });
+        Ok(())
+    }
+
+    /// Walker position, if walk mode has a live entity.
+    pub fn walker_position(&self) -> Option<Position> {
+        let walker = self.walker?;
+        self.authority
+            .entities()
+            .get(walker.handle)
+            .map(|entity| entity.position)
+    }
+
+    /// Integrate one walk tick and commit the displacement as an A4 movement
+    /// transaction; the authority resolves terrain collision in `prepare`.
+    ///
+    /// `wish` is a normalized horizontal direction in world units, `jump`
+    /// requests a jump while grounded, and `dt` is the fixed tick length.
+    /// Rejections (a stale observation, for instance) drop the tick and keep
+    /// the entity where it is; the caller sees the unchanged position.
+    pub fn step_walker(
+        &mut self,
+        wish: [f64; 3],
+        jump: bool,
+        dt: f32,
+    ) -> Result<(Position, bool), String> {
+        let Some(mut walker) = self.walker else {
+            return Err("walk mode has no entity".to_owned());
+        };
+        let Some(entity) = self.authority.entities().get(walker.handle) else {
+            return Err("walker entity is gone".to_owned());
+        };
+        let (id, previous) = (entity.id, entity.position);
+
+        // Client-side integration in blocks per second: horizontal velocity
+        // follows the input directly, gravity integrates downward, and jumps
+        // are only possible while standing on something. The committed delta
+        // scales by the tick length.
+        walker.velocity[0] = wish[0] * WALK_SPEED;
+        walker.velocity[2] = wish[2] * WALK_SPEED;
+        walker.velocity[1] -= GRAVITY * f64::from(dt);
+        if walker.grounded && jump {
+            walker.velocity[1] = JUMP_SPEED;
+        }
+        let dt = f64::from(dt);
+        let requested = previous.translated([
+            walker.velocity[0] * dt,
+            walker.velocity[1] * dt,
+            walker.velocity[2] * dt,
+        ]);
+        self.walker = Some(walker);
+
+        self.edit_counter += 1;
+        let counter = self.edit_counter;
+        let mut tx = Transaction::new(
+            TransactionId(u128::from(counter)),
+            key("client:motion"),
+            OrderingKey {
+                phase: Phase::Simulation,
+                rule_priority: 0,
+                stable_task_key: counter,
+                local_sequence: 0,
+            },
+        );
+        tx.move_entity(
+            self.walker.as_ref().expect("walker stored").handle,
+            id,
+            previous,
+            [
+                requested.x - previous.x,
+                requested.y - previous.y,
+                requested.z - previous.z,
+            ],
+            WALKER_HALF,
+        );
+        let result = self.authority.commit(&tx);
+
+        let Some(walker) = self.walker.as_mut() else {
+            return Err("walker vanished mid step".to_owned());
+        };
+        let Some(entity) = self.authority.entities().get(walker.handle) else {
+            return Err("walker entity is gone".to_owned());
+        };
+        if let Ok(outcome) = &result
+            && let TransactionOutcome::Rejected(code) = outcome.outcome
+        {
+            // Drop this tick: keep the entity at its committed position with
+            // the horizontal velocity already reset for the next tick.
+            walker.velocity[1] = 0.0;
+            let _ = code;
+            return Ok((entity.position, walker.grounded));
+        }
+        result.map_err(|fault| format!("commit fault: {fault:?}"))?;
+
+        // Compare the committed position against the request to recover the
+        // ground contact the collision sweep discovered. Resting above the
+        // request means the descent was blocked: that is the floor. Ending
+        // below the request means a ceiling stopped the rise.
+        let settled = entity.position;
+        if settled.y - requested.y > 1e-9 {
+            walker.grounded = true;
+            walker.velocity[1] = 0.0;
+        } else if requested.y - settled.y > 1e-9 {
+            walker.velocity[1] = 0.0;
+            walker.grounded = false;
+        } else {
+            walker.grounded = false;
+        }
+        Ok((settled, walker.grounded))
     }
 
     /// Plan and commit one place or break action through the action service.
@@ -557,5 +703,126 @@ mod tests {
         // Radius 1 leaves everything past 31 blocks unloaded on the x axis.
         let outcome = scene.pick([30.5, 40.0, 8.5], [1.0, 0.0, 0.0], 256.0);
         assert_eq!(outcome, PickOutcome::Miss);
+    }
+
+    #[test]
+    fn walker_spawns_mid_air_walks_and_ends_standing() {
+        let mut scene = Scene::new(3).expect("scene");
+        scene
+            .spawn_walker(Position::new(8.5, 13.3, 8.5))
+            .expect("spawn");
+        let mut final_position = Position::new(8.5, 13.3, 8.5);
+        let mut grounded = false;
+        for _ in 0..31 {
+            let (position, landed) = scene
+                .step_walker([0.0, 0.0, -1.0], false, 0.05)
+                .expect("step");
+            final_position = position;
+            grounded = landed;
+        }
+        // Walked into negative z and ended standing on the terrain.
+        assert!(final_position.z < 8.0, "moved to {final_position:?}");
+        assert!(grounded);
+        assert!(final_position.y > 0.0 && final_position.y < 16.0);
+    }
+
+    #[test]
+    fn walker_falls_until_it_lands_and_stays() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene
+            .spawn_walker(Position::new(8.5, 12.0, 8.5))
+            .expect("spawn");
+        let mut settled = Position::new(8.5, 12.0, 8.5);
+        for _ in 0..100 {
+            let (position, grounded) = scene
+                .step_walker([0.0, 0.0, 0.0], false, 0.05)
+                .expect("step");
+            settled = position;
+            if grounded {
+                break;
+            }
+        }
+        let (_, grounded) = scene
+            .step_walker([0.0, 0.0, 0.0], false, 0.05)
+            .expect("settle");
+        assert!(grounded, "must land within five seconds");
+        // Standing on the surface: inside the loaded layer, x and z unchanged.
+        assert!((settled.x - 8.5).abs() < 1e-9);
+        assert!((settled.z - 8.5).abs() < 1e-9);
+        assert!(settled.y > 0.0 && settled.y < 16.0);
+    }
+
+    #[test]
+    fn walker_walks_forward_over_rolling_terrain() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene
+            .spawn_walker(Position::new(8.5, 12.0, 8.5))
+            .expect("spawn");
+        // Warm up until grounded.
+        for _ in 0..100 {
+            let (_, grounded) = scene
+                .step_walker([0.0, 0.0, 0.0], false, 0.05)
+                .expect("step");
+            if grounded {
+                break;
+            }
+        }
+        let start = scene.walker_position().expect("walker");
+        let mut final_position = start;
+        for _ in 0..60 {
+            final_position = scene
+                .step_walker([0.0, 0.0, -1.0], false, 0.05)
+                .expect("step")
+                .0;
+        }
+        // Three seconds of walking moves along the surface until a terrain
+        // step blocks the collider; hills stop it early, so only require real
+        // progress plus a plausible standing height.
+        assert!(
+            start.z - final_position.z > 2.0,
+            "moved {:?} to {:?}",
+            start,
+            final_position
+        );
+        assert!(final_position.y > 0.0 && final_position.y < 16.0);
+        assert!((final_position.x - start.x).abs() < 1e-9);
+    }
+
+    #[test]
+    fn walker_jumps_and_lands_back() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene
+            .spawn_walker(Position::new(8.5, 12.0, 8.5))
+            .expect("spawn");
+        for _ in 0..100 {
+            let (_, grounded) = scene
+                .step_walker([0.0, 0.0, 0.0], false, 0.05)
+                .expect("step");
+            if grounded {
+                break;
+            }
+        }
+        let ground = scene.walker_position().expect("walker").y;
+
+        let (risen, grounded) = scene
+            .step_walker([0.0, 0.0, 0.0], true, 0.05)
+            .expect("jump tick");
+        assert!(!grounded);
+        assert!(risen.y > ground, "first jump tick must rise");
+
+        let mut landed = risen;
+        let mut on_ground = false;
+        for _ in 0..100 {
+            let (position, grounded) = scene
+                .step_walker([0.0, 0.0, 0.0], false, 0.05)
+                .expect("fall");
+            landed = position;
+            on_ground = grounded;
+            if grounded {
+                break;
+            }
+        }
+        assert!(on_ground, "must land again");
+        assert!((landed.y - ground).abs() < 0.5, "back at {landed:?}");
     }
 }

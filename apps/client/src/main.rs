@@ -36,6 +36,7 @@ fn main() -> ExitCode {
     let mut frames: Option<u32> = None;
     let mut screenshot: Option<String> = None;
     let mut autoplay = false;
+    let mut walk = false;
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -70,6 +71,7 @@ fn main() -> ExitCode {
             }
             "--screenshot" => screenshot = value(),
             "--autoplay" => autoplay = true,
+            "--walk" => walk = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -90,12 +92,14 @@ fn main() -> ExitCode {
             frames,
             screenshot,
             autoplay,
+            walk,
         };
         match run_window(config) {
             Ok(summary) => {
                 println!(
                     "adapter={} backend={} format={} frames={} streams={} rebuilds={} \
-                     uploads={} screenshots={} actions_ok={} actions_rejected={} sections={} \
+                     uploads={} screenshots={} actions_ok={} actions_rejected={} walk_ticks={} \
+                     walker=({:.1},{:.1},{:.1}) sections={} \
                      meshes={} vertices={} faces={} elapsed_ms={}",
                     summary.adapter,
                     summary.backend,
@@ -107,6 +111,10 @@ fn main() -> ExitCode {
                     summary.screenshots,
                     summary.actions_ok,
                     summary.actions_rejected,
+                    summary.walk_ticks,
+                    summary.walker.map_or(0.0, |p| p[0]),
+                    summary.walker.map_or(0.0, |p| p[1]),
+                    summary.walker.map_or(0.0, |p| p[2]),
                     summary.sections,
                     summary.meshes,
                     summary.vertices,

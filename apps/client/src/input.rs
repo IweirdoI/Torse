@@ -127,6 +127,11 @@ impl InputState {
         (input, base_speed * self.speed_factor)
     }
 
+    /// Whether the jump key is currently held.
+    pub fn jump_held(&self) -> bool {
+        self.held.contains(&KeyCode::Space)
+    }
+
     /// Consume the pending click, if the last press qualified as one.
     pub fn take_click(&mut self) -> Option<MouseButton> {
         self.pending_click.take()

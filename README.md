@@ -1,130 +1,124 @@
+<p align="center">
+  <img src="figures/torse-logo.png" alt="Torse项目标志" width="420">
+</p>
+
 # Torse
 
-Torse使用Rust构建开放方块世界的通用内核与开发框架，并以基础游戏验证。
+Torse是一个用Rust编写的开放方块世界内核与开发框架，提供世界存储、模拟执行、持久化、网络同步和Mod扩展能力，并通过基础游戏验证这些能力如何共同工作。
 
-## 当前状态
+项目将通用框架与具体玩法分开：内核负责世界状态和执行规则，玩法由内容定义、可选模块与Mod组合。客户端和服务端共用领域模型，世界修改经过统一授权与事务提交，再交给存储和网络层处理。
 
-B6/B7已完成本轮有限世界基线：六阶段持久任务、定时事件、动作结果与去重窗口、授权复制及内存/非阻塞TCP双客户端已接入。服务端主程序可以创建或恢复执行世界，并提供无GPU客户端示例。20项新增测试入口、全工作区420项通过；验证与范围见[执行和网络记录](benchmarks/B6-B7-execution-network.md)。
+[快速开始](#快速开始) | [项目结构](#项目结构) | [开发与验证](#开发与验证)
+
+## 开发状态
+
+Torse目前处于早期开发阶段，已有可运行的图形客户端、独立服务端与Mod示例。现阶段主要验证世界编辑、持久恢复和联机交互，接口与存档格式仍在演进。
+
+| 领域 | 已实现的范围 | 验证记录 |
+|---|---|---|
+| 世界与地形 | 方块状态、分区存储与流式装载、确定性地形生成、碰撞检测和网格生成 | [世界场景](benchmarks/M1-scenario.md) |
+| 模拟与事务 | 固定步长Tick、阶段调度、实体与组件、动作授权、库存转移和跨模块原子提交 | [Tick执行](benchmarks/M2-tick.md)、[跨模块事务](benchmarks/M4-cross-module.md) |
+| 图形客户端 | 窗口与离屏渲染、飞行与行走、方块选择与编辑、HUD、菜单和截图 | [窗口交互](benchmarks/M1-window.md)、[界面基础](benchmarks/M1-ui.md) |
+| 持久化 | 日志、检查点、实体生命周期恢复、持久任务与定时事件、请求结果与去重 | [世界恢复](benchmarks/M3-local-world.md)、[执行与网络](benchmarks/B6-B7-execution-network.md) |
+| 联机 | TCP连接、授权基线与增量同步、多人编辑、越界拒绝、撤权与重连 | [联机编辑](benchmarks/M5-net-edit.md)、[授权验收](benchmarks/A8-acceptance.md) |
+| Mod扩展 | 公开SDK、Wasm包加载、机器加工、持久唤醒，以及机器状态与库存的共同提交 | [Mod持久执行](benchmarks/M4-mod-durable.md)、[Mod原子执行](benchmarks/M4-mod-atomic.md) |
+
+联网移动的服务端结算与客户端校正、随玩家移动的订阅切换，以及图形界面对真实Mod机器的操作仍待接入。当前机器面板使用示例数据；放置与破坏尚未连接库存消耗和掉落。服务端使用有限世界与同步刷盘，现有功能验证不代表大规模世界或高并发性能。
+
+## 快速开始
+
+以下命令均在仓库根目录执行。项目通过[rust-toolchain.toml](rust-toolchain.toml)固定使用Rust 1.93.1，并在[Cargo.lock](Cargo.lock)中记录依赖版本。使用Rustup管理工具链时会按配置选择版本；图形客户端还需要可用的Vulkan、DirectX 12或Metal后端。
+
+### 本地体验
+
+启动交互窗口：
 
 ```sh
-cargo run -p torse-server -- .work/execution-world --listen 127.0.0.1:7777 --ticks 60
+cargo run -p torse-client -- --window
+```
+
+| 操作 | 输入 |
+|---|---|
+| 移动 | WASD |
+| 转向 | 按住鼠标左键或右键拖动 |
+| 飞行升降 | 空格 / 左Shift |
+| 切换飞行与行走 | F5，行走时空格跳跃 |
+| 破坏 / 放置方块 | 短按鼠标左键 / 右键 |
+| 选择方块 | 数字键1到3 |
+| 调节速度 | 鼠标滚轮 |
+| 菜单 / 机器面板预览 | Esc / E |
+| 截图 | F12 |
+
+也可以直接生成一张离屏截图：
+
+```sh
+cargo run -p torse-client -- --capture out.png --width 960 --height 720 --radius 2
+```
+
+离屏模式仍需要GPU。更多参数、字体配置与交互说明见[客户端文档](apps/client/README.md)。
+
+### 联机编辑
+
+先创建一个演示世界并启动服务端：
+
+```sh
+cargo run -p torse-server -- .work/demo-world --listen 127.0.0.1:7777 --fill --editors
+```
+
+保持服务端运行，在另一个终端启动客户端：
+
+```sh
+cargo run -p torse-client -- --window --connect 127.0.0.1:7777
+```
+
+可以再启动一个客户端，观察同一世界中的编辑结果。`--fill`只用于首次创建世界，重新打开同一目录时需去掉该参数。`--editors`会向所有连接授予演示范围内的编辑权限；省略时，客户端以访客权限连接，编辑请求会被拒绝。该策略用于本地演示，真实用户认证尚待实现。
+
+无需图形环境时，可在服务端运行期间使用无GPU客户端示例：
+
+```sh
 cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 ```
 
-第二条命令在另一终端执行。演示访客可看公开范围，无库存读取和修改权限；原durable_world工具继续使用旧本地模型与目录，不自动迁移为执行世界。
+服务端默认持续运行；指定`--ticks 60`可在运行60个Tick后保存并退出。持久目录、恢复行为与Mod加载方式见[服务端文档](apps/server/README.md)。
 
-M0公共契约与实验框架已完成，M1推进到无界面的可编辑世界层。
+## 项目结构
 
-M0交付：
+仓库采用Cargo工作区组织。`crates`承载通用能力，根目录的`modules`承载可选玩法，`games/base`负责基础游戏的组合与资源。
 
-- 有符号块坐标、Section转换、内容命名空间和运行时句柄失效。
-- 提交序号、持久序号、对象与事件身份、事务结果和复制声明。
-- `BlockDefinition`、`StateSchema`、`CapabilityDescriptor`和`ModuleDescriptor`四项内容契约。
-- 最小内容编译器和模块解析器，包含顺序无关摘要及可定位错误。
-- 石头、玻璃半砖和植物内容夹具。
-- 统一动作声明、命令冲突检查和模块服务注册校验。
-- codec预算、事务性编码回滚和场景指标框架。
-- 可复跑的ECS、Wasmtime和wgpu/winit技术实验。
-
-M1已实现：
-
-- 块状态的紧凑编号，含空占用哨兵、有限状态展开与默认状态。
-- Section存储：统一值与稠密两种表示，负坐标按欧几里得除法分区。
-- 分区生命周期：请求、装载、就绪、活动四个阶段与四类票据配额，未装载区域不返回空气。
-- 确定性地形生成：平坦地形与种子丘陵地形，生成结果与调度顺序无关。
-- AABB碰撞扫掠：轴分离、子步防穿透、未装载区域阻挡移动。
-- CPU网格生成：按遮挡掩码剔除面并保留未加载边界面，网格带依赖修订戳，旧结果不得覆盖新状态。
-- 无界面M1场景：生成、行走、挖补、网格化与卸载的端到端验收。
-
-M2已开始，当前覆盖模拟执行模型与实体存储：
-
-- 固定步长时钟：按Tick推进，超预算只记录并报告，不跳Tick也不改步长。
-- 阶段与系统排序：六个阶段按固定顺序执行，阶段内按依赖做拓扑排序，并列时按优先级与身份稳定排序，环与跨阶段依赖拒绝。
-- 类型化事务：读取前置条件按格记录，写入成组校验后一次应用，重复目标与空事务拒绝。
-- 提交拆分：准备阶段完成读集校验与写入校验，返回带`CommitMeta`的准备记录，世界不变；发布阶段才应用改动并分配提交序号。准备记录被丢弃时序号与世界都不变。
-- 单协调器提交：按阶段、优先级、稳定任务键与局部序号仲裁，成功才分配提交序号，冲突不消耗序号。
-- Tick驱动：系统只读上下文，事务在阶段末统一提交，阶段事务数设上限，系统不能跨阶段投放事务，每个阶段与每个Tick都会更新恢复位置。
-- 实体存储：持久身份与运行时句柄分离，槽位复用会推进代数，空间索引随移动同步维护。
-- 实体移动事务：准备阶段校验身份与位置，按碰撞结果生成记录，发布时成组更新位置和空间索引；可在发布前生成交换载荷，恢复直接重放已解析位置。
-- 有界组件：组件值按模式校验字段、类型、必填项、字符串长度、列表长度与嵌套深度。
-- 组件事务：检查模式所有者和精确前置字段，准备后可预留日志，发布时与块编辑、实体移动成组应用，恢复重放支持组件替换与删除。
-- 动作与库存：受限只读视图、统一授权、可选放置破坏动作、库存查询与守恒转移；两个机器争用同一原料时只有一个成功。
-- 权威装配与恢复：`WorldAuthority`统一持有存储、实体、注册表与协调器；`Recovery`在快照与日志尾都通过后才产出世界，续号与在线世界一致。
-- 提交仲裁、Tick与交换场景：同格争用只有一个成功，准备项被拒时世界不变，实体跨界移动后索引正确，快照往返与变更重放一致。
-- 世界载荷编码：快照与变更集按显式字段写入，读写两侧检查规范顺序、重复项、嵌套与预算；经文件日志与检查点保存后，可在新权威中恢复并续号。格式为M1临时版本，不承诺兼容。
-- 服务端真实世界装配：WorldHost接入B4协调器，可信本地事务经日志预留、发布与刷盘后返回持久位置；支持有界完整快照、文件恢复和关闭。旧LocalWorldModel保持本地入口；新的ExecutionHost已提供持久请求、事件与结果。
-- 实体生命周期事务：生成按准备顺序提出身份，发布时推进分配水位；销毁复核完整旧状态，能与块、移动和组件变化成组提交及重放。新写入使用世界格式3，继续读取版本2数据。
-- 阶段进度持久化：原advance_phase供可信本地工具显式推进；新ExecutionHost先持久冻结并结算任务、事件和请求，再推进阶段，支持中间任务恢复和截止关闭。
-- A7授权复制：ReplicaSource独占权威世界，按宿主范围、对象读取授权和组件声明生成有界基线与完整增量；支持撤权失效、慢订阅重建和旧代数拒绝。真实库存槽位仅对有对象读取授权的Viewer公开，协议编码与持久发送门槛由B7接入。验证见`benchmarks/M5-authorized-replicas.md`。
-- 离屏客户端渲染：装配世界、按半径生成分区、按修订戳建网格并上传显卡，一帧输出PNG；顶点颜色按方块内容映射，深度测试与方向光在着色器内。
-
-M1剩余：窗口与输入、客户端实体表现。离屏渲染已完成，画面证据见`benchmarks/M1-client.md`。放置破坏已提供统一动作路径，实际UI与网络适配仍待装配。B6/B7已接入持久阶段执行、事件、请求恢复和授权网络；图形窗口与输入仍待客户端任务。
-
-## 目录
-
-```text
-apps/
-    client/
-    server/
-    tools/
-crates/
-    types/
-    runtime/
-    content/
-    world/
-    sim/
-    actions/
-    modules/
-    world_services/
-    mod_api/
-    mod_host/
-    codec/
-    storage/
-    protocol/
-    net/
-    render/
-    assets/
-    diagnostics/
-modules/
-games/
-examples/
-tests/
-benchmarks/
-```
-
-| 位置 | 职责 |
+| 路径 | 内容 |
 |---|---|
-| [apps](apps/README.md) | 客户端、服务端与开发工具入口 |
-| [crates](crates/README.md) | 框架库与B部分编码库 |
-| [modules](modules/README.md) | 库存、配方与能量等可选标准玩法模块 |
-| [games/base](games/base/README.md) | 基础游戏的模块、内容与规则组合 |
-| [examples/mods](examples/mods/README.md) | 仅依赖公开SDK的Mod示例 |
-| [tests](tests/README.md) | 跨模块场景、故障注入与测试数据 |
-| [benchmarks](benchmarks/README.md) | 工作负载、性能测量与[M0实验记录](benchmarks/M0-experiments.md) |
+| [apps](apps/README.md) | 图形客户端、独立服务端与开发工具 |
+| [crates](crates/README.md) | 世界、模拟、渲染、编码、存储、协议与网络等框架库 |
+| [crates/mod_sdk](crates/mod_sdk/src/lib.rs) | 面向Mod开发者的SDK |
+| [modules](modules/README.md) | 库存、合成与能量等标准玩法模块 |
+| [games/base](games/base/README.md) | 基础游戏的内容、规则与素材 |
+| [examples/mods](examples/mods/README.md) | 通过公开SDK实现的Mod示例 |
+| [tests](tests/README.md) | 跨模块场景、故障注入与测试夹具 |
+| [benchmarks](benchmarks/README.md) | 可复现的验证过程、画面与测量记录 |
 
-## 检查
+世界与模拟层负责权威状态及提交语义，存储与网络层通过公共契约接收结果。渲染层读取世界投影，编辑操作通过动作服务提交。修改公共类型或行为时，需要同步检查调用方、编码格式和恢复路径。
 
-工作区固定使用Rust 1.93.1，依赖版本记录在`Cargo.lock`。
+## 开发与验证
+
+提交前执行格式、静态检查与工作区测试：
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+```
+
+开发工具提供可独立复跑的场景，例如：
+
+```sh
 cargo run -p torse-tools -- content-fixture
 cargo run -p torse-tools -- m1-scenario
 cargo run -p torse-tools -- commit-scenario
-cargo run -p torse-tools -- tick-scenario
-cargo run -p torse-tools -- exchange-scenario
 cargo run -p torse-tools -- recovery-scenario
-cargo run -p torse-client -- --capture out.png --width 960 --height 720 --radius 2
-cargo run -p torse-tools -- movement-scenario
 cargo run -p torse-tools -- persistence-scenario
-cargo run -p torse-server --example durable_world -- .work/local-world
 ```
 
-重复运行durable_world会从同一目录恢复并切换一个方块，同时生成或销毁一个实体，提交序号和运行代数连续递增，已删除身份不会重用。故障边界见[本地世界验证](benchmarks/M3-local-world.md)与[生命周期验证](benchmarks/M3-entity-lifecycle.md)。
-
-技术实验需要显式开启组件：
+ECS、Wasmtime与图形初始化实验需显式启用`experiments`特性：
 
 ```sh
 cargo run -p torse-tools --features experiments -- ecs-probe
@@ -132,8 +126,4 @@ cargo run -p torse-tools --features experiments -- wasm-probe
 cargo run -p torse-tools --features experiments -- gpu-probe
 ```
 
-## 协作边界
-
-A负责权威世界、模拟、生命周期和原子提交。B负责世界与磁盘、连接之间的数据交换，包括codec、storage、protocol、net和server装配。公共契约变更需要同步修改设计、类型、测试和受影响模块，不能在单个crate内悄悄改变语义。
-
-正式需求与架构材料在独立的设计材料目录中维护。M0实验结果与M1场景记录都是功能证据，不是性能承诺。
+CI配置见[ci.yml](.github/workflows/ci.yml)。窗口交互与实际GPU画面需在本地验证；各项功能的复现命令、结果和未覆盖范围记录在[benchmarks](benchmarks/README.md)中。

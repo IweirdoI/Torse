@@ -151,6 +151,7 @@ impl TransactionGroup {
         let mut component_targets = std::collections::BTreeSet::new();
         let mut lifecycle_entities = std::collections::BTreeSet::new();
         let mut touched_entities = std::collections::BTreeSet::new();
+        let mut moved_entities = std::collections::BTreeSet::new();
         let mut lifecycle_members = 0;
         for member in &members {
             for mutation in &member.mutations {
@@ -165,6 +166,12 @@ impl TransactionGroup {
                 touched_entities.insert(edit.id);
             }
             for movement in &member.movements {
+                // One entity may be moved by one member only: the merged
+                // change set forbids duplicate identities, and a duplicate
+                // would otherwise surface as an invariant stop at publish.
+                if !moved_entities.insert(movement.id) {
+                    return Err(RejectCode::Conflict);
+                }
                 touched_entities.insert(movement.id);
             }
             if !member.spawns.is_empty() || !member.despawns.is_empty() {

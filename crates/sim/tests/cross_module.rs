@@ -330,7 +330,7 @@ fn block_precondition_of_any_member_rejects_the_group() {
 
 #[test]
 fn constructor_rejects_structurally_invalid_groups() {
-    let (_world, _schemas, _machine, store) = setup();
+    let (world, _schemas, _machine, store) = setup();
     let ordering = OrderingKey {
         phase: Phase::Simulation,
         rule_priority: 0,
@@ -363,6 +363,31 @@ fn constructor_rejects_structurally_invalid_groups() {
         .err(),
         Some(RejectCode::Conflict)
     );
+    // Two members moving the same entity would yield a change set with a
+    // duplicate identity, which publish stops the world for; the constructor
+    // must reject it as a normal conflict instead.
+    let handle = world.entities().handle_of(store).expect("entity");
+    let mut mover_a = member("store", 61, Vec::new());
+    mover_a.move_entity(
+        handle,
+        store,
+        Position::new(2.0, 2.0, 2.0),
+        [0.1, 0.0, 0.0],
+        [0.3, 0.9, 0.3],
+    );
+    let mut mover_b = member("machine", 62, Vec::new());
+    mover_b.move_entity(
+        handle,
+        store,
+        Position::new(2.0, 2.0, 2.0),
+        [0.0, 0.0, 0.1],
+        [0.3, 0.9, 0.3],
+    );
+    assert_eq!(
+        TransactionGroup::new(TransactionId(1), ordering, vec![mover_a, mover_b]).err(),
+        Some(RejectCode::Conflict)
+    );
+
     // Empty and oversized groups.
     assert_eq!(
         TransactionGroup::new(TransactionId(1), ordering, Vec::new()).err(),

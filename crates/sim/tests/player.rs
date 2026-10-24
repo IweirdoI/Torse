@@ -130,8 +130,8 @@ fn input_buffer_orders_dedupes_and_caps() {
         jump: false,
     };
     // Out-of-order arrival still settles in sequence order.
-    buffer.push(input(2)).expect("push");
-    buffer.push(input(1)).expect("push");
+    buffer.push(input(2));
+    buffer.push(input(1));
     assert_eq!(buffer.watermark(), 0);
     let settled = buffer.settle(8);
     assert_eq!(
@@ -141,16 +141,27 @@ fn input_buffer_orders_dedupes_and_caps() {
     assert_eq!(buffer.watermark(), 2);
 
     // Stale and duplicate sequences drop silently.
-    buffer.push(input(2)).expect("push");
-    buffer.push(input(1)).expect("push");
+    buffer.push(input(2));
+    buffer.push(input(1));
     assert!(buffer.settle(8).is_empty());
 
-    // Capacity refuses further input.
+    // Overflow evicts the oldest pending input and raises the resync flag.
     for seq in 3..=6 {
-        buffer.push(input(seq)).expect("push");
+        buffer.push(input(seq));
     }
-    assert_eq!(buffer.push(input(7)), Err(RejectCode::QuotaExceeded));
+    assert!(!buffer.take_resync());
+    buffer.push(input(7));
+    assert!(buffer.take_resync());
+    // The evicted input is the oldest; the newest survives.
+    let settled = buffer.settle(8);
+    assert_eq!(
+        settled.iter().map(|i| i.seq).collect::<Vec<_>>(),
+        vec![4, 5, 6, 7]
+    );
     // Per-tick settlement respects the limit.
+    buffer.push(input(8));
+    buffer.push(input(9));
+    buffer.push(input(10));
     assert_eq!(buffer.settle(2).len(), 2);
 }
 

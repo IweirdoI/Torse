@@ -177,12 +177,15 @@ impl MoveInput {
 ///
 /// Sequence numbers are monotonic per session: duplicates and inputs at or
 /// below the executed watermark are dropped on arrival, never re-executed.
-/// Overflow refuses the input so the caller can force a resync.
+/// A full buffer evicts the oldest pending input and raises the resync flag,
+/// per the movement contract: the client replays its unconfirmed inputs
+/// after the reset instead of the server guessing which intent to keep.
 #[derive(Debug)]
 pub struct MoveInputBuffer {
     capacity: usize,
     watermark: u64,
     pending: BTreeMap<u64, MoveInput>,
+    resync_required: bool,
 }
 
 impl MoveInputBuffer {
@@ -192,6 +195,7 @@ impl MoveInputBuffer {
             capacity,
             watermark: 0,
             pending: BTreeMap::new(),
+            resync_required: false,
         }
     }
 
@@ -200,17 +204,24 @@ impl MoveInputBuffer {
         self.watermark
     }
 
-    /// Queue one input; stale and duplicate sequences are dropped, a full
-    /// buffer refuses.
-    pub fn push(&mut self, input: MoveInput) -> Result<(), RejectCode> {
+    /// Queue one input; stale and duplicate sequences are dropped, and a full
+    /// buffer evicts the oldest pending input and raises the resync flag.
+    pub fn push(&mut self, input: MoveInput) {
         if input.seq <= self.watermark || self.pending.contains_key(&input.seq) {
-            return Ok(());
+            return;
         }
-        if self.pending.len() >= self.capacity {
-            return Err(RejectCode::QuotaExceeded);
+        while self.pending.len() >= self.capacity {
+            let oldest = *self.pending.keys().next().expect("non-empty map");
+            self.pending.remove(&oldest);
+            self.resync_required = true;
         }
         self.pending.insert(input.seq, input);
-        Ok(())
+    }
+
+    /// Whether an overflow evicted pending inputs since the last check.
+    /// The host sends a resync demand (ResetRequired) when this is set.
+    pub fn take_resync(&mut self) -> bool {
+        std::mem::take(&mut self.resync_required)
     }
 
     /// Take up to `limit` inputs in sequence order for this tick's

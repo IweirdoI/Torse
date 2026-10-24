@@ -2,7 +2,7 @@
 
 | 目录 | 职责 | 当前状态 |
 |---|---|---|
-| [client](client/src/main.rs) | 窗口、输入、预测、表现与UI的应用装配 | 空入口，待对应负责人实现 |
+| [client](client/README.md) | 世界装配、网格上传与离屏渲染；窗口与输入待接 | `capture`输出PNG，见[说明](client/README.md) |
 | [server](server/README.md) | 权威模拟与存储、连接服务的应用装配 | B部分，空入口 |
 | [tools](tools/src/main.rs) | 内容检查、世界与提交场景、技术实验 | `content-fixture`、`m1-scenario`、`commit-scenario`、`tick-scenario`、`exchange-scenario`、`recovery-scenario`、`movement-scenario`、`persistence-scenario`、`ecs-probe`、`wasm-probe`和`gpu-probe` |
 

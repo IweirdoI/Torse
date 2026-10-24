@@ -46,8 +46,9 @@ M2已开始，当前覆盖模拟执行模型与实体存储：
 - 服务端真实世界装配：WorldHost接入B4协调器，可信本地事务经日志预留、发布与刷盘后返回持久位置；支持有界完整快照、文件恢复和关闭。网络请求、持久事件及去重结果仍待B6后续。
 - 实体生命周期事务：生成按准备顺序提出身份，发布时推进分配水位；销毁复核完整旧状态，能与块、移动和组件变化成组提交及重放。新写入使用世界格式3，继续读取版本2数据。
 - 阶段进度持久化：advance_phase经日志推进一个完整阶段，支持中间阶段恢复和关闭到下一Tick起点；完整系统执行与事件仍待接入。
+- 离屏客户端渲染：装配世界、按半径生成分区、按修订戳建网格并上传显卡，一帧输出PNG；顶点颜色按方块内容映射，深度测试与方向光在着色器内。
 
-M1尚未完成：GPU上传与可视客户端（窗口、相机、渲染管线）、可玩角色的输入装配。放置破坏已提供统一动作路径，实际UI与网络适配仍待装配。B6已接入可信本地事务，完整执行循环与请求恢复仍待后续。
+M1剩余：窗口与输入、客户端实体表现。离屏渲染已完成，画面证据见`benchmarks/M1-client.md`。放置破坏已提供统一动作路径，实际UI与网络适配仍待装配。B6已接入可信本地事务，完整执行循环与请求恢复仍待后续。
 
 ## 目录
 
@@ -105,6 +106,7 @@ cargo run -p torse-tools -- commit-scenario
 cargo run -p torse-tools -- tick-scenario
 cargo run -p torse-tools -- exchange-scenario
 cargo run -p torse-tools -- recovery-scenario
+cargo run -p torse-client -- --capture out.png --width 960 --height 720 --radius 2
 cargo run -p torse-tools -- movement-scenario
 cargo run -p torse-tools -- persistence-scenario
 cargo run -p torse-server --example durable_world -- .work/local-world

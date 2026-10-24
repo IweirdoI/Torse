@@ -2719,6 +2719,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "torse-content",
+ "torse-sim",
  "torse-types",
  "torse-world",
 ]
@@ -2806,10 +2807,19 @@ dependencies = [
 [[package]]
 name = "torse-net"
 version = "0.1.0"
+dependencies = [
+ "torse-sim",
+ "torse-types",
+ "torse-world",
+]
 
 [[package]]
 name = "torse-protocol"
 version = "0.1.0"
+dependencies = [
+ "torse-codec",
+ "torse-types",
+]
 
 [[package]]
 name = "torse-render"
@@ -2836,6 +2846,8 @@ dependencies = [
  "torse-codec",
  "torse-content",
  "torse-inventory",
+ "torse-net",
+ "torse-protocol",
  "torse-sim",
  "torse-storage",
  "torse-types",

@@ -45,6 +45,8 @@ jobs:
         run: cargo run -p torse-tools -- recovery-scenario
       - name: Persistence scenario
         run: cargo run -p torse-tools -- persistence-scenario
+      - name: Durable execution server smoke
+        run: cargo run -p torse-server -- .work/ci-execution-world --listen 127.0.0.1:0 --ticks 2
 
   experiments:
     runs-on: macos-latest

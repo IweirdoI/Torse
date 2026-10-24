@@ -134,6 +134,10 @@ impl ReplicaSource {
         self.world.prepare_phase_advance()
     }
 
+    pub fn prepare_barrier(&self) -> Result<PreparedChange, CommitFault> {
+        self.world.prepare_barrier()
+    }
+
     /// The host supplies an authenticated actor and approved interest, separately
     /// from the Viewer IDs. Call under the same host authentication used by actions.
     /// Failed opening consumes neither a slot nor an ID.
@@ -191,8 +195,14 @@ impl ReplicaSource {
     /// Publish after B reserves the full authoritative record. Projection failure
     /// or slow consumers reset only their subscription, never reject a world commit.
     pub fn publish(&mut self, prepared: PreparedChange) -> Result<Publication, CommitFault> {
+        let visible_work = !prepared.edits().is_empty()
+            || !prepared.entity_moves().is_empty()
+            || !prepared.component_edits().is_empty()
+            || prepared.entity_lifecycle().is_some();
         let mut publication = self.world.publish(prepared)?;
-        for (&id, sub) in &mut self.subscriptions {
+        // Durable task/phase barriers change no observable world data. They must
+        // still deliver pending invalidations, but need no projection or clone.
+        for (&id, sub) in self.subscriptions.iter_mut().filter(|_| visible_work) {
             if sub.state.is_none() {
                 continue;
             }

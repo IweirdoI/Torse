@@ -1,12 +1,14 @@
 # 网络协议
 
-包名：`torse-protocol`。当前各模块仅预留文件，尚无消息模式或协议版本。
+包名：`torse-protocol`。版本1已实现兼容握手、请求、结果、订阅和完整授权复制消息。消息本身是泛型包裹，应用层绑定Call/Reply及A7投影，协议不接收可信actor或管理员标记。
 
-| 文件 | 预留职责 |
+| 文件 | 职责 |
 |---|---|
-| [frame.rs](src/frame.rs) | 网络消息边界、长度检查与解码 |
-| [handshake.rs](src/handshake.rs) | 协议与锁定内容兼容协商消息 |
-| [input.rs](src/input.rs) | 输入请求与关联结果的消息编码 |
-| [replication.rs](src/replication.rs) | 已授权初始快照与原子增量批次的消息编码 |
+| [messages.rs](src/messages.rs) | ClientMessage<I>、ServerMessage<O,S,C>及显式消息标签 |
+| [FORMAT.md](FORMAT.md) | 长度前缀、字段顺序、版本、接纳状态及身份规则 |
 
-此crate定义网络表示，连接和复制流程由net组织。消息模式、版本、稳定身份和序号规则按用户指定的契约实现，不将存档原始记录直接作为客户端消息。
+正文使用codec/wire版本1，TCP帧使用u32小端长度前缀。兼容的协议、规则和权威内容摘要是加入前置条件。结构解码拒绝未知标签、截断、超额和尾随字节；ActionService再执行权限、目标与参数检查。
+
+Queued不表示成功，普通结果、查询和复制都等待DurableSeq。ReplicaSeq按订阅连续，不能用全局CommitSeq跳号判断丢包。撤权使用独立控制信号关闭连接并清队列，客户端重建基线。
+
+实现程序集成在apps/server/src/network.rs；测试覆盖内存和真实回环TCP双客户端。登录、TLS、压缩和任意大消息分片不在本版范围。

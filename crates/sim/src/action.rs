@@ -245,6 +245,13 @@ pub struct ActionService {
 }
 
 impl ActionService {
+    /// Declared execution phase; lookup does not authorize a caller.
+    pub fn phase(&self, action: &ContentKey) -> Option<Phase> {
+        self.registry
+            .actions()
+            .get(action)
+            .and_then(|a| Phase::from_index(a.phase.index() as u16))
+    }
     /// Validate aliases, schemas, ownership, and exact handler coverage at startup.
     pub fn bind(
         actions: Vec<ActionDescriptor>,

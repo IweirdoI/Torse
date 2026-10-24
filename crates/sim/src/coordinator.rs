@@ -229,13 +229,17 @@ impl CommitCoordinator {
         self.resume = resume;
     }
 
-    /// Prepare a journaled whole-phase completion without publishing progress.
-    /// The trusted driver must have settled all work in the current phase first.
-    pub fn prepare_phase_advance(&self) -> Result<PreparedChange, CommitFault> {
-        let resume_at = crate::phase::next_resume_point(self.resume).ok_or(
-            CommitFault::Invariant("phase progress is invalid or exhausted"),
-        )?;
+    /// Prepare a durable execution-state barrier without changing the phase.
+    pub fn prepare_barrier(&self) -> Result<PreparedChange, CommitFault> {
+        let mut prepared = self.prepare_empty(self.resume)?;
+        prepared.source = ContentKey::parse("torse:execution").expect("static key");
+        Ok(prepared)
+    }
+
+    fn prepare_empty(&self, resume_at: ResumePoint) -> Result<PreparedChange, CommitFault> {
         let seq = self.seq.next().ok_or(CommitFault::SequenceExhausted)?;
+        let phase = Phase::from_index(self.resume.next_phase)
+            .ok_or(CommitFault::Invariant("invalid phase"))?;
         Ok(PreparedChange {
             meta: CommitMeta {
                 cursor: CommitCursor {
@@ -248,8 +252,8 @@ impl CommitCoordinator {
             },
             observed_resume: self.resume,
             transaction: TransactionId(u128::from(seq.0)),
-            source: ContentKey::parse("torse:phase").expect("static phase identity is valid"),
-            phase: Phase::from_index(self.resume.next_phase).expect("phase was validated"),
+            source: ContentKey::parse("torse:phase").expect("static key"),
+            phase,
             edits: Vec::new(),
             touched: Vec::new(),
             entity_moves: Vec::new(),
@@ -259,6 +263,15 @@ impl CommitCoordinator {
             component_batch: ComponentBatch::default(),
             lifecycle_batch: None,
         })
+    }
+
+    /// Prepare a journaled whole-phase completion without publishing progress.
+    /// The trusted driver must have settled all work in the current phase first.
+    pub fn prepare_phase_advance(&self) -> Result<PreparedChange, CommitFault> {
+        let resume_at = crate::phase::next_resume_point(self.resume).ok_or(
+            CommitFault::Invariant("phase progress is invalid or exhausted"),
+        )?;
+        self.prepare_empty(resume_at)
     }
 
     /// Validate a transaction and build its record without touching the world.

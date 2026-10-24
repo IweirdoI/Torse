@@ -3,10 +3,13 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+pub mod bootstrap;
 mod checkpoint;
 mod coordinator;
 mod directory;
+pub mod execution;
 mod lifecycle;
+pub mod network;
 mod world;
 
 pub use authority::{HostAuthority, InvalidationSink, NoReplicas, PreparedChange, RecoveryTarget};

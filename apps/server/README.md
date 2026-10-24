@@ -1,6 +1,6 @@
 # 服务端协调
 
-包名：`torse-server`。B4提供串行协调器、世界目录锁和文件生命周期。B6新增WorldHost与WorldHostRecovery，将A的真实世界和B5的WorldCodec接入该流程。主二进制入口仍为空，可信本地事务可通过库和durable_world示例执行。
+包名：`torse-server`。B4提供串行协调器、世界目录锁和文件生命周期；原WorldHost继续服务可信本地事务。B6新增ExecutionHost、ExecutionRecovery与完整持久阶段驱动，B7新增NetworkHub、授权复制和内存/非阻塞TCP接入，主程序已可启动。范围与证据见[执行/网络验收](../../benchmarks/B6-B7-execution-network.md)。
 
 | 文件 | 职责 |
 |---|---|
@@ -10,8 +10,27 @@
 | [directory.rs](src/directory.rs) | 世界目录排他锁与运行代数分配 |
 | [lifecycle.rs](src/lifecycle.rs) | 文件世界创建、只读恢复检查、激活与日志重开 |
 | [world.rs](src/world.rs) | 真实世界的可信本地事务、完整记录、有界快照与独立恢复适配 |
+| [execution.rs](src/execution.rs) | 持久阶段工作、定时事件、动作结果、去重及完整执行恢复 |
+| [network.rs](src/network.rs) | 会话策略、输入适配、持久输出门槛、订阅与失效控制 |
+| [bootstrap.rs](src/bootstrap.rs) | 有限演示世界及显式容量配置 |
+| [main.rs](src/main.rs) | 非阻塞监听、固定逻辑Tick和有界关闭 |
 
-## 本地世界
+## B6/B7执行世界
+
+```sh
+cargo run -p torse-server -- .work/execution-world --listen 127.0.0.1:7777 --ticks 60
+cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
+```
+
+第二条在另一终端执行。--ticks 0持续运行，有限Tick结束后保存并关闭；同目录再次启动恢复Tick、事件、结果和任务位置，使用新epoch。演示创建两个Section及两个容器，对新连接使用只读访客PeerPolicy，因而headless_client看到实体但看不到库存组件。
+
+ExecutionHost独占A7 ReplicaSource，使用纯DurableRule规划系统和事件。阶段先写完整冻结任务，再逐项原子记录世界变化、任务进度、事件和结果，最后推进一个阶段。未来输入的关闭拒绝可以使用独立Stopping记录，不越过截止边界执行下一Tick。旧Simulation保留参考用途，不能在日志外直接执行后再补写进度。
+
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。这是新执行目录，原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。完整状态每条日志替换、有限世界驻留、同步刷盘是本轮边界，未进行吞吐或硬件断电验收。
+
+NetworkHub通过泛型协议接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线和增量都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。真实用户认证、TLS、窗口和移动预测由应用后续集成。
+
+## 原本地世界工具
 
 WorldHost消耗一个初始化完成的WorldAuthority，后续只提供只读world访问。Server::commit_transaction接收借用的可信本地事务，准备时生成完整ChangeSet，仍由通用协调器执行预留、发布、接纳和刷盘。LocalCommit分别表示业务拒绝、存储预留受阻或持久提交。预留受阻时世界、序号、实体分配水位和调用方事务均保持原状，可重新调用。
 
@@ -41,9 +60,9 @@ Server拥有权威实例、日志、检查点和目录锁。HostAuthority是应�
 
 drive_one依次准备、预留日志、发布、立即接纳日志、处理订阅失效、刷盘，最后返回DurablePublication。日志预留的Busy、TooLarge、InvalidRecord发生在发布前，返回Blocked，调用方可以处理背压或拒绝原因后重新准备。Stopped、发布不变量故障、接纳失败、失效处理失败和刷盘失败停止实例，不再次发布，也不返回持久确认。
 
-刷盘结果必须匹配完整Binding，覆盖目标，且不超过权威位置。发布位置、恢复位置与准备记录也必须一致。服务端不提供可变权威引用；只读authority访问要求实例正常且当前位置已持久。submit先拒绝无关世界和旧运行代数。会话身份、权限、速率与请求去重仍由后续网络及领域接入负责，Queued不构成动作成功承诺。
+刷盘结果必须匹配完整Binding，覆盖目标，且不超过权威位置。发布位置、恢复位置与准备记录也必须一致。服务端不提供可变权威引用；只读authority访问要求实例正常且当前位置已持久。submit先拒绝无关世界和旧运行代数。ExecutionHost与NetworkHub已负责会话身份、权限、速率及持久去重；Queued仍不构成动作成功承诺。
 
-订阅失效通过独立InvalidationSink处理，发生在释放输出之前。没有复制连接时使用NoReplicas，收到非空失效列表会停止实例，避免漏处理。普通结果与复制队列尚未接入。FlushMetrics单独记录日志屏障调用次数及耗时，包含无须追加的调用，不混入权威执行时间。
+订阅失效通过独立InvalidationSink处理，发生在释放输出之前。没有复制连接时使用NoReplicas，收到非空失效列表会停止实例，避免漏处理。ExecutionHost/NetworkHub已接入普通结果和复制队列，原LocalWorldModel继续使用NoReplicas。FlushMetrics单独记录日志屏障调用次数及耗时，包含无须追加的调用，不混入权威执行时间。
 
 ## 文件启动
 
@@ -102,4 +121,4 @@ shutdown消耗Server，先停止接纳，通知权威适配器按包含截止Tic
 
 [协调器测试](tests/coordinator.rs)检查调用次序、预留拒绝后的重试、失败后的持久门槛、输入身份、订阅失效、快照与有界关闭。[目录测试](tests/directory.rs)检查跨进程互斥、退出后解锁、逐字节截断与位翻转、代数递增和容量。[文件生命周期测试](tests/lifecycle.rs)覆盖恢复后续号、尾部保留、整条后缀缺失、初始化拒绝，以及发布后、接纳前突然退出。
 
-当前B2日志从位置1完整保留，恢复会校验整个文件。真实世界载荷编码和本地WorldHost适配已完成；日志分段回收、完整Tick执行循环、持久事件与去重结果、网络会话及授权复制仍待后续阶段。已有测试不能代替完整M3验收。
+当前B2日志从位置1完整保留，恢复会校验整个文件。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。分段回收、异步刷盘、脏区流送和硬件断电保证仍需单独验收，当前功能测试不代替性能或平台承诺。

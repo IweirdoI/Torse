@@ -11,7 +11,8 @@ torse-storage = { path = "../../crates/storage" }
 torse-types = { path = "../../crates/types" }
 torse-sim = { path = "../../crates/sim" }
 torse-world = { path = "../../crates/world" }
+torse-protocol = { path = "../../crates/protocol" }
+torse-net = { path = "../../crates/net" }
 
-[dev-dependencies]
 torse-content = { path = "../../crates/content" }
 torse-inventory = { path = "../../modules/inventory" }

@@ -6,6 +6,8 @@
 //! The crate has two layers. The generic layer (`Encoder`, `Decoder`, budgets, `record`,
 //! `metadata`) knows nothing about the world. [`WorldCodec`] builds on it to encode the
 //! world exchange payloads; its byte layout is documented in `WORLD.md`.
+//! [`wire`] additionally encodes stable execution state and authorized protocol
+//! payloads; its explicit layout is documented in `EXECUTION.md`.
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +22,7 @@ pub mod record;
 mod registry;
 mod snapshot;
 mod value;
+pub mod wire;
 mod world;
 
 pub use budget::{BudgetGuard, CodecLimits};

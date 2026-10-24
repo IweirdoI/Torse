@@ -116,6 +116,10 @@ pub struct WorldAuthority {
 }
 
 impl WorldAuthority {
+    /// Prepare an empty world change carrying an atomic host execution-state update.
+    pub fn prepare_barrier(&self) -> Result<PreparedChange, CommitFault> {
+        self.coordinator.prepare_barrier()
+    }
     /// Prepare a durable whole-phase completion after the driver settles its work.
     pub fn prepare_phase_advance(&self) -> Result<PreparedChange, CommitFault> {
         self.coordinator.prepare_phase_advance()

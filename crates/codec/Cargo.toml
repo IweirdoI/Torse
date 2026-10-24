@@ -8,6 +8,7 @@ publish.workspace = true
 crc32c = "=0.6.8"
 torse-types = { path = "../types" }
 torse-world = { path = "../world" }
+torse-sim = { path = "../sim" }
 
 [dev-dependencies]
 torse-content = { path = "../content" }

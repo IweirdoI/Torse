@@ -1,12 +1,18 @@
 # 连接与状态复制
 
-包名：`torse-net`。当前各模块仅预留文件，尚无传输库、连接或复制实现。
+包名：`torse-net`。B7已实现有界内存传输、非阻塞TCP、会话序号/速率和原子客户端镜像；应用层NetworkHub接入真实权威与持久门槛。
 
-| 文件 | 预留职责 |
+| 文件 | 职责 |
 |---|---|
-| [transport.rs](src/transport.rs) | 内存与外部传输适配、有界队列 |
-| [session.rs](src/session.rs) | 宿主管理的会话、请求序号与连接配额 |
-| [ingress.rs](src/ingress.rs) | 输入检查与带宿主身份的世界请求交付 |
-| [replication.rs](src/replication.rs) | 已授权快照、按序增量与重连流程 |
+| [transport.rs](src/transport.rs) | MemoryTransport、TcpTransport、完整帧队列和部分读写 |
+| [session.rs](src/session.rs) | 运行期唯一会话、新序号连续性、重传与每Tick限额 |
+| [replication.rs](src/replication.rs) | ReplicaMirror基线和完整增量校验、一次替换状态 |
+| [transports.rs](tests/transports.rs) | 部分帧、超大前缀、背压和控制关闭验证 |
 
-首版计划固定内容包，先使用内存传输验证，再接入真实连接。输入交给A裁定，状态复制遵守契约提供的可见性与授权结果。动作去重的最终结果需要与权威提交和恢复保持一致。
+传输不参与世界发布。TcpTransport的长度检查发生在正文分配前，socket非阻塞，每次poll限制字节和最多64次读/64次写尝试。配置显式限制单帧、排队帧数、累计字节和每poll工作量。Partial/WouldBlock保留到下一次poll，错误只关闭对应连接。
+
+MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据。NetworkHub还限制连接、空闲Tick、请求与订阅，按宿主PeerPolicy绑定权限；权威ExecutionHost负责持久请求去重。
+
+ReplicaMirror先校验完整新状态再替换，拒绝错误Binding、重复/缺失ReplicaSeq、无效字典、Section尺寸或实体位置。连接关闭后应用应丢弃镜像并重新获取基线，不能继续使用旧权限状态。
+
+端到端验证见[执行/网络记录](../../benchmarks/B6-B7-execution-network.md)。这是固定内容和有限范围的串行实现，不包含UDP、多通道、客户端预测或互联网认证。

@@ -27,6 +27,7 @@ fn run() -> Result<(), Fault> {
     let mut ticks = 0u64;
     let mut fill = false;
     let mut editors = false;
+    let mut revoke_after = 0u64;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
@@ -42,6 +43,12 @@ fn run() -> Result<(), Fault> {
             }
             "--fill" => fill = true,
             "--editors" => editors = true,
+            "--revoke-after" => {
+                revoke_after = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| Fault::invalid_data("invalid revoke tick count"))?
+            }
             _ => return Err(Fault::invalid_data("unknown server argument")),
         }
     }
@@ -87,6 +94,9 @@ fn run() -> Result<(), Fault> {
         server.authority()?.resume_point().tick.0
     );
     let mut hub = NetworkHub::new(server.binding(), base::network_limits())?;
+    let mut peers: Vec<u128> = Vec::new();
+    // Anchor the demo revocation to the first connection, not process start.
+    let mut revoke_at: Option<u64> = None;
     let transport = TransportLimits {
         frame: 8_388_608,
         queued_frames: 32,
@@ -115,13 +125,29 @@ fn run() -> Result<(), Fault> {
                         ActorContext::new(base::key("base:guest"))
                     };
                     let policy = PeerPolicy { actor, scope };
-                    let _ = hub.add(stream, policy, server.authority()?.resume_point().tick);
+                    if let Ok(id) = hub.add(stream, policy, server.authority()?.resume_point().tick)
+                    {
+                        peers.push(id);
+                        if revoke_at.is_none() && revoke_after != 0 {
+                            revoke_at = Some(done + revoke_after);
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(Fault::invalid_data(e.to_string())),
             }
         }
         hub.poll(&mut server)?;
+        if let Some(at) = revoke_at
+            && done >= at
+        {
+            revoke_at = None;
+            let count = peers.len();
+            for id in std::mem::take(&mut peers) {
+                hub.revoke(&mut server, id)?;
+            }
+            println!("revoked_sessions={count}");
+        }
         if Instant::now() >= next {
             let started = Instant::now();
             server.drive_tick(&mut hub, 4096)?;

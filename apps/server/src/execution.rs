@@ -347,6 +347,9 @@ impl ExecutionHost {
         if scope.sections.len() > self.limits.replicas.max_sections {
             return Err(Fault::resource_limit("session scope too large"));
         }
+        if actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS {
+            return Err(Fault::resource_limit("actor section grants too large"));
+        }
         self.highest_session = viewer.session.0;
         self.sessions.insert(
             viewer.session.0,

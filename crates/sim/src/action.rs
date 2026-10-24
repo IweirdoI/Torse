@@ -85,6 +85,9 @@ pub enum ActionTarget {
     Entity(EntityId),
 }
 
+/// Upper bound on section grants one actor may carry at registration.
+pub const MAX_ACTOR_SECTIONS: usize = 64;
+
 /// Identity and finite access grants established by the trusted host.
 ///
 /// Never deserialize this object from client assertions. A grant can represent
@@ -129,9 +132,15 @@ impl ActorContext {
     }
     /// Grant every cell of one section. Hosts use this for scope-wide access
     /// such as editing a subscribed area; it never widens entity access.
+    /// Registration rejects actors carrying more than [`MAX_ACTOR_SECTIONS`]
+    /// grants; the builder itself stays infallible.
     pub fn section(mut self, pos: SectionPos) -> Self {
         self.sections.insert(pos);
         self
+    }
+    /// How many section grants this actor carries.
+    pub fn section_count(&self) -> usize {
+        self.sections.len()
     }
     /// Authenticated caller identity, available for module-specific policies.
     pub fn principal(&self) -> &ContentKey {

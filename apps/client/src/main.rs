@@ -39,6 +39,7 @@ fn main() -> ExitCode {
     let mut autoplay = false;
     let mut walk = false;
     let mut connect: Option<String> = None;
+    let mut probe_outside = false;
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -75,6 +76,7 @@ fn main() -> ExitCode {
             "--autoplay" => autoplay = true,
             "--walk" => walk = true,
             "--connect" => connect = value(),
+            "--probe-outside" => probe_outside = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -97,6 +99,7 @@ fn main() -> ExitCode {
             autoplay,
             walk,
             connect,
+            probe_outside,
         };
         match run_window(config) {
             Ok(summary) => {

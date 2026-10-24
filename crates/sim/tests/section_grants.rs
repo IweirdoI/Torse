@@ -180,6 +180,20 @@ fn section_grants_do_not_widen_entity_or_permission_access() {
 }
 
 #[test]
+fn section_grants_have_a_registration_budget() {
+    let mut actor = editor();
+    let mut index = 1i64;
+    while actor.section_count() < torse_sim::action::MAX_ACTOR_SECTIONS {
+        actor = actor.section(SectionPos::new(index, 0, 0));
+        index += 1;
+    }
+    assert_eq!(actor.section_count(), torse_sim::action::MAX_ACTOR_SECTIONS);
+    // The builder stays infallible; registration is where the bound bites.
+    let overflowing = actor.section(SectionPos::new(999, 0, 0));
+    assert!(overflowing.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS);
+}
+
+#[test]
 fn exact_cell_grants_keep_working_alongside_sections() {
     let (world, service) = setup();
     let mixed = ActorContext::new(key("test:editor"))

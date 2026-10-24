@@ -55,6 +55,9 @@ pub struct WindowConfig {
     pub walk: bool,
     /// Connect to a standalone server and mirror its authorized projection.
     pub connect: Option<String>,
+    /// Send one edit request far outside the approved scope, for acceptance
+    /// evidence that the server rejects out-of-scope targets.
+    pub probe_outside: bool,
 }
 
 /// Measurements reported when the window closes.
@@ -135,6 +138,7 @@ struct WindowApp {
     autoplay_break: bool,
     net: Option<crate::net::Connection<torse_net::TcpTransport>>,
     session: Option<u128>,
+    probe_sent: bool,
     batches: u32,
     requests_sent: u32,
     requests_rejected: u32,
@@ -180,6 +184,7 @@ impl WindowApp {
             autoplay_break: false,
             net: None,
             session: None,
+            probe_sent: false,
             batches: 0,
             requests_sent: 0,
             requests_rejected: 0,
@@ -362,6 +367,28 @@ impl WindowApp {
         // The walk demo is about walking; firing place or break at the aim
         // while walking would block the walker's own path.
         let network = self.scene.as_ref().is_some_and(Scene::is_network);
+        if network
+            && self.config.probe_outside
+            && !self.probe_sent
+            && self.frames > 12
+            && let Some(net) = self.net.as_mut()
+        {
+            // One deliberate out-of-scope target; the server should reject
+            // it and neither world nor mirror changes.
+            self.probe_sent = true;
+            let call = crate::net::edit_call(
+                false,
+                &self.materials[self.material],
+                BlockPos::new(200, 1, 1),
+            );
+            match net.request(call) {
+                Ok(seq) => {
+                    self.requests_sent += 1;
+                    self.last_result = format!("outside probe seq {} sent", seq.0);
+                }
+                Err(error) => self.last_result = format!("probe failed: {error}"),
+            }
+        }
         if network && self.config.autoplay && self.frames.is_multiple_of(AUTOPLAY_PERIOD) {
             // Over a connection the demo exercises the request path: the
             // guest session should see its edit rejected by admission.

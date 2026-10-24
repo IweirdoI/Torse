@@ -32,8 +32,6 @@ use torse_world::Position;
 
 /// How far the pick ray reaches, in blocks.
 const PICK_RANGE: f32 = 64.0;
-/// Synthetic section key carrying the entity box buffers.
-const ENTITY_SLOT: SectionPos = SectionPos::new(i64::MAX, 0, i64::MAX);
 /// Sections generated per frame while streaming; spreading the work keeps
 /// the frame time bounded at the cost of populating a window over a few
 /// frames.
@@ -554,12 +552,21 @@ impl WindowApp {
                 // alongside any terrain upload.
                 let (entity_vertices, entity_indices) = scene.entity_geometry();
                 let entity_bytes = Scene::vertex_bytes(&entity_vertices);
-                gpu.context
-                    .upload_section(ENTITY_SLOT, &entity_bytes, &entity_indices);
-                gpu.context.retain_sections(scene.sections());
+                gpu.context.upload_section(
+                    crate::renderer::ENTITY_SLOT,
+                    &entity_bytes,
+                    &entity_indices,
+                );
             }
             self.uploaded = true;
             self.uploads += rebuilt.len();
+        }
+        // Unloaded sections must stop drawing even when nothing rebuilt this
+        // frame; retention is cheap and the entity slot survives it.
+        if let Some(gpu) = self.gpu.as_mut()
+            && let Some(scene) = self.scene.as_ref()
+        {
+            gpu.context.retain_sections(scene.sections());
         }
 
         if self.input.take_screenshot() {
@@ -713,7 +720,7 @@ impl WindowApp {
                 let loaded_top = (snapshot.side as i64).min(snapshot.bounds.max_y);
                 let scene = Scene::from_snapshot(&snapshot)?;
                 if let Some(camera) = self.camera.as_mut() {
-                    camera.eye = [8.0, (loaded_top as f32 - 2.0).max(4.0), 8.0];
+                    camera.eye = [4.0, (loaded_top as f32 - 2.0).max(4.0), 4.0];
                     // Look nearly straight down: the scope is 32 by 16 blocks,
                     // so a shallow view drifts out of the loaded area before
                     // the ray reaches the floor.

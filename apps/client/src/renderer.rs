@@ -70,6 +70,10 @@ pub const SKY: Color = Color {
 /// Selection outline capacity: 12 cube edges of 2 vertices each.
 const MAX_LINE_VERTICES: usize = 24;
 
+/// Synthetic key carrying the entity box buffers; retention never drops it.
+pub const ENTITY_SLOT: torse_types::SectionPos =
+    torse_types::SectionPos::new(i64::MAX, 0, i64::MAX);
+
 /// Device, queue, pipeline, camera uniform, and terrain buffers.
 pub struct GpuContext {
     device: Device,
@@ -286,8 +290,13 @@ impl GpuContext {
     }
 
     /// Drop the buffers of unloaded sections.
+    ///
+    /// The entity slot is synthetic and carries no section coordinate, so it
+    /// survives every retention; callers re-upload its contents when entity
+    /// positions change.
     pub fn retain_sections(&mut self, keep: &[torse_types::SectionPos]) {
-        self.terrain.retain(|pos, _| keep.contains(pos));
+        self.terrain
+            .retain(|pos, _| keep.contains(pos) || *pos == ENTITY_SLOT);
     }
 
     /// Stage the camera matrix for the next frame.

@@ -14,7 +14,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 
 /// Radians of yaw per pixel of horizontal drag.
 const LOOK_PER_PIXEL: f32 = 0.005;
-/// Multiplier applied to the fly speed per wheel notch.
+/// Multiplier applied to the fly speed per scroll step.
 const SPEED_STEP: f32 = 1.25;
 /// Fastest and slowest fly speed in blocks per second.
 const SPEED_RANGE: (f32, f32) = (1.0, 300.0);
@@ -96,14 +96,14 @@ impl InputState {
         }
     }
 
-    /// Adjust the speed factor by wheel notches, clamped to the speed range.
+    /// Adjust the speed factor by scroll steps, clamped to the speed range.
     pub fn wheel(&mut self, delta: MouseScrollDelta) {
-        let notches = match delta {
+        let steps = match delta {
             MouseScrollDelta::LineDelta(_, lines) => lines,
             MouseScrollDelta::PixelDelta(position) => position.y as f32 / 48.0,
         };
         self.speed_factor =
-            (self.speed_factor * SPEED_STEP.powf(notches)).clamp(SPEED_RANGE.0, SPEED_RANGE.1);
+            (self.speed_factor * SPEED_STEP.powf(steps)).clamp(SPEED_RANGE.0, SPEED_RANGE.1);
     }
 
     /// Consume one frame of movement intent and the pending look delta.

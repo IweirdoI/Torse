@@ -60,6 +60,9 @@ pub struct WindowConfig {
     pub walk: bool,
     /// Connect to a standalone server and mirror its authorized projection.
     pub connect: Option<String>,
+    /// Captured-look sensitivity multiplier; scroll steps multiply it in
+    /// walk mode.
+    pub sensitivity: f64,
     /// Send one edit request far outside the approved scope, for acceptance
     /// evidence that the server rejects out-of-scope targets.
     pub probe_outside: bool,
@@ -157,6 +160,7 @@ struct WindowApp {
     session: Option<u128>,
     grabbed: bool,
     last_cursor: Option<(f64, f64)>,
+    look_sensitivity: f64,
     probe_sent: bool,
     batches: u32,
     requests_sent: u32,
@@ -219,6 +223,7 @@ impl WindowApp {
             session: None,
             grabbed: false,
             last_cursor: None,
+            look_sensitivity: 1.0,
             probe_sent: false,
             batches: 0,
             requests_sent: 0,
@@ -1039,6 +1044,7 @@ impl ApplicationHandler for WindowApp {
             let eye = self.camera.as_ref().expect("camera was just installed").eye;
             self.enter_walk(eye);
         }
+        self.look_sensitivity = self.config.sensitivity;
         self.started = Some(Instant::now());
         self.fps_origin = Instant::now();
         // Capture the mouse right away; Esc opens the pause menu with the
@@ -1163,7 +1169,8 @@ impl ApplicationHandler for WindowApp {
                         let dx = position.x - last_x;
                         let dy = position.y - last_y;
                         if dx.abs() + dy.abs() > 0.0 {
-                            self.input.mouse_look(dx, dy);
+                            self.input
+                                .mouse_look(dx * self.look_sensitivity, dy * self.look_sensitivity);
                         }
                         // Recentre only on real drift; the hidden cursor may
                         // wander a little without anyone noticing.
@@ -1186,7 +1193,20 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !self.ui.modal() {
+                if !self.ui.modal() && self.walk {
+                    // Fly speed is meaningless on foot; the wheel tunes the
+                    // look sensitivity instead.
+                    let notches = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, lines) => f64::from(lines),
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 48.0,
+                    };
+                    if notches.is_finite() && notches != 0.0 {
+                        self.look_sensitivity = (self.look_sensitivity
+                            * 1.15f64.powf(notches.clamp(-8.0, 8.0)))
+                        .clamp(0.2, 5.0);
+                        self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                    }
+                } else if !self.ui.modal() {
                     self.input.wheel(delta);
                 }
             }

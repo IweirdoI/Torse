@@ -138,8 +138,10 @@ impl Overlay {
         })
     }
     pub fn upload(&mut self, device: &Device, queue: &Queue, canvas: &Canvas, scale: u32) {
-        if self.image.width() != canvas.width || self.image.height() != canvas.height {
-            self.image = Self::texture(device, canvas.width, canvas.height);
+        let pixel_width = canvas.pixel_width();
+        let pixel_height = canvas.pixel_height();
+        if self.image.width() != pixel_width || self.image.height() != pixel_height {
+            self.image = Self::texture(device, pixel_width, pixel_height);
             self.binding = Self::bind(device, &self.layout, &self.image, &self.params);
         }
         let mut params = [0; 16];
@@ -152,15 +154,15 @@ impl Overlay {
                 origin: Origin3d::ZERO,
                 aspect: TextureAspect::All,
             },
-            &canvas.pixels,
+            canvas.as_pixels(),
             TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(canvas.width * 4),
-                rows_per_image: Some(canvas.height),
+                bytes_per_row: Some(pixel_width * 4),
+                rows_per_image: Some(pixel_height),
             },
             Extent3d {
-                width: canvas.width,
-                height: canvas.height,
+                width: pixel_width,
+                height: pixel_height,
                 depth_or_array_layers: 1,
             },
         );

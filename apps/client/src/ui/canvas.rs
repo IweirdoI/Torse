@@ -61,24 +61,54 @@ impl Rect {
             && p[1] < self.y + self.h as i32
     }
 }
+/// Retained UI raster over physical pixels.
+///
+/// Draw calls take logical rects; every logical pixel lands as a
+/// `scale`x`scale` block so the nine-slice and fill math stay unchanged while
+/// the texture itself matches the surface one to one. Glyphs rasterize at the
+/// physical size and blend through [`Canvas::blend_px`], which keeps text
+/// crisp instead of magnifying anti-aliased logical pixels.
 pub struct Canvas {
+    /// Logical width; the pixel buffer is `width * scale` wide.
     pub width: u32,
+    /// Logical height.
     pub height: u32,
-    pub pixels: Vec<u8>,
+    /// Physical pixels per logical pixel.
+    pub scale: u32,
+    pixels: Vec<u8>,
 }
 impl Canvas {
-    pub fn new(width: u32, height: u32) -> Self {
+    pub fn new(width: u32, height: u32, scale: u32) -> Self {
+        let scale = scale.max(1);
         Self {
             width,
             height,
-            pixels: vec![0; (width * height * 4) as usize],
+            scale,
+            pixels: vec![0; (width * scale * height * scale * 4) as usize],
         }
     }
-    fn blend(&mut self, x: i32, y: i32, source: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 || source[3] == 0 {
+    /// Physical buffer width.
+    pub fn pixel_width(&self) -> u32 {
+        self.width * self.scale
+    }
+    /// Physical buffer height.
+    pub fn pixel_height(&self) -> u32 {
+        self.height * self.scale
+    }
+    /// Physical pixel bytes, for direct GPU upload.
+    pub fn as_pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+    fn blend_px(&mut self, x: i32, y: i32, source: [u8; 4]) {
+        if x < 0
+            || y < 0
+            || x >= self.pixel_width() as i32
+            || y >= self.pixel_height() as i32
+            || source[3] == 0
+        {
             return;
         }
-        let i = ((y as u32 * self.width + x as u32) * 4) as usize;
+        let i = ((y as u32 * self.pixel_width() + x as u32) * 4) as usize;
         let dst = &mut self.pixels[i..i + 4];
         let sa = u32::from(source[3]);
         let da = u32::from(dst[3]);
@@ -88,6 +118,14 @@ impl Canvas {
                 ((u32::from(source[c]) * sa * 255 + u32::from(dst[c]) * da * (255 - sa)) / a) as u8;
         }
         dst[3] = a.div_ceil(255) as u8;
+    }
+    fn blend(&mut self, x: i32, y: i32, source: [u8; 4]) {
+        let s = self.scale as i32;
+        for dy in 0..s {
+            for dx in 0..s {
+                self.blend_px(x * s + dx, y * s + dy, source);
+            }
+        }
     }
     pub fn fill(&mut self, rect: Rect, color: [u8; 4]) {
         for y in rect.y.max(0)..(rect.y + rect.h as i32).min(self.height as i32) {
@@ -148,6 +186,8 @@ pub struct Text {
     font: FontVec,
     glyphs: BTreeMap<(char, u16), Raster>,
     pub chinese: bool,
+    /// Physical pixels per logical point of requested text size.
+    scale: u16,
 }
 impl Text {
     pub fn load() -> Result<Self, String> {
@@ -176,11 +216,17 @@ impl Text {
                     chinese: font.glyph_id('\u{52a0}').0 != 0,
                     font,
                     glyphs: BTreeMap::new(),
+                    scale: 1,
                 });
             }
         }
         Err("UI font unavailable; set TORSE_UI_FONT to a TTF, OTF or TTC file".into())
     }
+    /// Set the physical pixel multiplier for subsequent measure and draw.
+    pub fn set_scale(&mut self, scale: u16) {
+        self.scale = scale.max(1);
+    }
+
     fn raster(&mut self, c: char, size: u16) -> &Raster {
         if self.glyphs.len() >= 1024 {
             self.glyphs.clear();
@@ -224,11 +270,13 @@ impl Text {
         })
     }
     pub fn measure(&mut self, value: &str, size: u16) -> u32 {
-        value
+        let scaled = size.saturating_mul(self.scale);
+        let total: u32 = value
             .chars()
             .take(160)
-            .map(|c| self.raster(c, size).advance.max(0) as u32)
-            .sum()
+            .map(|c| self.raster(c, scaled).advance.max(0) as u32)
+            .sum();
+        total / u32::from(self.scale)
     }
     pub fn draw(
         &mut self,
@@ -238,23 +286,32 @@ impl Text {
         size: u16,
         color: [u8; 4],
     ) {
-        let mut x = rect.x;
+        let scale = u16::try_from(canvas.scale).unwrap_or(1).max(self.scale);
+        let scaled = size.saturating_mul(scale);
+        let s = i32::try_from(canvas.scale).unwrap_or(1);
+        let prect = Rect {
+            x: rect.x * s,
+            y: rect.y * s,
+            w: rect.w * canvas.scale,
+            h: rect.h * canvas.scale,
+        };
+        let mut x = prect.x;
         for c in value.chars().take(160) {
-            let glyph = self.raster(c, size);
-            if x + glyph.advance > rect.x + rect.w as i32 {
+            let glyph = self.raster(c, scaled);
+            if x + glyph.advance > prect.x + prect.w as i32 {
                 break;
             }
             for gy in 0..glyph.height {
                 for gx in 0..glyph.width {
-                    let y = rect.y + glyph.y + gy as i32;
-                    if y < rect.y || y >= rect.y + rect.h as i32 {
+                    let y = prect.y + glyph.y + gy as i32;
+                    if y < prect.y || y >= prect.y + prect.h as i32 {
                         continue;
                     }
                     let mut ink = color;
                     ink[3] = (u16::from(color[3])
                         * u16::from(glyph.pixels[(gy * glyph.width + gx) as usize])
                         / 255) as u8;
-                    canvas.blend(x + glyph.x + gx as i32, y, ink);
+                    canvas.blend_px(x + glyph.x + gx as i32, y, ink);
                 }
             }
             x += glyph.advance;
@@ -283,7 +340,7 @@ mod tests {
             ]
             .concat(),
         };
-        let mut canvas = Canvas::new(9, 9);
+        let mut canvas = Canvas::new(9, 9, 1);
         canvas.sprite(&sprite, Rect::new(0, 0, 9, 9), 1);
         assert_eq!(&canvas.pixels[..4], &[255, 0, 0, 255]);
         assert_eq!(&canvas.pixels[32..36], &[0, 0, 255, 255]);
@@ -297,8 +354,34 @@ mod tests {
             height: 1,
             pixels: [[255, 255, 255, 255]; 4].concat(),
         };
-        let mut canvas = Canvas::new(4, 1);
+        let mut canvas = Canvas::new(4, 1, 1);
         canvas.progress(&sprite, 0, 0, 0.5, [255; 4]);
         assert_eq!(canvas.pixels.iter().filter(|p| **p == 255).count(), 8);
+    }
+
+    #[test]
+    fn scaled_canvas_maps_logical_pixels_to_blocks() {
+        let mut canvas = Canvas::new(2, 1, 2);
+        assert_eq!(canvas.pixel_width(), 4);
+        assert_eq!(canvas.pixel_height(), 2);
+        canvas.fill(Rect::new(0, 0, 1, 1), [255, 0, 0, 255]);
+        // One logical pixel becomes a 2x2 block; the rest stays transparent.
+        assert_eq!(
+            canvas
+                .pixels
+                .chunks_exact(4)
+                .filter(|p| *p == [255, 0, 0, 255])
+                .count(),
+            4
+        );
+        // Row 0: the red block covers columns 0 and 1, columns 2 and 3 stay
+        // transparent; row 1 mirrors row 0.
+        assert_eq!(&canvas.pixels[..4], &[255, 0, 0, 255]);
+        assert_eq!(&canvas.pixels[4..8], &[255, 0, 0, 255]);
+        assert_eq!(&canvas.pixels[8..12], &[0, 0, 0, 0]);
+        assert_eq!(&canvas.pixels[12..16], &[0, 0, 0, 0]);
+        assert_eq!(&canvas.pixels[16..20], &[255, 0, 0, 255]);
+        assert_eq!(&canvas.pixels[20..24], &[255, 0, 0, 255]);
+        assert_eq!(&canvas.pixels[24..28], &[0, 0, 0, 0]);
     }
 }

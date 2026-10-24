@@ -238,6 +238,10 @@ impl Layer {
         hud: Hud<'_>,
     ) {
         let layout = Layout::new(size);
+        eprintln!(
+            "ui prepare: size={size:?} scale={} logical={}x{} mode={:?}",
+            layout.scale, layout.width, layout.height, state.mode
+        );
         let view = View {
             size,
             mode: state.mode,
@@ -248,12 +252,12 @@ impl Layer {
             hover: layout.hit(state.mode, state.cursor),
             pressed: state.armed,
         };
-        if self.last.as_ref() == Some(&view) {
-            return;
-        }
-        let mut canvas = Canvas::new(layout.width, layout.height);
+
+        let mut canvas = Canvas::new(layout.width, layout.height, layout.scale);
         self.paint(&mut canvas, &layout, &view);
-        self.overlay.upload(device, queue, &canvas, layout.scale);
+        // The canvas already matches the surface one to one; the shader
+        // must not divide again.
+        self.overlay.upload(device, queue, &canvas, 1);
         self.last = Some(view);
     }
     pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
@@ -274,6 +278,7 @@ impl Layer {
         self.label(canvas, key, rect, size, [245, 247, 250, 255]);
     }
     fn paint(&mut self, c: &mut Canvas, l: &Layout, v: &View) {
+        self.text.set_scale(u16::try_from(c.scale).unwrap_or(1));
         let w = l.width as i32;
         let h = l.height as i32;
         let slot_x = w / 2 - 38;

@@ -24,7 +24,7 @@ use window::{WindowConfig, run_window};
 
 const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
-                        [--screenshot <png>] [--autoplay] [--ui-preview hud|pause|machine]";
+                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -40,6 +40,7 @@ fn main() -> ExitCode {
     let mut autoplay = false;
     let mut walk = false;
     let mut connect: Option<String> = None;
+    let mut sensitivity = 1.0f64;
     let mut probe_outside = false;
     let mut ui_preview = None;
     let mut index = 0;
@@ -80,6 +81,7 @@ fn main() -> ExitCode {
             "--autoplay" => autoplay = true,
             "--walk" => walk = true,
             "--connect" => connect = value(),
+            "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             "--probe-outside" => probe_outside = true,
             "--ui-preview" => match value().as_deref().map(ui::Mode::parse) {
                 Some(Ok(mode)) => ui_preview = Some(mode),
@@ -111,6 +113,7 @@ fn main() -> ExitCode {
             walk,
             connect,
             probe_outside,
+            sensitivity: sensitivity.clamp(0.2, 5.0),
             ui_mode: ui_preview.unwrap_or_default(),
         };
         match run_window(config) {

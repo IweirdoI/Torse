@@ -12,14 +12,16 @@ use torse_content::{BlockDefinition, Shape, compile, m0_fixture_pack};
 use torse_render::{MeshData, MeshJob, MeshSample, RenderBlock, RenderBox, build_mesh};
 use torse_sim::WorldAuthority;
 use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
+use torse_sim::replica::{ReplicaChanges, ReplicaEntity, ReplicaSnapshot};
 use torse_sim::{OrderingKey, Phase, Transaction, block_actions};
 use torse_types::{
-    BlockPos, Compatibility, ContentKey, Digest, EntityHandle, Revision, SectionPos, TransactionId,
-    TransactionOutcome, WorldId,
+    BlockPos, Compatibility, ContentKey, EntityHandle, LocalPos, Revision, SectionPos,
+    TransactionId, TransactionOutcome, WorldId,
 };
 use torse_world::{
-    BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentValue, Position,
-    TerrainQuery, WorldBounds,
+    BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentSet,
+    ComponentValue, Position, Section, SnapshotCells, SnapshotSection, StateEntry, TerrainQuery,
+    WorldBounds,
 };
 use torse_world_services::{GenerationParams, HillTerrain};
 
@@ -76,22 +78,41 @@ pub struct Scene {
     principal: ContentKey,
     edit_counter: u64,
     walker: Option<Walker>,
-    generator: HillTerrain,
+    generator: Option<HillTerrain>,
     side: u32,
     radius: i64,
     meshes: BTreeMap<SectionPos, (Revision, MeshData)>,
     sections: Vec<SectionPos>,
 }
 
+/// One content pack for every client mode, matching the server demo assembly
+/// so the handshake compatibility and the block colours agree everywhere.
+fn content_pack() -> torse_content::ContentPack {
+    let mut pack = m0_fixture_pack();
+    block_actions::register_content(&mut pack);
+    torse_inventory::register_content(&mut pack);
+    pack
+}
+
+/// Build the registry, schemas, and handshake compatibility from the shared pack.
+fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibility), String> {
+    let content =
+        compile(content_pack()).map_err(|errors| format!("content failed: {errors:?}"))?;
+    let registry =
+        BlockStateRegistry::build(&content).map_err(|error| format!("registry failed: {error}"))?;
+    let schemas = ComponentSchemas::build(&content);
+    let compatibility = Compatibility {
+        authority_schema: 4,
+        rules_digest: content.authority_digest,
+        content_digest: content.presentation_digest,
+    };
+    Ok((registry, schemas, compatibility))
+}
+
 impl Scene {
     /// Build a scene with a seeded hill terrain.
     pub fn new(radius: i64) -> Result<Self, String> {
-        let mut pack = m0_fixture_pack();
-        block_actions::register_content(&mut pack);
-        let content = compile(pack).map_err(|errors| format!("content failed: {errors:?}"))?;
-        let registry = BlockStateRegistry::build(&content)
-            .map_err(|error| format!("registry failed: {error}"))?;
-        let schemas = ComponentSchemas::build(&content);
+        let (registry, schemas, compatibility) = compile_content()?;
         let stone = registry
             .default_state(&key("base:stone"))
             .ok_or_else(|| "missing base:stone".to_owned())?;
@@ -103,19 +124,9 @@ impl Scene {
             &schemas,
         )
         .map_err(|error| format!("actions failed: {error}"))?;
-        let authority = WorldAuthority::new(
-            WorldId(1),
-            registry,
-            schemas,
-            side,
-            bounds,
-            Compatibility {
-                authority_schema: 1,
-                rules_digest: Digest([1; 32]),
-                content_digest: content.presentation_digest,
-            },
-        )
-        .map_err(|error| error.to_string())?;
+        let authority =
+            WorldAuthority::new(WorldId(1), registry, schemas, side, bounds, compatibility)
+                .map_err(|error| error.to_string())?;
         let params = GenerationParams::new(side, bounds, stone, BlockStateId::EMPTY)
             .map_err(|error| error.to_string())?;
         let generator = HillTerrain::new(params, 7, 7, 9);
@@ -125,7 +136,7 @@ impl Scene {
             principal: key("client:player"),
             edit_counter: 0,
             walker: None,
-            generator,
+            generator: Some(generator),
             side,
             radius,
             meshes: BTreeMap::new(),
@@ -133,6 +144,185 @@ impl Scene {
         };
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)
+    }
+
+    /// Build a scene from one authorized replica baseline.
+    ///
+    /// The network client has no generator: sections and entities come from
+    /// the server projection only, and `load_around` keeps the subscribed
+    /// section list as-is.
+    pub fn from_snapshot(snapshot: &ReplicaSnapshot) -> Result<Self, String> {
+        let (registry, schemas, compatibility) = compile_content()?;
+        let service = ActionService::bind(
+            block_actions::descriptors(),
+            block_actions::handlers(),
+            &schemas,
+        )
+        .map_err(|error| format!("actions failed: {error}"))?;
+        let authority = WorldAuthority::new(
+            WorldId(1),
+            registry,
+            schemas,
+            snapshot.side,
+            snapshot.bounds,
+            compatibility,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut scene = Self {
+            authority,
+            service,
+            principal: key("client:player"),
+            edit_counter: 0,
+            walker: None,
+            generator: None,
+            side: snapshot.side,
+            radius: 0,
+            meshes: BTreeMap::new(),
+            sections: Vec::new(),
+        };
+        scene.install_snapshot(snapshot)?;
+        Ok(scene)
+    }
+
+    /// Whether this scene mirrors a server projection instead of generating.
+    pub const fn is_network(&self) -> bool {
+        self.generator.is_none()
+    }
+
+    /// Handshake compatibility of the shared content pack.
+    pub fn compatibility() -> Result<Compatibility, String> {
+        Ok(compile_content()?.2)
+    }
+
+    /// Translate one replica baseline into local sections and entities.
+    fn install_snapshot(&mut self, snapshot: &ReplicaSnapshot) -> Result<(), String> {
+        let symbols = self.resolve_states(&snapshot.states)?;
+        for section in &snapshot.sections {
+            self.install_replica_section(section, &symbols)?;
+        }
+        self.sections = snapshot.sections.iter().map(|s| s.pos).collect();
+        for entity in &snapshot.entities {
+            self.install_replica_entity(entity)?;
+        }
+        Ok(())
+    }
+
+    /// Map the snapshot's runtime state table into local registry IDs.
+    fn resolve_states(
+        &self,
+        states: &[StateEntry],
+    ) -> Result<BTreeMap<BlockStateId, BlockStateId>, String> {
+        let mut symbols = BTreeMap::new();
+        symbols.insert(BlockStateId::EMPTY, BlockStateId::EMPTY);
+        for entry in states {
+            let local = registry_state(self.authority.registry(), &entry.block, &entry.values)?;
+            symbols.insert(entry.id, local);
+        }
+        Ok(symbols)
+    }
+
+    /// Install or replace one section from replica cells.
+    fn install_replica_section(
+        &mut self,
+        section: &SnapshotSection,
+        symbols: &BTreeMap<BlockStateId, BlockStateId>,
+    ) -> Result<(), String> {
+        let side = self.side;
+        let mut built = Section::new(side, BlockStateId::EMPTY)
+            .map_err(|error| format!("section failed: {error}"))?;
+        let write = |built: &mut Section, index: usize, state: BlockStateId| {
+            let side = side as usize;
+            let x = (index % side) as u32;
+            let z = ((index / side) % side) as u32;
+            let y = (index / (side * side)) as u32;
+            built
+                .set(LocalPos { x, y, z }, state)
+                .map_err(|error| format!("cell failed: {error}"))
+        };
+        match &section.cells {
+            SnapshotCells::Uniform(state) => {
+                let local = *symbols.get(state).ok_or("unknown replica state")?;
+                if !local.is_empty() {
+                    // `Section::new` fills every cell; only real blocks need
+                    // per-cell writes.
+                    for index in 0..(side as usize).pow(3) {
+                        write(&mut built, index, local)?;
+                    }
+                }
+            }
+            SnapshotCells::Dense(cells) => {
+                if cells.len() != (side as usize).pow(3) {
+                    return Err("dense section has the wrong length".to_owned());
+                }
+                for (index, state) in cells.iter().enumerate() {
+                    let local = *symbols.get(state).ok_or("unknown replica state")?;
+                    if !local.is_empty() {
+                        write(&mut built, index, local)?;
+                    }
+                }
+            }
+        }
+        let store = self.authority.store_mut();
+        let _ = store.unload(section.pos);
+        store
+            .request(section.pos)
+            .map_err(|error| error.to_string())?;
+        store
+            .install(section.pos, built)
+            .map_err(|error| error.to_string())?;
+        store
+            .finish_load(section.pos)
+            .map_err(|error| error.to_string())?;
+        // A reinstalled section can reuse the previous revision number, so the
+        // cached mesh must go or the change would render as a no-op.
+        self.meshes.remove(&section.pos);
+        Ok(())
+    }
+
+    /// Insert or replace one entity from a replica record, keeping its
+    /// persistent identity.
+    fn install_replica_entity(&mut self, entity: &ReplicaEntity) -> Result<(), String> {
+        if let Some(handle) = self.authority.entities().handle_of(entity.id) {
+            let _ = self.authority.entities_mut().despawn(handle);
+        }
+        let position = Position::from_bits(entity.position_bits);
+        let mut components = ComponentSet::new();
+        let schemas = self.authority.schemas().clone();
+        for (schema, fields) in &entity.components {
+            components
+                .insert(&schemas, schema, fields.clone())
+                .map_err(|error| format!("component failed: {error}"))?;
+        }
+        self.authority
+            .entities_mut()
+            .insert_restored(entity.id, position, components)
+            .map_err(|error| format!("entity failed: {error}"))?;
+        Ok(())
+    }
+
+    /// Apply one replica increment: replaced sections and entities, removals.
+    pub fn apply_changes(&mut self, changes: &ReplicaChanges) -> Result<(), String> {
+        let symbols = self.resolve_states(&changes.states)?;
+        for pos in &changes.removed_sections {
+            let _ = self.authority.store_mut().unload(*pos);
+            self.meshes.remove(pos);
+            self.sections.retain(|item| item != pos);
+        }
+        for section in &changes.sections {
+            self.install_replica_section(section, &symbols)?;
+            if !self.sections.contains(&section.pos) {
+                self.sections.push(section.pos);
+            }
+        }
+        for id in &changes.removed_entities {
+            if let Some(handle) = self.authority.entities().handle_of(*id) {
+                let _ = self.authority.entities_mut().despawn(handle);
+            }
+        }
+        for entity in &changes.entities {
+            self.install_replica_entity(entity)?;
+        }
+        Ok(())
     }
 
     /// Authoritative world.
@@ -346,7 +536,13 @@ impl Scene {
     }
 
     /// Load sections inside the radius around a centre and unload the rest.
+    ///
+    /// Network scenes keep the server's subscribed sections; streaming would
+    /// fabricate terrain the server does not have.
     pub fn load_around(&mut self, center: SectionPos) -> Result<(), String> {
+        if self.generator.is_none() {
+            return Ok(());
+        }
         let mut wanted = Vec::new();
         for x in -self.radius..=self.radius {
             for z in -self.radius..=self.radius {
@@ -360,6 +556,8 @@ impl Scene {
                 store.request(*pos).map_err(|error| error.to_string())?;
                 let section = self
                     .generator
+                    .as_mut()
+                    .expect("generator checked above")
                     .generate(*pos)
                     .map_err(|error| error.to_string())?;
                 store
@@ -418,7 +616,9 @@ impl Scene {
         )
     }
 
-    /// Flatten every cached mesh into one interleaved vertex and index buffer.
+    /// Flatten every cached mesh into one interleaved vertex and index buffer,
+    /// then append one coloured box per stored entity so mirrored bodies are
+    /// visible even before real entity art exists.
     pub fn geometry(&self) -> (Vec<Vertex>, Vec<u32>, usize) {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -445,6 +645,21 @@ impl Scene {
             indices.extend(mesh.indices.iter().map(|value| base + value));
             faces += mesh.face_count();
         }
+        for (handle, entity) in self.authority.entities().iter() {
+            // The walker is the camera; drawing its body would fill the view.
+            if Some(handle) == self.walker.map(|walker| walker.handle) {
+                continue;
+            }
+            faces += push_entity_box(
+                &mut vertices,
+                &mut indices,
+                [
+                    entity.position.x as f32,
+                    entity.position.y as f32,
+                    entity.position.z as f32,
+                ],
+            );
+        }
         (vertices, indices, faces)
     }
 
@@ -470,6 +685,57 @@ impl Scene {
         }
         [8.5, 12.0, 8.5]
     }
+}
+
+/// Resolve stable content into a local runtime state ID.
+fn registry_state(
+    registry: &BlockStateRegistry,
+    block: &ContentKey,
+    values: &[u16],
+) -> Result<BlockStateId, String> {
+    registry
+        .state_of(block, values)
+        .ok_or_else(|| format!("unresolved replica content {block}"))
+}
+
+/// Append one boxy body for an entity; returns the face count added.
+fn push_entity_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3]) -> usize {
+    const HALF: f32 = 0.35;
+    let color = [0.78, 0.55, 0.35];
+    let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
+        ([1.0, 0.0, 0.0], [HALF, -HALF, -HALF], [HALF, HALF, HALF]),
+        ([-1.0, 0.0, 0.0], [-HALF, HALF, -HALF], [-HALF, -HALF, HALF]),
+        ([0.0, 1.0, 0.0], [-HALF, HALF, -HALF], [HALF, HALF, HALF]),
+        ([0.0, -1.0, 0.0], [-HALF, -HALF, HALF], [HALF, -HALF, -HALF]),
+        ([0.0, 0.0, 1.0], [-HALF, -HALF, HALF], [HALF, HALF, HALF]),
+        ([0.0, 0.0, -1.0], [-HALF, HALF, -HALF], [HALF, -HALF, -HALF]),
+    ];
+    let mut added = 0usize;
+    for (normal, min_corner, max_corner) in faces {
+        let (nx, ny, nz) = (normal[0], normal[1], normal[2]);
+        let (lo, hi) = (min_corner, max_corner);
+        let corners = [
+            [lo[0], lo[1], lo[2]],
+            [hi[0], lo[1], lo[2]],
+            [hi[0], hi[1], lo[2]],
+            [lo[0], hi[1], lo[2]],
+        ];
+        let base = vertices.len() as u32;
+        for corner in corners {
+            vertices.push(Vertex {
+                position: [
+                    center[0] + corner[0],
+                    center[1] + corner[1],
+                    center[2] + corner[2],
+                ],
+                normal: [nx, ny, nz],
+                color,
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        added += 2;
+    }
+    added
 }
 
 fn key(value: &str) -> ContentKey {
@@ -545,6 +811,7 @@ fn material_color(registry: &BlockStateRegistry, material: u16) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use torse_types::EntityId;
 
     #[test]
     fn scene_generates_and_meshes_its_radius() {
@@ -703,6 +970,107 @@ mod tests {
         // Radius 1 leaves everything past 31 blocks unloaded on the x axis.
         let outcome = scene.pick([30.5, 40.0, 8.5], [1.0, 0.0, 0.0], 256.0);
         assert_eq!(outcome, PickOutcome::Miss);
+    }
+
+    fn stone_layer_section(pos: SectionPos) -> SnapshotSection {
+        let side = 16u32;
+        let mut cells = vec![BlockStateId::EMPTY; side.pow(3) as usize];
+        for x in 0..side {
+            for z in 0..side {
+                let index = x as usize + side as usize * z as usize;
+                cells[index] = BlockStateId(7);
+            }
+        }
+        SnapshotSection {
+            pos,
+            cells: SnapshotCells::Dense(cells),
+        }
+    }
+
+    fn replica_snapshot() -> ReplicaSnapshot {
+        ReplicaSnapshot {
+            side: 16,
+            bounds: WorldBounds::new(0, 32).expect("bounds"),
+            states: vec![StateEntry {
+                id: BlockStateId(7),
+                block: key("base:stone"),
+                values: Vec::new(),
+            }],
+            sections: vec![
+                stone_layer_section(SectionPos::ZERO),
+                stone_layer_section(SectionPos::new(1, 0, 0)),
+            ],
+            entities: vec![ReplicaEntity {
+                id: EntityId(9),
+                position_bits: Position::new(2.5, 2.0, 2.0).to_bits(),
+                components: BTreeMap::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn network_scene_installs_a_replica_baseline() {
+        let mut scene = Scene::from_snapshot(&replica_snapshot()).expect("scene");
+        assert!(scene.is_network());
+        // The symbol table resolved remote runtime ID 7 into local stone.
+        assert!(query(&scene, BlockPos::new(3, 0, 4)));
+        assert!(!query(&scene, BlockPos::new(3, 1, 4)));
+        // The mirrored entity landed in the client entity store.
+        assert_eq!(scene.authority().entities().len(), 1);
+        let stored = scene.authority().entities().get(
+            scene
+                .authority()
+                .entities()
+                .handle_of(EntityId(9))
+                .expect("entity"),
+        );
+        assert_eq!(stored.expect("entity").position.y, 2.0);
+        // Meshes build from the mirrored sections alone.
+        assert_eq!(scene.refresh_meshes(), 2);
+        let (vertices, indices, _) = scene.geometry();
+        assert!(!vertices.is_empty() && !indices.is_empty());
+        // Streaming must not fabricate terrain around the mirror.
+        scene.load_around(SectionPos::new(5, 0, 5)).expect("noop");
+        assert_eq!(scene.sections().len(), 2);
+    }
+
+    #[test]
+    fn network_scene_applies_a_replica_increment() {
+        let mut scene = Scene::from_snapshot(&replica_snapshot()).expect("scene");
+        scene.refresh_meshes();
+        // Carve one hole by replacing the section without its stone at x=3,z=4.
+        let mut cells = vec![BlockStateId(7); 16usize.pow(3)];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                for z in 0..16usize {
+                    let index = x + 16 * (z + 16 * y);
+                    cells[index] = if y == 0 && x != 3 && z != 4 {
+                        BlockStateId(7)
+                    } else {
+                        BlockStateId::EMPTY
+                    };
+                }
+            }
+        }
+        let changes = ReplicaChanges {
+            states: vec![StateEntry {
+                id: BlockStateId(7),
+                block: key("base:stone"),
+                values: Vec::new(),
+            }],
+            sections: vec![SnapshotSection {
+                pos: SectionPos::ZERO,
+                cells: SnapshotCells::Dense(cells),
+            }],
+            removed_sections: Vec::new(),
+            entities: Vec::new(),
+            removed_entities: Vec::new(),
+        };
+        scene.apply_changes(&changes).expect("apply");
+        assert!(!query(&scene, BlockPos::new(3, 0, 4)));
+        assert!(query(&scene, BlockPos::new(5, 0, 5)));
+        // The invalidated mesh rebuilds despite matching revision numbers.
+        assert_eq!(scene.refresh_meshes(), 1);
     }
 
     #[test]

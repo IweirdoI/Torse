@@ -8,6 +8,10 @@ publish.workspace = true
 pollster = "0.4.0"
 png = "0.17"
 torse-content = { path = "../../crates/content" }
+torse-inventory = { path = "../../modules/inventory" }
+torse-codec = { path = "../../crates/codec" }
+torse-net = { path = "../../crates/net" }
+torse-protocol = { path = "../../crates/protocol" }
 torse-render = { path = "../../crates/render" }
 torse-sim = { path = "../../crates/sim" }
 torse-types = { path = "../../crates/types" }

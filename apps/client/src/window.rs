@@ -53,6 +53,8 @@ pub struct WindowConfig {
     pub autoplay: bool,
     /// Start in walk mode with a player entity on the ground.
     pub walk: bool,
+    /// Connect to a standalone server and mirror its authorized projection.
+    pub connect: Option<String>,
 }
 
 /// Measurements reported when the window closes.
@@ -82,6 +84,16 @@ pub struct WindowSummary {
     pub walk_ticks: u32,
     /// Final walker position, when walk mode was entered.
     pub walker: Option<[f64; 3]>,
+    /// Server session, when a connection was established.
+    pub session: Option<u128>,
+    /// Replica increments applied.
+    pub batches: u32,
+    /// Edit requests sent over the connection.
+    pub requests_sent: u32,
+    /// Requests the server rejected at admission.
+    pub requests_rejected: u32,
+    /// Sections received in the baseline.
+    pub baseline_sections: usize,
     /// Resident sections at exit.
     pub sections: usize,
     /// Resident meshes at exit.
@@ -121,6 +133,11 @@ struct WindowApp {
     actions_ok: u32,
     actions_rejected: u32,
     autoplay_break: bool,
+    net: Option<crate::net::Connection<torse_net::TcpTransport>>,
+    session: Option<u128>,
+    batches: u32,
+    requests_sent: u32,
+    requests_rejected: u32,
     walk: bool,
     tick_accumulator: f32,
     walk_ticks: u32,
@@ -161,6 +178,11 @@ impl WindowApp {
             actions_ok: 0,
             actions_rejected: 0,
             autoplay_break: false,
+            net: None,
+            session: None,
+            batches: 0,
+            requests_sent: 0,
+            requests_rejected: 0,
             walk: false,
             tick_accumulator: 0.0,
             walk_ticks: 0,
@@ -187,9 +209,53 @@ impl WindowApp {
             .clamp(0.0001, 0.25);
         self.last_frame = Some(now);
 
+        // Drain the connection first: the baseline creates the scene and
+        // increments refresh it before this frame's meshes are captured.
+        let events = match self.net.as_mut().map(crate::net::Connection::poll) {
+            Some(Ok(events)) => events,
+            Some(Err(error)) => {
+                self.failure = Some(format!("connection failed: {error}"));
+                event_loop.exit();
+                return;
+            }
+            None => Vec::new(),
+        };
+        for event in events {
+            if let Err(error) = self.apply_net_event(event, event_loop) {
+                self.failure = Some(error);
+                event_loop.exit();
+                return;
+            }
+        }
+
         let Some(camera) = self.camera.as_mut() else {
             return;
         };
+        if self.scene.is_none() {
+            // Connected but no baseline yet: keep presenting cleared frames
+            // so polling continues and the window does not sit on an
+            // uninitialized surface.
+            if let Some(gpu) = self.gpu.as_mut() {
+                match gpu.surface.get_current_texture() {
+                    CurrentSurfaceTexture::Success(frame)
+                    | CurrentSurfaceTexture::Suboptimal(frame) => {
+                        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+                        let (device, queue) = gpu.context.parts();
+                        let mut encoder =
+                            device.create_command_encoder(&CommandEncoderDescriptor {
+                                label: Some("client idle frame"),
+                            });
+                        gpu.context
+                            .encode_draw(&mut encoder, &view, &gpu.depth_view);
+                        queue.submit([encoder.finish()]);
+                        queue.present(frame);
+                    }
+                    _ => {}
+                }
+                gpu.window.request_redraw();
+            }
+            return;
+        }
         let (mut motion, speed) = self.input.take_input(camera.speed);
         camera.speed = speed;
         if self.config.autoplay {
@@ -256,16 +322,25 @@ impl WindowApp {
             .expect("camera implies scene")
             .center_section(camera.eye);
         if self.center != Some(center) {
-            let Some(scene) = self.scene.as_mut() else {
-                return;
-            };
-            if let Err(error) = scene.load_around(center) {
-                self.failure = Some(format!("streaming failed: {error}"));
-                event_loop.exit();
-                return;
-            }
             self.center = Some(center);
-            self.streams += 1;
+            // Network scenes keep the subscribed sections; streaming would
+            // fabricate terrain the server does not have.
+            if !self
+                .scene
+                .as_ref()
+                .expect("camera implies scene")
+                .is_network()
+            {
+                let Some(scene) = self.scene.as_mut() else {
+                    return;
+                };
+                if let Err(error) = scene.load_around(center) {
+                    self.failure = Some(format!("streaming failed: {error}"));
+                    event_loop.exit();
+                    return;
+                }
+                self.streams += 1;
+            }
         }
 
         // Resolve the aim from the fresh camera, translate clicks and the
@@ -286,9 +361,31 @@ impl WindowApp {
             .and_then(|button| action_for(&aim, button));
         // The walk demo is about walking; firing place or break at the aim
         // while walking would block the walker's own path.
+        let network = self.scene.as_ref().is_some_and(Scene::is_network);
+        if network && self.config.autoplay && self.frames.is_multiple_of(AUTOPLAY_PERIOD) {
+            // Over a connection the demo exercises the request path: the
+            // guest session should see its edit rejected by admission.
+            let aim = {
+                let Some(scene) = self.scene.as_ref() else {
+                    return;
+                };
+                let Some(camera) = self.camera.as_ref() else {
+                    return;
+                };
+                scene.pick(camera.eye, camera.forward(), PICK_RANGE)
+            };
+            if let Some((place, target)) = action_for(&aim, MouseButton::Left) {
+                let call = crate::net::edit_call(place, &self.materials[self.material], target);
+                if let Some(Ok(seq)) = self.net.as_mut().map(|net| net.request(call)) {
+                    self.requests_sent += 1;
+                    self.last_result = format!("seq {} sent", seq.0);
+                }
+            }
+        }
         if intent.is_none()
             && self.config.autoplay
             && !self.walk
+            && !network
             && self.frames.is_multiple_of(AUTOPLAY_PERIOD)
         {
             let button = if self.autoplay_break {
@@ -300,19 +397,31 @@ impl WindowApp {
             self.autoplay_break = !self.autoplay_break;
         }
         if let Some((place, target)) = intent {
-            let material = self.materials[self.material].clone();
-            let result = match self.scene.as_mut() {
-                Some(scene) => scene.apply_edit(place, &material, target),
-                None => return,
-            };
-            match result {
-                Ok(()) => {
-                    self.actions_ok += 1;
-                    self.last_result.clear();
+            if self.scene.as_ref().is_some_and(Scene::is_network) {
+                // Edits go to the server, not the local mirror. The guest
+                // session has no edit grants, so the admission reply carries
+                // the rejection; the mirror never forks.
+                let call = crate::net::edit_call(place, &self.materials[self.material], target);
+                match self.net.as_mut().map(|net| net.request(call)) {
+                    Some(Ok(seq)) => self.last_result = format!("seq {} sent", seq.0),
+                    Some(Err(error)) => self.last_result = format!("send failed: {error}"),
+                    None => self.last_result = "offline".to_owned(),
                 }
-                Err(reason) => {
-                    self.actions_rejected += 1;
-                    self.last_result = reason;
+            } else {
+                let material = self.materials[self.material].clone();
+                let result = match self.scene.as_mut() {
+                    Some(scene) => scene.apply_edit(place, &material, target),
+                    None => return,
+                };
+                match result {
+                    Ok(()) => {
+                        self.actions_ok += 1;
+                        self.last_result.clear();
+                    }
+                    Err(reason) => {
+                        self.actions_rejected += 1;
+                        self.last_result = reason;
+                    }
                 }
             }
         }
@@ -460,6 +569,66 @@ impl WindowApp {
         gpu.window.request_redraw();
     }
 
+    /// Apply one decoded server event; errors stop the run.
+    fn apply_net_event(
+        &mut self,
+        event: crate::net::NetEvent,
+        _event_loop: &ActiveEventLoop,
+    ) -> Result<(), String> {
+        use crate::net::NetEvent;
+        match event {
+            NetEvent::Welcomed { session } => {
+                self.session = Some(session.0);
+            }
+            NetEvent::Baseline(snapshot) => {
+                // The mirror installs the y = 0 section layer; the eye must
+                // stay inside it or the pick ray stops at the first unloaded
+                // cell above the terrain.
+                let loaded_top = (snapshot.side as i64).min(snapshot.bounds.max_y);
+                let scene = Scene::from_snapshot(&snapshot)?;
+                if let Some(camera) = self.camera.as_mut() {
+                    camera.eye = [8.0, (loaded_top as f32 - 2.0).max(4.0), 8.0];
+                    // Look nearly straight down: the scope is 32 by 16 blocks,
+                    // so a shallow view drifts out of the loaded area before
+                    // the ray reaches the floor.
+                    camera.pitch = -1.5;
+                    camera.yaw = 0.6;
+                }
+                self.scene = Some(scene);
+                self.center = None;
+                self.uploaded = false;
+            }
+            NetEvent::Increment(changes) => {
+                self.batches += 1;
+                let Some(scene) = self.scene.as_mut() else {
+                    return Err("increment before baseline".to_owned());
+                };
+                scene.apply_changes(&changes)?;
+            }
+            NetEvent::Admitted { seq, rejected } => {
+                if rejected.is_some() {
+                    self.requests_rejected += 1;
+                }
+                self.last_result = match rejected {
+                    Some(code) => format!("seq {} rejected {code:?}", seq.0),
+                    None => format!("seq {} admitted", seq.0),
+                };
+            }
+            NetEvent::Finished { seq, committed } => {
+                if !committed {
+                    self.requests_rejected += 1;
+                }
+                self.last_result = format!(
+                    "seq {} {}",
+                    seq.0,
+                    if committed { "committed" } else { "denied" }
+                );
+            }
+            NetEvent::Closed(reason) => return Err(reason),
+        }
+        Ok(())
+    }
+
     /// Switch to walk mode by spawning the player entity under the camera.
     ///
     /// `Scene::eye` sits 1.4 blocks above the surface cell's top, and the
@@ -511,6 +680,14 @@ impl WindowApp {
                 screenshots: self.screenshots,
                 actions_ok: self.actions_ok,
                 actions_rejected: self.actions_rejected,
+                session: self.session,
+                batches: self.batches,
+                requests_sent: self.requests_sent,
+                requests_rejected: self.requests_rejected,
+                baseline_sections: self
+                    .scene
+                    .as_ref()
+                    .map_or(0, |scene| scene.sections().len()),
                 walk_ticks: self.walk_ticks,
                 walker: self
                     .scene
@@ -594,19 +771,60 @@ impl ApplicationHandler for WindowApp {
         let depth_view = depth.create_view(&TextureViewDescriptor::default());
         let context = GpuContext::new(device, queue, config.format);
 
-        let scene = match Scene::new(self.config.radius) {
-            Ok(scene) => scene,
-            Err(error) => {
-                self.failure = Some(error);
+        let scene = if self.config.connect.is_some() {
+            // Network scenes arrive with the first baseline; the window stays
+            // empty until then.
+            None
+        } else {
+            match Scene::new(self.config.radius) {
+                Ok(scene) => Some(scene),
+                Err(error) => {
+                    self.failure = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            }
+        };
+        let mut camera = FlyCamera::new([8.0, 26.0, 8.0]);
+        if let Some(scene) = scene.as_ref() {
+            camera = FlyCamera::new(scene.eye());
+            // Only the y = 0 section layer is loaded, and picking terminates at
+            // the first unloaded cell. Keep the starting eye inside that layer
+            // so the aim works no matter how high the spawn surface is.
+            camera.eye[1] = camera.eye[1].min(14.0);
+        } else {
+            // Overlook the subscribed scope until the baseline lands.
+            camera.pitch = -0.7;
+            camera.yaw = 0.6;
+        }
+        if let Some(address) = self.config.connect.clone() {
+            let compatibility = match Scene::compatibility() {
+                Ok(value) => value,
+                Err(error) => {
+                    self.failure = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            };
+            let mut connection: crate::net::Connection<torse_net::TcpTransport> =
+                match crate::net::Connection::connect(&address) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        self.failure = Some(format!("connect failed: {error}"));
+                        event_loop.exit();
+                        return;
+                    }
+                };
+            let handshake = connection
+                .hello(compatibility)
+                .and_then(|()| connection.subscribe(demo_scope().to_vec()));
+            if let Err(error) = handshake {
+                self.failure = Some(format!("handshake failed: {error}"));
                 event_loop.exit();
                 return;
             }
-        };
-        let mut camera = FlyCamera::new(scene.eye());
-        // Only the y = 0 section layer is loaded, and picking terminates at the
-        // first unloaded cell. Keep the starting eye inside that layer so the
-        // aim works no matter how high the spawn surface is.
-        camera.eye[1] = camera.eye[1].min(14.0);
+            self.net = Some(connection);
+        }
         self.adapter = info.name;
         self.gpu = Some(Gpu {
             backend_name: format!("{:?}", info.backend),
@@ -617,7 +835,7 @@ impl ApplicationHandler for WindowApp {
             depth_view,
             window,
         });
-        self.scene = Some(scene);
+        self.scene = scene;
         self.camera = Some(camera);
         // Enter walk mode only after the scene exists; enter_walk spawns the
         // walker through it.
@@ -685,7 +903,7 @@ impl ApplicationHandler for WindowApp {
                 self.input.wheel(delta);
             }
             WindowEvent::RedrawRequested => {
-                if self.gpu.is_some() && self.scene.is_some() && self.camera.is_some() {
+                if self.gpu.is_some() && self.camera.is_some() {
                     self.frame(event_loop);
                 }
             }
@@ -698,6 +916,11 @@ impl ApplicationHandler for WindowApp {
             gpu.window.request_redraw();
         }
     }
+}
+
+/// The demo server's host-approved scope; subscriptions must be a subset.
+const fn demo_scope() -> [SectionPos; 2] {
+    [SectionPos::new(0, 0, 0), SectionPos::new(1, 0, 0)]
 }
 
 /// Translate one aim and mouse button into a place or break intent.

@@ -22,7 +22,7 @@ cargo run -p torse-server -- .work/execution-world --listen 127.0.0.1:7777 --tic
 cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 ```
 
-第二条在另一终端执行。--ticks 0持续运行，有限Tick结束后保存并关闭；同目录再次启动恢复Tick、事件、结果和任务位置，使用新epoch。演示创建两个Section及两个容器，对新连接使用只读访客PeerPolicy，因而headless_client看到实体但看不到库存组件。
+第二条在另一终端执行。--ticks 0持续运行，有限Tick结束后保存并关闭；同目录再次启动恢复Tick、事件、结果和任务位置，使用新epoch。演示创建两个Section及两个容器，对新连接使用只读访客PeerPolicy，因而headless_client看到实体但看不到库存组件。`--fill`仅用于新世界，把两个演示分区铺一层石头地面，方便图形客户端连上后有地形可见；已有存档的世界使用该参数会报错。
 
 ExecutionHost独占A7 ReplicaSource，使用纯DurableRule规划系统和事件。阶段先写完整冻结任务，再逐项原子记录世界变化、任务进度、事件和结果，最后推进一个阶段。未来输入的关闭拒绝可以使用独立Stopping记录，不越过截止边界执行下一Tick。旧Simulation保留参考用途，不能在日志外直接执行后再补写进度。
 

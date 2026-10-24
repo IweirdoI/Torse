@@ -14,7 +14,7 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen 127.0.0.1:7777] [--ticks N; 0=continuous]"
+            "usage: torse-server <world-directory> [--listen 127.0.0.1:7777] [--ticks N; 0=continuous] [--fill]"
         );
         return Ok(());
     };
@@ -25,6 +25,7 @@ fn run() -> Result<(), Fault> {
     let path = PathBuf::from(path);
     let mut address = "127.0.0.1:7777".to_owned();
     let mut ticks = 0u64;
+    let mut fill = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
@@ -38,11 +39,18 @@ fn run() -> Result<(), Fault> {
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| Fault::invalid_data("invalid tick count"))?
             }
+            "--fill" => fill = true,
             _ => return Err(Fault::invalid_data("unknown server argument")),
         }
     }
     std::fs::create_dir_all(&path).map_err(|e| Fault::invalid_data(e.to_string()))?;
-    let (world, actions) = base::world()?;
+    let (mut world, actions) = base::world()?;
+    if fill && path.join("checkpoints/manifest.log").exists() {
+        return Err(Fault::invalid_data("--fill only applies to a fresh world"));
+    }
+    if fill {
+        base::fill_floor(&mut world)?;
+    }
     let compatibility = world.coordinator().compatibility();
     let limits = base::execution_limits();
     let policy = base::file_policy();

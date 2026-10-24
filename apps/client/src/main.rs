@@ -7,6 +7,7 @@
 
 mod camera;
 mod input;
+mod net;
 mod pick;
 mod renderer;
 mod scene;
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
     let mut screenshot: Option<String> = None;
     let mut autoplay = false;
     let mut walk = false;
+    let mut connect: Option<String> = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -72,6 +74,7 @@ fn main() -> ExitCode {
             "--screenshot" => screenshot = value(),
             "--autoplay" => autoplay = true,
             "--walk" => walk = true,
+            "--connect" => connect = value(),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -93,14 +96,15 @@ fn main() -> ExitCode {
             screenshot,
             autoplay,
             walk,
+            connect,
         };
         match run_window(config) {
             Ok(summary) => {
                 println!(
                     "adapter={} backend={} format={} frames={} streams={} rebuilds={} \
                      uploads={} screenshots={} actions_ok={} actions_rejected={} walk_ticks={} \
-                     walker=({:.1},{:.1},{:.1}) sections={} \
-                     meshes={} vertices={} faces={} elapsed_ms={}",
+                     walker=({:.1},{:.1},{:.1}) session={} batches={} requests_sent={} requests_rejected={} baseline_sections={} \
+                     sections={} meshes={} vertices={} faces={} elapsed_ms={}",
                     summary.adapter,
                     summary.backend,
                     summary.format,
@@ -115,6 +119,11 @@ fn main() -> ExitCode {
                     summary.walker.map_or(0.0, |p| p[0]),
                     summary.walker.map_or(0.0, |p| p[1]),
                     summary.walker.map_or(0.0, |p| p[2]),
+                    summary.session.map_or(0, |session| session),
+                    summary.batches,
+                    summary.requests_sent,
+                    summary.requests_rejected,
+                    summary.baseline_sections,
                     summary.sections,
                     summary.meshes,
                     summary.vertices,

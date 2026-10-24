@@ -2734,7 +2734,11 @@ version = "0.1.0"
 dependencies = [
  "png",
  "pollster",
+ "torse-codec",
  "torse-content",
+ "torse-inventory",
+ "torse-net",
+ "torse-protocol",
  "torse-render",
  "torse-sim",
  "torse-types",

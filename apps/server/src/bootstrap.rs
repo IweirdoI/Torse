@@ -90,6 +90,39 @@ pub fn network_limits() -> NetworkLimits {
         codec: codec_limits(),
     }
 }
+/// Replace the demo sections with a stone floor at the lowest layer, so a
+/// connected client has terrain to mirror. Only valid before the host is
+/// created; this is initial world state, not a runtime edit.
+pub fn fill_floor(world: &mut WorldAuthority) -> Result<(), Fault> {
+    let stone = world
+        .registry()
+        .default_state(&key("base:stone"))
+        .ok_or_else(|| Fault::invalid_data("missing base:stone"))?;
+    for pos in scope().sections {
+        let mut section = torse_world::Section::new(16, torse_world::BlockStateId::EMPTY)
+            .map_err(|e| Fault::invalid_data(format!("section: {e}")))?;
+        for x in 0..16u32 {
+            for z in 0..16u32 {
+                section
+                    .set(torse_types::LocalPos { x, y: 0, z }, stone)
+                    .map_err(|e| Fault::invalid_data(format!("cell: {e}")))?;
+            }
+        }
+        let store = world.store_mut();
+        let _ = store.unload(pos);
+        store
+            .request(pos)
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        store
+            .install(pos, section)
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        store
+            .finish_load(pos)
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+    }
+    Ok(())
+}
+
 pub fn scope() -> ReplicaScope {
     ReplicaScope {
         sections: [SectionPos::ZERO, SectionPos::new(1, 0, 0)].into(),

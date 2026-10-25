@@ -240,6 +240,17 @@ impl GamePack {
         ))
     }
 
+    /// Highest block the description can produce, trunk and canopy included.
+    pub fn height_limit(&self) -> i64 {
+        let core = &self.world.world;
+        let trunk = self
+            .world
+            .trees
+            .as_ref()
+            .map_or(0, |tree| tree.height.max(1));
+        core.base_y + core.amplitude.max(0) + trunk + 1
+    }
+
     /// Blocks a scene may place and break.
     ///
     /// The world description's own materials come first, because those are the
@@ -739,35 +750,67 @@ impl LayeredTerrain {
                         state,
                     )?;
                 }
-                self.decorate(&mut result, local_x, local_z, height, side_i)?;
+                self.scatter_plants(&mut result, local_x, local_z, height, side_i)?;
             }
         }
+        self.scatter_trees(&mut result, origin.x, origin.z)?;
         Ok(result)
     }
 
-    fn decorate(
+    /// Whether one column carries a tree.
+    ///
+    /// A tree depends only on its column and the generator seed, so the
+    /// neighbouring section reaches the same answer and can draw the part of
+    /// the canopy that crosses the boundary.
+    fn has_tree(&self, x: i64, z: i64) -> bool {
+        let Some(tree) = self.tree else {
+            return false;
+        };
+        if self.height_at(x, z) <= self.sea_level + 1 {
+            return false;
+        }
+        self.column_hash(x, z).is_multiple_of(tree.2)
+    }
+
+    /// Draw every tree whose canopy can reach this section.
+    ///
+    /// Strata are independent per column, but a canopy is two blocks wide, so
+    /// the origin scan reaches two columns past each edge and each section keeps
+    /// only the part inside its own bounds.
+    fn scatter_trees(
+        &self,
+        result: &mut Section,
+        base_x: i64,
+        base_z: i64,
+    ) -> Result<(), SectionError> {
+        let Some(tree) = self.tree else {
+            return Ok(());
+        };
+        let side = i64::from(self.side);
+        for z in (base_z - 2)..(base_z + side + 2) {
+            for x in (base_x - 2)..(base_x + side + 2) {
+                if !self.has_tree(x, z) {
+                    continue;
+                }
+                let height = self.height_at(x, z);
+                self.place_tree(result, x - base_x, z - base_z, height, tree)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn scatter_plants(
         &self,
         result: &mut Section,
         local_x: i64,
         local_z: i64,
         height: i64,
-        side: i64,
+        _side: i64,
     ) -> Result<(), SectionError> {
         if height <= self.sea_level {
             return Ok(());
         }
         let hash = self.column_hash(local_x, local_z);
-        // Trees need their canopy inside this section, so they stay off the rim.
-        if let Some(tree) = self.tree
-            && local_x >= 2
-            && local_z >= 2
-            && local_x + 2 < side
-            && local_z + 2 < side
-            && hash.is_multiple_of(tree.2)
-        {
-            self.place_tree(result, local_x, local_z, height, tree)?;
-            return Ok(());
-        }
         if !self.plants.is_empty() && hash.is_multiple_of(self.plant_density) {
             let plant =
                 self.plants[(hash / self.plant_density % self.plants.len() as u64) as usize];

@@ -116,6 +116,8 @@ pub struct Scene {
     state_materials: BTreeMap<BlockStateId, StateMaterials>,
     /// Blocks a pack scene may place and break; `None` keeps the fixture keys.
     placeable: Option<Vec<ContentKey>>,
+    /// Vertical section layers the stream keeps resident.
+    layers: i64,
     tint_provider: Option<Arc<dyn torse_assets::texture::PositionTintProvider>>,
     tint_provider_generation: u64,
 }
@@ -248,6 +250,7 @@ impl Scene {
             palette,
             state_materials,
             placeable: None,
+            layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
         };
@@ -297,6 +300,7 @@ impl Scene {
             palette,
             state_materials,
             placeable: None,
+            layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
         };
@@ -810,10 +814,12 @@ impl Scene {
                     .z
                     .checked_add(z)
                     .ok_or("streaming coordinate overflow")?;
-                let pos = SectionPos::new(sx, 0, sz);
-                pos.to_block(LocalPos { x: 0, y: 0, z: 0 }, self.side)
-                    .map_err(|error| error.to_string())?;
-                wanted.push(pos);
+                for sy in 0..self.layers {
+                    let pos = SectionPos::new(sx, sy, sz);
+                    pos.to_block(LocalPos { x: 0, y: 0, z: 0 }, self.side)
+                        .map_err(|error| error.to_string())?;
+                    wanted.push(pos);
+                }
             }
         }
 
@@ -933,10 +939,13 @@ impl Scene {
             palette,
             state_materials,
             placeable: None,
+            layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
         };
         scene.placeable = Some(game.placeable_blocks());
+        scene.layers = (game.height_limit() + i64::from(side) - 1) / i64::from(side);
+        scene.layers = scene.layers.clamp(1, 4);
         scene.set_position_tint_provider(Some(game.tint_provider()))?;
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)

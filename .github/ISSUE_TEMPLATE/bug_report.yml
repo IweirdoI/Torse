@@ -15,7 +15,7 @@ body:
       label: 复现步骤
       description: 逐条列出操作。能用命令复现的直接给出命令。
       placeholder: |
-        cargo run -p torse-client -- --window
+        cargo run -p torse-server -- .work/demo-world --listen 127.0.0.1:7777 --fill
         1. ...
         2. ...
     validations:

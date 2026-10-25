@@ -42,11 +42,21 @@ impl JournalBackend for MemoryBackend {
             .checked_add(bytes.len() as u64)
             .filter(|total| *total <= self.max_bytes)
             .ok_or_else(|| io::Error::other("memory journal retention limit exceeded"))?;
-        usize::try_from(total)
+        let total = usize::try_from(total)
             .map_err(|_| io::Error::other("memory journal length is not addressable"))?;
-        self.bytes
-            .try_reserve_exact(bytes.len())
-            .map_err(io::Error::other)?;
+        if total > self.bytes.capacity() {
+            let ceiling = self.max_bytes.min(usize::MAX as u64) as usize;
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(4096)
+                .max(total)
+                .min(ceiling);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(io::Error::other)?;
+        }
         self.bytes.extend_from_slice(bytes);
         Ok(())
     }
@@ -87,6 +97,18 @@ mod lock_tests {
     use super::*;
     use std::fs::{self, OpenOptions};
     use std::path::PathBuf;
+
+    #[test]
+    fn memory_growth_preserves_bytes_and_never_reserves_past_retention_limit() {
+        let mut backend = MemoryBackend::new(10003);
+        for _ in 0..10003 {
+            backend.append(&[7]).unwrap();
+            assert!(backend.bytes.capacity() <= 10003);
+        }
+        assert!(backend.append(&[8]).is_err());
+        assert_eq!(backend.bytes(), vec![7; 10003]);
+        backend.sync().unwrap();
+    }
 
     #[test]
     fn dropping_journal_owner_releases_lock_with_a_duplicate_descriptor_alive() {

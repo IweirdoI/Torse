@@ -14,13 +14,13 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N]"
+            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--commit-batch N; default 16]"
         );
         return Ok(());
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N]"
+            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--commit-batch N; default 16]"
         );
         return Ok(());
     }
@@ -33,8 +33,16 @@ fn run() -> Result<(), Fault> {
     let mut mod_dirs = Vec::new();
     let mut machine_operators = false;
     let mut planning = None;
+    let mut commit_batch = 16;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--commit-batch" => {
+                commit_batch = args
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|n| (1..=1024).contains(n))
+                    .ok_or_else(|| Fault::invalid_data("commit batch must be 1..1024"))?;
+            }
             "--planning-workers" => {
                 let workers = args
                     .next()
@@ -108,7 +116,8 @@ fn run() -> Result<(), Fault> {
     }
     let compatibility = world.coordinator().compatibility();
     let limits = base::execution_limits();
-    let policy = base::file_policy();
+    let mut policy = base::file_policy();
+    policy.journal.max_pending_records = commit_batch;
     let directory = WorldDirectory::acquire(&path, base::WORLD, 65_536)?;
     let codec = base::Codec::new(base::codec_limits())?;
     let mut server = if path.join("checkpoints/manifest.log").exists() {
@@ -128,6 +137,7 @@ fn run() -> Result<(), Fault> {
         })?
     };
     server.set_parallel_planning(planning)?;
+    server.set_commit_batch_limit(commit_batch)?;
     let listener = TcpListener::bind(&address).map_err(|e| Fault::invalid_data(e.to_string()))?;
     listener
         .set_nonblocking(true)

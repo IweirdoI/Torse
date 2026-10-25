@@ -48,7 +48,17 @@ ExecutionHost独占ReplicaSource，使用纯DurableRule规划系统和事件。�
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。这是新执行目录，原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。完整状态每条日志替换、有限世界驻留、同步刷盘是本轮边界，未进行吞吐或硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本2、读版本1和2，快照及协议仍为版本1。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。世界仍有限驻留，未进行硬件断电验收。
+
+## 运行态与批量刷盘
+
+默认共享不可变规则及冻结任务表，缓存其编码和解码预算成本；动态事件、结果及全运行态上限继续校验。逐任务记录保存进度，恢复仍重新核对终态，不重跑规则。`Server::set_runtime_optimization(false)`可切换到完整运行态记录和完整编码/解码校验作对照，内存表共享仍保留。
+
+`drive_one`继续每条记录同步。`drive_batch`逐项执行准备、日志预留、发布、立即接纳及失效控制，在达到记录上限、Tick边界、空闲或容量阻塞时同步已接纳前缀，然后返回CommitBatch。追加或同步失败时停止实例，不返回该批成功，结果、基线、复制与快照入口关闭。容量Busy时先同步已接纳部分，后续可以继续重试。
+
+Server的Tick驱动默认每批1条，可用`set_commit_batch_limit`设置1到1024。主程序默认16条，并设置相应日志槽数；`--commit-batch 1`可回到逐条同步。任何成功返回都要求该批完整前缀通过DurableSeq门槛，未确认的内存批次在进程退出后可能丢失。关闭流程仍有界排空并保存检查点。
+
+复现对照与故障验证见[运行态与批量提交](../../benchmarks/M6-runtime-commit.md)。当前简单事务的并行预验证实验未显示收益，因此继续使用串行事务准备与发布。
 
 NetworkHub通过泛型协议接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线和增量都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权世界与编辑请求；真实用户认证、TLS，以及服务端移动结算和客户端校正尚未接入。
 

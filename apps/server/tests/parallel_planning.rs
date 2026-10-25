@@ -217,6 +217,9 @@ fn one_and_four_workers_preserve_journal_bytes_events_replies_and_replicas() {
                 }))
                 .unwrap();
         }
+        if workers == 4 {
+            server.set_commit_batch_limit(16).unwrap();
+        }
         server
             .register_session(
                 Viewer {

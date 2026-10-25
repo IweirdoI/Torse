@@ -1,7 +1,7 @@
 //! Authenticated session/application assembly. Polling does bounded work outside
 //! the commit path. Only durable reads, seeds, results and deltas enter transports.
 use crate::execution::{ExecutionHost, ExecutionModel};
-use crate::{CommitStep, HostAuthority, HostCheckpointStore, InvalidationSink, Server};
+use crate::{HostAuthority, HostCheckpointStore, InvalidationSink, Server};
 use std::collections::{BTreeMap, BTreeSet};
 use torse_codec::{CodecLimits, wire};
 use torse_net::{SessionRegistry, Transport};
@@ -87,6 +87,11 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         }
         Ok(receipt)
     }
+    pub fn set_runtime_optimization(&mut self, enabled: bool) -> Result<(), Fault> {
+        self.authority()?;
+        self.authority.set_runtime_optimization(enabled);
+        Ok(())
+    }
     /// Finish one logical tick, including a recovered partial tick, within an
     /// explicit work budget. This never skips a tick or invokes future events.
     pub fn drive_tick(
@@ -101,15 +106,19 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             .0
             .checked_add(1)
             .ok_or_else(|| Fault::invalid_data("tick exhausted"))?;
-        for steps in 1..=max_steps {
-            match self.drive_one(sink)? {
-                CommitStep::Durable(_) => {}
-                CommitStep::Idle => return Ok(steps - 1),
-                CommitStep::Blocked(_) => {
-                    return Err(Fault::resource_limit(
-                        "journal blocked; tick remains recoverable",
-                    ));
-                }
+        let mut steps = 0;
+        while steps < max_steps {
+            let batch = self.drive_batch(sink, self.commit_batch_limit.min(max_steps - steps))?;
+            steps += batch.committed;
+            if batch.idle {
+                return Ok(steps);
+            }
+            if let Some(error) = batch.blocked
+                && (!matches!(error, StageError::Busy) || batch.committed == 0)
+            {
+                return Err(Fault::resource_limit(
+                    "journal blocked; tick remains recoverable",
+                ));
             }
             let authority = self.authority()?;
             if authority.at_tick_boundary() && authority.resume_point().tick.0 == target {

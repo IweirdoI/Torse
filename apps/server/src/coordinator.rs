@@ -58,6 +58,21 @@ pub enum CommitStep {
     Durable(DurablePublication),
 }
 
+/// Only returned after all accepted records in this bounded call are durable.
+#[derive(Debug)]
+pub struct CommitBatch {
+    pub committed: u32,
+    pub durability: Durability,
+    pub blocked: Option<StageError>,
+    pub idle: bool,
+}
+
+enum PublishedStep {
+    Idle,
+    Blocked(StageError),
+    Published(Publication),
+}
+
 /// Synchronization waiting is measured outside authority calls and world write ownership.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FlushMetrics {
@@ -85,6 +100,7 @@ pub struct Server<A: HostAuthority, J, S> {
     state: ServerState,
     flush: FlushMetrics,
     pub(crate) profiler: SerialProfiler,
+    pub(crate) commit_batch_limit: u32,
     _directory: WorldDirectory,
 }
 
@@ -142,6 +158,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
             state: ServerState::Running,
             flush: FlushMetrics::default(),
             profiler: SerialProfiler::default(),
+            commit_batch_limit: 1,
             _directory: directory,
         })
     }
@@ -196,6 +213,68 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         self.commit_one(sink, None)
     }
 
+    /// `drive_one` keeps its original one-record barrier. Tick driving may opt
+    /// into batches; journal capacity can shorten them without losing progress.
+    pub fn set_commit_batch_limit(&mut self, records: u32) -> Result<(), Fault> {
+        if !(1..=1024).contains(&records) {
+            return Err(Fault::invalid_data("commit batch must be 1..1024"));
+        }
+        self.authority()?;
+        self.commit_batch_limit = records;
+        Ok(())
+    }
+
+    /// Serial publication, one final synchronization barrier. No authority,
+    /// receipt, seed, or batch can escape while this mutable call is in progress.
+    /// Invalidations run immediately after each acceptance, before synchronization.
+    pub fn drive_batch(
+        &mut self,
+        sink: &mut impl InvalidationSink,
+        max_records: u32,
+    ) -> Result<CommitBatch, Fault> {
+        if self.state != ServerState::Running {
+            return Err(stopped());
+        }
+        if !(1..=1024).contains(&max_records) {
+            return Err(Fault::invalid_data("commit batch must be 1..1024"));
+        }
+        if let Err(error) =
+            self.validate_durable(self.authority.cursor(), self.journal.durability())
+        {
+            return Err(self.fail(error));
+        }
+        let mut committed = 0;
+        let mut blocked = None;
+        let mut idle = false;
+        for _ in 0..max_records {
+            match self.publish_one(sink, None)? {
+                PublishedStep::Published(_) => committed += 1,
+                PublishedStep::Blocked(error) => {
+                    blocked = Some(error);
+                    break;
+                }
+                PublishedStep::Idle => {
+                    idle = true;
+                    break;
+                }
+            }
+            if self.authority.at_tick_boundary() {
+                break;
+            }
+        }
+        let durability = if committed != 0 {
+            self.flush_to(self.authority.cursor())?
+        } else {
+            self.journal.durability()
+        };
+        Ok(CommitBatch {
+            committed,
+            durability,
+            blocked,
+            idle,
+        })
+    }
+
     fn commit_one(
         &mut self,
         sink: &mut impl InvalidationSink,
@@ -206,6 +285,24 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         {
             return Err(self.fail(error));
         }
+        match self.publish_one(sink, deadline)? {
+            PublishedStep::Idle => Ok(CommitStep::Idle),
+            PublishedStep::Blocked(error) => Ok(CommitStep::Blocked(error)),
+            PublishedStep::Published(publication) => {
+                let durability = self.flush_to(publication.at)?;
+                Ok(CommitStep::Durable(DurablePublication {
+                    publication,
+                    durability,
+                }))
+            }
+        }
+    }
+
+    fn publish_one(
+        &mut self,
+        sink: &mut impl InvalidationSink,
+        deadline: Option<Tick>,
+    ) -> Result<PublishedStep, Fault> {
         let before = self.authority.cursor();
         let resume_before = self.authority.resume_point();
         let preparation = {
@@ -226,7 +323,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
             )));
         }
         let Some(prepared) = prepared else {
-            return Ok(CommitStep::Idle);
+            return Ok(PublishedStep::Idle);
         };
         let meta = prepared.record().meta;
         if meta.cursor.world != before.world
@@ -246,7 +343,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         let staged = match self.journal.try_stage(prepared.record()) {
             Ok(staged) => staged,
             Err(StageError::Stopped(error)) => return Err(self.fail(error)),
-            Err(error) => return Ok(CommitStep::Blocked(error)),
+            Err(error) => return Ok(PublishedStep::Blocked(error)),
         };
         let publication_result = {
             let _span = self.profiler.span(Stage::Publication);
@@ -276,11 +373,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         {
             return Err(self.fail(error));
         }
-        let durability = self.flush_to(publication.at)?;
-        Ok(CommitStep::Durable(DurablePublication {
-            publication,
-            durability,
-        }))
+        Ok(PublishedStep::Published(publication))
     }
 
     pub fn checkpoint(&mut self) -> Result<Durability, Fault> {

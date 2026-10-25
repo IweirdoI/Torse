@@ -19,7 +19,8 @@ mod world;
 pub use authority::{HostAuthority, InvalidationSink, NoReplicas, PreparedChange, RecoveryTarget};
 pub use checkpoint::HostCheckpointStore;
 pub use coordinator::{
-    CommitStep, DurablePublication, FlushMetrics, Server, ServerConfig, ServerState, ShutdownReport,
+    CommitBatch, CommitStep, DurablePublication, FlushMetrics, Server, ServerConfig, ServerState,
+    ShutdownReport,
 };
 pub use directory::WorldDirectory;
 pub use lifecycle::{FileServer, FileServerConfig};

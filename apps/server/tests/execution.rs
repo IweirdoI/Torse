@@ -956,7 +956,10 @@ fn replay_rejects_unrecorded_event_effects_and_fake_execution_progress() {
         meta: p.record().meta,
         changes: p.record().changes.clone(),
     };
-    invalid.changes.runtime.next_event += 1;
+    let RuntimeUpdate::Full(state) = &mut invalid.changes.runtime else {
+        panic!("phase finish must be full");
+    };
+    state.next_event += 1;
     let (_, actions) = base::world().unwrap();
     let mut target = ExecutionRecovery::new(
         binding,

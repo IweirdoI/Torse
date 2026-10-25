@@ -22,6 +22,8 @@ struct Options {
     warmup: u32,
     backend: String,
     profiled: bool,
+    full_runtime: bool,
+    batch: u32,
 }
 
 fn options() -> Result<Options, Box<dyn Error>> {
@@ -31,6 +33,8 @@ fn options() -> Result<Options, Box<dyn Error>> {
         warmup: 5,
         backend: "all".into(),
         profiled: true,
+        full_runtime: false,
+        batch: 1,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -40,11 +44,16 @@ fn options() -> Result<Options, Box<dyn Error>> {
             "--warmup" => options.warmup = args.next().ok_or("missing warmup")?.parse()?,
             "--backend" => options.backend = args.next().ok_or("missing backend")?,
             "--unprofiled" => options.profiled = false,
+            "--full-runtime" => options.full_runtime = true,
+            "--batch" => options.batch = args.next().ok_or("missing batch")?.parse()?,
             _ => return Err(format!("unknown option: {arg}").into()),
         }
     }
     if options.ticks == 0 || options.ticks > 1000 || options.warmup > 100 {
         return Err("ticks must be 1..=1000 and warmup 0..=100".into());
+    }
+    if !(1..=1024).contains(&options.batch) {
+        return Err("batch must be 1..1024".into());
     }
     if !matches!(
         options.backend.as_str(),
@@ -136,7 +145,11 @@ fn file_case(
         WorldDirectory::acquire(path, base::WORLD, 1_048_576)?,
         compatibility,
         base::Codec::new(base::codec_limits())?,
-        base::file_policy(),
+        {
+            let mut policy = base::file_policy();
+            policy.journal.max_pending_records = options.batch;
+            policy
+        },
         |binding| {
             ExecutionHost::new(
                 binding,
@@ -189,7 +202,8 @@ fn memory_case(
         epoch: directory.epoch(),
         compatibility: world.coordinator().compatibility(),
     };
-    let config = base::file_policy();
+    let mut config = base::file_policy();
+    config.journal.max_pending_records = options.batch;
     let codec = base::Codec::new(base::codec_limits())?;
     let journal = Journal::with_backend(
         binding,
@@ -263,6 +277,8 @@ where
     B: JournalBackend,
     S: HostCheckpointStore<ExecutionModel>,
 {
+    server.set_runtime_optimization(!options.full_runtime)?;
+    server.set_commit_batch_limit(options.batch)?;
     let mut subscriptions = Vec::new();
     for id in 1..=subscribers as u128 {
         server.register_session(
@@ -290,11 +306,13 @@ where
         let start = Instant::now();
         let mut drive_ns = 0;
         let mut tick_batches = 0;
-        for _ in 0..load.tasks + 12 {
+        let mut remaining = load.tasks + 12;
+        while remaining != 0 {
             let started = Instant::now();
-            let step = server.drive_one(&mut NoReplicas)?;
+            let batch = server.drive_batch(&mut NoReplicas, options.batch.min(remaining as u32))?;
             drive_ns += started.elapsed().as_nanos() as u64;
-            assert!(matches!(step, CommitStep::Durable(_)));
+            assert!(batch.blocked.is_none() && !batch.idle && batch.committed != 0);
+            remaining -= batch.committed as usize;
             for &subscription in &subscriptions {
                 tick_batches += server.take_replica(subscription, base::budget())?.len() as u64;
             }
@@ -323,14 +341,14 @@ where
             profile.totals[Stage::Planning as usize].calls,
             u64::from(options.ticks) * 6
         );
-        for stage in [
-            Stage::Preparation,
-            Stage::Encoding,
-            Stage::Publication,
-            Stage::Flush,
-        ] {
+        for stage in [Stage::Preparation, Stage::Encoding, Stage::Publication] {
             assert_eq!(profile.totals[stage as usize].calls, steps);
         }
+        assert_eq!(
+            profile.totals[Stage::Flush as usize].calls,
+            ((load.tasks as u64 + 12).div_ceil(u64::from(options.batch)))
+                * u64::from(options.ticks)
+        );
         assert_eq!(profile.totals[Stage::Projection as usize].calls, batches);
         assert!(
             profile.totals.iter().map(|t| t.total_ns).sum::<u128>()
@@ -431,6 +449,11 @@ fn write_results(options: &Options, rows: &[ResultRow]) -> Result<(), Box<dyn Er
         std::env::consts::ARCH
     )?;
     writeln!(metadata, "debug_assertions={}", cfg!(debug_assertions))?;
+    writeln!(
+        metadata,
+        "runtime_optimization={}\ncommit_batch={}",
+        !options.full_runtime, options.batch
+    )?;
     writeln!(
         metadata,
         "logical_cpus={}",

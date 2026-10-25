@@ -3,6 +3,7 @@
 use crate::action::ActionTarget;
 use crate::{OrderingKey, Phase, Transaction, WorldAuthority};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use torse_types::*;
 use torse_world::*;
 
@@ -186,12 +187,12 @@ impl StoredTransactionGroup {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhaseWork {
-    pub tasks: Vec<FrozenTask>,
+    pub tasks: Arc<Vec<FrozenTask>>,
     pub next: u32,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeState {
-    pub rules: Vec<crate::SystemSpec>,
+    pub rules: Arc<Vec<crate::SystemSpec>>,
     pub next_event: u128,
     pub events: Vec<TimedEvent>,
     pub windows: Vec<Window>,
@@ -205,9 +206,54 @@ pub struct ExecutionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionChanges {
     pub world: ChangeSet,
-    pub runtime: RuntimeState,
+    pub runtime: RuntimeUpdate,
     pub outcome: Option<ReplyStatus>,
     pub cancelled: Option<Accepted>,
+}
+
+/// Full state freezes/finishes a phase. Progress reuses its immutable rule and
+/// task tables; replay must resolve it against the immediately preceding state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeUpdate {
+    Full(RuntimeState),
+    Progress(RuntimeProgress),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeProgress {
+    pub next: u32,
+    pub next_event: u128,
+    pub events: Vec<TimedEvent>,
+    pub windows: Vec<Window>,
+}
+
+impl RuntimeUpdate {
+    pub fn resolve(&self, before: &RuntimeState) -> Result<RuntimeState, Fault> {
+        match self {
+            Self::Full(state) => Ok(state.clone()),
+            Self::Progress(progress) => {
+                let work = before
+                    .work
+                    .as_ref()
+                    .ok_or_else(|| Fault::invalid_data("progress without frozen work"))?;
+                if work.next.checked_add(1) != Some(progress.next)
+                    || progress.next as usize > work.tasks.len()
+                {
+                    return Err(Fault::invalid_data("nonconsecutive task progress"));
+                }
+                Ok(RuntimeState {
+                    rules: Arc::clone(&before.rules),
+                    next_event: progress.next_event,
+                    events: progress.events.clone(),
+                    windows: progress.windows.clone(),
+                    work: Some(PhaseWork {
+                        tasks: Arc::clone(&work.tasks),
+                        next: progress.next,
+                    }),
+                })
+            }
+        }
+    }
 }
 
 fn stable(registry: &BlockStateRegistry, id: BlockStateId) -> Result<CellContent, Fault> {

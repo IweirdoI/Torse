@@ -2,7 +2,9 @@
 //! commits; every task, request result, event change and execution position then
 //! shares one journal record with its world mutation. Recovery never runs rules.
 use crate::{HostAuthority, PreparedChange, RecoveryTarget};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use torse_codec::{CodecLimits, wire};
 use torse_diagnostics::{SerialProfiler, Stage};
 use torse_sim::action::{ActionOrigin, ActionOutput, ActionRequest, ActionService, ActorContext};
@@ -20,6 +22,9 @@ use torse_world::{BlockStateRegistry, ComponentFields, ComponentSchemas};
 #[path = "planning.rs"]
 mod planning;
 pub use planning::PlanningConfig;
+#[path = "runtime_budget.rs"]
+mod runtime_budget;
+use runtime_budget::RuntimeBudget;
 
 pub struct ExecutionModel;
 impl AuthorityData for ExecutionModel {
@@ -144,11 +149,14 @@ pub struct ExecutionHost {
     highest_session: u128,
     profiler: SerialProfiler,
     planning: Option<PlanningConfig>,
+    compact_records: bool,
+    budget_cache: RefCell<RuntimeBudget>,
 }
 pub struct ExecutionPrepared {
     world: torse_sim::PreparedChange,
     record: CommitRecord<ExecutionChanges>,
     remove_pending: Vec<RequestId>,
+    runtime: RuntimeState,
 }
 impl PreparedChange for ExecutionPrepared {
     type Model = ExecutionModel;
@@ -174,6 +182,15 @@ fn checked_state(
     limits: ExecutionLimits,
     point: ResumePoint,
     world: WorldId,
+) -> Result<(), Fault> {
+    checked_state_cached(state, limits, point, world, None)
+}
+fn checked_state_cached(
+    state: &RuntimeState,
+    limits: ExecutionLimits,
+    point: ResumePoint,
+    world: WorldId,
+    cache: Option<&RefCell<RuntimeBudget>>,
 ) -> Result<(), Fault> {
     if point.next_step != 0
         || Phase::from_index(point.next_phase).is_none()
@@ -278,6 +295,9 @@ fn checked_state(
             }
         }
     }
+    if let Some(cache) = cache {
+        return cache.borrow_mut().check(state, limits);
+    }
     let mut encoded = Vec::new();
     wire::encode(state, &mut encoded, limits.runtime, limits.codec)?;
     // Decode enforces owned allocation/node budgets, not merely encoded length.
@@ -305,7 +325,7 @@ impl ExecutionHost {
         limits: ExecutionLimits,
     ) -> Result<Self, Fault> {
         let runtime = RuntimeState {
-            rules: specifications(&rules)?,
+            rules: specifications(&rules)?.into(),
             next_event: 1,
             events: Vec::new(),
             windows: Vec::new(),
@@ -322,7 +342,7 @@ impl ExecutionHost {
         runtime: RuntimeState,
     ) -> Result<Self, Fault> {
         limits.validate()?;
-        if specifications(&rules)? != runtime.rules {
+        if specifications(&rules)? != *runtime.rules {
             return Err(Fault::incompatible("durable rule declarations changed"));
         }
         checked_state(
@@ -352,6 +372,8 @@ impl ExecutionHost {
             highest_session: 0,
             profiler: SerialProfiler::default(),
             planning: None,
+            compact_records: true,
+            budget_cache: RefCell::default(),
         })
     }
     pub fn world(&self) -> &WorldAuthority {
@@ -359,6 +381,14 @@ impl ExecutionHost {
     }
     pub fn runtime(&self) -> &RuntimeState {
         &self.runtime
+    }
+    /// Disabling this uses full records and full wire validation for comparison.
+    /// Immutable table sharing remains enabled. Readers also accept old logs.
+    pub fn set_runtime_optimization(&mut self, enabled: bool) {
+        self.compact_records = enabled;
+    }
+    fn validation_cache(&self) -> Option<&RefCell<RuntimeBudget>> {
+        self.compact_records.then_some(&self.budget_cache)
     }
 
     pub(crate) fn set_serial_profiler(&mut self, profiler: SerialProfiler) {
@@ -580,7 +610,10 @@ impl ExecutionHost {
             };
             key(a).cmp(&key(b))
         });
-        Ok(PhaseWork { tasks, next: 0 })
+        Ok(PhaseWork {
+            tasks: tasks.into(),
+            next: 0,
+        })
     }
     fn record(
         &self,
@@ -588,11 +621,12 @@ impl ExecutionHost {
         runtime: RuntimeState,
         remove_pending: Vec<RequestId>,
     ) -> Result<ExecutionPrepared, Fault> {
-        checked_state(
+        checked_state_cached(
             &runtime,
             self.limits,
             prepared.meta().resume_at,
             self.binding.world,
+            self.validation_cache(),
         )?;
         receipt_bounds(&runtime, prepared.meta().cursor)?;
         let changes = changes_from_prepared(self.world().registry(), &prepared)
@@ -602,13 +636,14 @@ impl ExecutionHost {
                 meta: changes.meta,
                 changes: ExecutionChanges {
                     world: changes,
-                    runtime,
+                    runtime: RuntimeUpdate::Full(runtime.clone()),
                     outcome: None,
                     cancelled: None,
                 },
             },
             world: prepared,
             remove_pending,
+            runtime,
         })
     }
     fn prepare_task(&self, task: &FrozenTask) -> Result<ExecutionPrepared, Fault> {
@@ -635,6 +670,7 @@ impl ExecutionHost {
             prepared.meta().cursor,
             self.resume_point(),
             self.limits,
+            self.validation_cache(),
         ) {
             Ok(state) => state,
             Err(error) if !matches!(status, ReplyStatus::Rejected(_)) => {
@@ -651,12 +687,21 @@ impl ExecutionHost {
                     prepared.meta().cursor,
                     self.resume_point(),
                     self.limits,
+                    self.validation_cache(),
                 )?
             }
             Err(error) => return Err(error),
         };
         let mut result = self.record(prepared, state, Vec::new())?;
         result.record.changes.outcome = Some(status);
+        if self.compact_records {
+            result.record.changes.runtime = RuntimeUpdate::Progress(RuntimeProgress {
+                next: result.runtime.work.as_ref().expect("settled work").next,
+                next_event: result.runtime.next_event,
+                events: result.runtime.events.clone(),
+                windows: result.runtime.windows.clone(),
+            });
+        }
         Ok(result)
     }
 }
@@ -739,8 +784,17 @@ fn fit_state(
     point: ResumePoint,
     world: WorldId,
 ) -> Result<(), Fault> {
+    fit_state_cached(state, limits, point, world, None)
+}
+fn fit_state_cached(
+    state: &mut RuntimeState,
+    limits: ExecutionLimits,
+    point: ResumePoint,
+    world: WorldId,
+    cache: Option<&RefCell<RuntimeBudget>>,
+) -> Result<(), Fault> {
     loop {
-        match checked_state(state, limits, point, world) {
+        match checked_state_cached(state, limits, point, world, cache) {
             Ok(()) => return Ok(()),
             Err(e) if e.code == FaultCode::ResourceLimit && prune_one(state) => {}
             Err(e) => return Err(e),
@@ -754,6 +808,7 @@ fn settle(
     at: CommitCursor,
     point: ResumePoint,
     limits: ExecutionLimits,
+    cache: Option<&RefCell<RuntimeBudget>>,
 ) -> Result<RuntimeState, Fault> {
     if status != &task.status
         && (matches!(task.status, ReplyStatus::Rejected(_))
@@ -803,7 +858,7 @@ fn settle(
         .as_mut()
         .ok_or_else(|| Fault::invalid_data("task without work"))?
         .next += 1;
-    fit_state(&mut state, limits, point, at.world)?;
+    fit_state_cached(&mut state, limits, point, at.world, cache)?;
     Ok(state)
 }
 fn add_receipt(
@@ -1023,7 +1078,7 @@ impl HostAuthority for ExecutionHost {
                 ));
             };
             if work.tasks.len() == 1 {
-                let t = &mut work.tasks[index];
+                let t = &mut Arc::make_mut(&mut work.tasks)[index];
                 t.transaction = None;
                 t.output.clear();
                 t.status = ReplyStatus::Rejected(RejectCode::QuotaExceeded);
@@ -1035,7 +1090,7 @@ impl HostAuthority for ExecutionHost {
                 )?;
                 break;
             }
-            work.tasks.remove(index);
+            Arc::make_mut(&mut work.tasks).remove(index);
         }
         let remove_pending = state
             .work
@@ -1071,7 +1126,7 @@ impl HostAuthority for ExecutionHost {
         {
             live.completed = live.completed.max(request.id.seq.0);
         }
-        self.runtime = prepared.record.changes.runtime;
+        self.runtime = prepared.runtime;
         for r in self
             .runtime
             .windows
@@ -1151,6 +1206,7 @@ pub struct ExecutionRecovery<'a> {
     actions: ActionService,
     rules: Vec<Box<dyn DurableRule>>,
     limits: ExecutionLimits,
+    budget_cache: RefCell<RuntimeBudget>,
 }
 impl<'a> ExecutionRecovery<'a> {
     pub fn new(
@@ -1169,13 +1225,20 @@ impl<'a> ExecutionRecovery<'a> {
             actions,
             rules,
             limits,
+            budget_cache: RefCell::default(),
         }
     }
     fn validate(&self, state: &RuntimeState, point: ResumePoint) -> Result<(), Fault> {
-        if state.rules != specifications(&self.rules)? {
+        if *state.rules != specifications(&self.rules)? {
             return Err(Fault::incompatible("execution rules mismatch"));
         }
-        checked_state(state, self.limits, point, self.binding.world)
+        checked_state_cached(
+            state,
+            self.limits,
+            point,
+            self.binding.world,
+            Some(&self.budget_cache),
+        )
     }
 }
 impl RecoveryTarget for ExecutionRecovery<'_> {
@@ -1212,10 +1275,18 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
         {
             return Err(Fault::invalid_data("execution metadata mismatch"));
         }
-        self.validate(&record.changes.runtime, record.meta.resume_at)?;
-        receipt_bounds(&record.changes.runtime, record.meta.cursor)?;
         let before = self.runtime.as_ref().expect("snapshot applied");
-        let after = &record.changes.runtime;
+        if matches!(record.changes.runtime, RuntimeUpdate::Progress(_))
+            && (record.changes.outcome.is_none()
+                || record.changes.cancelled.is_some()
+                || record.meta.resume_at != previous)
+        {
+            return Err(Fault::invalid_data("progress outside task settlement"));
+        }
+        let resolved = record.changes.runtime.resolve(before)?;
+        self.validate(&resolved, record.meta.resume_at)?;
+        receipt_bounds(&resolved, record.meta.cursor)?;
+        let after = &resolved;
         let world = &record.changes.world;
         let empty = world.edits.is_empty()
             && world.entity_moves.is_empty()
@@ -1290,6 +1361,7 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
                                 record.meta.cursor,
                                 previous,
                                 self.limits,
+                                Some(&self.budget_cache),
                             )? == *after
                     }
                 }
@@ -1312,7 +1384,7 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
             .replay(world)
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
         self.point = Some(record.meta.resume_at);
-        self.runtime = Some(record.changes.runtime);
+        self.runtime = Some(resolved);
         Ok(())
     }
     fn finish(self, expected: CommitCursor) -> Result<ExecutionHost, Fault> {

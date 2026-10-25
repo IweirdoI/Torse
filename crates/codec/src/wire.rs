@@ -5,15 +5,51 @@ use crate::value::*;
 use crate::{CodecLimits, Decoder, EncodeResult, Encoder, StorageCodec};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use torse_sim::durable::*;
 use torse_sim::replica::*;
 use torse_types::*;
 use torse_world::*;
 
 pub const EXECUTION_VERSION: u16 = 1;
+pub const EXECUTION_COMMIT_VERSION: u16 = 2;
 pub trait Wire: Sized {
     fn write(&self, out: &mut Encoder<'_>) -> EncodeResult<()>;
     fn read(input: &mut Decoder<'_>) -> EncodeResult<Self>;
+}
+
+/// Cost of a field body, excluding its root envelope. Uses the actual bounded
+/// encoder and decoder so allocation/node accounting stays identical to replay.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WireCost {
+    pub encoded_bytes: u64,
+    pub owned_bytes: u64,
+    pub items: u32,
+}
+
+pub fn measure_inner<T: Wire>(
+    value: &T,
+    budget: OutputBudget,
+    limits: CodecLimits,
+) -> EncodeResult<WireCost> {
+    let budget = OutputBudget {
+        max_bytes: budget.max_bytes.min(u64::from(limits.max_frame_bytes)),
+        ..budget
+    };
+    let mut bytes = Vec::new();
+    let mut e = Encoder::new(&mut bytes, budget, limits);
+    value.write(&mut e)?;
+    e.finish();
+    let mut d = Decoder::new(&bytes, budget, limits);
+    let _value = T::read(&mut d)?;
+    if !d.is_complete() {
+        return Err(invalid("incomplete cost validation"));
+    }
+    Ok(WireCost {
+        encoded_bytes: bytes.len() as u64,
+        owned_bytes: d.guard().used_bytes(),
+        items: d.guard().used_items(),
+    })
 }
 pub fn encode<T: Wire>(
     value: &T,
@@ -112,6 +148,16 @@ impl<T: Wire> Wire for Vec<T> {
             out.push(T::read(d)?);
         }
         Ok(out)
+    }
+}
+impl<T: Wire> Wire for Arc<T> {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        self.as_ref().write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        let control = (2 * size_of::<usize>()).next_multiple_of(std::mem::align_of::<T>());
+        d.charge_bytes((size_of::<T>() + control) as u64)?;
+        Ok(Arc::new(T::read(d)?))
     }
 }
 impl<T: Wire> Wire for Option<T> {
@@ -546,6 +592,33 @@ fields!(RuntimeState {
     work
 });
 fields!(ExecutionSnapshot { world, runtime });
+fields!(RuntimeProgress {
+    next,
+    next_event,
+    events,
+    windows
+});
+impl Wire for RuntimeUpdate {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        match self {
+            Self::Full(state) => {
+                0u8.write(e)?;
+                state.write(e)
+            }
+            Self::Progress(progress) => {
+                1u8.write(e)?;
+                progress.write(e)
+            }
+        }
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        match u8::read(d)? {
+            0 => Ok(Self::Full(Wire::read(d)?)),
+            1 => Ok(Self::Progress(Wire::read(d)?)),
+            _ => Err(invalid("unknown runtime update")),
+        }
+    }
+}
 fields!(ExecutionChanges {
     world,
     runtime,
@@ -635,10 +708,40 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
         if v.meta != v.changes.world.meta {
             return Err(invalid("execution commit metadata"));
         }
-        encode(v, out, b, self.limits)
+        let b = OutputBudget {
+            max_bytes: b.max_bytes.min(u64::from(self.limits.max_frame_bytes)),
+            ..b
+        };
+        let mut encoder = Encoder::new(out, b, self.limits);
+        encoder.count_items(1)?;
+        encoder.write_u16(EXECUTION_COMMIT_VERSION)?;
+        v.write(&mut encoder)?;
+        encoder.finish();
+        Ok(())
     }
     fn decode_commit(&self, v: &[u8], b: OutputBudget) -> EncodeResult<ModelCommit<M>> {
-        let v: ModelCommit<M> = decode(v, b, self.limits)?;
+        if v.len() > self.limits.max_frame_bytes as usize {
+            return Err(Fault::resource_limit("wire frame too large"));
+        }
+        let mut d = Decoder::new(v, b, self.limits);
+        d.charge_items(1)?;
+        d.charge_bytes(size_of::<ModelCommit<M>>() as u64)?;
+        let v = match d.read_u16()? {
+            EXECUTION_VERSION => CommitRecord {
+                meta: Wire::read(&mut d)?,
+                changes: ExecutionChanges {
+                    world: Wire::read(&mut d)?,
+                    runtime: RuntimeUpdate::Full(Wire::read(&mut d)?),
+                    outcome: Wire::read(&mut d)?,
+                    cancelled: Wire::read(&mut d)?,
+                },
+            },
+            EXECUTION_COMMIT_VERSION => ModelCommit::<M>::read(&mut d)?,
+            _ => return Err(Fault::incompatible("execution commit version")),
+        };
+        if !d.is_complete() {
+            return Err(invalid("trailing execution commit bytes"));
+        }
         if v.meta != v.changes.world.meta {
             return Err(invalid("execution commit metadata"));
         }

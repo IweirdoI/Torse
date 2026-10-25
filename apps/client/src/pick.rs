@@ -171,8 +171,13 @@ pub fn cast_ray(
 
     // Classify one cell over the traversal span [t_enter, t_exit]:
     // None stops the world, an empty cell continues, a shape either catches
-    // the ray or lets it pass.
-    let mut classify = |cell: [i64; 3], t_enter: f32, t_exit: f32| -> Option<Option<PickHit>> {
+    // the ray or lets it pass. `crossed_face` is the unit normal of the cell
+    // boundary the traversal just stepped through, zero for the origin cell.
+    let mut classify = |cell: [i64; 3],
+                        t_enter: f32,
+                        t_exit: f32,
+                        crossed_face: [i32; 3]|
+     -> Option<Option<PickHit>> {
         let pos = BlockPos::new(cell[0], cell[1], cell[2]);
         match shape_of(pos) {
             None => None,
@@ -182,28 +187,14 @@ pub fn cast_ray(
                 match ray_box(origin, direction, min, max, t_enter, t_exit) {
                     None => Some(None),
                     Some((distance, mut face)) => {
-                        // Entering the cell without crossing the shape's own
-                        // face happens when the ray starts the segment inside
-                        // the shape: the reported face falls back to the cell
-                        // boundary crossed.
-                        if face == [0, 0, 0] && distance == t_enter && t_enter > 0.0 {
-                            face = [
-                                if direction[0] != 0.0 {
-                                    -step[0] as i32
-                                } else {
-                                    face[0]
-                                },
-                                if direction[1] != 0.0 {
-                                    -step[1] as i32
-                                } else {
-                                    face[1]
-                                },
-                                if direction[2] != 0.0 {
-                                    -step[2] as i32
-                                } else {
-                                    face[2]
-                                },
-                            ];
+                        // A zero face means the segment started inside the
+                        // box: the ray origin sits in the shape, or the
+                        // shape's face is flush with the crossed cell
+                        // boundary. The crossed boundary is the face a
+                        // placement attaches to; it stays zero when the ray
+                        // starts inside, where placement is rejected.
+                        if face == [0, 0, 0] {
+                            face = crossed_face;
                         }
                         let entry = [
                             origin[0] + direction[0] * distance,
@@ -222,13 +213,14 @@ pub fn cast_ray(
         }
     };
 
-    // Origin cell: the traversal span starts at zero.
+    // Origin cell: the traversal span starts at zero and no boundary was
+    // crossed, so a hit here keeps the zero face.
     let origin_exit = boundary
         .iter()
         .copied()
         .fold(f32::INFINITY, f32::min)
         .min(max_distance);
-    match classify(cell, 0.0, origin_exit) {
+    match classify(cell, 0.0, origin_exit, [0, 0, 0]) {
         None => return PickOutcome::Miss,
         Some(None) => {}
         Some(Some(hit)) => return PickOutcome::Hit(hit),
@@ -247,10 +239,8 @@ pub fn cast_ray(
             break;
         }
         cell[axis] += step[axis];
-        let crossed = [0i32, 0, 0];
         let mut crossed_face = [0i32; 3];
         crossed_face[axis] = -step[axis] as i32;
-        let _ = crossed;
         boundary[axis] += delta[axis];
 
         let cell_exit = boundary
@@ -258,18 +248,10 @@ pub fn cast_ray(
             .copied()
             .fold(f32::INFINITY, f32::min)
             .min(max_distance);
-        match classify(cell, t_enter, cell_exit) {
+        match classify(cell, t_enter, cell_exit, crossed_face) {
             None => return PickOutcome::Miss,
             Some(None) => continue,
-            Some(Some(mut hit)) => {
-                if hit.face == [0, 0, 0] {
-                    // The ray entered the cell already inside the shape (the
-                    // shape touches the crossed boundary): the placement face
-                    // is the boundary just crossed.
-                    hit.face = crossed_face;
-                }
-                return PickOutcome::Hit(hit);
-            }
+            Some(Some(hit)) => return PickOutcome::Hit(hit),
         }
     }
     PickOutcome::Miss
@@ -309,6 +291,41 @@ mod tests {
         assert_eq!(hit.face, [-1, 0, 0]);
         assert!((hit.distance - 2.5).abs() < 1e-4);
         assert!((hit.entry[0] - 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ray_descending_diagonally_reports_the_top_face() {
+        // A flush full-cube face used to leak the sideways step into the
+        // reported normal, placing blocks on the diagonal neighbour.
+        let ground = [(1i64, 0i64, 0i64)];
+        let outcome = cast_ray(world(&ground), [0.5, 3.5, 0.5], [1.0, -2.0, 0.0], 16.0);
+        let PickOutcome::Hit(hit) = outcome else {
+            panic!("expected the ground cube");
+        };
+        assert_eq!(hit.block, BlockPos::new(1, 0, 0));
+        assert_eq!(hit.face, [0, 1, 0], "the ray enters through the top");
+    }
+
+    #[test]
+    fn ray_tilted_at_a_wall_reports_only_the_crossed_face() {
+        let wall = [(3i64, 0i64, 0i64)];
+        let outcome = cast_ray(world(&wall), [0.0, 0.5, 0.5], [1.0, 0.0, 0.1], 16.0);
+        let PickOutcome::Hit(hit) = outcome else {
+            panic!("expected the wall");
+        };
+        assert_eq!(hit.block, BlockPos::new(3, 0, 0));
+        assert_eq!(hit.face, [-1, 0, 0], "no sideways component leaks in");
+    }
+
+    #[test]
+    fn ray_starting_inside_a_shape_keeps_the_zero_face() {
+        let cells = [(0i64, 0i64, 0i64)];
+        let outcome = cast_ray(world(&cells), [0.5, 0.5, 0.5], [1.0, 0.0, 0.0], 16.0);
+        let PickOutcome::Hit(hit) = outcome else {
+            panic!("expected the origin cell");
+        };
+        assert_eq!(hit.block, BlockPos::new(0, 0, 0));
+        assert_eq!(hit.face, [0, 0, 0]);
     }
 
     #[test]

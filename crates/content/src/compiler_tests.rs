@@ -148,6 +148,27 @@ fn partial_occlusion_claims_are_rejected() {
 }
 
 #[test]
+fn transparent_materials_may_not_claim_occlusion() {
+    // Neighbour faces stay visible through cutout and blended blocks, so
+    // claiming any occlusion would delete a face the player can still see.
+    let mut pack = m0_fixture_pack();
+    let glass = pack
+        .blocks
+        .iter_mut()
+        .find(|block| block.value.id.to_string() == "base:glass")
+        .unwrap();
+    glass.value.occlusion_profile.face_mask = 0b11_1111;
+    let errors = compile(pack).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.field == "occlusion_profile.face_mask"
+                && error.message.contains("may not claim occlusion")),
+        "got {errors:?}"
+    );
+}
+
+#[test]
 fn completion_target_must_be_a_registered_block() {
     let mut pack = m0_fixture_pack();
     let slab = pack

@@ -139,10 +139,9 @@ pub fn m0_fixture_pack() -> ContentPack {
                     Shape::LowerSlab,
                     Some(Shape::LowerSlab),
                     Some(Shape::LowerSlab),
-                    // Occlusion claims only fully covered faces: mesh culling
-                    // removes whole neighbour faces, and the slab covers its
-                    // bottom boundary alone.
-                    0b000100,
+                    // A blended material hides nothing: neighbours stay
+                    // visible through the glass, so occlusion claims none.
+                    0,
                     AlphaMode::Blend,
                     inspect_action.clone(),
                     Some(key("base:glass")),
@@ -177,7 +176,8 @@ pub fn m0_fixture_pack() -> ContentPack {
                     Shape::FullCube,
                     Some(Shape::FullCube),
                     Some(Shape::FullCube),
-                    0b11_1111,
+                    // Transparent like the slab it completes into.
+                    0,
                     AlphaMode::Blend,
                     inspect_action,
                     None,

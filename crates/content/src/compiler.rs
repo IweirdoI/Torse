@@ -657,6 +657,17 @@ fn validate_block(
              culling would delete visible neighbour faces",
         ));
     }
+    if block.render_profile.alpha_mode != AlphaMode::Opaque
+        && block.occlusion_profile.face_mask != 0
+    {
+        diagnostics.push(diagnostic(
+            source.clone(),
+            block.id.clone(),
+            "occlusion_profile.face_mask",
+            "cutout and blended materials may not claim occlusion; \
+             neighbours stay visible through them",
+        ));
+    }
     for (name, value) in [
         (
             "light_transport.absorption",

@@ -5,7 +5,7 @@
 | 目录 | 职责与当前范围 |
 |---|---|
 | [types](types/src/lib.rs) | 身份、坐标、时间、结果、持久位置与复制等公共类型 |
-| [runtime](runtime/src/lib.rs) | 运行时接口入口与可选ECS实验；通用任务调度尚未实现 |
+| [runtime](runtime/README.md) | 有界CPU执行器、预留、优先级与取消，另含可选ECS实验 |
 | [content](content/src/lib.rs) | 内容契约、编译、摘要与基础内容夹具 |
 | [world](world/src/lib.rs) | 方块状态、分区、实体、组件与快照、变更载荷 |
 | [sim](sim/src/lib.rs) | 固定步长、阶段排序、事务仲裁、动作授权、持久任务、授权复制与行走领域逻辑 |
@@ -21,7 +21,7 @@
 | [net](net/README.md) | 会话、速率、有界内存与TCP传输、原子客户端镜像 |
 | [render](render/src/lib.rs) | CPU网格、遮挡剔除、依赖修订校验与网格缓存，另含可选GPU初始化实验 |
 | [assets](assets/src/lib.rs) | 资源管理的预留入口；当前UI资源加载位于客户端 |
-| [diagnostics](diagnostics/src/lib.rs) | 统一诊断库的预留入口；现有指标由各实现提供 |
+| [diagnostics](diagnostics/src/lib.rs) | 可选、有界的串行分项计时；其他指标由各实现提供 |
 
 ## 依赖与执行
 

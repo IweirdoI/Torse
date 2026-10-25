@@ -2741,6 +2741,7 @@ dependencies = [
  "torse-net",
  "torse-protocol",
  "torse-render",
+ "torse-runtime",
  "torse-sim",
  "torse-types",
  "torse-world",
@@ -2887,6 +2888,7 @@ dependencies = [
  "crc32c",
  "torse-codec",
  "torse-content",
+ "torse-diagnostics",
  "torse-inventory",
  "torse-mod-api",
  "torse-mod-host",
@@ -2904,6 +2906,7 @@ version = "0.1.0"
 dependencies = [
  "torse-actions",
  "torse-content",
+ "torse-diagnostics",
  "torse-types",
  "torse-world",
  "torse-world-services",
@@ -2915,6 +2918,7 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "torse-codec",
+ "torse-diagnostics",
  "torse-types",
 ]
 

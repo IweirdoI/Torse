@@ -9,13 +9,13 @@
 use std::collections::BTreeMap;
 
 use torse_content::{BlockDefinition, Shape, compile, m0_fixture_pack};
-use torse_render::{MeshData, MeshJob, MeshSample, RenderBlock, RenderBox, build_mesh};
+use torse_render::{MeshData, MeshSample, RenderBlock, RenderBox, build_mesh};
 use torse_sim::WorldAuthority;
 use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
 use torse_sim::replica::{ReplicaChanges, ReplicaEntity, ReplicaSnapshot};
 use torse_sim::{OrderingKey, Phase, block_actions};
 use torse_types::{
-    BlockPos, Compatibility, ContentKey, LocalPos, SectionPos, TransactionId, WorldId,
+    BlockPos, Compatibility, ContentKey, LocalPos, SectionPos, TransactionId, WorldEpoch, WorldId,
 };
 use torse_world::{
     BlockStateId, BlockStateRegistry, ComponentFields, ComponentSchemas, ComponentSet,
@@ -25,6 +25,22 @@ use torse_world::{
 use torse_world_services::{GenerationParams, HillTerrain};
 
 use crate::pick::{PickOutcome, cast_ray};
+
+mod background;
+pub use background::BackgroundStats;
+use background::{Background, MeshStamp};
+
+pub fn background_config() -> torse_runtime::ExecutorConfig {
+    background::default_config()
+}
+
+fn scene_epoch() -> Result<WorldEpoch, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+        .map(|n| WorldEpoch(u128::from(n)))
+        .map_err(|_| "scene epoch exhausted".to_owned())
+}
 
 /// One vertex uploaded to the GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -65,8 +81,13 @@ pub struct Scene {
     radius: i64,
     /// Cached mesh plus the dependency revisions it was built against;
     /// a neighbour edit is detected by validating this stored job.
-    meshes: BTreeMap<SectionPos, (MeshJob, MeshData)>,
+    meshes: BTreeMap<SectionPos, (MeshStamp, MeshData)>,
     sections: Vec<SectionPos>,
+    epoch: WorldEpoch,
+    asset_generation: u64,
+    next_load_generation: u64,
+    load_generations: BTreeMap<SectionPos, u64>,
+    background: Option<Background>,
 }
 
 /// One content pack for every client mode, matching the server demo assembly
@@ -96,6 +117,9 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
 impl Scene {
     /// Build a scene with a seeded hill terrain.
     pub fn new(radius: i64) -> Result<Self, String> {
+        if !(0..=16).contains(&radius) {
+            return Err("scene radius must be 0..=16".to_owned());
+        }
         let (registry, schemas, compatibility) = compile_content()?;
         let stone = registry
             .default_state(&key("base:stone"))
@@ -125,6 +149,11 @@ impl Scene {
             radius,
             meshes: BTreeMap::new(),
             sections: Vec::new(),
+            epoch: scene_epoch()?,
+            asset_generation: 1,
+            next_load_generation: 1,
+            load_generations: BTreeMap::new(),
+            background: None,
         };
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)
@@ -163,6 +192,11 @@ impl Scene {
             radius: 0,
             meshes: BTreeMap::new(),
             sections: Vec::new(),
+            epoch: scene_epoch()?,
+            asset_generation: 1,
+            next_load_generation: 1,
+            load_generations: BTreeMap::new(),
+            background: None,
         };
         scene.install_snapshot(snapshot)?;
         Ok(scene)
@@ -260,6 +294,7 @@ impl Scene {
         // A reinstalled section can reuse the previous revision number, so the
         // cached mesh must go or the change would render as a no-op.
         self.meshes.remove(&section.pos);
+        self.assign_load_generation(section.pos)?;
         Ok(())
     }
 
@@ -290,6 +325,7 @@ impl Scene {
         for pos in &changes.removed_sections {
             let _ = self.authority.store_mut().unload(*pos);
             self.meshes.remove(pos);
+            self.load_generations.remove(pos);
             self.sections.retain(|item| item != pos);
         }
         for section in &changes.sections {
@@ -469,6 +505,63 @@ impl Scene {
         if self.generator.is_none() {
             return Ok(());
         }
+        let wanted = self.wanted_sections(center)?;
+        if let Some(mut background) = self.background.take() {
+            let result = background.stream(self, wanted, budget);
+            self.background = Some(background);
+            return result;
+        }
+        let mut generated = 0usize;
+        for pos in &wanted {
+            if self.authority.store().phase(*pos).is_none() {
+                if generated >= budget {
+                    break;
+                }
+                generated += 1;
+                let section = self
+                    .generator
+                    .as_ref()
+                    .expect("generator checked")
+                    .generate(*pos)
+                    .map_err(|error| error.to_string())?;
+                self.install_generated(*pos, section)?;
+            }
+        }
+        for pos in self.sections.clone() {
+            if !wanted.contains(&pos) {
+                if self.authority.store().phase(pos).is_some() {
+                    self.authority
+                        .store_mut()
+                        .unload(pos)
+                        .map_err(|e| e.to_string())?;
+                }
+                self.meshes.remove(&pos);
+                self.load_generations.remove(&pos);
+            }
+        }
+        self.sections = wanted;
+        Ok(())
+    }
+
+    fn assign_load_generation(&mut self, pos: SectionPos) -> Result<u64, String> {
+        let generation = self.next_load_generation;
+        self.next_load_generation = generation
+            .checked_add(1)
+            .ok_or("load generation exhausted")?;
+        self.load_generations.insert(pos, generation);
+        Ok(generation)
+    }
+
+    fn install_generated(&mut self, pos: SectionPos, section: Section) -> Result<(), String> {
+        let store = self.authority.store_mut();
+        store.request(pos).map_err(|e| e.to_string())?;
+        store.install(pos, section).map_err(|e| e.to_string())?;
+        store.finish_load(pos).map_err(|e| e.to_string())?;
+        self.assign_load_generation(pos)?;
+        Ok(())
+    }
+
+    fn wanted_sections(&self, center: SectionPos) -> Result<Vec<SectionPos>, String> {
         let mut wanted = Vec::new();
         for x in -self.radius..=self.radius {
             for z in -self.radius..=self.radius {
@@ -493,38 +586,7 @@ impl Scene {
             let dz = pos.z - center.z;
             dx * dx + dz * dz
         });
-        let mut generated = 0usize;
-        for pos in &wanted {
-            if self.authority.store().phase(*pos).is_none() {
-                if generated >= budget {
-                    break;
-                }
-                generated += 1;
-                let store = self.authority.store_mut();
-                store.request(*pos).map_err(|error| error.to_string())?;
-                let section = self
-                    .generator
-                    .as_mut()
-                    .expect("generator checked above")
-                    .generate(*pos)
-                    .map_err(|error| error.to_string())?;
-                store
-                    .install(*pos, section)
-                    .map_err(|error| error.to_string())?;
-                store.finish_load(*pos).map_err(|error| error.to_string())?;
-            }
-        }
-
-        let wanted_set = wanted.clone();
-        for pos in self.sections.clone() {
-            if !wanted_set.contains(&pos) {
-                let store = self.authority.store_mut();
-                let _ = store.unload(pos);
-                self.meshes.remove(&pos);
-            }
-        }
-        self.sections = wanted;
-        Ok(())
+        Ok(wanted)
     }
 
     /// Rebuild meshes whose section or neighbour revision changed.
@@ -543,12 +605,12 @@ impl Scene {
             let unchanged = self
                 .meshes
                 .get(pos)
-                .is_some_and(|(job, _)| job.validate(|query| store.revision(query)));
+                .is_some_and(|(job, _)| job == &MeshStamp::capture(self, *pos));
             if unchanged {
                 continue;
             }
-            let job = MeshJob::capture(self.side, *pos, |query| store.revision(query));
-            let Some(_revision) = job.section_revision else {
+            let job = MeshStamp::capture(self, *pos);
+            let Some(_revision) = job.terrain.section_revision else {
                 continue;
             };
             let mesh = build_mesh(self.side, *pos, |query| sample(store, registry, query));
@@ -556,6 +618,43 @@ impl Scene {
             rebuilt.push(*pos);
         }
         rebuilt
+    }
+
+    /// Bootstrap only the starting section synchronously. Subsequent generation
+    /// and all meshing use one shared bounded CPU pool in the windowed client.
+    pub fn new_background(radius: i64) -> Result<Self, String> {
+        if !(0..=16).contains(&radius) {
+            return Err("scene radius must be 0..=16".to_owned());
+        }
+        let mut scene = Self::new(0)?;
+        scene.radius = radius;
+        scene.enable_background(background::default_config())?;
+        Ok(scene)
+    }
+
+    pub fn enable_background(
+        &mut self,
+        config: torse_runtime::ExecutorConfig,
+    ) -> Result<(), String> {
+        let next = Background::new(config)?;
+        self.background = Some(next);
+        Ok(())
+    }
+
+    pub fn refresh_visuals(&mut self, budget: usize) -> Result<Vec<SectionPos>, String> {
+        let Some(mut background) = self.background.take() else {
+            return Ok(self.refresh_meshes());
+        };
+        let result = background.refresh(self, budget);
+        self.background = Some(background);
+        result
+    }
+
+    pub fn background_stats(&self) -> BackgroundStats {
+        self.background
+            .as_ref()
+            .map(|b| b.stats())
+            .unwrap_or_default()
     }
 
     /// Interleaved vertices and indices of the entity boxes, world space.

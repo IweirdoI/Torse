@@ -24,6 +24,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace --all-targets
+      - name: Repeat CPU cancellation and background result tests
+        if: runner.os == 'Linux'
+        run: |
+          for attempt in 1 2 3; do
+            cargo test -p torse-runtime --lib --locked
+            cargo test -p torse-client scene::background::tests --locked
+          done
       - name: Repeat checkpoint concurrency tests
         if: runner.os == 'Linux'
         run: |
@@ -47,6 +54,8 @@ jobs:
         run: cargo run -p torse-tools -- persistence-scenario
       - name: Durable execution server smoke
         run: cargo run -p torse-server -- .work/ci-execution-world --listen 127.0.0.1:0 --ticks 2
+      - name: Serial baseline smoke
+        run: cargo run -p torse-server --example serial_baseline -- --output .work/ci-serial-baseline --ticks 2 --warmup 1
 
   experiments:
     runs-on: macos-latest

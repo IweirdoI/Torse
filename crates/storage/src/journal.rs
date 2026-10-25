@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use torse_codec::record::{self, RecordKind};
 use torse_codec::{CodecLimits, Encoder, StorageCodec};
+use torse_diagnostics::{SerialProfiler, Stage};
 use torse_types::{
     AuthorityData, Binding, CommitCursor, CommitSeq, Durability, DurableSeq, Fault, FaultCode,
     ModelCommit, OutputBudget, StageError,
@@ -139,6 +140,7 @@ pub struct Journal<M, C, B> {
     pending: VecDeque<Pending>,
     stopped: Option<Fault>,
     model: PhantomData<fn() -> M>,
+    profiler: SerialProfiler,
 }
 
 impl<M: AuthorityData, C: StorageCodec<M>, B: JournalBackend> Journal<M, C, B> {
@@ -174,12 +176,18 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: JournalBackend> Journal<M, C, B> {
             pending,
             stopped: None,
             model: PhantomData,
+            profiler: SerialProfiler::default(),
         })
     }
 
     /// Read-only access cannot bypass ordering by appending or truncating the backend.
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Use the host's recorder to include domain encoding, framing, and checksum.
+    pub fn set_serial_profiler(&mut self, profiler: SerialProfiler) {
+        self.profiler = profiler;
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -318,6 +326,7 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: JournalBackend> CommitJournal<M>
         // The codec must honor the budget while growing output. The final check additionally
         // catches a faulty codec that returns an oversized successful result.
         let budget = self.config.encode_budget();
+        let mut encoding = self.profiler.span(Stage::Encoding);
         let mut payload = Vec::new();
         self.codec
             .encode_commit(value, &mut payload, budget)
@@ -345,6 +354,8 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: JournalBackend> CommitJournal<M>
         record::write_record(&mut out, RecordKind::Commit, &payload)
             .map_err(StageError::InvalidRecord)?;
         out.finish();
+        encoding.set_bytes(total);
+        drop(encoding);
 
         self.pool.records.fetch_add(1, Ordering::AcqRel);
         self.pool.bytes.fetch_add(total, Ordering::AcqRel);

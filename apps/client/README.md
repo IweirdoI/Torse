@@ -37,7 +37,7 @@ cargo run -p torse-client -- --window --connect 127.0.0.1:7777
 | `--window` | 打开交互窗口 |
 | `--capture FILE` | 离屏渲染一帧并写入PNG |
 | `--width N`、`--height N` | 输出图像或初始窗口尺寸，默认960x540 |
-| `--radius N` | 本地分区半径，离屏默认2，窗口默认4 |
+| `--radius N` | 本地分区半径0到16，离屏默认2，窗口默认4 |
 | `--view overview`、`--view player` | 离屏相机，默认俯视全景 |
 | `--frames N` | 窗口呈现指定帧数后退出，用于自动验证 |
 | `--screenshot FILE` | 窗口正常退出前保存最后一帧 |
@@ -56,7 +56,9 @@ cargo run --release -p torse-client -- --window --autoplay --frames 2000 --radiu
 cargo run --release -p torse-client -- --window --walk --autoplay --frames 2400 --radius 3
 ```
 
-退出汇总包含帧数、编辑结果、网络请求及帧时指标。GPU网格按分区上传，本地地形按距离排序、每帧限量生成，相关测量见[帧预算记录](../../benchmarks/M6-frame-budget.md)。这些数据取决于环境与场景，不代表通用性能保证。
+退出汇总包含帧数、编辑结果、网络请求、帧时以及CPU任务接纳、取消、过期、背压和预留峰值。窗口中的本地生成与网格共用有界CPU执行器，默认最多4个工作线程、8个在途任务、8MiB输入和32MiB工作及输出预留；每帧最多接纳4项生成、4项网格，并分别限量应用结果。脚下一个Section同步装载，其余后台生成；联网场景只构建服务器镜像的网格。离屏模式保留串行参考路径。
+
+每个网格结果校验世界、资源、目标与邻区装载代数及地形修订；离开窗口取消任务，持续编辑合并到最新需求。GPU上传仍按已接纳的分区结果执行。实现和验证见[有界执行器记录](../../benchmarks/M6-bounded-executor.md)，历史同步路径测量保留在[帧预算记录](../../benchmarks/M6-frame-budget.md)。不同设备与场景的帧时应独立测量。
 
 ## 界面与字体
 
@@ -76,6 +78,7 @@ cargo run -p torse-client -- --capture ui.png --width 960 --height 540 --ui-prev
 | 文件 | 职责 |
 |---|---|
 | [scene.rs](src/scene.rs) | 内容与世界装配、流式分区、网格、动作提交与行走接入 |
+| [background.rs](src/scene/background.rs) | 有界生成与网格任务、取消、背压与结果依赖校验 |
 | [renderer.rs](src/renderer.rs) | GPU管线、分区缓冲、离屏输出和截图 |
 | [window.rs](src/window.rs) | 窗口、帧循环、输入调度与网络轮询 |
 | [net.rs](src/net.rs) | 握手、订阅、授权镜像与编辑请求 |

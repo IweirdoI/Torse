@@ -90,6 +90,16 @@ impl Face {
         }
     }
 
+    /// Neighbor section, or None when the coordinate cannot be represented.
+    pub fn neighbor_section(self, section: SectionPos) -> Option<SectionPos> {
+        let (x, y, z) = self.offset();
+        Some(SectionPos::new(
+            section.x.checked_add(x)?,
+            section.y.checked_add(y)?,
+            section.z.checked_add(z)?,
+        ))
+    }
+
     /// Whether this is a negative-axis face.
     const fn is_negative(self) -> bool {
         matches!(self, Self::NegX | Self::NegY | Self::NegZ)
@@ -194,6 +204,16 @@ impl MeshData {
     }
 }
 
+impl MeshData {
+    /// Reserved heap capacity; use this when charging owned background output.
+    pub fn allocated_bytes(&self) -> usize {
+        self.positions.capacity() * size_of::<[f32; 3]>()
+            + self.normals.capacity() * size_of::<[f32; 3]>()
+            + self.indices.capacity() * size_of::<u32>()
+            + self.materials.capacity() * size_of::<u16>()
+    }
+}
+
 /// Build a section mesh.
 ///
 /// `sample` returns authoritative data for block coordinates. It is called for
@@ -205,6 +225,42 @@ pub fn build_mesh(
     section: SectionPos,
     sample: impl Fn(BlockPos) -> MeshSample,
 ) -> MeshData {
+    build_mesh_inner(side, section, sample, || false, None)
+        .expect("uncancelled unrestricted meshing succeeds")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MeshBuildError {
+    Cancelled,
+    OutputLimit,
+}
+
+/// Bound face output before allocation and check cancellation at each y slice.
+/// Input is owned by the caller; output allocation is at most twice the stated
+/// face payload, allowing final compaction while the original buffers exist.
+pub fn build_mesh_bounded(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+    cancelled: impl Fn() -> bool,
+    max_faces: usize,
+) -> Result<MeshData, MeshBuildError> {
+    if max_faces > u32::MAX as usize / 4 || max_faces > usize::MAX / 6 {
+        return Err(MeshBuildError::OutputLimit);
+    }
+    build_mesh_inner(side, section, sample, cancelled, Some(max_faces))
+}
+
+fn build_mesh_inner(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+    cancelled: impl Fn() -> bool,
+    max_faces: Option<usize>,
+) -> Result<MeshData, MeshBuildError> {
+    if cancelled() {
+        return Err(MeshBuildError::Cancelled);
+    }
     let origin = [
         section.x.saturating_mul(i64::from(side)),
         section.y.saturating_mul(i64::from(side)),
@@ -215,7 +271,25 @@ pub fn build_mesh(
         ..MeshData::default()
     };
 
+    if let Some(faces) = max_faces {
+        mesh.positions
+            .try_reserve_exact(faces * 4)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.normals
+            .try_reserve_exact(faces * 4)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.indices
+            .try_reserve_exact(faces * 6)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.materials
+            .try_reserve_exact(faces)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
+    }
+
     for y in 0..side {
+        if cancelled() {
+            return Err(MeshBuildError::Cancelled);
+        }
         for z in 0..side {
             for x in 0..side {
                 let pos = BlockPos::new(
@@ -234,6 +308,9 @@ pub fn build_mesh(
                     if face_culled(face, &block, &sample, pos) {
                         continue;
                     }
+                    if max_faces.is_some_and(|limit| mesh.face_count() >= limit) {
+                        return Err(MeshBuildError::OutputLimit);
+                    }
                     emit_face(
                         &mut mesh,
                         face,
@@ -245,7 +322,13 @@ pub fn build_mesh(
             }
         }
     }
-    mesh
+    if max_faces.is_some() {
+        mesh.positions.shrink_to_fit();
+        mesh.normals.shrink_to_fit();
+        mesh.indices.shrink_to_fit();
+        mesh.materials.shrink_to_fit();
+    }
+    Ok(mesh)
 }
 
 fn face_culled(
@@ -365,12 +448,7 @@ impl MeshJob {
     ) -> Self {
         let mut neighbor_revisions = [None; 6];
         for (slot, face) in neighbor_revisions.iter_mut().zip(Face::ALL) {
-            let (dx, dy, dz) = face.offset();
-            *slot = revision_of(SectionPos::new(
-                section.x + dx,
-                section.y + dy,
-                section.z + dz,
-            ));
+            *slot = face.neighbor_section(section).and_then(&revision_of);
         }
         Self {
             section,
@@ -386,13 +464,7 @@ impl MeshJob {
             return false;
         }
         for (face, captured) in Face::ALL.iter().zip(self.neighbor_revisions) {
-            let (dx, dy, dz) = face.offset();
-            let pos = SectionPos::new(
-                self.section.x + dx,
-                self.section.y + dy,
-                self.section.z + dz,
-            );
-            if revision_of(pos) != captured {
+            if face.neighbor_section(self.section).and_then(&revision_of) != captured {
                 return false;
             }
         }
@@ -491,6 +563,38 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn bounded_meshing_matches_reference_and_discards_partial_cancelled_or_oversized_output() {
+        let sample = single(Some(cube(0b11_1111)));
+        let expected = build_mesh(4, SectionPos::ZERO, &sample);
+        assert_eq!(
+            build_mesh_bounded(4, SectionPos::ZERO, &sample, || false, 6).unwrap(),
+            expected
+        );
+        assert_eq!(
+            build_mesh_bounded(4, SectionPos::ZERO, &sample, || false, 5),
+            Err(MeshBuildError::OutputLimit)
+        );
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= 3
+        };
+        assert_eq!(
+            build_mesh_bounded(4, SectionPos::ZERO, sample, cancelled, 6),
+            Err(MeshBuildError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn dependency_capture_at_coordinate_limits_keeps_unrepresentable_neighbors_absent() {
+        let pos = SectionPos::new(i64::MAX, i64::MIN, 0);
+        let job = MeshJob::capture(1, pos, |_| Some(Revision::INITIAL));
+        assert_eq!(job.neighbor_revisions[Face::PosX.index() as usize], None);
+        assert_eq!(job.neighbor_revisions[Face::NegY.index() as usize], None);
+        assert!(job.validate(|_| Some(Revision::INITIAL)));
+    }
 
     fn cube(occlusion: u8) -> RenderBlock {
         RenderBlock {

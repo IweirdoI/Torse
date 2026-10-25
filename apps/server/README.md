@@ -11,9 +11,20 @@
 | [lifecycle.rs](src/lifecycle.rs) | 文件世界创建、只读恢复检查、激活与日志重开 |
 | [world.rs](src/world.rs) | 真实世界的可信本地事务、完整记录、有界快照与独立恢复适配 |
 | [execution.rs](src/execution.rs) | 持久阶段工作、定时事件、动作结果、去重及完整执行恢复 |
+| [profiling.rs](src/profiling.rs) | 串行执行的可选计时接线 |
 | [network.rs](src/network.rs) | 会话策略、输入适配、持久输出门槛、订阅与失效控制 |
 | [bootstrap.rs](src/bootstrap.rs) | 有限演示世界及显式容量配置 |
 | [main.rs](src/main.rs) | 非阻塞监听、固定逻辑Tick和有界关闭 |
+
+## 串行计时
+
+`Server::set_serial_profiler`可接入有界的`torse_diagnostics::SerialProfiler`，默认关闭。规划与准备、复制投影与发布分别计时并扣除嵌套成本，日志另计编码字节与刷盘耗时。计时只服务诊断，不改变规则或持久数据。
+
+```sh
+cargo run --release -p torse-server --example serial_baseline --locked -- --output .work/serial-baseline --ticks 30 --warmup 5
+```
+
+基准对照无存储sink、保留日志的内存后端和真实文件后端，覆盖空Tick、不同任务数、争用与订阅数量。输出目录必须不存在；原始CSV、边界说明和本机测量见[串行基线](../../benchmarks/M6-serial-baseline.md)。
 
 ## 启动与连接
 

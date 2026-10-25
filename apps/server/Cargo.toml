@@ -9,6 +9,7 @@ license.workspace = true
 mods = ["torse-mod-host/package"]
 
 [dependencies]
+torse-diagnostics = { path = "../../crates/diagnostics" }
 crc32c = "=0.6.8"
 torse-codec = { path = "../../crates/codec" }
 torse-storage = { path = "../../crates/storage" }

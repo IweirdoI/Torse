@@ -161,6 +161,22 @@ impl HillTerrain {
     }
 }
 
+impl HillTerrain {
+    /// Cancellation discards the partial section; no caller-visible state changes.
+    pub fn generate_cancellable(
+        &self,
+        section: SectionPos,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<Section>, SectionError> {
+        fill_section_cancellable(
+            &self.params,
+            section,
+            |x, z| self.height_at(x, z),
+            cancelled,
+        )
+    }
+}
+
 impl SectionGenerator for HillTerrain {
     fn side(&self) -> u32 {
         self.params.side
@@ -180,6 +196,21 @@ fn fill_section(
     section: SectionPos,
     height_at: impl Fn(i64, i64) -> i64,
 ) -> Result<Section, SectionError> {
+    Ok(
+        fill_section_cancellable(params, section, height_at, || false)?
+            .expect("uncancelled generation returns a section"),
+    )
+}
+
+fn fill_section_cancellable(
+    params: &GenerationParams,
+    section: SectionPos,
+    height_at: impl Fn(i64, i64) -> i64,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<Section>, SectionError> {
+    if cancelled() {
+        return Ok(None);
+    }
     let mut result = Section::new(params.side, params.air)?;
     let side = params.side;
     let origin = section.to_block(torse_types::LocalPos { x: 0, y: 0, z: 0 }, side)?;
@@ -200,6 +231,9 @@ fn fill_section(
     // path is the dominant generation cost otherwise.
     let mut heights = vec![0i64; (side as usize) * (side as usize)];
     for local_z in 0..side {
+        if cancelled() {
+            return Ok(None);
+        }
         let world_z = base_z + i64::from(local_z);
         for local_x in 0..side {
             let world_x = base_x + i64::from(local_x);
@@ -208,6 +242,9 @@ fn fill_section(
         }
     }
     for local_y in 0..side {
+        if cancelled() {
+            return Ok(None);
+        }
         let world_y = base_y + i64::from(local_y);
         if !params.bounds.contains_y(world_y) {
             continue;
@@ -227,7 +264,7 @@ fn fill_section(
             }
         }
     }
-    Ok(result)
+    Ok(Some(result))
 }
 
 fn lattice(seed: u64, x: i64, z: i64) -> i64 {
@@ -284,6 +321,28 @@ mod tests {
             BlockStateId::EMPTY,
         )
         .expect("side is valid")
+    }
+
+    #[test]
+    fn cancellable_generation_matches_reference_and_discards_partial_work() {
+        let generator = HillTerrain::new(params(), 7, 7, 9);
+        for pos in [SectionPos::ZERO, SectionPos::new(-1, 0, 2)] {
+            assert_eq!(
+                generator.generate_cancellable(pos, || false).unwrap(),
+                Some(generator.generate(pos).unwrap())
+            );
+        }
+        let checks = std::cell::Cell::new(0);
+        let result = generator
+            .generate_cancellable(SectionPos::ZERO, || {
+                checks.set(checks.get() + 1);
+                checks.get() > 18
+            })
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "cancellation after height sampling must discard the partial section"
+        );
     }
 
     #[test]

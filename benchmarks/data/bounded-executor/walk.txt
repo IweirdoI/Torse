@@ -1,0 +1,3 @@
+adapter=NVIDIA GeForce RTX 4080 SUPER backend=Vulkan format=Bgra8UnormSrgb frames=601 streams=3 rebuilds=55 uploads=55 screenshots=1 actions_ok=0 actions_rejected=0 walk_ticks=160 walker=(8.5,7.9,-20.5) session=0 batches=0 requests_sent=0 requests_rejected=0 baseline_sections=25 sections=25 meshes=25 vertices=76760 faces=19190 elapsed_ms=8034
+mean_frame_us=13129 max_frame_us=27479 stream_frame_us=9248 rebuild_frame_us=14526
+cpu_admitted=99 cpu_cancelled=0 cpu_stale=10 cpu_backpressure=0 cpu_peak_jobs=8 cpu_peak_input_bytes=747072 cpu_peak_output_bytes=24027776

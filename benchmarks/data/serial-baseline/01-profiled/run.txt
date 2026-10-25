@@ -1,0 +1,8 @@
+format=1
+threads=1
+profiled=true
+ticks=30
+warmup=5
+backend=all
+os=windows
+arch=x86_64

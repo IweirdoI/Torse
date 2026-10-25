@@ -2,6 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+mod executor;
+pub use executor::{
+    Cancellation, Executor, ExecutorConfig, Job, JobBudget, JobError, JobOutput, Priority,
+    Reservation, ReserveError, Usage,
+};
+
 #[cfg(feature = "ecs-probe")]
 mod ecs_probe;
 

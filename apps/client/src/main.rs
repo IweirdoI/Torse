@@ -152,6 +152,16 @@ fn main() -> ExitCode {
                     summary.stream_frame_us,
                     summary.rebuild_frame_us,
                 );
+                println!(
+                    "cpu_admitted={} cpu_cancelled={} cpu_stale={} cpu_backpressure={} cpu_peak_jobs={} cpu_peak_input_bytes={} cpu_peak_output_bytes={}",
+                    summary.cpu.admitted,
+                    summary.cpu.cancelled,
+                    summary.cpu.stale,
+                    summary.cpu.backpressure,
+                    summary.cpu.peak_jobs,
+                    summary.cpu.peak_input_bytes,
+                    summary.cpu.peak_output_bytes,
+                );
                 ExitCode::SUCCESS
             }
             Err(error) => {

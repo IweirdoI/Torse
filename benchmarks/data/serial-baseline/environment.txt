@@ -1,0 +1,16 @@
+date=2026-10-25
+os=Windows 11 Pro 10.0.26300
+arch=x86_64
+cpu=Intel Core i7-14700KF
+physical_cores=20
+logical_cpus=28
+filesystem=NTFS
+profile=release
+rustc=1.93.1 (01f6ddf75 2026-02-11)
+cargo=1.93.1 (083ac5135 2025-12-15)
+base_revision=54c0ef87e3c4b10bbc63eb64e7c0712b7cbbbaa0
+source_state=serial profiling changes in working tree
+section_side=16
+resident_sections=2
+fixture_entities=2
+workload=native phase-start block edit plans

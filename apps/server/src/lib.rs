@@ -12,6 +12,7 @@ mod lifecycle;
 #[cfg(feature = "mods")]
 pub mod mods;
 pub mod network;
+mod profiling;
 mod world;
 
 pub use authority::{HostAuthority, InvalidationSink, NoReplicas, PreparedChange, RecoveryTarget};

@@ -4,6 +4,7 @@
 //! own outgoing queue when a publication invalidates a subscription.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use torse_diagnostics::{SerialProfiler, Stage};
 
 use torse_types::{
     AuthorityMode, Binding, CommitCursor, ContentKey, EntityId, Fault, FaultCode, OutputBudget,
@@ -90,6 +91,7 @@ pub struct ReplicaSource {
     next_subscription: u128,
     subscriptions: BTreeMap<u128, Subscription>,
     pending_invalidations: BTreeSet<u128>,
+    profiler: SerialProfiler,
 }
 
 impl ReplicaSource {
@@ -118,12 +120,17 @@ impl ReplicaSource {
             next_subscription: 1,
             subscriptions: BTreeMap::new(),
             pending_invalidations: BTreeSet::new(),
+            profiler: SerialProfiler::default(),
         })
     }
 
     /// Read-only; no mutable store/coordinator escape can bypass publication.
     pub fn world(&self) -> &WorldAuthority {
         &self.world
+    }
+
+    pub fn set_serial_profiler(&mut self, profiler: SerialProfiler) {
+        self.profiler = profiler;
     }
 
     pub fn prepare(&self, transaction: &Transaction) -> Result<PreparedChange, PrepareError> {
@@ -206,6 +213,7 @@ impl ReplicaSource {
             if sub.state.is_none() {
                 continue;
             }
+            let _span = self.profiler.span(Stage::Projection);
             if self.binding.compatibility != self.world.coordinator().compatibility() {
                 reset(sub);
                 self.pending_invalidations.insert(id);

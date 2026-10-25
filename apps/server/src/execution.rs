@@ -4,6 +4,7 @@
 use crate::{HostAuthority, PreparedChange, RecoveryTarget};
 use std::collections::BTreeMap;
 use torse_codec::{CodecLimits, wire};
+use torse_diagnostics::{SerialProfiler, Stage};
 use torse_sim::action::{ActionOrigin, ActionOutput, ActionRequest, ActionService, ActorContext};
 use torse_sim::durable::*;
 use torse_sim::replica::{
@@ -131,6 +132,7 @@ pub struct ExecutionHost {
     limits: ExecutionLimits,
     stopping: Option<Tick>,
     highest_session: u128,
+    profiler: SerialProfiler,
 }
 pub struct ExecutionPrepared {
     world: torse_sim::PreparedChange,
@@ -337,6 +339,7 @@ impl ExecutionHost {
             limits,
             stopping: None,
             highest_session: 0,
+            profiler: SerialProfiler::default(),
         })
     }
     pub fn world(&self) -> &WorldAuthority {
@@ -344,6 +347,11 @@ impl ExecutionHost {
     }
     pub fn runtime(&self) -> &RuntimeState {
         &self.runtime
+    }
+
+    pub(crate) fn set_serial_profiler(&mut self, profiler: SerialProfiler) {
+        self.source.set_serial_profiler(profiler.clone());
+        self.profiler = profiler;
     }
     pub fn register_session(
         &mut self,
@@ -467,6 +475,7 @@ impl ExecutionHost {
         })
     }
     fn collect_phase(&self) -> Result<PhaseWork, Fault> {
+        let _span = self.profiler.span(Stage::Planning);
         let point = self.resume_point();
         let phase = Phase::from_index(point.next_phase).expect("validated phase");
         let mut tasks = Vec::new();

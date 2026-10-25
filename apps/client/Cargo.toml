@@ -15,6 +15,7 @@ torse-codec = { path = "../../crates/codec" }
 torse-net = { path = "../../crates/net" }
 torse-protocol = { path = "../../crates/protocol" }
 torse-render = { path = "../../crates/render" }
+torse-runtime = { path = "../../crates/runtime" }
 torse-sim = { path = "../../crates/sim" }
 torse-types = { path = "../../crates/types" }
 torse-world = { path = "../../crates/world" }

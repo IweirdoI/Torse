@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+torse-diagnostics = { path = "../diagnostics" }
 torse-actions = { path = "../actions" }
 torse-content = { path = "../content" }
 torse-types = { path = "../types" }

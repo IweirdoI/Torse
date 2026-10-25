@@ -124,6 +124,7 @@ pub struct WindowSummary {
     pub stream_frame_us: u64,
     /// Mean frame time containing mesh rebuilds.
     pub rebuild_frame_us: u64,
+    pub cpu: crate::scene::BackgroundStats,
 }
 
 struct Gpu {
@@ -540,11 +541,19 @@ impl WindowApp {
             gpu.context.write_lines(&outline);
         }
 
-        let rebuilt = self
+        let rebuilt = match self
             .scene
             .as_mut()
             .expect("camera implies scene")
-            .refresh_meshes();
+            .refresh_visuals(STREAM_BUDGET)
+        {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                self.failure = Some(error);
+                event_loop.exit();
+                return;
+            }
+        };
         self.rebuilds += rebuilt.len();
         if !rebuilt.is_empty() || !self.uploaded {
             let scene = self.scene.as_ref().expect("camera implies scene");
@@ -729,7 +738,8 @@ impl WindowApp {
                 // stay inside it or the pick ray stops at the first unloaded
                 // cell above the terrain.
                 let loaded_top = (snapshot.side as i64).min(snapshot.bounds.max_y);
-                let scene = Scene::from_snapshot(&snapshot)?;
+                let mut scene = Scene::from_snapshot(&snapshot)?;
+                scene.enable_background(crate::scene::background_config())?;
                 if let Some(camera) = self.camera.as_mut() {
                     camera.eye = [4.0, (loaded_top as f32 - 2.0).max(4.0), 4.0];
                     // Look nearly straight down: the scope is 32 by 16 blocks,
@@ -843,6 +853,7 @@ impl WindowApp {
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
             let (vertices, _, faces) = scene.geometry();
             self.summary = Some(WindowSummary {
+                cpu: scene.background_stats(),
                 adapter: self.adapter.clone(),
                 backend: gpu.backend_name.clone(),
                 format: format!("{:?}", gpu.config.format),
@@ -967,7 +978,7 @@ impl ApplicationHandler for WindowApp {
             // empty until then.
             None
         } else {
-            match Scene::new(self.config.radius) {
+            match Scene::new_background(self.config.radius) {
                 Ok(scene) => Some(scene),
                 Err(error) => {
                     self.failure = Some(error);

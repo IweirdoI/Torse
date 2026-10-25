@@ -1,0 +1,4 @@
+bounded-workspace-tests.txt: runs=57 passed=506 failed=0 ignored=0
+bounded-runtime-probe.txt: runs=2 passed=7 failed=0 ignored=0
+bounded-client-repeat.txt: runs=20 passed=80 failed=0 ignored=0
+bounded-runtime-repeat.txt: runs=21 passed=126 failed=0 ignored=0

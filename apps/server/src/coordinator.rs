@@ -1,6 +1,7 @@
 //! One owner enforces prepare, reserve, publish, accept, synchronize, then expose.
 
 use std::time::{Duration, Instant};
+use torse_diagnostics::{SerialProfiler, Stage};
 
 use torse_storage::{CheckpointRetention, CommitJournal};
 use torse_types::{
@@ -83,6 +84,7 @@ pub struct Server<A: HostAuthority, J, S> {
     config: ServerConfig,
     state: ServerState,
     flush: FlushMetrics,
+    pub(crate) profiler: SerialProfiler,
     _directory: WorldDirectory,
 }
 
@@ -139,6 +141,7 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
             config,
             state: ServerState::Running,
             flush: FlushMetrics::default(),
+            profiler: SerialProfiler::default(),
             _directory: directory,
         })
     }
@@ -205,7 +208,11 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
         }
         let before = self.authority.cursor();
         let resume_before = self.authority.resume_point();
-        let prepared = match self.authority.prepare_next() {
+        let preparation = {
+            let _span = self.profiler.span(Stage::Preparation);
+            self.authority.prepare_next()
+        };
+        let prepared = match preparation {
             Ok(value) => value,
             Err(error) => return Err(self.fail(error)),
         };
@@ -241,7 +248,11 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
             Err(StageError::Stopped(error)) => return Err(self.fail(error)),
             Err(error) => return Ok(CommitStep::Blocked(error)),
         };
-        let publication = match self.authority.publish(prepared) {
+        let publication_result = {
+            let _span = self.profiler.span(Stage::Publication);
+            self.authority.publish(prepared)
+        };
+        let publication = match publication_result {
             Ok(value) => value,
             Err(error) => return Err(self.fail(error)),
         };
@@ -407,7 +418,10 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
 
     fn flush_to(&mut self, cursor: CommitCursor) -> Result<Durability, Fault> {
         let start = Instant::now();
-        let result = self.journal.flush_through(cursor);
+        let result = {
+            let _span = self.profiler.span(Stage::Flush);
+            self.journal.flush_through(cursor)
+        };
         self.flush.calls = self.flush.calls.saturating_add(1);
         self.flush.last_wait = start.elapsed();
         self.flush.total_wait = self.flush.total_wait.saturating_add(self.flush.last_wait);

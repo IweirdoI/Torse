@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+torse-diagnostics = { path = "../diagnostics" }
 crc32c = "=0.6.8"
 torse-codec = { path = "../codec" }
 torse-types = { path = "../types" }

@@ -1,0 +1,13 @@
+format=1
+threads=1
+profiled=false
+ticks=30
+warmup=5
+backend=sink
+os=windows
+arch=x86_64
+debug_assertions=false
+logical_cpus=28
+rustc=rustc 1.93.1 (01f6ddf75 2026-02-11)
+revision=54c0ef87e3c4b10bbc63eb64e7c0712b7cbbbaa0
+worktree=M .github/workflows/ci.yml; M Cargo.lock; M apps/server/Cargo.toml; M apps/server/README.md; M apps/server/src/coordinator.rs; M apps/server/src/execution.rs; M apps/server/src/lib.rs; M crates/diagnostics/src/lib.rs; M crates/sim/Cargo.toml; M crates/sim/src/replica.rs; M crates/storage/Cargo.toml; M crates/storage/src/journal.rs;?? apps/server/examples/serial_baseline.rs;?? apps/server/examples/serial_baseline/;?? apps/server/src/profiling.rs;?? apps/server/tests/profiling.rs

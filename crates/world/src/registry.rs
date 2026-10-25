@@ -18,7 +18,9 @@
 
 use std::collections::BTreeMap;
 
-use torse_content::{BlockDefinition, CompiledContent, FiniteField, MAX_FINITE_STATES};
+use torse_content::{
+    BlockDefinition, CompiledContent, FiniteField, MAX_FINITE_STATES, Shape, StateProfile,
+};
 use torse_types::ContentKey;
 
 /// Content key reserved for empty occupancy.
@@ -228,6 +230,12 @@ impl BlockStateRegistry {
         self.keys.get(index).filter(|_| !state.is_empty())
     }
 
+    /// Field identities of a block's state schema, in canonical order.
+    pub fn fields_of(&self, state: BlockStateId) -> Option<&[ContentKey]> {
+        let entry = self.entry_of(state)?;
+        Some(&entry.fields)
+    }
+
     /// Return the finite field values of a state identifier.
     ///
     /// The slice follows the schema's canonical field order. Empty cells have
@@ -242,10 +250,59 @@ impl BlockStateRegistry {
     /// Conservative face coverage of a state.
     ///
     /// Empty cells cover nothing, which makes their neighbors render every face
-    /// instead of accidentally culling it.
+    /// instead of accidentally culling it. A state profile override replaces
+    /// the block's own mask.
     pub fn occlusion_mask(&self, state: BlockStateId) -> u8 {
+        if let Some(profile) = self.state_override(state)
+            && let Some(mask) = profile.occlusion
+        {
+            return mask;
+        }
         self.definition(state)
             .map_or(0, |definition| definition.occlusion_profile.face_mask)
+    }
+
+    /// Render shape effective for one state, after any per-state override.
+    pub fn render_shape(&self, state: BlockStateId) -> Option<Shape> {
+        let definition = self.definition(state)?;
+        if let Some(profile) = self.state_override(state)
+            && let Some(shape) = &profile.render_shape
+        {
+            return Some(shape.clone());
+        }
+        Some(definition.render_profile.shape.clone())
+    }
+
+    /// Collision shape effective for one state, after any per-state override.
+    pub fn collision_shape(&self, state: BlockStateId) -> Option<Shape> {
+        let definition = self.definition(state)?;
+        if let Some(profile) = self.state_override(state)
+            && let Some(shape) = &profile.collision_shape
+        {
+            return Some(shape.clone());
+        }
+        definition.collision_profile.shape.clone()
+    }
+
+    /// Selection shape effective for one state, after any per-state override.
+    pub fn selection_shape(&self, state: BlockStateId) -> Option<Shape> {
+        let definition = self.definition(state)?;
+        if let Some(profile) = self.state_override(state)
+            && let Some(shape) = &profile.selection_shape
+        {
+            return Some(shape.clone());
+        }
+        definition.selection_profile.shape.clone()
+    }
+
+    /// The definition's state override matching this state's exact values.
+    fn state_override(&self, state: BlockStateId) -> Option<&StateProfile> {
+        let definition = self.definition(state)?;
+        let values = self.state_values(state)?;
+        definition
+            .state_overrides
+            .iter()
+            .find(|profile| profile.values == values)
     }
 
     fn scan_state(&self, entry: &BlockEntry, values: &[u16]) -> Option<BlockStateId> {
@@ -400,11 +457,10 @@ mod tests {
     #[test]
     fn default_states_cover_every_block() {
         let registry = fixture_registry();
-        assert_eq!(registry.block_count(), 5);
+        assert_eq!(registry.block_count(), 4);
         for block in [
             key("base:stone"),
             key("base:glass_slab"),
-            key("base:glass_slab_upper"),
             key("base:plant"),
             key("base:glass"),
         ] {
@@ -473,13 +529,20 @@ mod tests {
         // precedes `growth` even though it was appended last. The final field in
         // that canonical order varies fastest inside the state space.
         let mut pack = m0_fixture_pack();
-        let mut schema = pack.state_schemas[1].value.clone();
+        // The plant growth schema carries one field already; it sits after
+        // the simple and slab schemas in the fixture.
+        let plant_schema = pack
+            .state_schemas
+            .iter()
+            .position(|schema| schema.value.id == key("base:state/plant_growth"))
+            .expect("plant schema");
+        let mut schema = pack.state_schemas[plant_schema].value.clone();
         schema.finite_fields.push(FiniteField {
             id: key("base:field/axis"),
             default_value: 1,
             values: vec![0, 1],
         });
-        pack.state_schemas[1].value = schema;
+        pack.state_schemas[plant_schema].value = schema;
         let content = compile(pack).expect("two-field schema compiles");
         let registry = BlockStateRegistry::build(&content).expect("registry builds");
         let plant = key("base:plant");

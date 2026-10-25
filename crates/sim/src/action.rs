@@ -238,6 +238,33 @@ impl ActionView<'_> {
         self.world.registry().default_state(block)
     }
 
+    /// Resolve the state a placement produces for one entry face.
+    ///
+    /// Blocks whose state schema carries a `base:field/half` field switch
+    /// between their lower and upper halves: a click on a ceiling underside
+    /// (face -y) places the upper half, anything else the default lower one.
+    /// Blocks without the field resolve to their default state.
+    pub fn state_for_face(&self, block: &ContentKey, face: u32) -> Option<BlockStateId> {
+        let registry = self.world.registry();
+        let state = registry.default_state(block)?;
+        let values = registry.state_values(state)?;
+        // Blocks without a half field always place their default state.
+        let Some(half_index) = registry
+            .fields_of(state)?
+            .iter()
+            .position(|field| field == &ContentKey::parse("base:field/half").expect("static key"))
+        else {
+            return Some(state);
+        };
+        let mut resolved = values.to_vec();
+        // A click on a ceiling underside places the upper half.
+        resolved[half_index] = u16::try_from(face)
+            .ok()
+            .filter(|v| *v == 2)
+            .map_or(0, |_| 1);
+        registry.state_of(block, &resolved)
+    }
+
     /// Whether placing `state` into `pos` would overlap an entity's collider.
     ///
     /// Burying a walker wedges it: movement refuses colliders that already

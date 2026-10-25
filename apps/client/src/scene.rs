@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use torse_content::{BlockDefinition, Face, Shape, compile, m0_fixture_pack};
+use torse_content::{Face, Shape, compile, m0_fixture_pack};
 use torse_render::{MeshData, MeshSample, RenderBlock, RenderBox, build_mesh};
 use torse_sim::WorldAuthority;
 use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
@@ -512,15 +512,12 @@ impl Scene {
             TerrainQuery::Ready(state) if !state.is_empty() => state,
             _ => return Vec::new(),
         };
-        let Some(definition) = self.authority.registry().definition(state) else {
+        // The selection shape follows state values: an upper slab outlines
+        // its top half, a lower one its bottom half.
+        let Some(selection) = self.authority.registry().selection_shape(state) else {
             return Vec::new();
         };
-        let Some(bounds) = definition
-            .selection_profile
-            .shape
-            .as_ref()
-            .and_then(shape_box)
-        else {
+        let Some(bounds) = shape_box(&selection) else {
             return Vec::new();
         };
         const INFLATE: f32 = 0.004;
@@ -674,6 +671,7 @@ impl Scene {
         place: bool,
         block: &ContentKey,
         target: BlockPos,
+        face: [i32; 3],
     ) -> Result<(), String> {
         self.edit_counter += 1;
         let counter = self.edit_counter;
@@ -688,6 +686,18 @@ impl Scene {
                 key("world:field/block"),
                 ComponentValue::Content(block.clone()),
             );
+            // The entry face steers half-type blocks between their lower and
+            // upper states.
+            let face_index = match face {
+                [-1, 0, 0] => 0u32,
+                [1, 0, 0] => 1,
+                [0, -1, 0] => 2,
+                [0, 1, 0] => 3,
+                [0, 0, -1] => 4,
+                [0, 0, 1] => 5,
+                _ => 3,
+            };
+            parameters.insert(key("world:field/face"), ComponentValue::U32(face_index));
         }
         let request = ActionRequest {
             action,
@@ -1208,7 +1218,9 @@ fn sample(
             if state.is_empty() {
                 return MeshSample::Ready(RenderBlock::EMPTY);
             }
-            let Some(definition) = registry.definition(state) else {
+            // The per-state render shape follows state values: an upper
+            // slab renders in the top half, a lower one in the bottom.
+            let Some(shape) = registry.render_shape(state) else {
                 return MeshSample::Ready(RenderBlock::EMPTY);
             };
             let materials = state_materials
@@ -1227,9 +1239,9 @@ fn sample(
                 })
             });
             MeshSample::Ready(RenderBlock {
-                bounds: render_box(definition),
-                cross: matches!(&definition.render_profile.shape, Shape::Cross),
-                occlusion: definition.occlusion_profile.face_mask,
+                bounds: render_box(&shape),
+                cross: matches!(shape, Shape::Cross),
+                occlusion: registry.occlusion_mask(state),
                 material: 0,
                 face_materials: Some(materials.base),
                 face_overlays: Some(materials.overlays),
@@ -1242,8 +1254,8 @@ fn sample(
     }
 }
 
-fn render_box(definition: &BlockDefinition) -> Option<RenderBox> {
-    shape_box(&definition.render_profile.shape)
+fn render_box(shape: &Shape) -> Option<RenderBox> {
+    shape_box(shape)
 }
 
 fn shape_box(shape: &Shape) -> Option<RenderBox> {
@@ -1328,7 +1340,7 @@ mod tests {
         // X sits in section (0,0,0) against the border, exposing a +x face
         // into neighbour (1,0,0).
         scene
-            .apply_edit(true, &stone, BlockPos::new(15, 15, 1))
+            .apply_edit(true, &stone, BlockPos::new(15, 15, 1), [0, 1, 0])
             .expect("place X");
         scene.refresh_meshes();
         let faces_before = scene.mesh_face_count(SectionPos::ZERO).expect("cached");
@@ -1336,7 +1348,7 @@ mod tests {
         // Y lands in the neighbour and occludes that face; the border
         // section's own revision does not change.
         scene
-            .apply_edit(true, &stone, BlockPos::new(16, 15, 1))
+            .apply_edit(true, &stone, BlockPos::new(16, 15, 1), [0, 1, 0])
             .expect("place Y");
         let rebuilt = scene.refresh_meshes();
         assert!(
@@ -1531,21 +1543,21 @@ mod tests {
 
         let stone = key("base:stone");
         scene
-            .apply_edit(true, &stone, target)
+            .apply_edit(true, &stone, target, [0, 1, 0])
             .expect("place commits");
         assert!(query(&scene, target));
 
         // Placing into the now occupied cell is rejected without a commit.
-        let again = scene.apply_edit(true, &stone, target);
+        let again = scene.apply_edit(true, &stone, target, [0, 1, 0]);
         assert!(again.is_err());
 
         scene
-            .apply_edit(false, &stone, target)
+            .apply_edit(false, &stone, target, [0, 1, 0])
             .expect("break commits");
         assert!(!query(&scene, target));
 
         // Breaking air is a conflict, not a silent no-op.
-        let empty = scene.apply_edit(false, &stone, target);
+        let empty = scene.apply_edit(false, &stone, target, [0, 1, 0]);
         assert!(empty.is_err());
     }
 
@@ -1555,13 +1567,15 @@ mod tests {
         let target = air_above_surface(&scene);
 
         let slab = key("base:glass_slab");
-        scene.apply_edit(true, &slab, target).expect("first slab");
+        scene
+            .apply_edit(true, &slab, target, [0, 1, 0])
+            .expect("first slab");
         assert!(scene.completes_at(target));
 
         // Placing the same slab into the occupied cell merges the pair into
         // one full glass block, exactly what the top-face aim sends.
         scene
-            .apply_edit(true, &slab, target)
+            .apply_edit(true, &slab, target, [0, 1, 0])
             .expect("second slab merges");
         assert!(!scene.completes_at(target));
         let state = scene
@@ -1576,7 +1590,7 @@ mod tests {
         );
 
         // The full block completes no further; a third slab is a conflict.
-        let third = scene.apply_edit(true, &slab, target);
+        let third = scene.apply_edit(true, &slab, target, [0, 1, 0]);
         assert!(third.is_err());
     }
 
@@ -1607,7 +1621,9 @@ mod tests {
         let target = air_above_surface(&scene);
 
         let glass = key("base:glass_slab");
-        scene.apply_edit(true, &glass, target).expect("place slab");
+        scene
+            .apply_edit(true, &glass, target, [0, 1, 0])
+            .expect("place slab");
         scene.refresh_meshes();
         let (min_y, max_y) = cell_vertex_range(&scene, target);
         // A lower slab fills only the bottom half of the cell.
@@ -1618,8 +1634,12 @@ mod tests {
         );
 
         let plant = key("base:plant");
-        scene.apply_edit(false, &glass, target).expect("clear");
-        scene.apply_edit(true, &plant, target).expect("place plant");
+        scene
+            .apply_edit(false, &glass, target, [0, 1, 0])
+            .expect("clear");
+        scene
+            .apply_edit(true, &plant, target, [0, 1, 0])
+            .expect("place plant");
         scene.refresh_meshes();
         // A panel is a thin vertical slab along x: vertices hug the cell's
         // x midline while y spans the full cell.
@@ -1657,19 +1677,19 @@ mod tests {
         let stone = key("base:stone");
         assert!(
             scene
-                .apply_edit(true, &stone, BlockPos::new(0, 64, 0))
+                .apply_edit(true, &stone, BlockPos::new(0, 64, 0), [0, 1, 0])
                 .is_err()
         );
         assert!(
             scene
-                .apply_edit(true, &stone, BlockPos::new(0, -1, 0))
+                .apply_edit(true, &stone, BlockPos::new(0, -1, 0), [0, 1, 0])
                 .is_err()
         );
         // Above the loaded layer the target is not loaded, which is also a
         // rejection rather than a silent drop.
         assert!(
             scene
-                .apply_edit(true, &stone, BlockPos::new(0, 40, 0))
+                .apply_edit(true, &stone, BlockPos::new(0, 40, 0), [0, 1, 0])
                 .is_err()
         );
     }
@@ -1803,9 +1823,13 @@ mod tests {
         scene.refresh_meshes();
         let base = air_above_surface(&scene);
         let glass = key("base:glass_slab");
-        scene.apply_edit(true, &glass, base).expect("place lower");
+        scene
+            .apply_edit(true, &glass, base, [0, 1, 0])
+            .expect("place lower");
         let upper = BlockPos::new(base.x, base.y + 1, base.z);
-        scene.apply_edit(true, &glass, upper).expect("place upper");
+        scene
+            .apply_edit(true, &glass, upper, [0, 1, 0])
+            .expect("place upper");
         scene.refresh_meshes();
 
         // Same-material neighbours merge: no face lies flat on the shared
@@ -1840,9 +1864,13 @@ mod tests {
         let plant = key("base:plant");
         // Glass with a plant in the x-adjacent cell: different states keep
         // the shared face (the plant occludes nothing).
-        scene.apply_edit(true, &glass, base).expect("place glass");
+        scene
+            .apply_edit(true, &glass, base, [0, 1, 0])
+            .expect("place glass");
         let beside = BlockPos::new(base.x + 1, base.y, base.z);
-        scene.apply_edit(true, &plant, beside).expect("place plant");
+        scene
+            .apply_edit(true, &plant, beside, [0, 1, 0])
+            .expect("place plant");
         scene.refresh_meshes();
 
         let plane = base.x as f32 + 1.0;

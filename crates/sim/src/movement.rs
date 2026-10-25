@@ -49,7 +49,7 @@ const ESCAPE_STEPS: usize = 8;
 /// Resolve one stuck entity: find the nearest free position by stepping
 /// along the escape directions and report the relocation as a movement.
 ///
-/// Unlike [`prepare_movements`], the start position is allowed to overlap
+/// Unlike ordinary movement preparation, the start position is allowed to overlap
 /// terrain -- that is the condition being escaped. The destination must be
 /// free, offsets are bounded, and entity identity is validated exactly like
 /// a normal move. `None` means no free neighbour was reachable; the entity
@@ -271,13 +271,18 @@ impl CollisionSource for CollisionView<'_> {
                 if state.is_empty() {
                     return CollisionCell::Empty;
                 }
-                let Some(definition) = self.registry.definition(state) else {
+                // Unknown states stay unknown: treating them as empty would
+                // let entities walk into cells the registry cannot validate.
+                if self.registry.definition(state).is_none() {
                     *self.unknown.borrow_mut() = true;
                     return CollisionCell::NotLoaded;
-                };
-                match &definition.collision_profile.shape {
+                }
+                // The per-state collision shape follows state values, so an
+                // upper slab blocks its own half and a lower one blocks the
+                // other.
+                match self.registry.collision_shape(state) {
                     None => CollisionCell::Empty,
-                    Some(shape) => CollisionCell::Solid(boxes(shape)),
+                    Some(shape) => CollisionCell::Solid(boxes(&shape)),
                 }
             }
             TerrainQuery::NotLoaded => CollisionCell::NotLoaded,

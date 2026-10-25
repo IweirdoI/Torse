@@ -63,11 +63,20 @@ pub fn register_content(pack: &mut ContentPack) {
             schema_version: 1,
             owner_module: owner(),
             fields: if name == "place" {
-                vec![ComponentField {
-                    id: key("world:field/block"),
-                    field_type: ComponentFieldType::ContentReference,
-                    required: true,
-                }]
+                vec![
+                    ComponentField {
+                        id: key("world:field/block"),
+                        field_type: ComponentFieldType::ContentReference,
+                        required: true,
+                    },
+                    // The entry face steers half-type blocks between their
+                    // lower and upper states.
+                    ComponentField {
+                        id: key("world:field/face"),
+                        field_type: ComponentFieldType::Unsigned32,
+                        required: false,
+                    },
+                ]
             } else {
                 Vec::new()
             },
@@ -127,7 +136,14 @@ impl ActionHandler for BlockHandler {
                 return Err(RejectCode::InvalidData);
             };
             if current.is_empty() {
-                view.default_state(block).ok_or(RejectCode::MissingTarget)?
+                // The entry face picks the half for half-type blocks: a click
+                // on a ceiling underside (face -y) places the upper half.
+                let face = match request.parameters.get(&key("world:field/face")) {
+                    Some(ComponentValue::U32(value)) => *value,
+                    _ => 3,
+                };
+                view.state_for_face(block, face)
+                    .ok_or(RejectCode::MissingTarget)?
             } else {
                 // A cell that already holds the same block may complete into
                 // the block its content names, filling the remaining volume.

@@ -24,7 +24,7 @@ use torse_world::{
 };
 use torse_world_services::{GenerationParams, HillTerrain};
 
-use crate::pick::{PickOutcome, cast_ray};
+use crate::pick::{PickHit, PickOutcome, cast_ray};
 
 mod background;
 pub use background::BackgroundStats;
@@ -356,6 +356,62 @@ impl Scene {
             TerrainQuery::Ready(state) => Some(!state.is_empty()),
             TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => None,
         }
+    }
+
+    /// Build the selection outline edges for one hit, following the block's
+    /// render bounds: a slab outlines its lower half, a plant its panel.
+    pub fn outline_bytes(&self, hit: &PickHit) -> Vec<u8> {
+        let state = match self.authority.store().query(hit.block) {
+            TerrainQuery::Ready(state) if !state.is_empty() => state,
+            _ => return Vec::new(),
+        };
+        let Some(definition) = self.authority.registry().definition(state) else {
+            return Vec::new();
+        };
+        let bounds = render_box(definition).unwrap_or(RenderBox::FULL_CUBE);
+        const INFLATE: f32 = 0.004;
+        let min = [
+            hit.block.x as f32 + bounds.min[0] - INFLATE,
+            hit.block.y as f32 + bounds.min[1] - INFLATE,
+            hit.block.z as f32 + bounds.min[2] - INFLATE,
+        ];
+        let max = [
+            hit.block.x as f32 + bounds.max[0] + INFLATE,
+            hit.block.y as f32 + bounds.max[1] + INFLATE,
+            hit.block.z as f32 + bounds.max[2] + INFLATE,
+        ];
+        let corner = |bits: u32| {
+            [
+                if bits & 1 != 0 { max[0] } else { min[0] },
+                if bits & 2 != 0 { max[1] } else { min[1] },
+                if bits & 4 != 0 { max[2] } else { min[2] },
+            ]
+        };
+        const EDGES: [(u32, u32); 12] = [
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (0, 2),
+            (1, 3),
+            (4, 6),
+            (5, 7),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ];
+        let mut vertices = Vec::with_capacity(EDGES.len() * 2);
+        for (from, to) in EDGES {
+            for position in [corner(from), corner(to)] {
+                vertices.push(Vertex {
+                    position,
+                    normal: [0.0, 1.0, 0.0],
+                    color: [0.05, 0.05, 0.05],
+                });
+            }
+        }
+        Scene::vertex_bytes(&vertices)
     }
 
     /// Cast a ray through loaded terrain and report the first solid cell.
@@ -1116,6 +1172,77 @@ mod tests {
         // Breaking air is a conflict, not a silent no-op.
         let empty = scene.apply_edit(false, &stone, target);
         assert!(empty.is_err());
+    }
+
+    /// Highest and lowest world-space vertex Y inside one cell's footprint.
+    fn cell_vertex_range(scene: &Scene, cell: BlockPos) -> (f32, f32) {
+        let (vertices, _, _) = scene.geometry();
+        let mut min_y = f32::MAX;
+        let mut max_y = f32::MIN;
+        for vertex in &vertices {
+            if vertex.position[0] >= cell.x as f32
+                && vertex.position[0] <= cell.x as f32 + 1.0
+                && vertex.position[2] >= cell.z as f32
+                && vertex.position[2] <= cell.z as f32 + 1.0
+                && vertex.position[1] >= cell.y as f32
+                && vertex.position[1] <= cell.y as f32 + 1.0
+            {
+                min_y = min_y.min(vertex.position[1]);
+                max_y = max_y.max(vertex.position[1]);
+            }
+        }
+        (min_y, max_y)
+    }
+
+    #[test]
+    fn slab_and_plant_meshes_stay_within_their_shapes() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene.refresh_meshes();
+        let target = air_above_surface(&scene);
+
+        let glass = key("base:glass_slab");
+        scene.apply_edit(true, &glass, target).expect("place slab");
+        scene.refresh_meshes();
+        let (min_y, max_y) = cell_vertex_range(&scene, target);
+        // A lower slab fills only the bottom half of the cell.
+        assert!((min_y - target.y as f32).abs() < 1e-4);
+        assert!(
+            (max_y - (target.y as f32 + 0.5)).abs() < 1e-4,
+            "slab top {max_y} must sit at the cell midline"
+        );
+
+        let plant = key("base:plant");
+        scene.apply_edit(false, &glass, target).expect("clear");
+        scene.apply_edit(true, &plant, target).expect("place plant");
+        scene.refresh_meshes();
+        // A panel is a thin vertical slab along x: vertices hug the cell's
+        // x midline while y spans the full cell.
+        let (min_x, max_x) = {
+            let (vertices, _, _) = scene.geometry();
+            let mut min_x = f32::MAX;
+            let mut max_x = f32::MIN;
+            for vertex in &vertices {
+                // Strictly inside the cell: the terrain block below shares
+                // the y boundary plane and its top face spans the cell.
+                if vertex.position[0] >= target.x as f32
+                    && vertex.position[0] <= target.x as f32 + 1.0
+                    && vertex.position[2] >= target.z as f32
+                    && vertex.position[2] <= target.z as f32 + 1.0
+                    && vertex.position[1] > target.y as f32
+                    && vertex.position[1] <= target.y as f32 + 1.0
+                {
+                    min_x = min_x.min(vertex.position[0]);
+                    max_x = max_x.max(vertex.position[0]);
+                }
+            }
+            (min_x, max_x)
+        };
+        assert!(
+            min_x >= target.x as f32 + 0.44 && max_x <= target.x as f32 + 0.56,
+            "plant x range [{min_x}, {max_x}] must hug the panel"
+        );
+        let (_, plant_max_y) = cell_vertex_range(&scene, target);
+        assert!((plant_max_y - (target.y as f32 + 1.0)).abs() < 1e-4);
     }
 
     #[test]

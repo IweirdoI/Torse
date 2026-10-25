@@ -24,9 +24,9 @@ use winit::window::{Window, WindowId};
 
 use crate::camera::FlyCamera;
 use crate::input::InputState;
-use crate::pick::{PickHit, PickOutcome};
+use crate::pick::PickOutcome;
 use crate::renderer::GpuContext;
-use crate::scene::{Scene, Vertex};
+use crate::scene::Scene;
 use torse_types::{BlockPos, ContentKey, SectionPos};
 use torse_world::Position;
 
@@ -533,7 +533,7 @@ impl WindowApp {
                 return;
             };
             match scene.pick(camera.eye, camera.forward(), PICK_RANGE) {
-                PickOutcome::Hit(hit) => outline_bytes(&hit),
+                PickOutcome::Hit(hit) => scene.outline_bytes(&hit),
                 PickOutcome::Miss => Vec::new(),
             }
         };
@@ -1155,12 +1155,12 @@ impl ApplicationHandler for WindowApp {
                                 }
                                 crate::ui::Action::SensDown => {
                                     self.look_sensitivity =
-                                        (self.look_sensitivity - 0.25).clamp(0.2, 5.0);
+                                        (self.look_sensitivity - 0.1).clamp(0.2, 5.0);
                                     self.last_result = format!("sens {:.2}", self.look_sensitivity);
                                 }
                                 crate::ui::Action::SensUp => {
                                     self.look_sensitivity =
-                                        (self.look_sensitivity + 0.25).clamp(0.2, 5.0);
+                                        (self.look_sensitivity + 0.1).clamp(0.2, 5.0);
                                     self.last_result = format!("sens {:.2}", self.look_sensitivity);
                                 }
                             }
@@ -1225,7 +1225,7 @@ impl ApplicationHandler for WindowApp {
                     };
                     if notches.is_finite() && notches != 0.0 {
                         self.look_sensitivity = (self.look_sensitivity
-                            * 1.15f64.powf(notches.clamp(-8.0, 8.0)))
+                            * 1.08f64.powf(notches.clamp(-8.0, 8.0)))
                         .clamp(0.2, 5.0);
                         self.last_result = format!("sens {:.2}", self.look_sensitivity);
                     }
@@ -1290,56 +1290,6 @@ fn action_for(outcome: &PickOutcome, button: MouseButton) -> Option<(bool, Block
         }
         _ => None,
     }
-}
-
-/// Build the 12 outline edges of the targeted cell, inflated outward slightly
-/// so the wireframe does not z-fight with the block faces it sits on.
-fn outline_bytes(hit: &PickHit) -> Vec<u8> {
-    const INFLATE: f32 = 0.004;
-    let min = [
-        hit.block.x as f32 - INFLATE,
-        hit.block.y as f32 - INFLATE,
-        hit.block.z as f32 - INFLATE,
-    ];
-    let max = [
-        hit.block.x as f32 + 1.0 + INFLATE,
-        hit.block.y as f32 + 1.0 + INFLATE,
-        hit.block.z as f32 + 1.0 + INFLATE,
-    ];
-    // Corner bits: x, y, z select the min or max end per axis.
-    let corner = |bits: u32| {
-        [
-            if bits & 1 != 0 { max[0] } else { min[0] },
-            if bits & 2 != 0 { max[1] } else { min[1] },
-            if bits & 4 != 0 { max[2] } else { min[2] },
-        ]
-    };
-    // 12 edges of the cube as corner-index pairs.
-    const EDGES: [(u32, u32); 12] = [
-        (0, 1),
-        (2, 3),
-        (4, 5),
-        (6, 7),
-        (0, 2),
-        (1, 3),
-        (4, 6),
-        (5, 7),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ];
-    let mut vertices = Vec::with_capacity(EDGES.len() * 2);
-    for (from, to) in EDGES {
-        for position in [corner(from), corner(to)] {
-            vertices.push(Vertex {
-                position,
-                normal: [0.0, 1.0, 0.0],
-                color: [0.05, 0.05, 0.05],
-            });
-        }
-    }
-    Scene::vertex_bytes(&vertices)
 }
 
 fn create_depth(device: &Device, width: u32, height: u32) -> Texture {

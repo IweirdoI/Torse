@@ -25,7 +25,7 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
       - name: Repeat CPU cancellation and background result tests
-        if: runner.os == 'Linux'
+        shell: bash
         run: |
           for attempt in 1 2 3; do
             cargo test -p torse-runtime --lib --locked
@@ -62,6 +62,31 @@ jobs:
         run: cargo run -p torse-server -- .work/ci-execution-world --listen 127.0.0.1:0 --ticks 2 --planning-workers 4 --prevalidate-workers 4 --prevalidate-components
       - name: Serial baseline smoke
         run: cargo run -p torse-server --example serial_baseline -- --output .work/ci-serial-baseline --ticks 2 --warmup 1 --batch 16
+
+  mods:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install guest target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Mod host and server Clippy
+        run: cargo clippy -p torse-mod-host --features package -p torse-server --features mods --all-targets --locked -- -D warnings
+      - name: Mod host tests
+        run: cargo test -p torse-mod-host --features package --all-targets --locked
+      - name: Server with mods
+        run: cargo test -p torse-server --features mods --all-targets --locked
+      - name: Repeat real multi-machine durability
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            cargo test -p torse-server --features mods --test multi_machine --locked
+          done
+      - name: Real multi-machine benchmark smoke
+        run: cargo run -p torse-server --features mods --example multi_machine --locked -- .work/ci-multi-machine --machines 8 --subscribers 2 --ticks 2 --warmup 1 --workers 4 --file
 
   experiments:
     runs-on: macos-latest

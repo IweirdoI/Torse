@@ -32,12 +32,12 @@ pub fn measure_inner<T: Wire>(
     budget: OutputBudget,
     limits: CodecLimits,
 ) -> EncodeResult<WireCost> {
-    let budget = OutputBudget {
+    let encoded_budget = OutputBudget {
         max_bytes: budget.max_bytes.min(u64::from(limits.max_frame_bytes)),
         ..budget
     };
     let mut bytes = Vec::new();
-    let mut e = Encoder::new(&mut bytes, budget, limits);
+    let mut e = Encoder::new(&mut bytes, encoded_budget, limits);
     value.write(&mut e)?;
     e.finish();
     let mut d = Decoder::new(&bytes, budget, limits);

@@ -89,6 +89,75 @@ fn one_and_four_workers_match_serial_generation_and_meshes_under_backpressure() 
 }
 
 #[test]
+fn tinted_overlay_meshes_match_serial_and_reject_completed_provider_revisions() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use torse_assets::texture::{Atlas, MaterialEntry, PositionTintProvider, TintSource};
+    struct Tint(AtomicU64);
+    impl PositionTintProvider for Tint {
+        fn sample(&self, _: TintSource, _: BlockPos) -> [u8; 3] {
+            if self.0.load(Ordering::Relaxed) == 0 {
+                [255, 0, 0]
+            } else {
+                [0, 255, 0]
+            }
+        }
+        fn revision(&self, _: SectionPos) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    for workers in [1, 4] {
+        let atlas = Atlas::decode(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../games/base/assets/textures/atlas.png"
+        )))
+        .unwrap();
+        let pack = TexturePack::new(
+            atlas,
+            vec![MaterialEntry {
+                key: "base:material/stone",
+                rect: [4, 4, 16, 16],
+                tint_source: Some(TintSource::Grass),
+                ..MaterialEntry::new("", [0; 4])
+            }],
+            [76, 4, 16, 16],
+            [100, 4, 16, 16],
+        )
+        .unwrap();
+        let mut scene = Scene::with_pack(0, pack).unwrap();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let material = scene.state_materials.get_mut(&stone).unwrap();
+        material.overlays = [Some(material.base[0]); 6];
+        let provider = Arc::new(Tint(AtomicU64::new(0)));
+        scene
+            .set_position_tint_provider(Some(provider.clone()))
+            .unwrap();
+        scene.enable_background(config(workers, 2)).unwrap();
+        scene.refresh_visuals(1).unwrap();
+        wait(|| idle(&scene));
+        provider.0.store(1, Ordering::Relaxed);
+        assert!(scene.refresh_visuals(1).unwrap().is_empty());
+        assert_eq!(scene.background.as_ref().unwrap().stats.stale, 1);
+        drain_meshes(&mut scene);
+        let actual = scene.geometry();
+        assert!(actual.0.iter().any(|v| v.overlay_material != u32::MAX));
+        assert!(
+            actual
+                .0
+                .iter()
+                .all(|v| v.tint == [0.0, 1.0, 0.0] && v.overlay_tint == [0.0, 1.0, 0.0])
+        );
+        scene.meshes.clear();
+        scene.refresh_meshes();
+        assert_eq!(scene.geometry(), actual);
+        assert!(scene.background.as_ref().unwrap().stats.peak_input_bytes <= 2 * 1024 * 1024);
+    }
+}
+
+#[test]
 fn completed_meshes_reject_terrain_neighbor_reload_epoch_and_asset_changes() {
     fn replace(scene: &mut Scene, pos: SectionPos) {
         let symbols = [(

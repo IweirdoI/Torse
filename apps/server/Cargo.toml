@@ -30,3 +30,7 @@ torse-mod-api = { path = "../../crates/mod_api" }
 [[example]]
 name = "mod_baseline"
 required-features = ["mods"]
+
+[[example]]
+name = "multi_machine"
+required-features = ["mods"]

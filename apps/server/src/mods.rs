@@ -579,10 +579,68 @@ pub struct ModWorld {
     pub actions: torse_sim::action::ActionService,
     pub rules: Vec<Box<dyn DurableRule>>,
     pub stats: Rc<RefCell<ModStats>>,
-    /// Machine entity per package id, in package order.
+    /// Machine entities in package and copy order.
     pub machines: Vec<(String, EntityId)>,
     pub input: EntityId,
     pub output: EntityId,
+}
+
+/// Bounded assembly for real multi-machine workloads. The executable keeps one
+/// machine per package and shared ports through `Default`.
+#[derive(Clone, Copy, Debug)]
+pub struct ModLayout {
+    pub machines_per_package: usize,
+    pub shared_ports: bool,
+}
+impl Default for ModLayout {
+    fn default() -> Self {
+        Self {
+            machines_per_package: 1,
+            shared_ports: true,
+        }
+    }
+}
+
+fn additional_ports(
+    world: &mut WorldAuthority,
+    catalog: &ItemCatalog,
+    position: Position,
+    stock: bool,
+) -> Result<[EntityId; 2], Fault> {
+    let schemas = world.schemas().clone();
+    let mut ids = [EntityId(0); 2];
+    for (index, id) in ids.iter_mut().enumerate() {
+        let handle = world
+            .entities_mut()
+            .spawn(Position::new(
+                position.x - 0.5,
+                position.y,
+                position.z + index as f64 * 0.25,
+            ))
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        *id = world.entities().get(handle).expect("port entity").id;
+        let mut inventory = torse_inventory::Inventory::new(2)
+            .map_err(|e| Fault::invalid_data(format!("{e:?}")))?;
+        if stock && index == 0 {
+            inventory
+                .set(
+                    0,
+                    Some(ItemStack {
+                        item: bootstrap::key("base:stone"),
+                        count: 1,
+                    }),
+                    catalog,
+                )
+                .map_err(|e| Fault::invalid_data(format!("{e:?}")))?;
+        }
+        world
+            .entities_mut()
+            .components_mut(handle)
+            .expect("port components")
+            .insert(&schemas, &torse_inventory::schema(), inventory.fields())
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+    }
+    Ok(ids)
 }
 
 fn build_guest_bytes(package: &package::LoadedPackage, spin: bool) -> Result<Vec<u8>, Fault> {
@@ -639,6 +697,20 @@ pub fn mod_world(
     stock_input: bool,
     spin: &SpinPackages,
 ) -> Result<ModWorld, Fault> {
+    mod_world_with_layout(dirs, stock_input, spin, ModLayout::default())
+}
+
+pub fn mod_world_with_layout(
+    dirs: &[PathBuf],
+    stock_input: bool,
+    spin: &SpinPackages,
+    layout: ModLayout,
+) -> Result<ModWorld, Fault> {
+    if !(1..=64).contains(&layout.machines_per_package) {
+        return Err(Fault::invalid_data(
+            "machine count must be 1..64 per package",
+        ));
+    }
     let mut base = torse_content::m0_fixture_pack();
     torse_sim::block_actions::register_content(&mut base);
     torse_inventory::register_content(&mut base);
@@ -734,38 +806,54 @@ pub fn mod_world(
         }
         let mut extra_targets = Vec::new();
         if !owned.is_empty() {
-            // One machine entity per package, referencing the shared chests.
-            let position = Position::new(4.0 + machines.len() as f64, 2.0, 2.0);
-            let handle = world
-                .entities_mut()
-                .spawn(position)
-                .map_err(|e| Fault::invalid_data(format!("{e:?}")))?;
-            let machine = world.entities().get(handle).expect("entity").id;
-            let fields = ComponentFields::from([
-                (
-                    ContentKey::parse(&format!("{}:field/progress", package.manifest.id))
-                        .expect("field"),
-                    ComponentValue::U32(0),
-                ),
-                (
-                    ContentKey::parse(&format!("{}:field/input", package.manifest.id))
-                        .expect("field"),
-                    ComponentValue::Entity(input),
-                ),
-                (
-                    ContentKey::parse(&format!("{}:field/output", package.manifest.id))
-                        .expect("field"),
-                    ComponentValue::Entity(output),
-                ),
-            ]);
-            world
-                .entities_mut()
-                .components_mut(handle)
-                .expect("components")
-                .insert(&schemas, &owned[0], fields)
-                .map_err(|e| Fault::invalid_data(e.to_string()))?;
-            machines.push((package.manifest.id.clone(), machine));
-            extra_targets.push(machine);
+            for copy in 0..layout.machines_per_package {
+                let index = machines.len();
+                let position = if layout.machines_per_package == 1 {
+                    Position::new(4.0 + index as f64, 2.0, 2.0)
+                } else {
+                    Position::new(
+                        4.0 + (index % 7) as f64 * 4.0,
+                        2.0,
+                        2.0 + (index / 7) as f64 * 1.5,
+                    )
+                };
+                let ports = if layout.shared_ports || (copy == 0 && machines.is_empty()) {
+                    ids
+                } else {
+                    additional_ports(&mut world, &catalog, position, stock_input)?
+                };
+                extra_targets.extend(ports);
+                let handle = world
+                    .entities_mut()
+                    .spawn(position)
+                    .map_err(|e| Fault::invalid_data(format!("{e:?}")))?;
+                let machine = world.entities().get(handle).expect("entity").id;
+                let fields = ComponentFields::from([
+                    (
+                        ContentKey::parse(&format!("{}:field/progress", package.manifest.id))
+                            .expect("field"),
+                        ComponentValue::U32(0),
+                    ),
+                    (
+                        ContentKey::parse(&format!("{}:field/input", package.manifest.id))
+                            .expect("field"),
+                        ComponentValue::Entity(ports[0]),
+                    ),
+                    (
+                        ContentKey::parse(&format!("{}:field/output", package.manifest.id))
+                            .expect("field"),
+                        ComponentValue::Entity(ports[1]),
+                    ),
+                ]);
+                world
+                    .entities_mut()
+                    .components_mut(handle)
+                    .expect("components")
+                    .insert(&schemas, &owned[0], fields)
+                    .map_err(|e| Fault::invalid_data(e.to_string()))?;
+                machines.push((package.manifest.id.clone(), machine));
+                extra_targets.push(machine);
+            }
         }
         let bytes = build_guest_bytes(package, spin.contains(&package.manifest.id))?;
         let extras: Vec<String> = package

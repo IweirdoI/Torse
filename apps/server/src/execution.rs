@@ -632,6 +632,15 @@ impl ExecutionHost {
         runtime: RuntimeState,
         remove_pending: Vec<RequestId>,
     ) -> Result<ExecutionPrepared, Fault> {
+        self.record_outcome(prepared, runtime, remove_pending, None)
+    }
+    fn record_outcome(
+        &self,
+        prepared: torse_sim::PreparedChange,
+        runtime: RuntimeState,
+        remove_pending: Vec<RequestId>,
+        outcome: Option<ReplyStatus>,
+    ) -> Result<ExecutionPrepared, Fault> {
         checked_state_cached(
             &runtime,
             self.limits,
@@ -642,13 +651,23 @@ impl ExecutionHost {
         receipt_bounds(&runtime, prepared.meta().cursor)?;
         let changes = changes_from_prepared(self.world().registry(), &prepared)
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        let update = if self.compact_records && outcome.is_some() {
+            RuntimeUpdate::Progress(RuntimeProgress {
+                next: runtime.work.as_ref().expect("settled work").next,
+                next_event: runtime.next_event,
+                events: runtime.events.clone(),
+                windows: runtime.windows.clone(),
+            })
+        } else {
+            RuntimeUpdate::Full(runtime.clone())
+        };
         Ok(ExecutionPrepared {
             record: CommitRecord {
                 meta: changes.meta,
                 changes: ExecutionChanges {
                     world: changes,
-                    runtime: RuntimeUpdate::Full(runtime.clone()),
-                    outcome: None,
+                    runtime: update,
+                    outcome,
                     cancelled: None,
                 },
             },
@@ -705,17 +724,7 @@ impl ExecutionHost {
             }
             Err(error) => return Err(error),
         };
-        let mut result = self.record(prepared, state, Vec::new())?;
-        result.record.changes.outcome = Some(status);
-        if self.compact_records {
-            result.record.changes.runtime = RuntimeUpdate::Progress(RuntimeProgress {
-                next: result.runtime.work.as_ref().expect("settled work").next,
-                next_event: result.runtime.next_event,
-                events: result.runtime.events.clone(),
-                windows: result.runtime.windows.clone(),
-            });
-        }
-        Ok(result)
+        self.record_outcome(prepared, state, Vec::new(), Some(status))
     }
 }
 fn matches_plan(task: &FrozenTask, status: &ReplyStatus, world: &torse_world::ChangeSet) -> bool {

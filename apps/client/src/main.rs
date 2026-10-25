@@ -265,7 +265,10 @@ fn run(
         _ => ([40.0, 18.0, 40.0], [0.0, 6.0, 0.0]),
     };
     let camera = Camera::new(eye, target);
-    renderer.render(camera.view_projection(width as f32 / height as f32));
+    renderer.render(
+        camera.view_projection(width as f32 / height as f32),
+        camera.eye,
+    );
     if let Some(mode) = ui_preview {
         renderer.render_ui(mode)?;
     }

@@ -639,12 +639,13 @@ impl WindowApp {
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
         let (device, queue) = gpu.context.parts();
-        gpu.context.write_camera(
-            self.camera
-                .as_ref()
-                .expect("gpu implies camera")
-                .view_projection(aspect),
-        );
+        let view_projection = self
+            .camera
+            .as_ref()
+            .expect("gpu implies camera")
+            .view_projection(aspect);
+        let eye = self.camera.as_ref().expect("gpu implies camera").eye;
+        gpu.context.write_camera(view_projection, eye);
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("client window frame"),
         });

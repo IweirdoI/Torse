@@ -34,6 +34,7 @@ use crate::texture::{MAX_MATERIALS, Palette};
 const TERRAIN_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
+    eye: vec4<f32>,
 };
 
 struct Surface {
@@ -77,6 +78,7 @@ struct VertexOut {
     @location(3) @interpolate(flat) overlay_material: u32,
     @location(4) tint: vec3<f32>,
     @location(5) overlay_tint: vec3<f32>,
+    @location(6) world: vec3<f32>,
 };
 
 fn sample_surface(surface: Surface, uv: vec2<f32>) -> vec4<f32> {
@@ -102,6 +104,31 @@ fn sample_surface(surface: Surface, uv: vec2<f32>) -> vec4<f32> {
     return mix(first, second, surface.frame.x);
 }
 
+fn srgb_encode(color: vec3<f32>) -> vec3<f32> {
+    let high = 1.055 * pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(high, color * 12.92, color <= vec3<f32>(0.0031308));
+}
+
+fn srgb_decode(color: vec3<f32>) -> vec3<f32> {
+    let high = pow((color + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(high, color / 12.92, color <= vec3<f32>(0.04045));
+}
+
+// Brightness of one face. A block surface is lit by its axis, not by a dot
+// product with a sun direction, which keeps every voxel face equally readable.
+fn face_shade(normal: vec3<f32>) -> f32 {
+    if (normal.y > 0.5) {
+        return 1.0;
+    }
+    if (normal.y < -0.5) {
+        return 0.5;
+    }
+    if (abs(normal.x) > 0.5) {
+        return 0.6;
+    }
+    return 0.8;
+}
+
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
@@ -112,6 +139,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.overlay_material = input.overlay_material;
     out.tint = input.tint;
     out.overlay_tint = input.overlay_tint;
+    out.world = input.position;
     return out;
 }
 
@@ -123,23 +151,22 @@ fn fs_main(
     let surface = materials.entries[input.material];
     let texel = sample_surface(surface, input.uv);
 
-    let light = normalize(vec3<f32>(0.35, 0.9, 0.25));
-    let normal = select(-input.normal, input.normal, front_facing);
-    let diffuse = max(dot(normalize(normal), light), 0.0);
-    let shade = 0.38 + 0.62 * diffuse;
-
     // tint.w encodes the alpha mode: 0 opaque, 1 mask, 2 blend.
     let mode = surface.tint.w;
     if (mode > 0.5 && mode < 1.5 && texel.a < 0.5) {
         discard;
     }
-    var color = texel.rgb * surface.tint.rgb * input.tint;
+    // Colours combine in sRGB space, the space the textures were authored in;
+    // the linear result is re-encoded for the sRGB target.
+    var color = srgb_encode(texel.rgb) * srgb_encode(surface.tint.rgb) * srgb_encode(input.tint);
     var alpha = select(1.0, texel.a, mode > 1.5);
     if (input.overlay_material != 0xffffffffu) {
         let overlay = materials.entries[input.overlay_material];
         let overlay_texel = sample_surface(overlay, input.uv);
         let overlay_mode = overlay.tint.w;
-        let overlay_color = overlay_texel.rgb * overlay.tint.rgb * input.overlay_tint;
+        let overlay_color = srgb_encode(overlay_texel.rgb)
+            * srgb_encode(overlay.tint.rgb)
+            * srgb_encode(input.overlay_tint);
         if (overlay_mode < 0.5) {
             color = overlay_color;
             alpha = 1.0;
@@ -158,13 +185,19 @@ fn fs_main(
             alpha = combined_alpha;
         }
     }
-    return vec4<f32>(color * shade, alpha);
+    let normal = select(-input.normal, input.normal, front_facing);
+    let sky = srgb_encode(vec3<f32>(0.66, 0.74, 0.80));
+    let distance = length(input.world - camera.eye.xyz);
+    let fog = clamp(1.0 - exp(-distance * 0.0028), 0.0, 0.72);
+    let lit = color * face_shade(normal);
+    return vec4<f32>(srgb_decode(mix(lit, sky, fog)), alpha);
 }
 "#;
 
 const LINE_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
+    eye: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -250,7 +283,7 @@ impl GpuContext {
             label: Some("client camera layout"),
             entries: &[BindGroupLayoutEntry {
                 binding: 0,
-                visibility: ShaderStages::VERTEX,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -292,7 +325,7 @@ impl GpuContext {
         });
         let camera = device.create_buffer(&BufferDescriptor {
             label: Some("client camera uniform"),
-            size: 64,
+            size: 80,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -622,9 +655,16 @@ impl GpuContext {
     }
 
     /// Stage the camera matrix for the next frame.
-    pub fn write_camera(&self, view_projection: [f32; 16]) {
+    pub fn write_camera(&self, view_projection: [f32; 16], eye: [f32; 3]) {
         self.queue
             .write_buffer(&self.camera, 0, &matrix_bytes(view_projection));
+        let mut position = [0f32; 4];
+        position[..3].copy_from_slice(&eye);
+        let mut bytes = Vec::with_capacity(16);
+        for value in position {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        self.queue.write_buffer(&self.camera, 64, &bytes);
     }
 
     /// Replace the selection outline. `vertex_bytes` uses the terrain layout
@@ -774,8 +814,8 @@ impl Renderer {
     }
 
     /// Render one frame into the offscreen target.
-    pub fn render(&mut self, view_projection: [f32; 16]) {
-        self.context.write_camera(view_projection);
+    pub fn render(&mut self, view_projection: [f32; 16], eye: [f32; 3]) {
+        self.context.write_camera(view_projection, eye);
         let mut encoder = self
             .context
             .device

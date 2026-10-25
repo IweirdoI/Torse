@@ -1,0 +1,16 @@
+format=1
+threads=1
+profiled=true
+ticks=30
+warmup=5
+backend=all
+os=windows
+arch=x86_64
+debug_assertions=false
+projection_optimization=true
+runtime_optimization=true
+commit_batch=16
+logical_cpus=28
+rustc=rustc 1.93.1 (01f6ddf75 2026-02-11)
+revision=92fe51b5925b5dc1221d458c9ae398b49fc876c9
+worktree=M .github/workflows/ci.yml; M apps/server/examples/serial_baseline.rs; M apps/server/src/execution.rs; M apps/server/src/network.rs; M crates/sim/src/replica.rs; M crates/sim/tests/replica.rs;?? apps/server/tests/projection.rs;?? crates/sim/src/replica/;?? crates/sim/tests/replica/

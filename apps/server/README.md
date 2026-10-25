@@ -46,6 +46,12 @@ cargo run --release -p torse-server --example serial_baseline --locked -- --outp
 
 大碰撞体负载有实测收益，小碰撞体默认跳过。完整路径、原始数据及真实单机器Mod对照见[移动预验证与投影](../../benchmarks/M6-movement-prevalidation.md)。
 
+## 授权增量投影
+
+复制源默认根据提交实际修改的分区和实体更新订阅，只重建改变的Section及实体可见组件集合。状态引用计数维护完整可见字典，缓存成本继续检查整个投影的条目和字节上限；队列也在克隆载荷前检查。每个可见提交仍输出一个原子批次，撤权、慢订阅重置和DurableSeq发送门槛保持原语义。
+
+`Server::set_projection_optimization(false)`可切换到完整投影作诊断对照，ExecutionHost及ReplicaSource也提供同名入口。重新启用时从当前订阅基线重建派生缓存。缓存不进入存档或协议；本轮不提供运行期地形装卸。测量、容量边界和编码一致性验证见[增量投影记录](../../benchmarks/M6-incremental-projection.md)。
+
 ## 启动与连接
 
 ```sh

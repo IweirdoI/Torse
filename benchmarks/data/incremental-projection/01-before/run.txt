@@ -1,0 +1,15 @@
+format=1
+threads=1
+profiled=true
+ticks=30
+warmup=5
+backend=sink
+os=windows
+arch=x86_64
+debug_assertions=false
+runtime_optimization=true
+commit_batch=16
+logical_cpus=28
+rustc=rustc 1.93.1 (01f6ddf75 2026-02-11)
+revision=92fe51b5925b5dc1221d458c9ae398b49fc876c9
+worktree=

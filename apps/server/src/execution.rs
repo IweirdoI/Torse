@@ -394,6 +394,10 @@ impl ExecutionHost {
     pub fn set_runtime_optimization(&mut self, enabled: bool) {
         self.compact_records = enabled;
     }
+
+    pub fn set_projection_optimization(&mut self, enabled: bool) {
+        self.source.set_projection_optimization(enabled);
+    }
     fn validation_cache(&self) -> Option<&RefCell<RuntimeBudget>> {
         self.compact_records.then_some(&self.budget_cache)
     }

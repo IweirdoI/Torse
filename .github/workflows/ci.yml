@@ -33,6 +33,8 @@ jobs:
             cargo test -p torse-server --test parallel_planning --locked
             cargo test -p torse-server --test runtime_commit --locked
             cargo test -p torse-server --test prevalidation --locked
+            cargo test -p torse-server --test projection --locked
+            cargo test -p torse-sim --test replica --locked
           done
       - name: Repeat checkpoint concurrency tests
         if: runner.os == 'Linux'

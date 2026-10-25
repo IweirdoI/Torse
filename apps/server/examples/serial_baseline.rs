@@ -23,6 +23,7 @@ struct Options {
     backend: String,
     profiled: bool,
     full_runtime: bool,
+    full_projection: bool,
     batch: u32,
 }
 
@@ -34,6 +35,7 @@ fn options() -> Result<Options, Box<dyn Error>> {
         backend: "all".into(),
         profiled: true,
         full_runtime: false,
+        full_projection: false,
         batch: 1,
     };
     let mut args = std::env::args().skip(1);
@@ -45,6 +47,7 @@ fn options() -> Result<Options, Box<dyn Error>> {
             "--backend" => options.backend = args.next().ok_or("missing backend")?,
             "--unprofiled" => options.profiled = false,
             "--full-runtime" => options.full_runtime = true,
+            "--full-projection" => options.full_projection = true,
             "--batch" => options.batch = args.next().ok_or("missing batch")?.parse()?,
             _ => return Err(format!("unknown option: {arg}").into()),
         }
@@ -278,6 +281,7 @@ where
     S: HostCheckpointStore<ExecutionModel>,
 {
     server.set_runtime_optimization(!options.full_runtime)?;
+    server.set_projection_optimization(!options.full_projection)?;
     server.set_commit_batch_limit(options.batch)?;
     let mut subscriptions = Vec::new();
     for id in 1..=subscribers as u128 {
@@ -449,6 +453,11 @@ fn write_results(options: &Options, rows: &[ResultRow]) -> Result<(), Box<dyn Er
         std::env::consts::ARCH
     )?;
     writeln!(metadata, "debug_assertions={}", cfg!(debug_assertions))?;
+    writeln!(
+        metadata,
+        "projection_optimization={}",
+        !options.full_projection
+    )?;
     writeln!(
         metadata,
         "runtime_optimization={}\ncommit_batch={}",

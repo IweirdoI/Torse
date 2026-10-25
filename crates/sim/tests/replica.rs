@@ -56,8 +56,11 @@ fn tx(id: u128) -> Transaction {
 }
 
 fn world() -> WorldAuthority {
+    world_with_payload(false)
+}
+fn world_with_payload(payload: bool) -> WorldAuthority {
     let mut pack = m0_fixture_pack();
-    let schemas = [
+    let mut schemas: Vec<_> = [
         (
             "test:public",
             ReplicationVisibility::Public,
@@ -98,6 +101,12 @@ fn world() -> WorldAuthority {
         migration_binding: None,
     })
     .into();
+    if payload {
+        let mut schema = schemas[0].clone();
+        schema.id = key("test:payload");
+        schema.fields[0].field_type = ComponentFieldType::List { max_items: 8 };
+        schemas.push(schema);
+    }
     register_action_module(
         &mut pack,
         key("test:owner"),
@@ -152,6 +161,9 @@ fn world() -> WorldAuthority {
     }
     world
 }
+
+#[path = "replica/incremental.rs"]
+mod incremental;
 
 fn source(limits: ReplicaLimits) -> (ReplicaSource, Binding) {
     let world = world();

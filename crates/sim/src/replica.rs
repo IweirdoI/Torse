@@ -18,6 +18,9 @@ use torse_world::{
 use crate::action::{ActionTarget, ActorContext};
 use crate::{CommitFault, PrepareError, PreparedChange, Publication, Transaction, WorldAuthority};
 
+mod incremental;
+use incremental::{Dirty, ProjectionCache};
+
 /// Host-approved interest. Terrain and entity presence are public within this
 /// range; Authorized components additionally require the actor's entity grant.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +80,7 @@ struct Subscription {
     actor: ActorContext,
     scope: ReplicaScope,
     state: Option<ReplicaSnapshot>,
+    cache: ProjectionCache,
     next_seq: u64,
     queue: VecDeque<(WorldReplicaBatch, Cost)>,
     queued: Cost,
@@ -92,6 +96,7 @@ pub struct ReplicaSource {
     subscriptions: BTreeMap<u128, Subscription>,
     pending_invalidations: BTreeSet<u128>,
     profiler: SerialProfiler,
+    incremental: bool,
 }
 
 impl ReplicaSource {
@@ -121,6 +126,7 @@ impl ReplicaSource {
             subscriptions: BTreeMap::new(),
             pending_invalidations: BTreeSet::new(),
             profiler: SerialProfiler::default(),
+            incremental: true,
         })
     }
 
@@ -131,6 +137,11 @@ impl ReplicaSource {
 
     pub fn set_serial_profiler(&mut self, profiler: SerialProfiler) {
         self.profiler = profiler;
+    }
+
+    /// Retain full projection as a diagnostic reference, including for live subscriptions.
+    pub fn set_projection_optimization(&mut self, enabled: bool) {
+        self.incremental = enabled;
     }
 
     pub fn prepare(&self, transaction: &Transaction) -> Result<PreparedChange, PrepareError> {
@@ -173,6 +184,7 @@ impl ReplicaSource {
             &scope,
             smaller(budget, self.limits.snapshot),
         )?;
+        let cache = ProjectionCache::new(&state)?;
         let subscription = SubscriptionId(self.next_subscription);
         self.next_subscription += 1;
         let seed = WorldReplicaSeed {
@@ -191,6 +203,7 @@ impl ReplicaSource {
                 actor,
                 scope,
                 state: Some(state),
+                cache,
                 next_seq: 1,
                 queue: VecDeque::new(),
                 queued: Cost::default(),
@@ -206,6 +219,11 @@ impl ReplicaSource {
             || !prepared.entity_moves().is_empty()
             || !prepared.component_edits().is_empty()
             || prepared.entity_lifecycle().is_some();
+        let dirty = (visible_work
+            && self.incremental
+            && self.subscriptions.values().any(|s| s.state.is_some()))
+        .then(|| Dirty::capture(&self.world, &prepared))
+        .flatten();
         let mut publication = self.world.publish(prepared)?;
         // Durable task/phase barriers change no observable world data. They must
         // still deliver pending invalidations, but need no projection or clone.
@@ -219,34 +237,26 @@ impl ReplicaSource {
                 self.pending_invalidations.insert(id);
                 continue;
             }
-            let projected = project(&self.world, &sub.actor, &sub.scope, self.limits.snapshot);
-            let result = projected.and_then(|next| {
-                let previous = sub.state.as_ref().expect("active subscription");
-                if &next == previous {
-                    return Ok(());
-                }
-                let changes = difference(previous, &next);
-                let batch = WorldReplicaBatch {
-                    binding: self.binding,
-                    subscription: SubscriptionId(id),
-                    seq: ReplicaSeq(sub.next_seq),
-                    through: publication.cursor,
-                    changes,
-                };
-                let cost = batch_cost(&batch)?;
-                let total = sub.queued.add(cost)?;
-                if sub.queue.len() >= self.limits.max_queued_batches
-                    || !total.fits(self.limits.queue)
-                    || sub.next_seq == u64::MAX
-                {
-                    return Err(Fault::resource_limit("replica queue exhausted"));
-                }
-                sub.queue.push_back((batch, cost));
-                sub.queued = total;
-                sub.next_seq += 1;
-                sub.state = Some(next);
-                Ok(())
-            });
+            let result = if let Some(dirty) = &dirty {
+                incremental::update(
+                    &self.world,
+                    self.binding,
+                    self.limits,
+                    SubscriptionId(id),
+                    publication.cursor,
+                    sub,
+                    dirty,
+                )
+            } else {
+                full_projection(
+                    &self.world,
+                    self.binding,
+                    self.limits,
+                    SubscriptionId(id),
+                    publication.cursor,
+                    sub,
+                )
+            };
             if result.is_err() {
                 reset(sub);
                 self.pending_invalidations.insert(id);
@@ -343,6 +353,7 @@ impl ReplicaSource {
 
 fn reset(sub: &mut Subscription) {
     sub.state = None;
+    sub.cache = ProjectionCache::default();
     sub.queue.clear();
     sub.queued = Cost::default();
 }
@@ -371,6 +382,18 @@ struct Cost {
 }
 
 impl Cost {
+    fn subtract(self, other: Self) -> Result<Self, Fault> {
+        Ok(Self {
+            items: self
+                .items
+                .checked_sub(other.items)
+                .ok_or_else(|| Fault::invalid_data("replica cost underflow"))?,
+            bytes: self
+                .bytes
+                .checked_sub(other.bytes)
+                .ok_or_else(|| Fault::invalid_data("replica cost underflow"))?,
+        })
+    }
     fn add(self, other: Self) -> Result<Self, Fault> {
         Ok(Self {
             items: self
@@ -686,4 +709,41 @@ fn batch_cost(batch: &WorldReplicaBatch) -> Result<Cost, Fault> {
         cost.entity(entity)?;
     }
     Ok(cost)
+}
+
+fn full_projection(
+    world: &WorldAuthority,
+    binding: Binding,
+    limits: ReplicaLimits,
+    id: SubscriptionId,
+    through: CommitCursor,
+    sub: &mut Subscription,
+) -> Result<(), Fault> {
+    let next = project(world, &sub.actor, &sub.scope, limits.snapshot)?;
+    let previous = sub.state.as_ref().expect("active subscription");
+    if &next == previous {
+        return Ok(());
+    }
+    let batch = WorldReplicaBatch {
+        binding,
+        subscription: id,
+        seq: ReplicaSeq(sub.next_seq),
+        through,
+        changes: difference(previous, &next),
+    };
+    let cost = batch_cost(&batch)?;
+    let total = sub.queued.add(cost)?;
+    if sub.queue.len() >= limits.max_queued_batches
+        || !total.fits(limits.queue)
+        || sub.next_seq == u64::MAX
+    {
+        return Err(Fault::resource_limit("replica queue exhausted"));
+    }
+    // Rebuild only if diagnostics switches this subscription back to incremental.
+    sub.cache = ProjectionCache::default();
+    sub.queue.push_back((batch, cost));
+    sub.queued = total;
+    sub.next_seq += 1;
+    sub.state = Some(next);
+    Ok(())
 }

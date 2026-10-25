@@ -1392,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn stacked_slabs_merge_and_drop_the_shared_plane() {
+    fn stacked_slabs_keep_the_gap_plane() {
         let mut scene = Scene::new(1).expect("scene builds");
         scene.refresh_meshes();
         let base = air_above_surface(&scene);
@@ -1417,9 +1417,11 @@ mod tests {
                     && v.position[2] <= base.z as f32 + 1.0
             })
             .count();
+        // The upper slab's bottom faces the half-block gap between the two
+        // slabs, so it must render; the lower slab never reaches the plane.
         assert_eq!(
-            flat_on_plane, 0,
-            "the shared plane must be culled on both sides"
+            flat_on_plane, 4,
+            "the upper slab's bottom quad must face the gap"
         );
     }
 

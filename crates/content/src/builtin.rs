@@ -139,7 +139,9 @@ pub fn m0_fixture_pack() -> ContentPack {
                     Shape::LowerSlab,
                     Some(Shape::LowerSlab),
                     Some(Shape::LowerSlab),
-                    0b11_1100,
+                    // Occlusion follows the shape: a lower slab touches its
+                    // bottom and four side boundaries but never its top.
+                    0b110100,
                     AlphaMode::Blend,
                     inspect_action.clone(),
                 ),

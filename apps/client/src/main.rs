@@ -243,7 +243,12 @@ fn run(
         let key = torse_types::ContentKey::parse(material)
             .map_err(|error| format!("--place `{material}`: {error}"))?;
         scene
-            .apply_edit(true, &key, torse_types::BlockPos::new(*x, *y, *z))
+            .apply_edit(
+                true,
+                &key,
+                torse_types::BlockPos::new(*x, *y, *z),
+                [0, 1, 0],
+            )
             .map_err(|error| format!("--place `{material}`: {error}"))?;
     }
     scene.refresh_meshes();

@@ -19,6 +19,6 @@ pub use descriptor::{
     CollisionProfile, ComponentField, ComponentFieldType, ComponentSchema, ExecutionContract, Face,
     FaceMaterials, FaceOverlay, FaceOverlays, FiniteField, InteractionProfile, LightTransport,
     MethodDescriptor, ModuleDescriptor, ModuleSide, OcclusionProfile, PersistencePolicy,
-    RenderProfile, RequestedPermission, SelectionProfile, ServiceDescriptor, Shape, StateSchema,
-    SystemDescriptor,
+    RenderProfile, RequestedPermission, SelectionProfile, ServiceDescriptor, Shape, StateProfile,
+    StateSchema, SystemDescriptor,
 };

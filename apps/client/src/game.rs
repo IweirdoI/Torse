@@ -502,6 +502,7 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
                 },
                 component_defaults: Vec::new(),
                 capability_bindings: Vec::new(),
+                state_overrides: Vec::new(),
                 behavior_bindings: Vec::new(),
                 tags: Vec::new(),
             },

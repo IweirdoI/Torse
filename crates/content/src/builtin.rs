@@ -13,12 +13,13 @@ use crate::{
     CollisionProfile, ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FaceOverlays,
     FiniteField, InteractionProfile, LightTransport, MethodDescriptor, ModuleDescriptor,
     ModuleSide, OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission,
-    SelectionProfile, ServiceDescriptor, Shape, SourceRef, Sourced, StateSchema,
+    SelectionProfile, ServiceDescriptor, Shape, SourceRef, Sourced, StateProfile, StateSchema,
 };
 
 /// Build the deterministic content pack used by M0 tests and tooling.
 pub fn m0_fixture_pack() -> ContentPack {
     let simple_state = key("base:state/simple");
+    let slab_state = key("base:state/slab");
     let plant_state = key("base:state/plant_growth");
     // The inventory schema is declared but not attached to one of the three
     // blocks. This keeps the built-in block models visually realistic while
@@ -35,6 +36,19 @@ pub fn m0_fixture_pack() -> ContentPack {
                     id: simple_state.clone(),
                     schema_version: 1,
                     finite_fields: Vec::new(),
+                    component_schemas: Vec::new(),
+                },
+            ),
+            sourced(
+                "fixtures/m0/state_slab.json",
+                StateSchema {
+                    id: slab_state.clone(),
+                    schema_version: 1,
+                    finite_fields: vec![FiniteField {
+                        id: key("base:field/half"),
+                        default_value: 0,
+                        values: vec![0, 1],
+                    }],
                     component_schemas: Vec::new(),
                 },
             ),
@@ -135,7 +149,7 @@ pub fn m0_fixture_pack() -> ContentPack {
             sourced("fixtures/m0/glass_slab.json", {
                 let mut slab = block(
                     "base:glass_slab",
-                    key("base:state/simple"),
+                    slab_state.clone(),
                     Shape::LowerSlab,
                     Some(Shape::LowerSlab),
                     Some(Shape::LowerSlab),
@@ -148,6 +162,33 @@ pub fn m0_fixture_pack() -> ContentPack {
                 );
                 // The slab and the full glass block share one material.
                 slab.render_profile.material = key("base:material/glass");
+                // One block, two halves: the half field selects which part of
+                // the cell the slab occupies.
+                slab.state_overrides = vec![
+                    StateProfile {
+                        values: vec![0],
+                        render_shape: None,
+                        collision_shape: None,
+                        selection_shape: None,
+                        occlusion: None,
+                    },
+                    StateProfile {
+                        values: vec![1],
+                        render_shape: Some(Shape::Box(BoxBounds {
+                            min: [0.0, 0.5, 0.0],
+                            max: [1.0, 1.0, 1.0],
+                        })),
+                        collision_shape: Some(Shape::Box(BoxBounds {
+                            min: [0.0, 0.5, 0.0],
+                            max: [1.0, 1.0, 1.0],
+                        })),
+                        selection_shape: Some(Shape::Box(BoxBounds {
+                            min: [0.0, 0.5, 0.0],
+                            max: [1.0, 1.0, 1.0],
+                        })),
+                        occlusion: None,
+                    },
+                ];
                 slab
             }),
             sourced(
@@ -167,33 +208,6 @@ pub fn m0_fixture_pack() -> ContentPack {
                         None,
                     )
                 },
-            ),
-            sourced(
-                "fixtures/m0/glass_slab_upper.json",
-                block(
-                    "base:glass_slab_upper",
-                    key("base:state/simple"),
-                    // The mirrored half: the box hugs the top of the cell.
-                    Shape::Box(BoxBounds {
-                        min: [0.0, 0.5, 0.0],
-                        max: [1.0, 1.0, 1.0],
-                    }),
-                    Some(Shape::Box(BoxBounds {
-                        min: [0.0, 0.5, 0.0],
-                        max: [1.0, 1.0, 1.0],
-                    })),
-                    Some(Shape::Box(BoxBounds {
-                        min: [0.0, 0.5, 0.0],
-                        max: [1.0, 1.0, 1.0],
-                    })),
-                    // A blended material claims no occlusion: neighbours
-                    // stay visible through it. Same-material faces merge in
-                    // the mesher instead.
-                    0,
-                    AlphaMode::Mask,
-                    inspect_action.clone(),
-                    Some(key("base:glass")),
-                ),
             ),
             sourced(
                 "fixtures/m0/glass.json",
@@ -262,6 +276,7 @@ fn block(
         component_defaults: Vec::new(),
         capability_bindings: Vec::<CapabilityBinding>::new(),
         behavior_bindings: Vec::new(),
+        state_overrides: Vec::new(),
         tags: Vec::new(),
     }
 }

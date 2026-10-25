@@ -240,10 +240,33 @@ pub struct SelectionProfile {
 ///
 /// The mask uses six bits in `-x, +x, -y, +y, -z, +z` order. A missing bit must
 /// produce extra visible faces rather than incorrectly removing a neighbor.
+/// The mask uses six bits in `-x, +x, -y, +y, -z, +z` order. A missing bit must
+/// produce extra visible faces rather than incorrectly removing a neighbor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OcclusionProfile {
-    /// Bit mask for the six cell faces, in `-x, +x, -y, +y, -z, +z` order.
+    /// Coverage of the six cell boundaries.
     pub face_mask: u8,
+}
+
+/// Per-state profile overrides for blocks whose shape varies by state
+/// values, such as slabs with an upper and a lower half.
+///
+/// Every listed entry pins one exact value combination in the schema's
+/// canonical field order. Fields not overridden fall back to the block
+/// definition's own profiles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StateProfile {
+    /// Exact finite field values this override applies to, in the schema's
+    /// canonical field order.
+    pub values: Vec<u16>,
+    /// Render shape override.
+    pub render_shape: Option<Shape>,
+    /// Collision shape override.
+    pub collision_shape: Option<Shape>,
+    /// Selection shape override.
+    pub selection_shape: Option<Shape>,
+    /// Occlusion mask override.
+    pub occlusion: Option<u8>,
 }
 
 /// Light absorption and emission values for the content definition.
@@ -396,6 +419,9 @@ pub struct BlockDefinition {
     pub light_transport: LightTransport,
     /// Interaction action binding.
     pub interaction_profile: InteractionProfile,
+    /// Per-state profile overrides; an empty list means every state uses the
+    /// block's own profiles.
+    pub state_overrides: Vec<StateProfile>,
     /// Component schemas instantiated by default.
     pub component_defaults: Vec<ContentKey>,
     /// Gameplay capabilities exposed by this block.

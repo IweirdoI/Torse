@@ -479,6 +479,7 @@ impl WindowApp {
                 false,
                 &self.materials[self.material],
                 BlockPos::new(200, 1, 1),
+                [0, 1, 0],
             );
             match net.request(call) {
                 Ok(seq) => {
@@ -506,7 +507,8 @@ impl WindowApp {
             };
             if let Some((place, target)) = action_for(&aim, MouseButton::Left) {
                 let material = placement_material(&aim, &self.materials[self.material]);
-                let call = crate::net::edit_call(place, &material, target);
+                let face = aim_hit_face(&aim);
+                let call = crate::net::edit_call(place, &material, target, face);
                 if let Some(Ok(seq)) = self.net.as_mut().map(|net| net.request(call)) {
                     self.requests_sent += 1;
                     self.last_result = format!("seq {} sent", seq.0);
@@ -542,7 +544,8 @@ impl WindowApp {
                 // session has no edit grants, so the admission reply carries
                 // the rejection; the mirror never forks.
                 let material = placement_material(&aim, &self.materials[self.material]);
-                let call = crate::net::edit_call(place, &material, target);
+                let face = aim_hit_face(&aim);
+                let call = crate::net::edit_call(place, &material, target, face);
                 match self.net.as_mut().map(|net| net.request(call)) {
                     Some(Ok(seq)) => self.last_result = format!("seq {} sent", seq.0),
                     Some(Err(error)) => self.last_result = format!("send failed: {error}"),
@@ -550,8 +553,9 @@ impl WindowApp {
                 }
             } else {
                 let material = placement_material(&aim, &self.materials[self.material]);
+                let face = aim_hit_face(&aim);
                 let result = match self.scene.as_mut() {
-                    Some(scene) => scene.apply_edit(place, &material, target),
+                    Some(scene) => scene.apply_edit(place, &material, target, face),
                     None => return,
                 };
                 match result {
@@ -1398,6 +1402,15 @@ fn upper_variant(block: &ContentKey) -> Option<ContentKey> {
 /// The material key a placement actually uses. A click on a ceiling
 /// underside (entry face pointing down) swaps a lower slab for its upper
 /// variant; every other face keeps the selected material.
+/// Entry face of the aim hit, in engine face-index order; a miss falls back
+/// to the top face.
+fn aim_hit_face(aim: &PickOutcome) -> [i32; 3] {
+    match aim {
+        PickOutcome::Hit(hit) => hit.face,
+        PickOutcome::Miss => [0, 1, 0],
+    }
+}
+
 fn placement_material(aim: &PickOutcome, base: &ContentKey) -> ContentKey {
     if let PickOutcome::Hit(hit) = aim
         && hit.face == [0, 0, -1]

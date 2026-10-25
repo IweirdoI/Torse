@@ -169,7 +169,12 @@ impl Connection<torse_net::TcpTransport> {
 
 /// Build the same place or break call the local scene commits, for the
 /// network request path.
-pub fn edit_call(place: bool, block: &ContentKey, target: BlockPos) -> torse_sim::durable::Call {
+pub fn edit_call(
+    place: bool,
+    block: &ContentKey,
+    target: BlockPos,
+    face: [i32; 3],
+) -> torse_sim::durable::Call {
     let action = if place {
         "world:action/place"
     } else {
@@ -180,6 +185,18 @@ pub fn edit_call(place: bool, block: &ContentKey, target: BlockPos) -> torse_sim
         parameters.insert(
             ContentKey::parse("world:field/block").expect("static key"),
             torse_world::ComponentValue::Content(block.clone()),
+        );
+        let face_index = match face {
+            [-1, 0, 0] => 0u32,
+            [1, 0, 0] => 1,
+            [0, -1, 0] => 2,
+            [0, 1, 0] => 3,
+            [0, 0, -1] => 4,
+            _ => 5,
+        };
+        parameters.insert(
+            ContentKey::parse("world:field/face").expect("static key"),
+            torse_world::ComponentValue::U32(face_index),
         );
     }
     torse_sim::durable::Call {
@@ -211,6 +228,7 @@ mod tests {
             false,
             &ContentKey::parse("base:stone").expect("key"),
             BlockPos::new(1, 1, 1),
+            [0, 1, 0],
         );
         let first = connection.request(call.clone()).expect("send");
         let second = connection.request(call).expect("send");

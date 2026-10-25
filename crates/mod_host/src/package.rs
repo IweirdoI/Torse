@@ -948,6 +948,7 @@ fn parse_block(
             },
             component_defaults: Vec::new(),
             capability_bindings: Vec::new(),
+            state_overrides: Vec::new(),
             behavior_bindings: if entry.get("behavior").and_then(toml::Value::as_bool) == Some(true)
             {
                 vec![parse_key(&format!("{package}:rule/behavior")).expect("package key")]

@@ -35,6 +35,8 @@ pub struct GamePack {
     pub content: ContentPack,
     /// Atlas plus material rectangles.
     pub texture: TexturePack,
+    /// Opaque full cubes the pack offers for placement, sorted by key.
+    placeable: Vec<ContentKey>,
     /// World description for the demonstration terrain.
     pub world: WorldFile,
     /// Biome colour table keyed by biome name.
@@ -145,12 +147,21 @@ impl GamePack {
         let world: WorldFile =
             toml::from_str(&world_text).map_err(|error| format!("{}: {error}", world.display()))?;
 
+        let placeable: Vec<ContentKey> = descriptor
+            .blocks
+            .iter()
+            .filter(|(_, spec)| spec.shape == "full_cube" && spec.alpha == "opaque")
+            .filter_map(|(name, _)| {
+                ContentKey::parse(&format!("{}:{}", descriptor.pack.namespace, name)).ok()
+            })
+            .collect();
         let source = format!("{}/atlas.toml", descriptor.pack.namespace);
         let texture = texture_pack(&descriptor, atlas)?;
         let content = content_pack(&descriptor, &source)?;
         Ok(Self {
             content,
             texture,
+            placeable,
             world,
             biomes: descriptor.biomes,
             default_biome: descriptor.pack.biome,
@@ -227,6 +238,38 @@ impl GamePack {
             &self.world.world.biomes,
             self.default_biome.clone(),
         ))
+    }
+
+    /// Blocks a scene may place and break.
+    ///
+    /// The world description's own materials come first, because those are the
+    /// surfaces the terrain is made of; every other opaque full cube follows in
+    /// key order. The client therefore offers real pack content instead of keys
+    /// of its own.
+    pub fn placeable_blocks(&self) -> Vec<ContentKey> {
+        let core = &self.world.world;
+        let mut keys = Vec::new();
+        for name in [
+            &core.stone,
+            &core.dirt,
+            &core.surface,
+            &core.beach,
+            &core.water,
+        ] {
+            if let Ok(key) = ContentKey::parse(name)
+                && !keys.contains(&key)
+            {
+                keys.push(key);
+            }
+        }
+        let extra: Vec<ContentKey> = self
+            .placeable
+            .iter()
+            .filter(|key| !keys.contains(key))
+            .cloned()
+            .collect();
+        keys.extend(extra);
+        keys
     }
 }
 

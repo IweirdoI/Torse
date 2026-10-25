@@ -114,6 +114,8 @@ pub struct Scene {
     palette: Palette,
     /// Material slot per block state and face.
     state_materials: BTreeMap<BlockStateId, StateMaterials>,
+    /// Blocks a pack scene may place and break; `None` keeps the fixture keys.
+    placeable: Option<Vec<ContentKey>>,
     tint_provider: Option<Arc<dyn torse_assets::texture::PositionTintProvider>>,
     tint_provider_generation: u64,
 }
@@ -245,6 +247,7 @@ impl Scene {
             background: None,
             palette,
             state_materials,
+            placeable: None,
             tint_provider: None,
             tint_provider_generation: 0,
         };
@@ -293,6 +296,7 @@ impl Scene {
             background: None,
             palette,
             state_materials,
+            placeable: None,
             tint_provider: None,
             tint_provider_generation: 0,
         };
@@ -324,6 +328,11 @@ impl Scene {
     /// Whether this scene mirrors a server projection instead of generating.
     pub const fn is_network(&self) -> bool {
         self.generator.is_none() && self.layered.is_none()
+    }
+
+    /// Blocks a pack scene may place and break, when the scene came from a pack.
+    pub fn placeable_blocks(&self) -> Option<&[ContentKey]> {
+        self.placeable.as_deref()
     }
 
     /// Handshake compatibility of the shared content pack.
@@ -923,9 +932,11 @@ impl Scene {
             background: None,
             palette,
             state_materials,
+            placeable: None,
             tint_provider: None,
             tint_provider_generation: 0,
         };
+        scene.placeable = Some(game.placeable_blocks());
         scene.set_position_tint_provider(Some(game.tint_provider()))?;
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)

@@ -188,6 +188,8 @@ struct View {
     network: bool,
     ready: bool,
     result: String,
+    /// Hotbar labels supplied by the scene; empty keeps the packaged icons.
+    names: Vec<String>,
     sensitivity: u16,
     hover: Option<Action>,
     pressed: Option<Action>,
@@ -206,6 +208,8 @@ pub struct Hud<'a> {
     pub network: bool,
     pub ready: bool,
     pub result: &'a str,
+    /// Hotbar labels; empty uses the packaged icon names.
+    pub names: Vec<String>,
     /// Captured-look sensitivity, shown and tuned in the pause menu.
     pub sensitivity: f64,
 }
@@ -250,6 +254,7 @@ impl Layer {
             network: hud.network,
             ready: hud.ready,
             result: hud.result.chars().take(120).collect(),
+            names: hud.names.into_iter().take(3).collect(),
             sensitivity: (hud.sensitivity * 100.0).round() as u16,
             hover: layout.hit(state.mode, state.cursor),
             pressed: state.armed,
@@ -367,10 +372,13 @@ impl Layer {
     fn paint_hud(&mut self, c: &mut Canvas, l: &Layout, v: &View, w: i32, h: i32) {
         let slot_x = w / 2 - 38;
         let slot_y = h - 36;
+        let packaged = v.names.is_empty();
         for i in 0..3 {
             let x = slot_x + i as i32 * 26;
             style::slot(c, Rect::new(x, slot_y, 24, 24), i == v.material);
-            c.sprite(&self.skin.icons[i], Rect::new(x + 4, slot_y + 4, 16, 16), 0);
+            if packaged {
+                c.sprite(&self.skin.icons[i], Rect::new(x + 4, slot_y + 4, 16, 16), 0);
+            }
             self.text.draw(
                 c,
                 &(i + 1).to_string(),
@@ -381,14 +389,29 @@ impl Layer {
         }
         // The selected item name would collide with the modal panels.
         if v.mode == Mode::Game {
-            let selected = ["item_stone", "item_glass", "item_plant"][v.material];
-            let width = self.text.measure(self.labels[selected], 12);
-            self.shadow_label(
-                c,
-                selected,
-                Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
-                12,
-            );
+            match v.names.get(v.material) {
+                Some(name) => {
+                    let name = name.clone();
+                    let width = self.text.measure(&name, 12);
+                    self.text.draw(
+                        c,
+                        &name,
+                        Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
+                        12,
+                        TEXT,
+                    );
+                }
+                None => {
+                    let selected = ["item_stone", "item_glass", "item_plant"][v.material];
+                    let width = self.text.measure(self.labels[selected], 12);
+                    self.shadow_label(
+                        c,
+                        selected,
+                        Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
+                        12,
+                    );
+                }
+            }
         }
         let info = if !v.network {
             "hud_local"

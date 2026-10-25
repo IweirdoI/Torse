@@ -150,6 +150,8 @@ struct WindowApp {
     gpu: Option<Gpu>,
     materials: Vec<ContentKey>,
     material: usize,
+    /// Whether the hotbar names come from a pack instead of the packaged icons.
+    pack: bool,
     center: Option<SectionPos>,
     uploaded: bool,
     frames: u32,
@@ -216,6 +218,7 @@ impl WindowApp {
             gpu: None,
             materials,
             material: 0,
+            pack: false,
             center: None,
             uploaded: false,
             frames: 0,
@@ -262,6 +265,8 @@ impl WindowApp {
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
+        // The HUD needs the pack labels before the GPU borrow starts.
+        let names = self.hotbar_names();
         let frame_started = Instant::now();
         let now = frame_started;
         // First frame assumes 60 fps; afterwards integrate the real interval,
@@ -320,6 +325,7 @@ impl WindowApp {
                                 network: self.net.is_some(),
                                 ready: false,
                                 result: &self.last_result,
+                                names: names.clone(),
                                 sensitivity: self.look_sensitivity,
                             },
                         );
@@ -661,6 +667,7 @@ impl WindowApp {
                 network: self.net.is_some(),
                 ready: self.scene.is_some(),
                 result: &self.last_result,
+                names: names.clone(),
                 sensitivity: self.look_sensitivity,
             },
         );
@@ -810,6 +817,18 @@ impl WindowApp {
     /// back. winit's own grab is deliberately not used on Windows because
     /// both of its modes clip the cursor to a one-pixel rect there, which
     /// freezes the reported positions and with them the camera.
+    /// Hotbar labels for a pack scene; an empty list keeps the packaged icons.
+    fn hotbar_names(&self) -> Vec<String> {
+        if !self.pack {
+            return Vec::new();
+        }
+        self.materials
+            .iter()
+            .take(3)
+            .map(|key| key.path().to_owned())
+            .collect()
+    }
+
     fn set_grab(&mut self, grab: bool) {
         self.grabbed = grab;
         if let Some(gpu) = self.gpu.as_ref() {
@@ -1087,6 +1106,11 @@ impl ApplicationHandler for WindowApp {
             window,
         });
         self.scene = scene;
+        if let Some(keys) = self.scene.as_ref().and_then(Scene::placeable_blocks) {
+            self.materials = keys.iter().take(3).cloned().collect();
+            self.material = 0;
+            self.pack = true;
+        }
         self.pending_palette = self.scene.as_ref().map(|scene| scene.palette().clone());
         self.camera = Some(camera);
         // Enter walk mode only after the scene exists; enter_walk spawns the

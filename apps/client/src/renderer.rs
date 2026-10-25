@@ -843,6 +843,7 @@ impl Renderer {
                 network: false,
                 ready: true,
                 result: "",
+                names: Vec::new(),
                 sensitivity: 1.0,
             },
         );

@@ -10,6 +10,10 @@
 //! - A face is culled only when the neighbor's occlusion mask claims the face and
 //!   the block actually touches that cell boundary. Conservative defaults must
 //!   leave extra faces visible rather than delete a visible surface.
+//! - Touching faces of one material form a single surface: a face whose
+//!   cross-section fits inside the neighbor's same-material opposite face is
+//!   dropped, and equal sections drop both sides. This is the explicit
+//!   contact rule that removes coincident panes between glass neighbours.
 //! - A mesh computed from older data must never replace a newer one. [`MeshJob`]
 //!   records the section revision and the six neighbor revisions, and
 //!   [`MeshCache::insert`] rejects results whose stamp no longer matches.
@@ -402,11 +406,23 @@ fn face_culled(
     };
     match sample(neighbor) {
         MeshSample::Ready(neighbor_block) => {
+            let opposite = face.opposite();
+            // Two touching faces of one material describe a single surface.
+            // When this side's cross-section fits inside the neighbour's,
+            // drop it and let the neighbour's face carry the surface: equal
+            // sections cull both sides, which removes the coincident glass
+            // panes between same-material neighbours.
+            if let Some(neighbor_bounds) = neighbor_block.bounds
+                && neighbor_bounds.touches(opposite)
+                && neighbor_block.material_for(opposite) == block.material_for(face)
+                && section_within(face, bounds, neighbor_bounds)
+            {
+                return true;
+            }
             // The shared plane sits on the neighbour's opposite boundary:
             // a half slab below cannot hide the face above its midline, so
             // the neighbour must claim coverage of that boundary and its
             // shape must actually reach it.
-            let opposite = face.opposite();
             if neighbor_block.occlusion & opposite.bit() == 0 {
                 return false;
             }
@@ -419,6 +435,20 @@ fn face_culled(
         // punch holes in the world exactly where the client has no data.
         MeshSample::NotLoaded | MeshSample::OutOfBounds => false,
     }
+}
+
+/// Whether this face's cross-section on the shared plane fits inside the
+/// neighbour's opposite face, so the neighbour's face can replace it.
+fn section_within(face: Face, bounds: RenderBox, neighbor: RenderBox) -> bool {
+    let (first, second) = match face.axis() {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    neighbor.min[first] <= bounds.min[first]
+        && bounds.max[first] <= neighbor.max[first]
+        && neighbor.min[second] <= bounds.min[second]
+        && bounds.max[second] <= neighbor.max[second]
 }
 
 fn emit_face(mesh: &mut MeshData, face: Face, bounds: RenderBox, cell: [f32; 3], material: u16) {
@@ -847,11 +877,11 @@ mod tests {
     }
 
     #[test]
-    fn same_material_without_coverage_keeps_faces() {
+    fn same_material_contact_faces_merge_without_coverage_claims() {
         let sample = |pos: BlockPos| {
             if (1..=2).contains(&pos.x) && pos.y == 1 && pos.z == 1 {
-                // Both cells claim no boundary coverage (mask 0): nothing
-                // may cull the faces between or around them.
+                // Neither cube claims coverage, yet the shared faces are of
+                // one material with equal sections and merge away.
                 MeshSample::Ready(cube(0))
             } else {
                 MeshSample::Ready(RenderBlock {
@@ -863,7 +893,40 @@ mod tests {
             }
         };
         let mesh = build_mesh(4, SectionPos::ZERO, sample);
-        assert_eq!(mesh.face_count(), 12);
+        assert_eq!(mesh.face_count(), 10);
+    }
+
+    #[test]
+    fn same_material_slab_side_merges_into_the_larger_face() {
+        // A lower slab beside a full cube of the same material: the slab's
+        // side face is a subset and disappears, the cube's larger face stays
+        // and carries the whole interface.
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::new(1, 1, 1) {
+                MeshSample::Ready(RenderBlock {
+                    bounds: Some(RenderBox {
+                        min: [0.0, 0.0, 0.0],
+                        max: [1.0, 0.5, 1.0],
+                    }),
+                    occlusion: 0,
+                    material: 1,
+                    face_materials: None,
+                })
+            } else if pos == BlockPos::new(2, 1, 1) {
+                MeshSample::Ready(cube(0))
+            } else {
+                MeshSample::Ready(RenderBlock {
+                    bounds: None,
+                    occlusion: 0,
+                    material: 0,
+                    face_materials: None,
+                })
+            }
+        };
+        let mesh = build_mesh(4, SectionPos::ZERO, sample);
+        // Slab keeps five faces (+x merged); the cube keeps six (-x carries
+        // the interface, including above the slab's empty half).
+        assert_eq!(mesh.face_count(), 11);
     }
 
     #[test]

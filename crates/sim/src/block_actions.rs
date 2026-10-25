@@ -140,6 +140,13 @@ impl ActionHandler for BlockHandler {
             }
             BlockStateId::EMPTY
         };
+        // A solid placement must not overlap any entity's collider:
+        // burying a walker leaves it wedged, since movement refuses
+        // colliders that already overlap terrain. Empty results (air,
+        // break) and non-solid completions fall through.
+        if view.cell_blockers(pos, state)? {
+            return Err(RejectCode::Conflict);
+        }
         let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
         tx.read_block(pos, current).write_block(pos, state);
         Ok(ActionOutput::Mutation(Box::new(tx)))

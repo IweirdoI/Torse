@@ -122,6 +122,98 @@ fn walker_falls_lands_and_jumps() {
 }
 
 #[test]
+fn unstuck_relocates_a_buried_walker() {
+    use torse_sim::OrderingKey;
+    use torse_sim::Transaction;
+    use torse_sim::player::WalkerState;
+    use torse_sim::player::unstuck;
+    use torse_types::TransactionOutcome;
+    use torse_world::Section;
+
+    let content = compile(m0_fixture_pack()).expect("content");
+    let mut world = WorldAuthority::new(
+        WorldId(1),
+        torse_world::BlockStateRegistry::build(&content).expect("registry"),
+        torse_world::ComponentSchemas::build(&content),
+        16,
+        WorldBounds::new(0, 32).expect("bounds"),
+        Compatibility {
+            authority_schema: 1,
+            rules_digest: Digest([1; 32]),
+            content_digest: Digest([2; 32]),
+        },
+    )
+    .expect("authority");
+    for pos in [
+        torse_types::SectionPos::ZERO,
+        torse_types::SectionPos::new(1, 0, 0),
+    ] {
+        world.store_mut().request(pos).expect("request");
+        world
+            .store_mut()
+            .install(pos, Section::empty(16).expect("section"))
+            .expect("install");
+        world.store_mut().finish_load(pos).expect("finish");
+    }
+
+    // Seal the walker in: floor at y=0, walls at the four sides up to y=3,
+    // and a lid at y=3. Free space exists above the lid.
+    let stone = world
+        .registry()
+        .default_state(&key("base:stone"))
+        .expect("stone");
+    let mut seal = Transaction::new(
+        TransactionId(1),
+        key("test:seal"),
+        OrderingKey {
+            phase: torse_sim::Phase::Simulation,
+            rule_priority: 0,
+            stable_task_key: 1,
+            local_sequence: 0,
+        },
+    );
+    for y in 0..=3i64 {
+        for x in 3..=7i64 {
+            for z in 3..=7i64 {
+                let wall = y == 0 || y == 3 || x == 3 || x == 7 || z == 3 || z == 7;
+                if wall {
+                    seal.write_block(torse_types::BlockPos::new(x, y, z), stone);
+                }
+            }
+        }
+    }
+    match world.commit(&seal).expect("no fault").outcome {
+        TransactionOutcome::Committed { .. } => {}
+        outcome => panic!("seal committed: {outcome:?}"),
+    }
+
+    // The walker starts inside the sealed box, its collider overlapping the
+    // walls (embedding is the state being escaped).
+    let handle = world
+        .entities_mut()
+        .spawn(Position::new(5.5, 2.5, 5.5))
+        .expect("spawn");
+    let mut state = WalkerState::new(handle);
+    let source = key("test:motion");
+
+    let outcome = unstuck(&mut world, &mut state, &source, TransactionId(200));
+    let Some(position) = outcome.expect("no fault") else {
+        panic!("a box with headroom above the lid is escapable");
+    };
+    // The escape moved the walker out of the sealed volume.
+    let inside = position.x > 3.0
+        && position.x < 7.0
+        && position.z > 3.0
+        && position.z < 7.0
+        && position.y > 0.0
+        && position.y < 4.0;
+    assert!(!inside, "escaped to {position:?}");
+    // The committed entity position matches.
+    let committed = world.entities().get(handle).expect("entity").position;
+    assert_eq!(committed, position);
+}
+
+#[test]
 fn input_buffer_orders_dedupes_and_caps() {
     let mut buffer = MoveInputBuffer::new(4);
     let input = |seq: u64| MoveInput {

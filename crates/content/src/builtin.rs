@@ -9,11 +9,11 @@
 use torse_types::{ContentKey, ReplicationDeclaration};
 
 use crate::{
-    AlphaMode, BlockDefinition, CapabilityBinding, CapabilityDescriptor, CollisionProfile,
-    ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FaceOverlays, FiniteField,
-    InteractionProfile, LightTransport, MethodDescriptor, ModuleDescriptor, ModuleSide,
-    OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile,
-    ServiceDescriptor, Shape, SourceRef, Sourced, StateSchema,
+    AlphaMode, BlockDefinition, BoxBounds, CapabilityBinding, CapabilityDescriptor,
+    CollisionProfile, ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FaceOverlays,
+    FiniteField, InteractionProfile, LightTransport, MethodDescriptor, ModuleDescriptor,
+    ModuleSide, OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission,
+    SelectionProfile, ServiceDescriptor, Shape, SourceRef, Sourced, StateSchema,
 };
 
 /// Build the deterministic content pack used by M0 tests and tooling.
@@ -142,7 +142,7 @@ pub fn m0_fixture_pack() -> ContentPack {
                     // A blended material hides nothing: neighbours stay
                     // visible through the glass, so occlusion claims none.
                     0,
-                    AlphaMode::Blend,
+                    AlphaMode::Mask,
                     inspect_action.clone(),
                     Some(key("base:glass")),
                 );
@@ -169,6 +169,33 @@ pub fn m0_fixture_pack() -> ContentPack {
                 },
             ),
             sourced(
+                "fixtures/m0/glass_slab_upper.json",
+                block(
+                    "base:glass_slab_upper",
+                    key("base:state/simple"),
+                    // The mirrored half: the box hugs the top of the cell.
+                    Shape::Box(BoxBounds {
+                        min: [0.0, 0.5, 0.0],
+                        max: [1.0, 1.0, 1.0],
+                    }),
+                    Some(Shape::Box(BoxBounds {
+                        min: [0.0, 0.5, 0.0],
+                        max: [1.0, 1.0, 1.0],
+                    })),
+                    Some(Shape::Box(BoxBounds {
+                        min: [0.0, 0.5, 0.0],
+                        max: [1.0, 1.0, 1.0],
+                    })),
+                    // A blended material claims no occlusion: neighbours
+                    // stay visible through it. Same-material faces merge in
+                    // the mesher instead.
+                    0,
+                    AlphaMode::Mask,
+                    inspect_action.clone(),
+                    Some(key("base:glass")),
+                ),
+            ),
+            sourced(
                 "fixtures/m0/glass.json",
                 block(
                     "base:glass",
@@ -178,7 +205,7 @@ pub fn m0_fixture_pack() -> ContentPack {
                     Some(Shape::FullCube),
                     // Transparent like the slab it completes into.
                     0,
-                    AlphaMode::Blend,
+                    AlphaMode::Mask,
                     inspect_action,
                     None,
                 ),

@@ -54,6 +54,8 @@ impl WalkerState {
 pub enum StepError {
     /// The observed entity no longer exists.
     EntityGone,
+    /// The request was rejected; the entity stays where it is.
+    Rejected(RejectCode),
     /// Publication failed; the world stopped by invariant.
     Fault(CommitFault),
 }
@@ -115,13 +117,38 @@ pub fn walker_step(
     );
     let result = world.commit(&tx);
 
+    // A rejection with the entity embedded in terrain is the wedged state:
+    // movement refuses colliders that already overlap. Try to escape to the
+    // nearest free position; when no neighbour is free the walker stays put
+    // by contract. The wedged check runs while the entity borrow is alive,
+    // then the escape takes the world mutably.
+    let wedged_now = match &result {
+        Ok(outcome) => {
+            matches!(outcome.outcome, TransactionOutcome::Rejected(_))
+                && wedged(world, state.handle, id) == Ok(true)
+        }
+        Err(_) => false,
+    };
+
+    if wedged_now
+        && let Ok(Some(escaped)) = unstuck(
+            world,
+            state,
+            source,
+            TransactionId(transaction.0.wrapping_add(1)),
+        )
+    {
+        return Ok((escaped, false));
+    }
+
     let Some(entity) = world.entities().get(state.handle) else {
         return Err(StepError::EntityGone);
     };
     match result {
         Ok(outcome) => {
-            if let TransactionOutcome::Rejected(_) = outcome.outcome {
+            if let TransactionOutcome::Rejected(code) = outcome.outcome {
                 // Drop this tick: the entity stays at its committed position.
+                let _ = code;
                 state.velocity[1] = 0.0;
                 return Ok((entity.position, state.grounded));
             }
@@ -142,6 +169,110 @@ pub fn walker_step(
         state.grounded = false;
     }
     Ok((settled, state.grounded))
+}
+
+/// Escape a wedged entity: relocate it to the nearest free position and
+/// commit the move.
+///
+/// The start may overlap terrain -- that is the condition being escaped.
+/// `None` means no free neighbour was reachable within the escape budget;
+/// the entity stays where it is.
+pub fn unstuck(
+    world: &mut WorldAuthority,
+    state: &mut WalkerState,
+    source: &torse_types::ContentKey,
+    transaction: TransactionId,
+) -> Result<Option<Position>, StepError> {
+    let Some(entity) = world.entities().get(state.handle) else {
+        return Err(StepError::EntityGone);
+    };
+    let (id, previous) = (entity.id, entity.position);
+    let move_result = crate::movement::prepare_escape(
+        world.store(),
+        world.entities(),
+        world.registry(),
+        state.handle,
+        id,
+        WALKER_HALF,
+    );
+    let Some(entity_move) = move_result.map_err(StepError::Rejected)? else {
+        return Ok(None);
+    };
+    let target = Position::from_bits(entity_move.position_bits);
+    let delta = [
+        target.x - previous.x,
+        target.y - previous.y,
+        target.z - previous.z,
+    ];
+    let mut tx = Transaction::new(
+        transaction,
+        source.clone(),
+        OrderingKey {
+            phase: Phase::Simulation,
+            rule_priority: 0,
+            stable_task_key: u64::try_from(transaction.0).unwrap_or(u64::MAX),
+            local_sequence: 0,
+        },
+    );
+    tx.movements.push(crate::Movement {
+        handle: state.handle,
+        id,
+        previous_bits: previous.to_bits(),
+        delta_bits: delta.map(f64::to_bits),
+        half_bits: WALKER_HALF.map(f64::to_bits),
+    });
+    let result = world.commit_escape(&tx);
+    let Some(entity) = world.entities().get(state.handle) else {
+        return Err(StepError::EntityGone);
+    };
+    match result {
+        Ok(committed) => {
+            if !committed {
+                return Ok(None);
+            }
+            state.velocity = [0.0; 3];
+            state.grounded = false;
+            Ok(Some(entity.position))
+        }
+        Err(fault) => Err(StepError::Fault(fault)),
+    }
+}
+
+/// Whether the entity's collider currently overlaps terrain.
+fn wedged(world: &WorldAuthority, handle: EntityHandle, id: EntityId) -> Result<bool, RejectCode> {
+    let entity = world
+        .entities()
+        .get(handle)
+        .ok_or(RejectCode::MissingTarget)?;
+    if entity.id != id {
+        return Err(RejectCode::MissingTarget);
+    }
+    use torse_world_services::{Aabb, CollisionCell, CollisionSource, collides};
+    struct View<'a> {
+        world: &'a WorldAuthority,
+    }
+    impl CollisionSource for View<'_> {
+        fn collision(&self, pos: torse_types::BlockPos) -> CollisionCell {
+            match self.world.store().query(pos) {
+                torse_world::TerrainQuery::Ready(state) => {
+                    let Some(definition) = self.world.registry().definition(state) else {
+                        return CollisionCell::Empty;
+                    };
+                    match &definition.collision_profile.shape {
+                        None => CollisionCell::Empty,
+                        Some(shape) => CollisionCell::Solid(crate::movement::boxes(shape)),
+                    }
+                }
+                torse_world::TerrainQuery::NotLoaded => CollisionCell::NotLoaded,
+                torse_world::TerrainQuery::OutOfBounds => CollisionCell::OutOfBounds,
+            }
+        }
+    }
+    let collider = Aabb::from_center(
+        [entity.position.x, entity.position.y, entity.position.z],
+        WALKER_HALF,
+    );
+    Ok(collides(&View { world }, &collider))
 }
 
 /// One tick of aggregated movement intent.

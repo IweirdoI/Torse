@@ -258,7 +258,7 @@ mod tests {
                 .slot_for(
                     &key(material),
                     match material {
-                        "base:material/glass" => AlphaMode::Blend,
+                        "base:material/glass" => AlphaMode::Mask,
                         "base:material/plant" => AlphaMode::Mask,
                         _ => AlphaMode::Opaque,
                     },
@@ -274,11 +274,11 @@ mod tests {
         assert_eq!(
             palette.surfaces()[usize::from(
                 palette
-                    .slot_for(&key("base:material/glass"), AlphaMode::Blend)
+                    .slot_for(&key("base:material/glass"), AlphaMode::Mask)
                     .unwrap(),
             )]
             .alpha,
-            AlphaMode::Blend
+            AlphaMode::Mask
         );
         assert_eq!(
             palette.surfaces()[usize::from(
@@ -337,7 +337,7 @@ mod tests {
             .slot_for(&key("base:material/stone"), AlphaMode::Opaque)
             .unwrap();
         let blended = palette
-            .slot_for(&key("base:material/stone"), AlphaMode::Blend)
+            .slot_for(&key("base:material/stone"), AlphaMode::Mask)
             .unwrap();
         assert_ne!(opaque, blended);
         assert_eq!(

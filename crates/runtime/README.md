@@ -50,4 +50,4 @@ if let Some(result) = job.try_take() {
 
 该接口不暴露阻塞等待结果的方法。工作线程不执行磁盘、网络操作，也不等待同池子任务；生成与网格适配器按高度行或切片检查取消。执行器不强制终止任意原生代码。
 
-客户端的生成与网格接入见[实现](../../apps/client/src/scene/background.rs)，取消、背压与结果失效的验证见[记录](../../benchmarks/M6-bounded-executor.md)。ECS实验仍通过ecs-probe特性启用。
+生成与网格接入有界执行器的取消、背压与结果失效验证见[记录](../../benchmarks/M6-bounded-executor.md)。ECS实验仍通过ecs-probe特性启用。

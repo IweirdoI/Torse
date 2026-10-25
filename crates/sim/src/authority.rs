@@ -11,7 +11,8 @@
 //! authority escapes.
 
 use torse_types::{
-    CommitCursor, CommitSeq, Compatibility, ResumePoint, SnapshotMeta, TransactionResult, WorldId,
+    CommitCursor, CommitSeq, Compatibility, ResumePoint, SnapshotMeta, TransactionOutcome,
+    TransactionResult, WorldId,
 };
 use torse_world::{
     BlockStateRegistry, ChangeSet, ComponentSchemas, EntityStore, ExchangeError, RestoredWorld,
@@ -294,8 +295,23 @@ impl WorldAuthority {
         )
     }
 
-    /// Prepare and publish one multi-source group in a single hop, for
-    /// journal-less hosts and tests.
+    /// Relocate a wedged entity in one hop. The transaction carries a move
+    /// whose start overlaps terrain; the destination must be free. Returns
+    /// `Ok(false)` when the move was rejected.
+    pub fn commit_escape(&mut self, transaction: &crate::Transaction) -> Result<bool, CommitFault> {
+        let result = self.coordinator.commit_escape(
+            &mut self.store,
+            &mut self.entities,
+            &self.registry,
+            &self.schemas,
+            transaction,
+        )?;
+        Ok(matches!(
+            result.outcome,
+            TransactionOutcome::Committed { .. }
+        ))
+    }
+
     pub fn commit_group(
         &mut self,
         group: &crate::TransactionGroup,

@@ -6,13 +6,13 @@ Torse仍处于早期开发阶段，欢迎提交问题报告、文档修订、测
 
 小范围的文档修正或明确的Bug修复可以直接提交Pull Request。新功能、架构调整、公共接口，以及存档、网络协议或Mod边界的变更，请先在[Issues](https://github.com/TorseWorks/Torse/issues)说明用途和方案，确认范围后再开始实现。
 
-报告问题时，请提供使用的提交版本、操作系统、运行命令、预期结果和实际结果。涉及图形客户端时，补充GPU、图形后端与截图；涉及恢复问题时，保留原始存档，使用副本复现。日志和附件中请去除口令、访问令牌和个人信息。
+报告问题时，请提供使用的提交版本、操作系统、运行命令、预期结果和实际结果。涉及恢复问题时，保留原始存档，使用副本复现。日志和附件中请去除口令、访问令牌和个人信息。
 
 贡献可以从修正文档、补充复现用例或改进错误提示开始。若不确定某项工作是否有人在做，可以在相关Issue下说明计划。
 
 ## 准备环境
 
-仓库使用Rustup管理Rust工具链，[rust-toolchain.toml](rust-toolchain.toml)固定版本为1.93.1，并包含Rustfmt与Clippy。Windows原生构建需要MSVC构建工具。图形客户端需要可用的Vulkan、DirectX 12或Metal后端；无GPU的环境可以运行服务端和无界面场景。
+仓库使用Rustup管理Rust工具链，[rust-toolchain.toml](rust-toolchain.toml)固定版本为1.93.1，并包含Rustfmt与Clippy。Windows原生构建需要MSVC构建工具。GPU探测需要可用的Vulkan、DirectX 12或Metal后端；无GPU的环境可以运行服务端和无界面场景。
 
 先Fork仓库，再克隆自己的副本并创建工作分支：
 
@@ -31,7 +31,7 @@ cargo check --workspace --locked
 rustup target add wasm32-unknown-unknown
 ```
 
-运行方式见[客户端](apps/client/README.md)、[服务端](apps/server/README.md)与[Mod示例](examples/mods/README.md)。各库职责见[框架库说明](crates/README.md)。
+运行方式见[服务端](apps/server/README.md)与[Mod示例](examples/mods/README.md)。各库职责见[框架库说明](crates/README.md)。
 
 ## 修改约定
 

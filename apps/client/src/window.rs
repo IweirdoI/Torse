@@ -69,6 +69,8 @@ pub struct WindowConfig {
     pub probe_outside: bool,
     /// Initial UI screen; machine mode is explicitly a sample-data preview.
     pub ui_mode: crate::ui::Mode,
+    /// Data-driven content pack directory; `None` keeps the fixture content.
+    pub content: Option<String>,
 }
 
 /// Measurements reported when the window closes.
@@ -148,6 +150,8 @@ struct WindowApp {
     gpu: Option<Gpu>,
     materials: Vec<ContentKey>,
     material: usize,
+    /// Whether the hotbar names come from a pack instead of the packaged icons.
+    pack: bool,
     center: Option<SectionPos>,
     uploaded: bool,
     frames: u32,
@@ -161,8 +165,10 @@ struct WindowApp {
     net: Option<crate::net::Connection<torse_net::TcpTransport>>,
     session: Option<u128>,
     grabbed: bool,
+    focused: bool,
     last_cursor: Option<(f64, f64)>,
     look_sensitivity: f64,
+    recentring: bool,
     probe_sent: bool,
     batches: u32,
     requests_sent: u32,
@@ -170,6 +176,10 @@ struct WindowApp {
     walk: bool,
     tick_accumulator: f32,
     walk_ticks: u32,
+    /// Camera position at the last completed walk tick.
+    walk_prev: [f32; 3],
+    /// Camera position at the next walk tick target.
+    walk_next: [f32; 3],
     /// Autoplay sets this when the walker stopped against a terrain step.
     walk_blocked: bool,
     last_result: String,
@@ -214,6 +224,7 @@ impl WindowApp {
             gpu: None,
             materials,
             material: 0,
+            pack: false,
             center: None,
             uploaded: false,
             frames: 0,
@@ -227,8 +238,10 @@ impl WindowApp {
             net: None,
             session: None,
             grabbed: false,
+            focused: true,
             last_cursor: None,
             look_sensitivity: 1.0,
+            recentring: false,
             probe_sent: false,
             batches: 0,
             requests_sent: 0,
@@ -236,6 +249,8 @@ impl WindowApp {
             walk: false,
             tick_accumulator: 0.0,
             walk_ticks: 0,
+            walk_prev: [0.0; 3],
+            walk_next: [0.0; 3],
             walk_blocked: false,
             last_result: String::new(),
             adapter: String::new(),
@@ -260,6 +275,8 @@ impl WindowApp {
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
+        // The HUD needs the pack labels before the GPU borrow starts.
+        let names = self.hotbar_names();
         let frame_started = Instant::now();
         let now = frame_started;
         // First frame assumes 60 fps; afterwards integrate the real interval,
@@ -318,6 +335,7 @@ impl WindowApp {
                                 network: self.net.is_some(),
                                 ready: false,
                                 result: &self.last_result,
+                                names: names.clone(),
                                 sensitivity: self.look_sensitivity,
                             },
                         );
@@ -376,7 +394,11 @@ impl WindowApp {
                         let drifted =
                             (position.x - before.0).abs() + (position.z - before.1).abs() > 0.02;
                         self.walk_blocked = wanted && !drifted;
-                        camera.eye = [
+                        // Interpolation endpoints: the camera glides from the
+                        // previous tick position to this one across the tick
+                        // interval instead of snapping once per tick.
+                        self.walk_prev = self.walk_next;
+                        self.walk_next = [
                             position.x as f32,
                             (position.y + WALKER_EYE_OFFSET) as f32,
                             position.z as f32,
@@ -388,6 +410,13 @@ impl WindowApp {
                         return;
                     }
                 }
+            }
+            // Between ticks the camera glides from the last tick position to
+            // the next: frames no longer wait for a 20 Hz step to move.
+            let alpha = (self.tick_accumulator / TICK).clamp(0.0, 1.0);
+            for axis in 0..3 {
+                camera.eye[axis] =
+                    self.walk_prev[axis] + (self.walk_next[axis] - self.walk_prev[axis]) * alpha;
             }
         } else {
             camera.advance(motion, step);
@@ -476,7 +505,8 @@ impl WindowApp {
                 scene.pick(camera.eye, camera.forward(), PICK_RANGE)
             };
             if let Some((place, target)) = action_for(&aim, MouseButton::Left) {
-                let call = crate::net::edit_call(place, &self.materials[self.material], target);
+                let material = placement_material(&aim, &self.materials[self.material]);
+                let call = crate::net::edit_call(place, &material, target);
                 if let Some(Ok(seq)) = self.net.as_mut().map(|net| net.request(call)) {
                     self.requests_sent += 1;
                     self.last_result = format!("seq {} sent", seq.0);
@@ -511,14 +541,15 @@ impl WindowApp {
                 // Edits go to the server, not the local mirror. The guest
                 // session has no edit grants, so the admission reply carries
                 // the rejection; the mirror never forks.
-                let call = crate::net::edit_call(place, &self.materials[self.material], target);
+                let material = placement_material(&aim, &self.materials[self.material]);
+                let call = crate::net::edit_call(place, &material, target);
                 match self.net.as_mut().map(|net| net.request(call)) {
                     Some(Ok(seq)) => self.last_result = format!("seq {} sent", seq.0),
                     Some(Err(error)) => self.last_result = format!("send failed: {error}"),
                     None => self.last_result = "offline".to_owned(),
                 }
             } else {
-                let material = self.materials[self.material].clone();
+                let material = placement_material(&aim, &self.materials[self.material]);
                 let result = match self.scene.as_mut() {
                     Some(scene) => scene.apply_edit(place, &material, target),
                     None => return,
@@ -600,6 +631,16 @@ impl WindowApp {
         {
             gpu.context.retain_sections(scene.sections());
         }
+        // Belt and braces: some focus transitions skip the Focused event, and
+        // a captured look with no focus moves the camera from outside.
+        if self.grabbed
+            && let Some(gpu) = self.gpu.as_ref()
+            && !gpu.window.has_focus()
+        {
+            self.focused = false;
+            self.input.reset();
+            self.set_grab(false);
+        }
 
         if self.input.take_screenshot() {
             self.pending_shot = Some(format!("torse-shot-{}.png", self.screenshots + 1));
@@ -637,12 +678,13 @@ impl WindowApp {
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
         let (device, queue) = gpu.context.parts();
-        gpu.context.write_camera(
-            self.camera
-                .as_ref()
-                .expect("gpu implies camera")
-                .view_projection(aspect),
-        );
+        let view_projection = self
+            .camera
+            .as_ref()
+            .expect("gpu implies camera")
+            .view_projection(aspect);
+        let eye = self.camera.as_ref().expect("gpu implies camera").eye;
+        gpu.context.write_camera(view_projection, eye);
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("client window frame"),
         });
@@ -658,6 +700,7 @@ impl WindowApp {
                 network: self.net.is_some(),
                 ready: self.scene.is_some(),
                 result: &self.last_result,
+                names: names.clone(),
                 sensitivity: self.look_sensitivity,
             },
         );
@@ -807,7 +850,22 @@ impl WindowApp {
     /// back. winit's own grab is deliberately not used on Windows because
     /// both of its modes clip the cursor to a one-pixel rect there, which
     /// freezes the reported positions and with them the camera.
+    /// Hotbar labels for a pack scene; an empty list keeps the packaged icons.
+    fn hotbar_names(&self) -> Vec<String> {
+        if !self.pack {
+            return Vec::new();
+        }
+        self.materials
+            .iter()
+            .take(3)
+            .map(|key| key.path().to_owned())
+            .collect()
+    }
+
     fn set_grab(&mut self, grab: bool) {
+        // Never capture while the window is unfocused; the next focus event
+        // or the per-frame check re-arms capture.
+        let grab = grab && self.focused;
         self.grabbed = grab;
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.set_cursor_visible(!grab);
@@ -818,11 +876,13 @@ impl WindowApp {
                 ));
                 let _ = gpu.window.set_cursor_position(center);
                 // Deltas are measured from this baseline until real motion
-                // or the drift allowance moves the cursor.
+                // or the drift allowance moves the cursor. The first event
+                // after the programmatic jump is synthetic and skipped.
                 self.last_cursor = Some((
                     f64::from(gpu.config.width / 2),
                     f64::from(gpu.config.height / 2),
                 ));
+                self.recentring = true;
             } else {
                 self.last_cursor = None;
             }
@@ -853,6 +913,15 @@ impl WindowApp {
         }
         self.walk = true;
         self.tick_accumulator = 0.0;
+        // Seed the interpolation endpoints with the spawn position so the
+        // first frames do not glide in from the origin.
+        let start = [
+            under.x as f32,
+            (under.y + WALKER_EYE_OFFSET) as f32,
+            under.z as f32,
+        ];
+        self.walk_prev = start;
+        self.walk_next = start;
     }
 
     /// F5 flips between fly and walk; the walker entity stays in the world.
@@ -995,7 +1064,15 @@ impl ApplicationHandler for WindowApp {
             // empty until then.
             None
         } else {
-            match Scene::new_background(self.config.radius) {
+            // A pack scene generates on the foreground thread; the built-in
+            // fixture scene keeps the bounded background pool.
+            let built = match self.config.content.as_deref() {
+                Some(directory) => {
+                    Scene::new_game(self.config.radius, std::path::Path::new(directory))
+                }
+                None => Scene::new_background(self.config.radius),
+            };
+            match built {
                 Ok(scene) => Some(scene),
                 Err(error) => {
                     self.failure = Some(error);
@@ -1007,10 +1084,19 @@ impl ApplicationHandler for WindowApp {
         let mut camera = FlyCamera::new([8.0, 26.0, 8.0]);
         if let Some(scene) = scene.as_ref() {
             camera = FlyCamera::new(scene.eye());
-            // Only the y = 0 section layer is loaded, and picking terminates at
-            // the first unloaded cell. Keep the starting eye inside that layer
-            // so the aim works no matter how high the spawn surface is.
-            camera.eye[1] = camera.eye[1].min(14.0);
+            if self.config.content.is_some() {
+                // A pack scene is a landscape overview: stand above the spawn
+                // column and look across the terrain instead of into it.
+                camera.eye[1] = (camera.eye[1] + 12.0).min(56.0);
+                camera.eye[2] = (camera.eye[2] - 26.0).max(2.0);
+                camera.pitch = -0.28;
+                camera.yaw = 0.0;
+            } else {
+                // Only the y = 0 section layer is loaded, and picking terminates
+                // at the first unloaded cell. Keep the starting eye inside that
+                // layer so the aim works no matter how high the spawn surface is.
+                camera.eye[1] = camera.eye[1].min(14.0);
+            }
         } else {
             // Overlook the subscribed scope until the baseline lands.
             camera.pitch = -0.7;
@@ -1067,6 +1153,11 @@ impl ApplicationHandler for WindowApp {
             window,
         });
         self.scene = scene;
+        if let Some(keys) = self.scene.as_ref().and_then(Scene::placeable_blocks) {
+            self.materials = keys.iter().take(3).cloned().collect();
+            self.material = 0;
+            self.pack = true;
+        }
         self.pending_palette = self.scene.as_ref().map(|scene| scene.palette().clone());
         self.camera = Some(camera);
         // Enter walk mode only after the scene exists; enter_walk spawns the
@@ -1197,7 +1288,7 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.cursor = [position.x, position.y];
-                if self.grabbed && !self.ui.modal() {
+                if self.grabbed && self.focused && !self.ui.modal() {
                     if let Some(gpu) = self.gpu.as_ref() {
                         let center = (
                             f64::from(gpu.config.width / 2),
@@ -1207,14 +1298,20 @@ impl ApplicationHandler for WindowApp {
                         // per-event re-centring would feed rounding jitter
                         // into the camera every event.
                         let (last_x, last_y) = self.last_cursor.unwrap_or(center);
+                        // The OS cursor lands a pixel off after re-centring;
+                        // that synthetic jump must not reach the camera.
+                        let recentred = self.recentring;
+                        self.recentring = false;
                         let dx = position.x - last_x;
                         let dy = position.y - last_y;
-                        if dx.abs() + dy.abs() > 0.0 {
+                        if !recentred && dx.abs() + dy.abs() > 0.5 {
                             self.input
                                 .mouse_look(dx * self.look_sensitivity, dy * self.look_sensitivity);
                         }
                         // Recentre only on real drift; the hidden cursor may
-                        // wander a little without anyone noticing.
+                        // wander a little without anyone noticing. The next
+                        // CursorMoved after a recentre is the synthetic jump,
+                        // so it is skipped above.
                         if (position.x - center.0).abs() > 24.0
                             || (position.y - center.1).abs() > 24.0
                         {
@@ -1225,6 +1322,7 @@ impl ApplicationHandler for WindowApp {
                                 ));
                             let _ = gpu.window.set_cursor_position(point);
                             self.last_cursor = Some(center);
+                            self.recentring = true;
                         } else {
                             self.last_cursor = Some((position.x, position.y));
                         }
@@ -1252,10 +1350,12 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::Focused(false) => {
+                self.focused = false;
                 self.input.reset();
                 self.set_grab(false);
             }
             WindowEvent::Focused(true) => {
+                self.focused = true;
                 if !self.ui.modal() {
                     self.set_grab(true);
                 }
@@ -1286,6 +1386,28 @@ const fn demo_scope() -> [SectionPos; 2] {
 /// Left breaks the hit cell; right places the selected material against the
 /// entered face. A hit inside a solid cell carries no face, so placement is
 /// dropped rather than guessed.
+/// Mirror-half mapping: a lower slab offers an upper variant, placed when
+/// the click faces a ceiling or the underside of any block.
+fn upper_variant(block: &ContentKey) -> Option<ContentKey> {
+    match block.path() {
+        "glass_slab" => Some(ContentKey::parse("base:glass_slab_upper").expect("static key")),
+        _ => None,
+    }
+}
+
+/// The material key a placement actually uses. A click on a ceiling
+/// underside (entry face pointing down) swaps a lower slab for its upper
+/// variant; every other face keeps the selected material.
+fn placement_material(aim: &PickOutcome, base: &ContentKey) -> ContentKey {
+    if let PickOutcome::Hit(hit) = aim
+        && hit.face == [0, 0, -1]
+        && let Some(upper) = upper_variant(base)
+    {
+        return upper;
+    }
+    base.clone()
+}
+
 fn action_for(outcome: &PickOutcome, button: MouseButton) -> Option<(bool, BlockPos)> {
     let PickOutcome::Hit(hit) = outcome else {
         return None;

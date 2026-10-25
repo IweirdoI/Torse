@@ -32,14 +32,17 @@ def stone(rng: Random) -> Image.Image:
 
 
 def glass() -> Image.Image:
-    image = Image.new("RGBA", (TILE, TILE), (168, 205, 218, 150))
+    # Mask-mode tile: the centre is fully transparent so looking through
+    # glass shows the world unblended, and only the frame plus one highlight
+    # streak are drawn. No alpha sorting is needed this way.
+    image = Image.new("RGBA", (TILE, TILE), (0, 0, 0, 0))
     for i in range(TILE):
-        image.putpixel((i, 0), (208, 236, 244, 210))
-        image.putpixel((i, TILE - 1), (208, 236, 244, 210))
-        image.putpixel((0, i), (208, 236, 244, 210))
-        image.putpixel((TILE - 1, i), (208, 236, 244, 210))
+        image.putpixel((i, 0), (188, 226, 238, 255))
+        image.putpixel((i, TILE - 1), (188, 226, 238, 255))
+        image.putpixel((0, i), (188, 226, 238, 255))
+        image.putpixel((TILE - 1, i), (188, 226, 238, 255))
     for i in range(3, 11):
-        image.putpixel((i, 13 - i), (236, 250, 255, 230))
+        image.putpixel((i, 13 - i), (236, 250, 255, 255))
     return image
 
 

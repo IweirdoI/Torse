@@ -633,6 +633,7 @@ impl CommitCoordinator {
                 registry,
                 &member_edits,
                 &member.movements,
+                crate::movement::MovementMode::Normal,
             )
             .map_err(PrepareError::Rejected)?;
             if lifecycle_batch.is_some() && lifecycle.is_some() {
@@ -721,6 +722,7 @@ impl CommitCoordinator {
             registry,
             &prepared.edits,
             &transaction.movements,
+            crate::movement::MovementMode::Normal,
         )
         .map_err(PrepareError::Rejected)?;
         prepared.entity_moves = resolved.moves;
@@ -977,7 +979,70 @@ impl CommitCoordinator {
         self.finish_commit(store, entities, transaction.id, prepared)
     }
 
-    /// One-hop prepare and publish for a multi-source group.
+    /// One-hop prepare and publish for an escape relocation. The start may
+    /// overlap terrain; the transaction's destination must be free.
+    pub fn commit_escape(
+        &mut self,
+        store: &mut SectionStore,
+        entities: &mut EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        transaction: &crate::Transaction,
+    ) -> Result<TransactionResult<Committed>, CommitFault> {
+        let lifecycle = crate::lifecycle::prepare_lifecycle(store, entities, schemas, transaction);
+        let prepared = self.prepare_escape_prepared(
+            store,
+            entities,
+            registry,
+            schemas,
+            transaction,
+            lifecycle,
+        );
+        self.finish_commit(store, entities, transaction.id, prepared)
+    }
+
+    fn prepare_escape_prepared(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        transaction: &crate::Transaction,
+        lifecycle: Result<Option<LifecycleBatch>, torse_types::RejectCode>,
+    ) -> Result<PreparedChange, PrepareError> {
+        let mut prepared = self.prepare_blocks(store, transaction)?;
+        let resolved = crate::movement::prepare_movements(
+            store,
+            entities,
+            registry,
+            &prepared.edits,
+            &transaction.movements,
+            crate::movement::MovementMode::Escape,
+        )
+        .map_err(PrepareError::Rejected)?;
+        prepared.entity_moves = resolved.moves;
+        prepared.movement_reads = resolved.reads;
+        prepared.movement_handles = transaction
+            .movements
+            .iter()
+            .map(|request| (request.handle, request.id))
+            .collect();
+        let batch = entities
+            .prepare_components(&transaction.components, schemas)
+            .map_err(|error| {
+                PrepareError::Rejected(match error {
+                    torse_world::EntityError::StaleHandle => RejectCode::MissingTarget,
+                    torse_world::EntityError::ComponentConflict => RejectCode::Conflict,
+                    _ => RejectCode::InvalidData,
+                })
+            })?;
+        prepared.component_edits = transaction.components.clone();
+        prepared.component_batch = batch;
+        prepared.lifecycle_batch = lifecycle.ok().flatten();
+        Ok(prepared)
+    }
+
+    /// One-hop prepare and publish for a multi-source group.    /// One-hop prepare and publish for a multi-source group.
     pub fn commit_group(
         &mut self,
         store: &mut SectionStore,

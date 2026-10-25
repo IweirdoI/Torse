@@ -18,6 +18,6 @@
 cargo run -p torse-tools -- recovery-scenario
 ```
 
-Mod测试需要`wasm32-unknown-unknown`目标。窗口编辑、行走、UI与联机画面见[客户端运行说明](../../apps/client/README.md)和[验证记录](../../benchmarks/README.md)。未知内容原始载荷保留仍未实现，不列入已通过的能力。
+Mod测试需要`wasm32-unknown-unknown`目标。窗口编辑、行走与联机画面的验证记录见[验证与测量记录](../../benchmarks/README.md)。未知内容原始载荷保留仍未实现，不列入已通过的能力。
 
 运行产生的数据放入`.work/`，复现存档问题时使用副本，避免覆盖人工存档。

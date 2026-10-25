@@ -6,6 +6,7 @@
 //! rendering.
 
 mod camera;
+mod game;
 mod input;
 mod net;
 mod pick;
@@ -26,7 +27,9 @@ use window::{WindowConfig, run_window};
 const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
                     [--place KEY:X,Y,Z]...\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
-                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]";
+                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]\n\
+       both modes accept [--content <dir>] to load a data-driven pack (atlas.toml,\n\
+       atlas.png, world.toml) instead of the built-in fixture content";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
     let mut probe_outside = false;
     let mut ui_preview = None;
     let mut places: Vec<(String, [i64; 3])> = Vec::new();
+    let mut content: Option<String> = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -84,6 +88,7 @@ fn main() -> ExitCode {
             "--autoplay" => autoplay = true,
             "--walk" => walk = true,
             "--connect" => connect = value(),
+            "--content" => content = value(),
             "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             "--probe-outside" => probe_outside = true,
             "--place" => match value().as_deref().map(parse_place) {
@@ -133,6 +138,7 @@ fn main() -> ExitCode {
             probe_outside,
             sensitivity: sensitivity.clamp(0.2, 5.0),
             ui_mode: ui_preview.unwrap_or_default(),
+            content: content.clone(),
         };
         match run_window(config) {
             Ok(summary) => {
@@ -188,7 +194,16 @@ fn main() -> ExitCode {
             }
         }
     } else if let Some(path) = capture {
-        match run(&path, width, height, radius, &view, ui_preview, &places) {
+        match run(
+            &path,
+            width,
+            height,
+            radius,
+            &view,
+            ui_preview,
+            &places,
+            content.as_deref(),
+        ) {
             Ok(summary) => {
                 println!("{summary}");
                 ExitCode::SUCCESS
@@ -204,6 +219,11 @@ fn main() -> ExitCode {
     }
 }
 
+/// Render one offscreen frame and write it as a PNG.
+///
+/// Every parameter comes straight from the command line, so the list is long by
+/// construction rather than by accident.
+#[allow(clippy::too_many_arguments)]
 fn run(
     path: &str,
     width: u32,
@@ -212,9 +232,13 @@ fn run(
     view: &str,
     ui_preview: Option<ui::Mode>,
     places: &[(String, [i64; 3])],
+    content: Option<&str>,
 ) -> Result<String, String> {
     let start = Instant::now();
-    let mut scene = Scene::new(radius)?;
+    let mut scene = match content {
+        Some(directory) => Scene::new_game(radius, std::path::Path::new(directory))?,
+        None => Scene::new(radius)?,
+    };
     for (material, [x, y, z]) in places {
         let key = torse_types::ContentKey::parse(material)
             .map_err(|error| format!("--place `{material}`: {error}"))?;
@@ -241,7 +265,10 @@ fn run(
         _ => ([40.0, 18.0, 40.0], [0.0, 6.0, 0.0]),
     };
     let camera = Camera::new(eye, target);
-    renderer.render(camera.view_projection(width as f32 / height as f32));
+    renderer.render(
+        camera.view_projection(width as f32 / height as f32),
+        camera.eye,
+    );
     if let Some(mode) = ui_preview {
         renderer.render_ui(mode)?;
     }

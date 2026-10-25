@@ -1,4 +1,4 @@
-use crate::{BoxBounds, Shape, SourceRef, Sourced, compile, m0_fixture_pack};
+use crate::{BoxBounds, Face, Shape, SourceRef, Sourced, compile, m0_fixture_pack};
 
 #[test]
 fn builtin_fixture_compiles() {
@@ -162,6 +162,71 @@ fn capability_binding_and_host_permission_are_independent() {
     assert!(errors.iter().any(|error| {
         error.field == "capability_bindings" && error.message.contains("missing:capability")
     }));
+}
+
+#[test]
+fn face_materials_affect_presentation_only() {
+    // A per-face surface change is a presentation decision: clients may see a
+    // different image while the authoritative content identity stays stable.
+    let base = compile(m0_fixture_pack()).unwrap();
+
+    let mut pack = m0_fixture_pack();
+    let stone = pack
+        .blocks
+        .iter_mut()
+        .find(|block| block.value.id.to_string() == "base:stone")
+        .unwrap();
+    stone
+        .value
+        .render_profile
+        .face_materials
+        .set(Face::PosY, key("base:material/stone_top"));
+
+    let changed = compile(pack).unwrap();
+    assert_eq!(base.authority_digest, changed.authority_digest);
+    assert_ne!(base.presentation_digest, changed.presentation_digest);
+
+    let stone = &changed.blocks[&key("base:stone")];
+    assert_eq!(
+        stone
+            .render_profile
+            .face_materials
+            .get(Face::PosY)
+            .map(|material| material.path()),
+        Some("material/stone_top")
+    );
+    assert_eq!(
+        stone
+            .render_profile
+            .face_materials
+            .resolve(Face::NegY, &stone.render_profile.material)
+            .path(),
+        "material/stone"
+    );
+}
+
+#[test]
+fn same_face_material_change_keeps_authority_digest() {
+    // Setting an override equal to the block material must still be a
+    // presentation change only, never an authority change.
+    let base = compile(m0_fixture_pack()).unwrap();
+
+    let mut pack = m0_fixture_pack();
+    let stone = pack
+        .blocks
+        .iter_mut()
+        .find(|block| block.value.id.to_string() == "base:stone")
+        .unwrap();
+    let material = stone.value.render_profile.material.clone();
+    stone
+        .value
+        .render_profile
+        .face_materials
+        .set(Face::NegX, material);
+
+    let changed = compile(pack).unwrap();
+    assert_eq!(base.authority_digest, changed.authority_digest);
+    assert_ne!(base.presentation_digest, changed.presentation_digest);
 }
 
 fn key(value: &str) -> torse_types::ContentKey {

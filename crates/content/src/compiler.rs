@@ -14,7 +14,7 @@ use torse_types::{ContentKey, Digest};
 
 use crate::descriptor::{
     AlphaMode, BlockDefinition, CapabilityDescriptor, ComponentFieldType, ComponentSchema,
-    ExecutionContract, ModuleDescriptor, ModuleSide, PersistencePolicy, Shape, StateSchema,
+    ExecutionContract, Face, ModuleDescriptor, ModuleSide, PersistencePolicy, Shape, StateSchema,
 };
 
 /// Version of the canonical content model that participates in every digest.
@@ -954,6 +954,16 @@ fn presentation_digest(blocks: &BTreeMap<ContentKey, BlockDefinition>) -> Digest
     for block in blocks.values() {
         writer.key(&block.id);
         writer.key(&block.render_profile.material);
+        // One presence tag plus the key per face keeps the encoding explicit.
+        for face in Face::ALL {
+            match block.render_profile.face_materials.get(face) {
+                Some(material) => {
+                    writer.u8(1);
+                    writer.key(material);
+                }
+                None => writer.u8(0),
+            }
+        }
         writer.u8(match block.render_profile.alpha_mode {
             AlphaMode::Opaque => 0,
             AlphaMode::Mask => 1,

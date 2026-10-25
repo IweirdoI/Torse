@@ -19,8 +19,8 @@
 | [storage](storage/README.md) | 有界日志、检查点、文件恢复扫描与故障处理 |
 | [protocol](protocol/README.md) | 兼容握手、请求、结果、订阅和授权复制消息 |
 | [net](net/README.md) | 会话、速率、有界内存与TCP传输、原子客户端镜像 |
-| [render](render/src/lib.rs) | CPU网格、遮挡剔除、依赖修订校验与网格缓存，另含可选GPU初始化实验 |
-| [assets](assets/src/lib.rs) | 资源管理的预留入口；当前UI资源加载位于客户端 |
+| [render](render/src/lib.rs) | CPU网格、逐面材质槽与局部贴图坐标、遮挡剔除、依赖修订校验与网格缓存，另含可选GPU初始化实验 |
+| [assets](assets/src/lib.rs) | 资源管理的预留入口；当前UI资源与地形图集加载位于客户端 |
 | [diagnostics](diagnostics/src/lib.rs) | 可选、有界的串行分项计时；其他指标由各实现提供 |
 
 ## 依赖与执行

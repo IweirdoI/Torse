@@ -296,8 +296,12 @@ impl Background {
             }
             let side = scene.side as usize;
             let max_faces = side.pow(3) * 6;
-            // Four vertices/normals, six indices, and one material per face.
-            let face_bytes = 8 * size_of::<[f32; 3]>() + 6 * size_of::<u32>() + size_of::<u16>();
+            // Four positions, four normals, four texture coordinates, six
+            // indices, and one material per face.
+            let face_bytes = 8 * size_of::<[f32; 3]>()
+                + 4 * size_of::<[f32; 2]>()
+                + 6 * size_of::<u32>()
+                + size_of::<u16>();
             let task_budget = JobBudget {
                 input_bytes: (side + 2).pow(3) * size_of::<MeshSample>() + size_of::<MeshInput>(),
                 output_bytes: size_of::<MeshData>() + max_faces * face_bytes * 2,
@@ -359,7 +363,12 @@ impl MeshInput {
             for z in -1..=i64::from(scene.side) {
                 for x in -1..=i64::from(scene.side) {
                     cells.push(match origin.checked_add(x, y, z) {
-                        Ok(p) => sample(scene.authority.store(), scene.authority.registry(), p),
+                        Ok(p) => sample(
+                            scene.authority.store(),
+                            scene.authority.registry(),
+                            &scene.state_materials,
+                            p,
+                        ),
                         Err(_) => MeshSample::OutOfBounds,
                     });
                 }

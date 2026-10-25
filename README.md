@@ -18,7 +18,7 @@ Torse目前处于早期开发阶段，已有可运行的图形客户端、独立
 |---|---|---|
 | 世界与地形 | 方块状态、分区存储与流式装载、确定性地形生成、碰撞检测和网格生成 | [世界场景](benchmarks/M1-scenario.md) |
 | 模拟与事务 | 固定步长Tick、阶段调度、实体与组件、动作授权、库存转移和跨模块原子提交 | [Tick执行](benchmarks/M2-tick.md)、[跨模块事务](benchmarks/M4-cross-module.md) |
-| 图形客户端 | 窗口与离屏渲染、飞行与行走、方块选择与编辑、HUD、菜单和截图 | [窗口交互](benchmarks/M1-window.md)、[界面基础](benchmarks/M1-ui.md) |
+| 图形客户端 | 窗口与离屏渲染、图集贴图与逐面材质、飞行与行走、方块选择与编辑、HUD、菜单和截图 | [窗口交互](benchmarks/M1-window.md)、[地形贴图](benchmarks/M1-textures.md) |
 | 持久化 | 日志、检查点、实体生命周期恢复、持久任务与定时事件、请求结果与去重 | [世界恢复](benchmarks/M3-local-world.md)、[执行与网络](benchmarks/B6-B7-execution-network.md) |
 | 联机 | TCP连接、授权基线与增量同步、多人编辑、越界拒绝、撤权与重连 | [联机编辑](benchmarks/M5-net-edit.md)、[授权验收](benchmarks/A8-acceptance.md) |
 | Mod扩展 | 公开SDK、Wasm包加载、机器加工、持久唤醒，以及机器状态与库存的共同提交 | [Mod持久执行](benchmarks/M4-mod-durable.md)、[Mod原子执行](benchmarks/M4-mod-atomic.md) |

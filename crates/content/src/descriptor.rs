@@ -76,13 +76,95 @@ fn validate_box(bounds: &BoxBounds) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Cell faces in occlusion-mask order: `-x, +x, -y, +y, -z, +z`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Face {
+    /// Negative x.
+    NegX,
+    /// Positive x.
+    PosX,
+    /// Negative y.
+    NegY,
+    /// Positive y.
+    PosY,
+    /// Negative z.
+    NegZ,
+    /// Positive z.
+    PosZ,
+}
+
+impl Face {
+    /// All faces in occlusion-mask order.
+    pub const ALL: [Self; 6] = [
+        Self::NegX,
+        Self::PosX,
+        Self::NegY,
+        Self::PosY,
+        Self::NegZ,
+        Self::PosZ,
+    ];
+
+    /// Position of this face in a mask or material slot array.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::NegX => 0,
+            Self::PosX => 1,
+            Self::NegY => 2,
+            Self::PosY => 3,
+            Self::NegZ => 4,
+            Self::PosZ => 5,
+        }
+    }
+}
+
+/// Per-face material overrides for one block.
+///
+/// A missing slot falls back to [`RenderProfile::material`]. Overrides let one
+/// block show different surfaces per face without registering separate block
+/// definitions, for example grass with a top material and a side material.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FaceMaterials {
+    slots: [Option<ContentKey>; 6],
+}
+
+impl FaceMaterials {
+    /// No overrides; every face uses the block material.
+    pub const fn none() -> Self {
+        Self {
+            slots: [None, None, None, None, None, None],
+        }
+    }
+
+    /// Set the material of one face.
+    pub fn set(&mut self, face: Face, material: ContentKey) {
+        self.slots[face.index()] = Some(material);
+    }
+
+    /// Override declared for one face, if any.
+    pub fn get(&self, face: Face) -> Option<&ContentKey> {
+        self.slots[face.index()].as_ref()
+    }
+
+    /// Material of one face, falling back to the block material.
+    pub fn resolve<'a>(&'a self, face: Face, default: &'a ContentKey) -> &'a ContentKey {
+        self.get(face).unwrap_or(default)
+    }
+
+    /// Whether no face carries an override.
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+}
+
 /// Geometry and material selected for rendering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderProfile {
     /// Geometry used for visual meshing.
     pub shape: Shape,
-    /// Material resource selected for the block.
+    /// Material resource selected for faces without an override.
     pub material: ContentKey,
+    /// Per-face material overrides.
+    pub face_materials: FaceMaterials,
     /// Material blending mode.
     pub alpha_mode: AlphaMode,
 }

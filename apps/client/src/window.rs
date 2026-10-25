@@ -27,6 +27,7 @@ use crate::input::InputState;
 use crate::pick::PickOutcome;
 use crate::renderer::GpuContext;
 use crate::scene::Scene;
+use crate::texture::Palette;
 use torse_types::{BlockPos, ContentKey, SectionPos};
 use torse_world::Position;
 
@@ -187,6 +188,9 @@ struct WindowApp {
     rebuild_total_us: u128,
     rebuild_count: u32,
     pending_shot: Option<String>,
+    /// Palette waiting for the next frame to be uploaded, set when a scene is
+    /// installed before the GPU context exists or from a network baseline.
+    pending_palette: Option<Palette>,
     summary: Option<WindowSummary>,
     failure: Option<String>,
 }
@@ -249,6 +253,7 @@ impl WindowApp {
             rebuild_total_us: 0,
             rebuild_count: 0,
             pending_shot: None,
+            pending_palette: None,
             summary: None,
             failure: None,
         }
@@ -618,6 +623,9 @@ impl WindowApp {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
+        if let Some(palette) = self.pending_palette.take() {
+            gpu.context.set_palette(&palette);
+        }
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
         let (device, queue) = gpu.context.parts();
@@ -749,6 +757,7 @@ impl WindowApp {
                     camera.yaw = 0.6;
                 }
                 self.scene = Some(scene);
+                self.pending_palette = self.scene.as_ref().map(|scene| scene.palette().clone());
                 self.center = None;
                 self.uploaded = false;
             }
@@ -1050,6 +1059,7 @@ impl ApplicationHandler for WindowApp {
             window,
         });
         self.scene = scene;
+        self.pending_palette = self.scene.as_ref().map(|scene| scene.palette().clone());
         self.camera = Some(camera);
         // Enter walk mode only after the scene exists; enter_walk spawns the
         // walker through it.

@@ -11,6 +11,7 @@ mod net;
 mod pick;
 mod renderer;
 mod scene;
+mod texture;
 mod ui;
 mod window;
 
@@ -23,6 +24,7 @@ use scene::Scene;
 use window::{WindowConfig, run_window};
 
 const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
+                    [--place KEY:X,Y,Z]...\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
                         [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]";
 
@@ -43,6 +45,7 @@ fn main() -> ExitCode {
     let mut sensitivity = 1.0f64;
     let mut probe_outside = false;
     let mut ui_preview = None;
+    let mut places: Vec<(String, [i64; 3])> = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -83,6 +86,17 @@ fn main() -> ExitCode {
             "--connect" => connect = value(),
             "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             "--probe-outside" => probe_outside = true,
+            "--place" => match value().as_deref().map(parse_place) {
+                Some(Ok(place)) => places.push(place),
+                Some(Err(error)) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
+                }
+                None => {
+                    eprintln!("--place expects MATERIAL:X,Y,Z");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--ui-preview" => match value().as_deref().map(ui::Mode::parse) {
                 Some(Ok(mode)) => ui_preview = Some(mode),
                 _ => {
@@ -103,6 +117,10 @@ fn main() -> ExitCode {
     }
 
     if window {
+        if !places.is_empty() {
+            eprintln!("--place is only available with --capture");
+            return ExitCode::FAILURE;
+        }
         let config = WindowConfig {
             radius: if radius_set { radius } else { 4 },
             width,
@@ -170,7 +188,7 @@ fn main() -> ExitCode {
             }
         }
     } else if let Some(path) = capture {
-        match run(&path, width, height, radius, &view, ui_preview) {
+        match run(&path, width, height, radius, &view, ui_preview, &places) {
             Ok(summary) => {
                 println!("{summary}");
                 ExitCode::SUCCESS
@@ -193,9 +211,17 @@ fn run(
     radius: i64,
     view: &str,
     ui_preview: Option<ui::Mode>,
+    places: &[(String, [i64; 3])],
 ) -> Result<String, String> {
     let start = Instant::now();
     let mut scene = Scene::new(radius)?;
+    for (material, [x, y, z]) in places {
+        let key = torse_types::ContentKey::parse(material)
+            .map_err(|error| format!("--place `{material}`: {error}"))?;
+        scene
+            .apply_edit(true, &key, torse_types::BlockPos::new(*x, *y, *z))
+            .map_err(|error| format!("--place `{material}`: {error}"))?;
+    }
     scene.refresh_meshes();
     let (vertices, indices, faces) = scene.geometry();
     if indices.is_empty() {
@@ -204,6 +230,7 @@ fn run(
     let vertex_bytes = Scene::vertex_bytes(&vertices);
 
     let mut renderer = Renderer::new(width, height)?;
+    renderer.set_palette(scene.palette());
     renderer.upload_section(torse_types::SectionPos::ZERO, &vertex_bytes, &indices);
 
     let (eye, target) = match view {
@@ -235,4 +262,23 @@ fn run(
         eye[2],
         elapsed.as_millis()
     ))
+}
+
+/// Parse one `MATERIAL:X,Y,Z` placement argument.
+fn parse_place(spec: &str) -> Result<(String, [i64; 3]), String> {
+    let (material, coordinates) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| format!("--place expects MATERIAL:X,Y,Z, got `{spec}`"))?;
+    let parts: Vec<&str> = coordinates.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!("--place expects three coordinates in `{spec}`"));
+    }
+    let mut values = [0i64; 3];
+    for (slot, part) in values.iter_mut().zip(parts) {
+        *slot = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("--place coordinate `{part}` is not an integer"))?;
+    }
+    Ok((material.to_string(), values))
 }

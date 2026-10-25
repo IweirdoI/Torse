@@ -161,8 +161,38 @@ pub struct RenderBlock {
     pub bounds: Option<RenderBox>,
     /// Faces this block covers for neighbors, in mask order.
     pub occlusion: u8,
-    /// Material identifier used for batching.
+    /// Material identifier for faces without a per-face override.
     pub material: u16,
+    /// Materials for the six faces in mask order; `None` uses `material`.
+    pub face_materials: Option<[u16; 6]>,
+}
+
+impl RenderBlock {
+    /// Block with no visual; used for empty cells.
+    pub const EMPTY: Self = Self {
+        bounds: None,
+        occlusion: 0,
+        material: 0,
+        face_materials: None,
+    };
+
+    /// Full cube using one material on every face.
+    pub const fn uniform(material: u16) -> Self {
+        Self {
+            bounds: Some(RenderBox::FULL_CUBE),
+            occlusion: 0b0011_1111,
+            material,
+            face_materials: None,
+        }
+    }
+
+    /// Material of one face.
+    pub fn material_for(&self, face: Face) -> u16 {
+        match &self.face_materials {
+            Some(materials) => materials[face.index() as usize],
+            None => self.material,
+        }
+    }
 }
 
 /// Result of sampling one cell.
@@ -185,6 +215,8 @@ pub struct MeshData {
     pub positions: Vec<[f32; 3]>,
     /// One normal per vertex.
     pub normals: Vec<[f32; 3]>,
+    /// One texture coordinate per vertex, local to the face.
+    pub uvs: Vec<[f32; 2]>,
     /// Triangle indices.
     pub indices: Vec<u32>,
     /// Material per emitted quad.
@@ -211,6 +243,7 @@ impl MeshData {
     pub fn byte_size(&self) -> usize {
         self.positions.len() * size_of::<[f32; 3]>()
             + self.normals.len() * size_of::<[f32; 3]>()
+            + self.uvs.len() * size_of::<[f32; 2]>()
             + self.indices.len() * size_of::<u32>()
             + self.materials.len() * size_of::<u16>()
     }
@@ -221,6 +254,7 @@ impl MeshData {
     pub fn allocated_bytes(&self) -> usize {
         self.positions.capacity() * size_of::<[f32; 3]>()
             + self.normals.capacity() * size_of::<[f32; 3]>()
+            + self.uvs.capacity() * size_of::<[f32; 2]>()
             + self.indices.capacity() * size_of::<u32>()
             + self.materials.capacity() * size_of::<u16>()
     }
@@ -290,6 +324,9 @@ fn build_mesh_inner(
         mesh.normals
             .try_reserve_exact(faces * 4)
             .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.uvs
+            .try_reserve_exact(faces * 4)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
         mesh.indices
             .try_reserve_exact(faces * 6)
             .map_err(|_| MeshBuildError::OutputLimit)?;
@@ -328,7 +365,7 @@ fn build_mesh_inner(
                         face,
                         bounds,
                         [x as f32, y as f32, z as f32],
-                        block.material,
+                        block.material_for(face),
                     );
                 }
             }
@@ -337,6 +374,7 @@ fn build_mesh_inner(
     if max_faces.is_some() {
         mesh.positions.shrink_to_fit();
         mesh.normals.shrink_to_fit();
+        mesh.uvs.shrink_to_fit();
         mesh.indices.shrink_to_fit();
         mesh.materials.shrink_to_fit();
     }
@@ -393,9 +431,13 @@ fn emit_face(mesh: &mut MeshData, face: Face, bounds: RenderBox, cell: [f32; 3],
         add(add(origin, edge_u), edge_v),
         add(origin, edge_v),
     ];
-    for corner in corners {
+    // Local face coordinates. The origin corner is the bottom left of the face
+    // image, and v grows towards the first row of the texture.
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    for (corner, uv) in corners.into_iter().zip(uvs) {
         mesh.positions.push(corner);
         mesh.normals.push(normal);
+        mesh.uvs.push(uv);
     }
     // Two triangles: (0, 1, 2) and (0, 2, 3). The corner order is chosen so the
     // cross product points along the face normal.
@@ -626,6 +668,7 @@ mod tests {
             bounds: Some(RenderBox::FULL_CUBE),
             occlusion,
             material: 1,
+            face_materials: None,
         }
     }
 
@@ -641,6 +684,7 @@ mod tests {
                     bounds: None,
                     occlusion: 0,
                     material: 0,
+                    face_materials: None,
                 })
             }
         }
@@ -653,6 +697,34 @@ mod tests {
         assert_eq!(mesh.positions.len(), 24);
         assert_eq!(mesh.triangle_count(), 12);
         assert_eq!(mesh.normals.len(), mesh.positions.len());
+        assert_eq!(mesh.uvs.len(), mesh.positions.len());
+    }
+
+    #[test]
+    fn every_quad_carries_local_face_coordinates() {
+        let mesh = build_mesh(4, SectionPos::ZERO, single(Some(cube(0b11_1111))));
+        for quad in mesh.uvs.chunks(4) {
+            // Corner order is origin, +u, +u+v, +v.
+            assert_eq!(quad, [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+        }
+    }
+
+    #[test]
+    fn per_face_materials_select_by_face_order() {
+        let block = RenderBlock {
+            bounds: Some(RenderBox::FULL_CUBE),
+            occlusion: 0b11_1111,
+            material: 9,
+            face_materials: Some([10, 11, 12, 13, 14, 15]),
+        };
+        let mesh = build_mesh(4, SectionPos::ZERO, single(Some(block)));
+        assert_eq!(mesh.materials, vec![10, 11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn uniform_block_keeps_one_material_on_every_face() {
+        let mesh = build_mesh(4, SectionPos::ZERO, single(Some(RenderBlock::uniform(7))));
+        assert_eq!(mesh.materials, vec![7; 6]);
     }
 
     #[test]
@@ -665,6 +737,7 @@ mod tests {
                     bounds: None,
                     occlusion: 0,
                     material: 0,
+                    face_materials: None,
                 })
             }
         };
@@ -695,6 +768,7 @@ mod tests {
                     bounds: None,
                     occlusion: 0,
                     material: 0,
+                    face_materials: None,
                 })
             }
         };
@@ -711,6 +785,7 @@ mod tests {
             }),
             occlusion: 0b11_1111,
             material: 1,
+            face_materials: None,
         };
         let sample = |pos: BlockPos| {
             if pos == BlockPos::new(1, 1, 1) {
@@ -722,6 +797,7 @@ mod tests {
                     bounds: None,
                     occlusion: 0,
                     material: 0,
+                    face_materials: None,
                 })
             }
         };
@@ -752,12 +828,14 @@ mod tests {
                     bounds: Some(RenderBox::FULL_CUBE),
                     occlusion: 0,
                     material: 2,
+                    face_materials: None,
                 })
             } else {
                 MeshSample::Ready(RenderBlock {
                     bounds: None,
                     occlusion: 0,
                     material: 0,
+                    face_materials: None,
                 })
             }
         };
@@ -780,6 +858,7 @@ mod tests {
                     bounds: None,
                     occlusion: 0,
                     material: 0,
+                    face_materials: None,
                 })
             }
         };
@@ -797,6 +876,7 @@ mod tests {
                     bounds: None,
                     occlusion: 0,
                     material: 0,
+                    face_materials: None,
                 })
             }
         };

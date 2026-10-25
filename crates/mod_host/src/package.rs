@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use torse_content::{
     AlphaMode, BlockDefinition, CollisionProfile, ComponentField, ComponentFieldType,
-    ComponentSchema as ContentComponentSchema, ContentPack, FiniteField, InteractionProfile,
-    LightTransport, ModuleDescriptor, ModuleSide, OcclusionProfile, PersistencePolicy,
-    RenderProfile, RequestedPermission, SelectionProfile, Shape, SourceRef, Sourced, StateSchema,
-    compile,
+    ComponentSchema as ContentComponentSchema, ContentPack, FaceMaterials, FiniteField,
+    InteractionProfile, LightTransport, ModuleDescriptor, ModuleSide, OcclusionProfile,
+    PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile, Shape, SourceRef,
+    Sourced, StateSchema, compile,
 };
 use torse_types::{ContentKey, ReplicationDeclaration};
 use torse_world::{BlockStateRegistry, ComponentSchemas};
@@ -853,6 +853,7 @@ fn parse_block(
             render_profile: RenderProfile {
                 shape,
                 material,
+                face_materials: FaceMaterials::none(),
                 alpha_mode: alpha,
             },
             collision_profile: CollisionProfile { shape: collision },

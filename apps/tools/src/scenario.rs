@@ -316,23 +316,16 @@ fn sample_render(store: &SectionStore, registry: &BlockStateRegistry, pos: Block
     match store.query(pos) {
         TerrainQuery::Ready(state) => {
             if state.is_empty() {
-                return MeshSample::Ready(RenderBlock {
-                    bounds: None,
-                    occlusion: 0,
-                    material: 0,
-                });
+                return MeshSample::Ready(RenderBlock::EMPTY);
             }
             let Some(definition) = registry.definition(state) else {
-                return MeshSample::Ready(RenderBlock {
-                    bounds: None,
-                    occlusion: 0,
-                    material: 0,
-                });
+                return MeshSample::Ready(RenderBlock::EMPTY);
             };
             MeshSample::Ready(RenderBlock {
                 bounds: render_box(definition),
                 occlusion: definition.occlusion_profile.face_mask,
                 material: state.0,
+                face_materials: None,
             })
         }
         TerrainQuery::NotLoaded => MeshSample::NotLoaded,

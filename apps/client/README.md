@@ -39,6 +39,7 @@ cargo run -p torse-client -- --window --connect 127.0.0.1:7777
 | `--width N`、`--height N` | 输出图像或初始窗口尺寸，默认960x540 |
 | `--radius N` | 本地分区半径0到16，离屏默认2，窗口默认4 |
 | `--view overview`、`--view player` | 离屏相机，默认俯视全景 |
+| `--place KEY:X,Y,Z` | 离屏模式先放置一个方块，可重复；用于复现形状与透明检查 |
 | `--frames N` | 窗口呈现指定帧数后退出，用于自动验证 |
 | `--screenshot FILE` | 窗口正常退出前保存最后一帧 |
 | `--autoplay` | 自动前进并周期性尝试破坏或放置方块，会修改世界 |
@@ -73,13 +74,22 @@ cargo run -p torse-client -- --capture ui.png --width 960 --height 540 --ui-prev
 
 界面按可用空间选择1到4倍整数缩放。PNG和文案位于[基础游戏资源](../../games/base/assets/README.md)，编译时嵌入；修改后需重新编译。字体从操作系统读取，可用`TORSE_UI_FONT`指定TTF、OTF或TTC。缺少中文字形时使用英文文案，没有可用字体则报告错误。
 
+## 贴图与材质
+
+地形绘制使用一张纹理图集与固定大小的材质表。内容为每个方块面选择材质键，客户端把材质键解析为图集矩形、色调和混合模式，顶点携带材质槽位；片元着色器按槽位采样图集，乘以色调与方向光，并按混合模式处理透明。顶点布局为位置、法线、局部贴图坐标和一个材质槽，共36字节。
+
+材质表上限256项，内容用到的材质超过上限时启动失败。混合模式来自内容定义：不透明与二值透明在片元阶段处理，二值透明按alpha阈值丢弃；半透明面积进入同一绘制通道并开启alpha混合，因此透明面之间没有排序，交叠观感取决于绘制顺序。图集采样使用最近邻，当前没有mipmap、各向异性过滤与纹理数组。
+
+图集与材质条目位于[基础游戏贴图](../../games/base/assets/textures/README.md)，客户端在[texture.rs](src/texture.rs)编译期嵌入图集并声明材质矩形。其他游戏用自有内容键构造`TexturePack`，交给`Scene::with_pack`，再由`GpuContext::set_palette`上传；公开接口不依赖基础游戏的键名。证据与限制见[贴图记录](../../benchmarks/M1-textures.md)。
+
 ## 实现入口
 
 | 文件 | 职责 |
 |---|---|
 | [scene.rs](src/scene.rs) | 内容与世界装配、流式分区、网格、动作提交与行走接入 |
 | [background.rs](src/scene/background.rs) | 有界生成与网格任务、取消、背压与结果依赖校验 |
-| [renderer.rs](src/renderer.rs) | GPU管线、分区缓冲、离屏输出和截图 |
+| [renderer.rs](src/renderer.rs) | GPU管线、材质表、图集上传、分区缓冲、离屏输出和截图 |
+| [texture.rs](src/texture.rs) | 图集解码、材质包校验、材质表与透明分类 |
 | [window.rs](src/window.rs) | 窗口、帧循环、输入调度与网络轮询 |
 | [net.rs](src/net.rs) | 握手、订阅、授权镜像与编辑请求 |
 | [input.rs](src/input.rs)、[camera.rs](src/camera.rs) | 输入聚合与相机 |
@@ -94,6 +104,6 @@ cargo run -p torse-client -- --capture ui.png --width 960 --height 540 --ui-prev
 - 实体以色块呈现，行走玩家由相机表现，本地行走实体不持久化。出生点嵌入地形时可能冻结，可切回飞行后重新进入行走。
 - 放置不消耗库存，破坏不生成掉落；机器面板仍为预览，真实库存图形操作尚未接入。
 - 拾取把非空格按完整立方体处理，当前演示只装载`y = 0`分区层。
-- 地形使用顶点颜色与方向光，没有纹理、阴影、透明排序、自动上台阶或水体物理。
+- 地形使用图集贴图与方向光；没有阴影、透明排序、mipmap、自动上台阶或水体物理。
 
 CI执行编译和测试，窗口交互、输入及真实GPU画面仍需本地验证。

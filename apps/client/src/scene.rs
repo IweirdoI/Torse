@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use torse_content::{BlockDefinition, Shape, compile, m0_fixture_pack};
+use torse_content::{BlockDefinition, Face, Shape, compile, m0_fixture_pack};
 use torse_render::{MeshData, MeshSample, RenderBlock, RenderBox, build_mesh};
 use torse_sim::WorldAuthority;
 use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
@@ -25,6 +25,7 @@ use torse_world::{
 use torse_world_services::{GenerationParams, HillTerrain};
 
 use crate::pick::{PickHit, PickOutcome, cast_ray};
+use crate::texture::{Palette, TexturePack};
 
 mod background;
 pub use background::BackgroundStats;
@@ -49,8 +50,10 @@ pub struct Vertex {
     pub position: [f32; 3],
     /// Face normal.
     pub normal: [f32; 3],
-    /// Flat colour for the material.
-    pub color: [f32; 3],
+    /// Local texture coordinates within the face.
+    pub uv: [f32; 2],
+    /// Material slot looked up in the client material table.
+    pub material: u32,
 }
 
 impl Vertex {
@@ -62,10 +65,11 @@ impl Vertex {
             .position
             .iter()
             .chain(self.normal.iter())
-            .chain(self.color.iter())
+            .chain(self.uv.iter())
         {
             out.extend_from_slice(&value.to_le_bytes());
         }
+        out.extend_from_slice(&self.material.to_le_bytes());
     }
 }
 
@@ -88,6 +92,9 @@ pub struct Scene {
     next_load_generation: u64,
     load_generations: BTreeMap<SectionPos, u64>,
     background: Option<Background>,
+    palette: Palette,
+    /// Material slot per block state and face.
+    state_materials: BTreeMap<BlockStateId, [u16; 6]>,
 }
 
 /// One content pack for every client mode, matching the server demo assembly
@@ -114,13 +121,56 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
     Ok((registry, schemas, compatibility))
 }
 
+/// Build the palette and the per-state material slots.
+///
+/// Every block state resolves six material slots once at startup; meshing then
+/// copies the slots into each render block without touching content keys.
+fn material_tables(
+    registry: &BlockStateRegistry,
+    pack: &TexturePack,
+) -> Result<(Palette, BTreeMap<BlockStateId, [u16; 6]>), String> {
+    let palette = Palette::build(registry, pack)?;
+    let mut states = BTreeMap::new();
+    for index in 0..registry.state_count() {
+        let state = BlockStateId(index as u16);
+        let Some(definition) = registry.definition(state) else {
+            continue;
+        };
+        let profile = &definition.render_profile;
+        let mut slots = [0u16; 6];
+        for face in Face::ALL {
+            let material = profile.face_materials.resolve(face, &profile.material);
+            slots[face.index()] = palette
+                .slot(material)
+                .ok_or_else(|| format!("material `{material}` is missing from the palette"))?;
+        }
+        states.insert(state, slots);
+    }
+    Ok((palette, states))
+}
+
 impl Scene {
-    /// Build a scene with a seeded hill terrain.
+    /// Build a scene with a seeded hill terrain and the base game texture pack.
     pub fn new(radius: i64) -> Result<Self, String> {
+        Self::with_pack(radius, TexturePack::embedded()?)
+    }
+
+    /// Build a scene from one authorized replica baseline.
+    ///
+    /// The network client has no generator: sections and entities come from
+    /// the server projection only, and `load_around` keeps the subscribed
+    /// section list as-is.
+    pub fn from_snapshot(snapshot: &ReplicaSnapshot) -> Result<Self, String> {
+        Self::from_snapshot_with_pack(snapshot, TexturePack::embedded()?)
+    }
+
+    /// Build a scene with an explicit texture pack.
+    pub fn with_pack(radius: i64, pack: TexturePack) -> Result<Self, String> {
         if !(0..=16).contains(&radius) {
             return Err("scene radius must be 0..=16".to_owned());
         }
         let (registry, schemas, compatibility) = compile_content()?;
+        let (palette, state_materials) = material_tables(&registry, &pack)?;
         let stone = registry
             .default_state(&key("base:stone"))
             .ok_or_else(|| "missing base:stone".to_owned())?;
@@ -154,18 +204,20 @@ impl Scene {
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
             background: None,
+            palette,
+            state_materials,
         };
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)
     }
 
-    /// Build a scene from one authorized replica baseline.
-    ///
-    /// The network client has no generator: sections and entities come from
-    /// the server projection only, and `load_around` keeps the subscribed
-    /// section list as-is.
-    pub fn from_snapshot(snapshot: &ReplicaSnapshot) -> Result<Self, String> {
+    /// Build a network scene with an explicit texture pack.
+    pub fn from_snapshot_with_pack(
+        snapshot: &ReplicaSnapshot,
+        pack: TexturePack,
+    ) -> Result<Self, String> {
         let (registry, schemas, compatibility) = compile_content()?;
+        let (palette, state_materials) = material_tables(&registry, &pack)?;
         let service = ActionService::bind(
             block_actions::descriptors(),
             block_actions::handlers(),
@@ -197,9 +249,16 @@ impl Scene {
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
             background: None,
+            palette,
+            state_materials,
         };
         scene.install_snapshot(snapshot)?;
         Ok(scene)
+    }
+
+    /// Material palette used by the terrain shader.
+    pub fn palette(&self) -> &Palette {
+        &self.palette
     }
 
     /// Whether this scene mirrors a server projection instead of generating.
@@ -416,7 +475,8 @@ impl Scene {
                 vertices.push(Vertex {
                     position,
                     normal: [0.0, 1.0, 0.0],
-                    color: [0.05, 0.05, 0.05],
+                    uv: [0.0, 0.0],
+                    material: 0,
                 });
             }
         }
@@ -683,7 +743,9 @@ impl Scene {
             let Some(_revision) = job.terrain.section_revision else {
                 continue;
             };
-            let mesh = build_mesh(self.side, *pos, |query| sample(store, registry, query));
+            let mesh = build_mesh(self.side, *pos, |query| {
+                sample(store, registry, &self.state_materials, query)
+            });
             self.meshes.insert(*pos, (job, mesh));
             rebuilt.push(*pos);
         }
@@ -744,6 +806,7 @@ impl Scene {
                     entity.position.y as f32,
                     entity.position.z as f32,
                 ],
+                u32::from(self.palette.entity_slot()),
             );
         }
         (vertices, indices)
@@ -760,7 +823,6 @@ impl Scene {
         let mut vertices = Vec::with_capacity(mesh.positions.len());
         let mut indices = Vec::with_capacity(mesh.indices.len());
         for (index, position) in mesh.positions.iter().enumerate() {
-            let material = mesh.materials[index / 4];
             vertices.push(Vertex {
                 position: [
                     position[0] + offset[0],
@@ -768,7 +830,8 @@ impl Scene {
                     position[2] + offset[2],
                 ],
                 normal: mesh.normals[index],
-                color: material_color(self.authority.registry(), material),
+                uv: mesh.uvs[index],
+                material: u32::from(mesh.materials[index / 4]),
             });
         }
         indices.extend(mesh.indices.iter().copied());
@@ -805,7 +868,6 @@ impl Scene {
             ];
             let base = vertices.len() as u32;
             for (index, position) in mesh.positions.iter().enumerate() {
-                let material = mesh.materials[index / 4];
                 vertices.push(Vertex {
                     position: [
                         position[0] + offset[0],
@@ -813,7 +875,8 @@ impl Scene {
                         position[2] + offset[2],
                     ],
                     normal: mesh.normals[index],
-                    color: material_color(self.authority.registry(), material),
+                    uv: mesh.uvs[index],
+                    material: u32::from(mesh.materials[index / 4]),
                 });
             }
             indices.extend(mesh.indices.iter().map(|value| base + value));
@@ -832,6 +895,7 @@ impl Scene {
                     entity.position.y as f32,
                     entity.position.z as f32,
                 ],
+                u32::from(self.palette.entity_slot()),
             );
         }
         (vertices, indices, faces)
@@ -873,9 +937,13 @@ fn registry_state(
 }
 
 /// Append one boxy body for an entity; returns the face count added.
-fn push_entity_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3]) -> usize {
+fn push_entity_box(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    material: u32,
+) -> usize {
     const HALF: f32 = 0.35;
-    let color = [0.78, 0.55, 0.35];
     let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
         ([1.0, 0.0, 0.0], [HALF, -HALF, -HALF], [HALF, HALF, HALF]),
         ([-1.0, 0.0, 0.0], [-HALF, HALF, -HALF], [-HALF, -HALF, HALF]),
@@ -903,7 +971,8 @@ fn push_entity_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [
                     center[2] + corner[2],
                 ],
                 normal: [nx, ny, nz],
-                color,
+                uv: [0.0, 0.0],
+                material,
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -919,32 +988,26 @@ fn key(value: &str) -> ContentKey {
 fn sample(
     store: &torse_world::SectionStore,
     registry: &BlockStateRegistry,
+    state_materials: &BTreeMap<BlockStateId, [u16; 6]>,
     pos: BlockPos,
 ) -> MeshSample {
     match store.query(pos) {
         TerrainQuery::Ready(state) => {
             if state.is_empty() {
-                return MeshSample::Ready(empty_block());
+                return MeshSample::Ready(RenderBlock::EMPTY);
             }
             let Some(definition) = registry.definition(state) else {
-                return MeshSample::Ready(empty_block());
+                return MeshSample::Ready(RenderBlock::EMPTY);
             };
             MeshSample::Ready(RenderBlock {
                 bounds: render_box(definition),
                 occlusion: definition.occlusion_profile.face_mask,
-                material: state.0,
+                material: 0,
+                face_materials: Some(state_materials.get(&state).copied().unwrap_or([0; 6])),
             })
         }
         TerrainQuery::NotLoaded => MeshSample::NotLoaded,
         TerrainQuery::OutOfBounds => MeshSample::OutOfBounds,
-    }
-}
-
-const fn empty_block() -> RenderBlock {
-    RenderBlock {
-        bounds: None,
-        occlusion: 0,
-        material: 0,
     }
 }
 
@@ -964,21 +1027,6 @@ fn render_box(definition: &BlockDefinition) -> Option<RenderBox> {
             min: bounds.min,
             max: bounds.max,
         }),
-    }
-}
-
-fn material_color(registry: &BlockStateRegistry, material: u16) -> [f32; 3] {
-    let Some(path) = registry
-        .definition_key(BlockStateId(material))
-        .map(|key| key.path())
-    else {
-        return [0.70, 0.70, 0.70];
-    };
-    match path {
-        "stone" => [0.62, 0.61, 0.58],
-        "glass_slab" => [0.62, 0.78, 0.82],
-        "plant" => [0.36, 0.55, 0.32],
-        _ => [0.70, 0.70, 0.70],
     }
 }
 
@@ -1130,10 +1178,13 @@ mod tests {
         let vertices = [Vertex {
             position: [1.0, 2.0, 3.0],
             normal: [0.0, 1.0, 0.0],
-            color: [0.5, 0.5, 0.5],
+            uv: [0.25, 0.75],
+            material: 3,
         }];
         let bytes = Scene::vertex_bytes(&vertices);
         assert_eq!(bytes.len(), Vertex::STRIDE);
+        // Material is the trailing little-endian u32.
+        assert_eq!(&bytes[32..36], &3u32.to_le_bytes());
     }
 
     fn query(scene: &Scene, pos: BlockPos) -> bool {

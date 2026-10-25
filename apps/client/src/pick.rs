@@ -100,8 +100,8 @@ fn cell_box(cell: BlockPos, bounds: &RenderBox) -> ([f32; 3], [f32; 3]) {
 
 /// Traverse the grid and report the first block shape the ray intersects.
 ///
-/// `shape_of` classifies one cell (see [`ShapeQuery`]). Direction need not
-/// be normalized. Partial shapes only stop the ray when the ray actually
+/// The caller supplies `shape_of`, which classifies one cell. Direction need
+/// not be normalized. Partial shapes only stop the ray when the ray actually
 /// passes through their box; the reported face is that box's entered face,
 /// or the crossed cell boundary when the ray was already inside the shape.
 pub fn cast_ray(

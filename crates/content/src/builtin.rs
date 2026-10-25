@@ -10,10 +10,10 @@ use torse_types::{ContentKey, ReplicationDeclaration};
 
 use crate::{
     AlphaMode, BlockDefinition, CapabilityBinding, CapabilityDescriptor, CollisionProfile,
-    ComponentSchema, ContentPack, ExecutionContract, FiniteField, InteractionProfile,
-    LightTransport, MethodDescriptor, ModuleDescriptor, ModuleSide, OcclusionProfile,
-    PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile, ServiceDescriptor,
-    Shape, SourceRef, Sourced, StateSchema,
+    ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FiniteField,
+    InteractionProfile, LightTransport, MethodDescriptor, ModuleDescriptor, ModuleSide,
+    OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile,
+    ServiceDescriptor, Shape, SourceRef, Sourced, StateSchema,
 };
 
 /// Build the deterministic content pack used by M0 tests and tooling.
@@ -181,13 +181,18 @@ fn block(
     // A helper keeps the fixture focused on deliberately different profiles.
     // Render, collision, selection, occlusion, and light are still populated as
     // separate fields so no hidden inference is introduced.
+    let id = key(id);
+    // One material per block keeps the fallback colours distinct; real content
+    // may share a material across blocks and override individual faces.
+    let material = key(&format!("base:material/{}", id.path()));
     BlockDefinition {
-        id: key(id),
+        id,
         definition_version: 1,
         state_schema,
         render_profile: RenderProfile {
             shape: render_shape,
-            material: key("base:material/default"),
+            material,
+            face_materials: FaceMaterials::none(),
             alpha_mode,
         },
         collision_profile: CollisionProfile {

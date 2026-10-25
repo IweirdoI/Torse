@@ -1,0 +1,8 @@
+ticks=20
+warmup=3
+rules=8
+max_in_flight=8
+synthetic_rounds=0,200000
+backend=sink-with-streaming-crc32c
+logical_cpus=28
+rustc 1.93.1 (01f6ddf75 2026-02-11)

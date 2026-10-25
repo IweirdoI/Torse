@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use torse_net::{TcpTransport, TransportLimits};
 use torse_server::{
-    HostAuthority, WorldDirectory, bootstrap as base,
+    HostAuthority, PlanningConfig, WorldDirectory, bootstrap as base,
     execution::{ExecutionHost, ExecutionRecovery},
     network::{NetworkHub, PeerPolicy},
 };
@@ -14,13 +14,13 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators]"
+            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N]"
         );
         return Ok(());
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators]"
+            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N]"
         );
         return Ok(());
     }
@@ -32,8 +32,20 @@ fn run() -> Result<(), Fault> {
     let mut revoke_after = 0u64;
     let mut mod_dirs = Vec::new();
     let mut machine_operators = false;
+    let mut planning = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--planning-workers" => {
+                let workers = args
+                    .next()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| (1..=64).contains(n))
+                    .ok_or_else(|| Fault::invalid_data("planning workers must be 1..64"))?;
+                planning = Some(PlanningConfig {
+                    workers,
+                    max_in_flight: workers,
+                });
+            }
             "--mod" => mod_dirs
                 .push(PathBuf::from(args.next().ok_or_else(|| {
                     Fault::invalid_data("missing mod directory")
@@ -115,6 +127,7 @@ fn run() -> Result<(), Fault> {
             ExecutionHost::new(binding, world, actions, rules, limits)
         })?
     };
+    server.set_parallel_planning(planning)?;
     let listener = TcpListener::bind(&address).map_err(|e| Fault::invalid_data(e.to_string()))?;
     listener
         .set_nonblocking(true)

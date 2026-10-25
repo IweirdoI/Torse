@@ -51,8 +51,8 @@ const RETRY_TICKS: u64 = 8;
 const MAX_ATTEMPTS: u32 = 8;
 
 /// Mutable rule state: the guest executor. The rule trait
-/// takes `&self`, so mutation lives behind a `RefCell`; the server is
-/// single-threaded and dispatches never recurse.
+/// takes `&self`, so mutation lives behind a `RefCell`; this adapter keeps
+/// serial callbacks on the host thread and dispatches never recurse.
 struct RuleInner {
     guest: DurableGuest,
 }

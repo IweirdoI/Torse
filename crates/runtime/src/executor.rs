@@ -16,6 +16,23 @@ pub struct ExecutorConfig {
     pub max_output_bytes: usize,
 }
 
+impl ExecutorConfig {
+    pub(crate) fn validate(self) -> io::Result<()> {
+        if self.workers == 0
+            || self.workers > 64
+            || self.max_jobs == 0
+            || self.max_input_bytes == 0
+            || self.max_output_bytes == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid CPU executor limits",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct JobBudget {
     pub input_bytes: usize,
@@ -136,17 +153,7 @@ pub struct Executor<T> {
 
 impl<T: Send + 'static> Executor<T> {
     pub fn new(config: ExecutorConfig) -> io::Result<Self> {
-        if config.workers == 0
-            || config.workers > 64
-            || config.max_jobs == 0
-            || config.max_input_bytes == 0
-            || config.max_output_bytes == 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid CPU executor limits",
-            ));
-        }
+        config.validate()?;
         let mut tasks = VecDeque::new();
         tasks
             .try_reserve_exact(config.max_jobs)

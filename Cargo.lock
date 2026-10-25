@@ -2894,6 +2894,7 @@ dependencies = [
  "torse-mod-host",
  "torse-net",
  "torse-protocol",
+ "torse-runtime",
  "torse-sim",
  "torse-storage",
  "torse-types",

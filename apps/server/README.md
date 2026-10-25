@@ -12,6 +12,7 @@
 | [world.rs](src/world.rs) | 真实世界的可信本地事务、完整记录、有界快照与独立恢复适配 |
 | [execution.rs](src/execution.rs) | 持久阶段工作、定时事件、动作结果、去重及完整执行恢复 |
 | [profiling.rs](src/profiling.rs) | 串行执行的可选计时接线 |
+| [planning.rs](src/planning.rs) | 冻结前的独立规则并行与稳定归并 |
 | [network.rs](src/network.rs) | 会话策略、输入适配、持久输出门槛、订阅与失效控制 |
 | [bootstrap.rs](src/bootstrap.rs) | 有限演示世界及显式容量配置 |
 | [main.rs](src/main.rs) | 非阻塞监听、固定逻辑Tick和有界关闭 |
@@ -25,6 +26,14 @@ cargo run --release -p torse-server --example serial_baseline --locked -- --outp
 ```
 
 基准对照无存储sink、保留日志的内存后端和真实文件后端，覆盖空Tick、不同任务数、争用与订阅数量。输出目录必须不存在；原始CSV、边界说明和本机测量见[串行基线](../../benchmarks/M6-serial-baseline.md)。
+
+## 冻结前并行规划
+
+`ExecutionHost::set_parallel_planning(Some(PlanningConfig { workers: 4, max_in_flight: 4 }))`启用有界批次；Server提供同名入口，主程序可传`--planning-workers 4`。默认保留串行执行。规则通过`DurableRule::parallel_planner`返回`Some(self)`显式加入，编译器要求其实现Sync。现有Mod适配器继续在宿主线程执行。
+
+请求与定时事件先按原次序规划，周期规则只在相邻且没有声明依赖时并行。工作线程借用同一阶段起点世界，批次全部结束后按原拓扑次序归并，再使用原稳定事务排序。每批最多max_in_flight项，原生规划器须遵守阶段和运行态预算。冻结缓存、逐项准备、日志接纳、发布、刷盘和恢复均沿用现有路径。
+
+借用批次通过torse-runtime的run_scoped执行，每批创建并回收有限线程；轻规划会增加开销，启用前应实测。`cargo run --release -p torse-server --example parallel_baseline -- --output .work/parallel-baseline`生成串行、1和4线程对照，详见[并行规划记录](../../benchmarks/M6-parallel-planning.md)。
 
 ## 启动与连接
 

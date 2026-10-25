@@ -13,6 +13,7 @@ mod lifecycle;
 pub mod mods;
 pub mod network;
 mod profiling;
+pub use execution::PlanningConfig;
 mod world;
 
 pub use authority::{HostAuthority, InvalidationSink, NoReplicas, PreparedChange, RecoveryTarget};

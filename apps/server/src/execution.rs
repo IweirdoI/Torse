@@ -1,4 +1,4 @@
-//! Durable serial phase driver. Phase output is frozen before the first task
+//! Durable phase driver. Phase output is frozen before the first task
 //! commits; every task, request result, event change and execution position then
 //! shares one journal record with its world mutation. Recovery never runs rules.
 use crate::{HostAuthority, PreparedChange, RecoveryTarget};
@@ -16,6 +16,10 @@ use torse_sim::{
 };
 use torse_types::*;
 use torse_world::{BlockStateRegistry, ComponentFields, ComponentSchemas};
+
+#[path = "planning.rs"]
+mod planning;
+pub use planning::PlanningConfig;
 
 pub struct ExecutionModel;
 impl AuthorityData for ExecutionModel {
@@ -67,6 +71,12 @@ impl ExecutionLimits {
 /// world. Freeze/retry may call a planner again before it has published any state.
 pub trait DurableRule {
     fn spec(&self) -> SystemSpec;
+    /// Opt in only when `plan` is thread-safe, pure, and bounded by the host's
+    /// phase/runtime limits. Return `Some(self)` on a Sync implementation.
+    /// Actions and timed events continue through their serial callbacks.
+    fn parallel_planner(&self) -> Option<&(dyn DurableRule + Sync)> {
+        None
+    }
     /// Derive bounded notifications from a planned action. They are frozen with
     /// that action and registered only if its world transaction commits.
     /// This callback must not invoke guests or change process-local state.
@@ -133,6 +143,7 @@ pub struct ExecutionHost {
     stopping: Option<Tick>,
     highest_session: u128,
     profiler: SerialProfiler,
+    planning: Option<PlanningConfig>,
 }
 pub struct ExecutionPrepared {
     world: torse_sim::PreparedChange,
@@ -340,6 +351,7 @@ impl ExecutionHost {
             stopping: None,
             highest_session: 0,
             profiler: SerialProfiler::default(),
+            planning: None,
         })
     }
     pub fn world(&self) -> &WorldAuthority {
@@ -453,26 +465,7 @@ impl ExecutionHost {
         phase: Phase,
         consume: Option<EventId>,
     ) -> Result<FrozenTask, Fault> {
-        if plan
-            .transaction
-            .as_ref()
-            .is_some_and(|t| t.ordering.phase != phase)
-        {
-            return Err(Fault::invalid_data("rule transaction phase mismatch"));
-        }
-        Ok(FrozenTask {
-            transaction: plan
-                .transaction
-                .as_ref()
-                .map(|t| StoredTransactionGroup::capture(self.world(), t))
-                .transpose()?,
-            request: None,
-            consume,
-            schedule: plan.schedule,
-            cancel: plan.cancel,
-            status: ReplyStatus::Committed,
-            output: ComponentFields::new(),
-        })
+        planning::freeze_rule_plan(self.world(), plan, phase, consume)
     }
     fn collect_phase(&self) -> Result<PhaseWork, Fault> {
         let _span = self.profiler.span(Stage::Planning);
@@ -572,23 +565,7 @@ impl ExecutionHost {
                 )?);
             }
         }
-        let specs: Vec<_> = self
-            .runtime
-            .rules
-            .iter()
-            .filter(|s| s.phase == phase)
-            .cloned()
-            .collect();
-        for id in order_phase(&specs).map_err(|e| Fault::invalid_data(e.to_string()))? {
-            let rule = self
-                .rules
-                .iter()
-                .find(|r| r.spec().id == id)
-                .expect("declared rule");
-            for plan in rule.plan(self.world(), point.tick)? {
-                tasks.push(self.freeze_plan(plan, phase, None)?);
-            }
-        }
+        self.collect_rules(phase, point.tick, &mut tasks)?;
         if tasks.len() > self.limits.phase_tasks {
             return Err(Fault::resource_limit("phase task budget"));
         }

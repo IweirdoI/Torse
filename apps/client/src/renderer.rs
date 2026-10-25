@@ -194,6 +194,35 @@ fn fs_main(
 }
 "#;
 
+const SKY_SHADER: &str = r#"
+struct VertexOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) height: f32,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
+    var corners = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let corner = corners[index];
+    var out: VertexOut;
+    out.clip = vec4<f32>(corner, 0.0, 1.0);
+    out.height = corner.y * 0.5 + 0.5;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let horizon = vec3<f32>(0.66, 0.74, 0.80);
+    let zenith = vec3<f32>(0.34, 0.52, 0.80);
+    let blend = smoothstep(0.30, 0.95, input.height);
+    return vec4<f32>(mix(horizon, zenith, blend), 1.0);
+}
+"#;
+
 const LINE_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -241,6 +270,7 @@ pub struct GpuContext {
     queue: Queue,
     pipeline: RenderPipeline,
     line_pipeline: RenderPipeline,
+    sky_pipeline: RenderPipeline,
     camera: Buffer,
     camera_bind: BindGroup,
     palette_layout: BindGroupLayout,
@@ -475,6 +505,48 @@ impl GpuContext {
             multiview_mask: None,
             cache: None,
         });
+        // The sky covers the whole target behind the terrain, so it carries no
+        // bind group and never writes depth.
+        let sky_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("client sky shader"),
+            source: ShaderSource::Wgsl(SKY_SHADER.into()),
+        });
+        let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("client sky pipeline layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let sky_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("client sky pipeline"),
+            layout: Some(&sky_pipeline_layout),
+            vertex: VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let line_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("client outline vertices"),
             size: (MAX_LINE_VERTICES * VERTEX_STRIDE) as u64,
@@ -487,6 +559,7 @@ impl GpuContext {
             queue,
             pipeline,
             line_pipeline,
+            sky_pipeline,
             camera,
             camera_bind,
             palette_layout,
@@ -713,6 +786,8 @@ impl GpuContext {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.draw(0..3, 0..1);
         if let Some(palette) = &self.palette {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind, &[]);

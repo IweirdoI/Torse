@@ -608,9 +608,10 @@ impl BiomeTints {
         if self.order.is_empty() {
             return &self.fallback;
         }
-        // One biome region every sixty-four blocks, so a nearby view still
-        // shows more than one grass colour.
-        let cell = 64;
+        // One biome region every twenty-four blocks: small enough that a
+        // nearby view still shows more than one grass colour, large enough that
+        // the borders read as regions instead of noise.
+        let cell = 24;
         let x = position.x.div_euclid(cell);
         let z = position.z.div_euclid(cell);
         let hash = mix(self.hash(x, z));

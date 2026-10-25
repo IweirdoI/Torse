@@ -10,7 +10,7 @@
 use torse_types::{ContentKey, ReplicationDeclaration};
 
 /// Material blending mode consumed by the presentation pipeline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum AlphaMode {
     /// The material is fully opaque.
     Opaque,
@@ -42,6 +42,7 @@ pub enum Shape {
     FullCube,
     LowerSlab,
     Panel,
+    Cross,
     Corner,
     Stair,
     Box(BoxBounds),
@@ -56,7 +57,12 @@ impl Shape {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Box(bounds) => validate_box(bounds),
-            Self::FullCube | Self::LowerSlab | Self::Panel | Self::Corner | Self::Stair => Ok(()),
+            Self::FullCube
+            | Self::LowerSlab
+            | Self::Panel
+            | Self::Cross
+            | Self::Corner
+            | Self::Stair => Ok(()),
         }
     }
 }
@@ -156,6 +162,45 @@ impl FaceMaterials {
     }
 }
 
+/// One independent overlay layer on a face.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FaceOverlay {
+    /// Material resource for the overlay.
+    pub material: ContentKey,
+    /// Alpha behavior for this layer, independent of the base material.
+    pub alpha_mode: AlphaMode,
+}
+
+/// Optional overlay materials for the six block faces.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FaceOverlays {
+    slots: [Option<FaceOverlay>; 6],
+}
+
+impl FaceOverlays {
+    /// No face has an overlay.
+    pub const fn none() -> Self {
+        Self {
+            slots: [None, None, None, None, None, None],
+        }
+    }
+
+    /// Set the overlay of one face.
+    pub fn set(&mut self, face: Face, overlay: FaceOverlay) {
+        self.slots[face.index()] = Some(overlay);
+    }
+
+    /// Overlay declared for one face, if any.
+    pub fn get(&self, face: Face) -> Option<&FaceOverlay> {
+        self.slots[face.index()].as_ref()
+    }
+
+    /// Whether no face has an overlay.
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+}
+
 /// Geometry and material selected for rendering.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderProfile {
@@ -165,6 +210,8 @@ pub struct RenderProfile {
     pub material: ContentKey,
     /// Per-face material overrides.
     pub face_materials: FaceMaterials,
+    /// Optional material overlay for each face.
+    pub face_overlays: FaceOverlays,
     /// Material blending mode.
     pub alpha_mode: AlphaMode,
 }

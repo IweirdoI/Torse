@@ -1,4 +1,6 @@
-use crate::{BoxBounds, Face, Shape, SourceRef, Sourced, compile, m0_fixture_pack};
+use crate::{
+    AlphaMode, BoxBounds, Face, FaceOverlay, Shape, SourceRef, Sourced, compile, m0_fixture_pack,
+};
 
 #[test]
 fn builtin_fixture_compiles() {
@@ -258,6 +260,28 @@ fn face_materials_affect_presentation_only() {
             .path(),
         "material/stone"
     );
+}
+
+#[test]
+fn face_overlays_affect_presentation_only() {
+    let base = compile(m0_fixture_pack()).unwrap();
+    let mut pack = m0_fixture_pack();
+    let stone = pack
+        .blocks
+        .iter_mut()
+        .find(|block| block.value.id.to_string() == "base:stone")
+        .unwrap();
+    stone.value.render_profile.face_overlays.set(
+        Face::NegX,
+        FaceOverlay {
+            material: key("base:material/stone_overlay"),
+            alpha_mode: AlphaMode::Mask,
+        },
+    );
+
+    let changed = compile(pack).unwrap();
+    assert_eq!(base.authority_digest, changed.authority_digest);
+    assert_ne!(base.presentation_digest, changed.presentation_digest);
 }
 
 #[test]

@@ -13,8 +13,9 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::Cursor;
+use std::time::Duration;
 
-use torse_types::ContentKey;
+use torse_types::{BlockPos, ContentKey, SectionPos};
 
 /// Decoded RGBA8 texture atlas.
 #[derive(Clone, Debug)]
@@ -92,6 +93,53 @@ impl Atlas {
     }
 }
 
+/// Source category for a tint sampled from world-position data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TintSource {
+    Grass,
+    Foliage,
+    Water,
+}
+
+/// Strategy for constructing mip levels for one material.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MipmapStrategy {
+    /// Average the four source texels without adjusting alpha coverage.
+    #[default]
+    Average,
+    /// Scale mip alpha to preserve the base level's mask coverage.
+    CutoutCoverage,
+    /// Fill transparent RGB with the darkest opaque colour and preserve coverage.
+    DarkCutout,
+}
+
+/// Timing and playback order for a vertical strip animation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaterialAnimation {
+    /// Number of equal-height frames in the texture rectangle.
+    pub frame_count: u32,
+    /// Duration used when `frame_durations` is absent.
+    pub frame_duration: Duration,
+    /// Frame indices in playback order; `None` plays `0..frame_count`.
+    pub frame_order: Option<&'static [u32]>,
+    /// Optional duration per playback entry.
+    pub frame_durations: Option<&'static [Duration]>,
+    /// Blend each frame toward the next during its display interval.
+    pub interpolate: bool,
+}
+
+/// A source for location-dependent material colours.
+///
+/// Providers return sRGB bytes. The renderer converts them to linear RGB before
+/// multiplying the sampled texture.
+pub trait PositionTintProvider: Send + Sync {
+    /// Resolve the tint at one block coordinate.
+    fn sample(&self, source: TintSource, position: BlockPos) -> [u8; 3];
+
+    /// Revision covering all tint data a mesh in `section` may sample.
+    fn revision(&self, section: SectionPos) -> u64;
+}
+
 /// One material entry of a pack.
 #[derive(Clone, Copy, Debug)]
 pub struct MaterialEntry {
@@ -101,6 +149,26 @@ pub struct MaterialEntry {
     pub rect: [u32; 4],
     /// Optional sRGB tint multiplied with the sampled texture.
     pub tint: Option<[f32; 3]>,
+    /// Optional world-position tint source.
+    pub tint_source: Option<TintSource>,
+    /// Optional vertical-strip animation.
+    pub animation: Option<MaterialAnimation>,
+    /// Mipmap generation strategy for this material.
+    pub mipmap_strategy: MipmapStrategy,
+}
+
+impl MaterialEntry {
+    /// Declare a static material with default white tint and average mipmaps.
+    pub const fn new(key: &'static str, rect: [u32; 4]) -> Self {
+        Self {
+            key,
+            rect,
+            tint: None,
+            tint_source: None,
+            animation: None,
+            mipmap_strategy: MipmapStrategy::Average,
+        }
+    }
 }
 
 /// Resolved appearance of one material.
@@ -110,6 +178,21 @@ pub struct MaterialSurface {
     pub rect: [f32; 4],
     /// Linear RGB tint multiplied with the sampled texture.
     pub tint: [f32; 3],
+    /// Optional world-position tint source.
+    pub tint_source: Option<TintSource>,
+    /// Optional vertical-strip animation.
+    pub animation: Option<MaterialAnimation>,
+}
+
+/// Two frame rectangles and their interpolation weight at one time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaterialFrameSample {
+    /// Current frame rectangle.
+    pub current: [f32; 4],
+    /// Next frame rectangle, equal to `current` for a static sample.
+    pub next: [f32; 4],
+    /// Blend amount from current to next.
+    pub blend: f32,
 }
 
 /// One level of the generated mip chain.
@@ -146,6 +229,7 @@ impl TexturePack {
         let mut entries = BTreeMap::new();
         for entry in materials {
             check_rect(&atlas, entry.rect, &format!("material `{}`", entry.key))?;
+            validate_material(&entry)?;
             if entries.insert(entry.key.to_string(), entry).is_some() {
                 return Err(format!("material `{}` is declared twice", entry.key));
             }
@@ -188,6 +272,8 @@ impl TexturePack {
         Some(MaterialSurface {
             rect: self.atlas.rect(entry.rect),
             tint: entry.tint.map_or([1.0, 1.0, 1.0], srgb_to_linear),
+            tint_source: entry.tint_source,
+            animation: entry.animation,
         })
     }
 
@@ -211,31 +297,229 @@ impl TexturePack {
             return Err("a mip chain needs at least one level".to_string());
         }
         let mut pixels = self.atlas.pixels.clone();
-        for rect in self.rects() {
-            solidify(&mut pixels, self.atlas.width, rect);
-            extrude(&mut pixels, self.atlas.width, rect);
+        let mut strategies: Vec<([u32; 4], u32, MipmapStrategy)> = self
+            .materials
+            .values()
+            .map(|entry| {
+                (
+                    entry.rect,
+                    entry.animation.map_or(1, |animation| animation.frame_count),
+                    entry.mipmap_strategy,
+                )
+            })
+            .collect();
+        for rect in [self.missing, self.white] {
+            strategies.push((rect, 1, MipmapStrategy::Average));
         }
-        let mut chain = vec![MipLevel {
+        for (rect, frame_count, strategy) in &strategies {
+            let frame_height = rect[3] / frame_count;
+            for frame in 0..*frame_count {
+                let frame_rect = [
+                    rect[0],
+                    rect[1] + frame * frame_height,
+                    rect[2],
+                    frame_height,
+                ];
+                match strategy {
+                    MipmapStrategy::DarkCutout => {
+                        solidify_dark(&mut pixels, self.atlas.width, frame_rect)
+                    }
+                    MipmapStrategy::Average | MipmapStrategy::CutoutCoverage => {
+                        solidify(&mut pixels, self.atlas.width, frame_rect)
+                    }
+                }
+            }
+            extrude(&mut pixels, self.atlas.width, *rect);
+        }
+        let base = MipLevel {
             width: self.atlas.width,
             height: self.atlas.height,
             pixels,
-        }];
-        for _ in 1..levels {
+        };
+        let coverage: Vec<Vec<f32>> = strategies
+            .iter()
+            .map(|(rect, frame_count, strategy)| {
+                if *strategy == MipmapStrategy::Average {
+                    return Vec::new();
+                }
+                (0..*frame_count)
+                    .map(|frame| {
+                        rect_coverage(
+                            &base.pixels,
+                            base.width,
+                            [
+                                rect[0],
+                                rect[1] + frame * (rect[3] / frame_count),
+                                rect[2],
+                                rect[3] / frame_count,
+                            ],
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut chain = vec![base];
+        for level_index in 1..levels {
             let previous = chain.last().expect("chain is not empty");
             if previous.width == 1 && previous.height == 1 {
                 break;
             }
-            chain.push(halve(previous));
+            let mut next = halve(previous);
+            for (index, (rect, frame_count, strategy)) in strategies.iter().enumerate() {
+                if *strategy == MipmapStrategy::Average {
+                    continue;
+                }
+                let scale = 1u32.checked_shl(level_index).unwrap_or(u32::MAX);
+                let scaled_height = rect[3] / scale;
+                if scaled_height < *frame_count || !scaled_height.is_multiple_of(*frame_count) {
+                    continue;
+                }
+                let frame_height = scaled_height / frame_count;
+                for frame in 0..*frame_count {
+                    let scaled = [
+                        rect[0] / scale,
+                        rect[1] / scale + frame * frame_height,
+                        (rect[2] / scale).max(1),
+                        frame_height,
+                    ];
+                    preserve_coverage(
+                        &mut next.pixels,
+                        next.width,
+                        scaled,
+                        coverage[index][frame as usize],
+                    );
+                }
+            }
+            chain.push(next);
         }
         Ok(chain)
     }
+}
 
-    fn rects(&self) -> Vec<[u32; 4]> {
-        let mut rects: Vec<[u32; 4]> = self.materials.values().map(|entry| entry.rect).collect();
-        rects.push(self.missing);
-        rects.push(self.white);
-        rects
+impl MaterialSurface {
+    /// Select animation frames for elapsed time since playback began.
+    pub fn frame_sample(&self, elapsed: Duration) -> MaterialFrameSample {
+        let Some(animation) = self.animation else {
+            return MaterialFrameSample {
+                current: self.rect,
+                next: self.rect,
+                blend: 0.0,
+            };
+        };
+        let order_len = animation
+            .frame_order
+            .map_or(animation.frame_count as usize, <[u32]>::len);
+        let total_nanos = (0..order_len).fold(0u128, |total, index| {
+            total.saturating_add(animation_duration(animation, index).as_nanos())
+        });
+        if total_nanos == 0 {
+            return MaterialFrameSample {
+                current: self.rect,
+                next: self.rect,
+                blend: 0.0,
+            };
+        }
+        let mut cursor = elapsed.as_nanos() % total_nanos;
+        let mut current_index = 0;
+        for index in 0..order_len {
+            let duration = animation_duration(animation, index).as_nanos();
+            if cursor < duration {
+                current_index = index;
+                break;
+            }
+            cursor -= duration;
+        }
+        let current_frame = animation
+            .frame_order
+            .map_or(current_index as u32, |order| order[current_index]);
+        let next_index = (current_index + 1) % order_len;
+        let next_frame = animation
+            .frame_order
+            .map_or(next_index as u32, |order| order[next_index]);
+        let duration = animation_duration(animation, current_index).as_nanos();
+        let blend = if animation.interpolate {
+            (cursor as f64 / duration as f64) as f32
+        } else {
+            0.0
+        };
+        MaterialFrameSample {
+            current: frame_rect(self.rect, animation.frame_count, current_frame),
+            next: frame_rect(self.rect, animation.frame_count, next_frame),
+            blend,
+        }
     }
+}
+
+fn animation_duration(animation: MaterialAnimation, playback_index: usize) -> Duration {
+    animation
+        .frame_durations
+        .map_or(animation.frame_duration, |durations| {
+            durations[playback_index]
+        })
+}
+
+fn frame_rect(rect: [f32; 4], frame_count: u32, frame: u32) -> [f32; 4] {
+    let frame_height = rect[3] / frame_count as f32;
+    [
+        rect[0],
+        rect[1] + frame_height * frame as f32,
+        rect[2],
+        frame_height,
+    ]
+}
+
+fn validate_material(entry: &MaterialEntry) -> Result<(), String> {
+    if let Some(animation) = entry.animation {
+        if animation.frame_count == 0 || !entry.rect[3].is_multiple_of(animation.frame_count) {
+            return Err(format!(
+                "material `{}` animation frame count must divide its rectangle height",
+                entry.key
+            ));
+        }
+        if animation.frame_durations.is_none() && animation.frame_duration.is_zero() {
+            return Err(format!(
+                "material `{}` animation frame duration must be positive",
+                entry.key
+            ));
+        }
+        let order_len = animation
+            .frame_order
+            .map_or(animation.frame_count as usize, <[u32]>::len);
+        if order_len == 0 {
+            return Err(format!(
+                "material `{}` animation order must not be empty",
+                entry.key
+            ));
+        }
+        if animation
+            .frame_order
+            .is_some_and(|order| order.iter().any(|frame| *frame >= animation.frame_count))
+        {
+            return Err(format!(
+                "material `{}` animation order contains an invalid frame",
+                entry.key
+            ));
+        }
+        if animation
+            .frame_durations
+            .is_some_and(|durations| durations.len() != order_len)
+        {
+            return Err(format!(
+                "material `{}` animation duration count does not match its playback order",
+                entry.key
+            ));
+        }
+        if animation
+            .frame_durations
+            .is_some_and(|durations| durations.iter().any(Duration::is_zero))
+        {
+            return Err(format!(
+                "material `{}` animation frame durations must be positive",
+                entry.key
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Convert one sRGB colour to linear RGB.
@@ -316,6 +600,93 @@ fn solidify(pixels: &mut [u8], width: u32, rect: [u32; 4]) {
             pixels[target + 1] = color[1];
             pixels[target + 2] = color[2];
             queue.push_back((nx, ny, target));
+        }
+    }
+}
+
+/// Fill fully transparent pixels with the darkest opaque colour in the sprite.
+fn solidify_dark(pixels: &mut [u8], width: u32, rect: [u32; 4]) {
+    let [rx, ry, rw, rh] = rect;
+    let darkest = (ry..ry + rh)
+        .flat_map(|y| (rx..rx + rw).map(move |x| (x, y)))
+        .filter_map(|(x, y)| {
+            let offset = index(width, x, y);
+            (pixels[offset + 3] > 0).then(|| {
+                let red = u32::from(pixels[offset]);
+                let green = u32::from(pixels[offset + 1]);
+                let blue = u32::from(pixels[offset + 2]);
+                let luminance = 299 * red + 587 * green + 114 * blue;
+                (
+                    luminance,
+                    [pixels[offset], pixels[offset + 1], pixels[offset + 2]],
+                )
+            })
+        })
+        .min_by_key(|(luminance, _)| *luminance)
+        .map(|(_, color)| color);
+    let Some(darkest) = darkest else {
+        return;
+    };
+    for y in ry..ry + rh {
+        for x in rx..rx + rw {
+            let offset = index(width, x, y);
+            if pixels[offset + 3] == 0 {
+                pixels[offset..offset + 3].copy_from_slice(&darkest);
+            }
+        }
+    }
+}
+
+fn rect_coverage(pixels: &[u8], width: u32, rect: [u32; 4]) -> f32 {
+    let [x, y, rect_width, rect_height] = rect;
+    let mut covered = 0usize;
+    for row in y..y + rect_height {
+        for column in x..x + rect_width {
+            covered += usize::from(pixels[index(width, column, row) + 3] >= 128);
+        }
+    }
+    covered as f32 / (rect_width * rect_height) as f32
+}
+
+fn preserve_coverage(pixels: &mut [u8], width: u32, rect: [u32; 4], target: f32) {
+    let [x, y, rect_width, rect_height] = rect;
+    if rect_width == 0 || rect_height == 0 {
+        return;
+    }
+    let count = (rect_width * rect_height) as usize;
+    let target_count = (target * count as f32).round() as usize;
+    let alphas: Vec<u8> = (y..y + rect_height)
+        .flat_map(|row| (x..x + rect_width).map(move |column| index(width, column, row) + 3))
+        .map(|offset| pixels[offset])
+        .collect();
+    let mut low = 0.0f32;
+    let mut high = 16.0f32;
+    for _ in 0..16 {
+        let scale = (low + high) * 0.5;
+        let covered = alphas
+            .iter()
+            .filter(|alpha| f32::from(**alpha) * scale >= 128.0)
+            .count();
+        if covered > target_count {
+            high = scale;
+        } else {
+            low = scale;
+        }
+    }
+    let coverage_at = |scale: f32| {
+        alphas
+            .iter()
+            .filter(|alpha| f32::from(**alpha) * scale >= 128.0)
+            .count()
+    };
+    let low_error = coverage_at(low).abs_diff(target_count);
+    let high_error = coverage_at(high).abs_diff(target_count);
+    let scale = if low_error <= high_error { low } else { high };
+    for row in y..y + rect_height {
+        for column in x..x + rect_width {
+            let offset = index(width, column, row) + 3;
+            let alpha = f32::from(pixels[offset]);
+            pixels[offset] = (alpha * scale).round().clamp(0.0, 255.0) as u8;
         }
     }
 }
@@ -411,6 +782,7 @@ mod tests {
                 key: "base:material/stone",
                 rect: [2, 2, 4, 4],
                 tint: Some([0.5, 0.5, 0.5]),
+                ..MaterialEntry::new("", [0; 4])
             }],
             [8, 8, 1, 1],
             [8, 2, 1, 1],
@@ -441,6 +813,7 @@ mod tests {
                 key: "base:material/oops",
                 rect: [4, 4, 16, 16],
                 tint: None,
+                ..MaterialEntry::new("", [0; 4])
             }],
             [8, 8, 1, 1],
             [8, 2, 1, 1],
@@ -458,11 +831,13 @@ mod tests {
                     key: "base:material/left",
                     rect: [1, 1, 4, 4],
                     tint: None,
+                    ..MaterialEntry::new("", [0; 4])
                 },
                 MaterialEntry {
                     key: "base:material/right",
                     rect: [5, 1, 4, 4],
                     tint: None,
+                    ..MaterialEntry::new("", [0; 4])
                 },
             ],
             [1, 6, 1, 1],
@@ -491,6 +866,7 @@ mod tests {
                 key: "base:material/red",
                 rect: [2, 2, 4, 4],
                 tint: None,
+                ..MaterialEntry::new("", [0; 4])
             }],
             [8, 8, 1, 1],
             [8, 2, 1, 1],
@@ -509,6 +885,117 @@ mod tests {
         assert_eq!(&chain[0].pixels[gutter..gutter + 3], &[200, 40, 30]);
         let corner = index(6, 1, 1);
         assert!(chain[1].pixels[corner] > 100, "level 1 turned black");
+    }
+
+    #[test]
+    fn animation_selects_ordered_frames_and_interpolates_by_duration() {
+        const ORDER: [u32; 4] = [2, 0, 3, 1];
+        const DURATIONS: [Duration; 4] = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            Duration::from_secs(4),
+        ];
+        let pack = TexturePack::new(
+            solid_atlas(32, 24, [255, 255, 255, 255]),
+            vec![MaterialEntry {
+                key: "base:material/animated",
+                rect: [2, 2, 4, 16],
+                animation: Some(MaterialAnimation {
+                    frame_count: 4,
+                    frame_duration: Duration::from_secs(1),
+                    frame_order: Some(&ORDER),
+                    frame_durations: Some(&DURATIONS),
+                    interpolate: true,
+                }),
+                ..MaterialEntry::new("", [0; 4])
+            }],
+            [10, 2, 1, 1],
+            [14, 2, 1, 1],
+        )
+        .expect("pack builds");
+        let surface = pack
+            .surface(&key("base:material/animated"))
+            .expect("animated material exists");
+        let first = surface.frame_sample(Duration::ZERO);
+        assert!((first.current[1] - 10.0 / 24.0).abs() < 1e-6);
+        assert!((first.next[1] - 2.0 / 24.0).abs() < 1e-6);
+        assert_eq!(first.blend, 0.0);
+        let middle = surface.frame_sample(Duration::from_millis(500));
+        assert!((middle.blend - 0.5).abs() < 1e-6);
+        let boundary = surface.frame_sample(Duration::from_secs(1));
+        assert!((boundary.current[1] - 2.0 / 24.0).abs() < 1e-6);
+        assert_eq!(boundary.blend, 0.0);
+    }
+
+    #[test]
+    fn static_material_keeps_one_frame_for_all_times() {
+        let pack = TexturePack::new(
+            solid_atlas(12, 12, [255, 255, 255, 255]),
+            vec![MaterialEntry::new("base:material/static", [2, 2, 4, 4])],
+            [8, 2, 1, 1],
+            [8, 8, 1, 1],
+        )
+        .expect("pack builds");
+        let surface = pack
+            .surface(&key("base:material/static"))
+            .expect("static material exists");
+        assert_eq!(
+            surface.frame_sample(Duration::from_secs(100)),
+            surface.frame_sample(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn cutout_mips_keep_coverage_and_dark_mips_use_dark_transparent_rgb() {
+        let mut pixels = vec![0u8; 32 * 32 * 4];
+        for y in 4..12 {
+            for x in 4..12 {
+                let offset = index(32, x, y);
+                let alpha = if y < 8 { 255 } else { 0 };
+                pixels[offset..offset + 4].copy_from_slice(&[220, 180, 100, alpha]);
+            }
+        }
+        for y in 4..12 {
+            for x in 16..24 {
+                let offset = index(32, x, y);
+                let alpha = if y < 8 { 255 } else { 0 };
+                pixels[offset..offset + 4].copy_from_slice(&[70, 60, 50, alpha]);
+            }
+        }
+        let pack = TexturePack::new(
+            Atlas {
+                width: 32,
+                height: 32,
+                pixels,
+            },
+            vec![
+                MaterialEntry {
+                    key: "base:material/leaves",
+                    rect: [4, 4, 8, 8],
+                    mipmap_strategy: MipmapStrategy::CutoutCoverage,
+                    ..MaterialEntry::new("", [0; 4])
+                },
+                MaterialEntry {
+                    key: "base:material/dark_leaves",
+                    rect: [16, 4, 8, 8],
+                    mipmap_strategy: MipmapStrategy::DarkCutout,
+                    ..MaterialEntry::new("", [0; 4])
+                },
+            ],
+            [4, 16, 1, 1],
+            [8, 16, 1, 1],
+        )
+        .expect("pack builds");
+        let chain = pack.mips(3).expect("mips build");
+        assert!((rect_coverage(&chain[0].pixels, 32, [4, 4, 8, 8]) - 0.5).abs() < 0.01);
+        assert!((rect_coverage(&chain[1].pixels, 16, [2, 2, 4, 4]) - 0.5).abs() < 0.1);
+        assert!((rect_coverage(&chain[2].pixels, 8, [1, 1, 2, 2]) - 0.5).abs() < 0.1);
+        let dark_transparent = index(32, 16, 10);
+        assert_eq!(
+            &chain[0].pixels[dark_transparent..dark_transparent + 3],
+            &[70, 60, 50]
+        );
     }
 
     #[test]

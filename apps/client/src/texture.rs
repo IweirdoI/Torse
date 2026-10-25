@@ -6,16 +6,16 @@
 //! more distinct materials fails at startup instead of silently drawing the
 //! wrong surface.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use torse_assets::texture::TexturePack;
-use torse_assets::texture::{Atlas, MaterialEntry, MipLevel};
+use torse_assets::texture::{Atlas, MaterialAnimation, MaterialEntry, MipLevel, TintSource};
 use torse_content::{AlphaMode, Face};
 use torse_types::ContentKey;
 use torse_world::{BlockStateId, BlockStateRegistry};
 
 /// Maximum materials addressable by one terrain vertex.
-pub const MAX_MATERIALS: usize = 256;
+pub const MAX_MATERIALS: usize = 512;
 
 /// Mip levels uploaded for the terrain atlas, including the base level.
 pub const MIP_LEVELS: u32 = 3;
@@ -27,6 +27,10 @@ pub struct Surface {
     pub rect: [f32; 4],
     /// Linear RGB tint multiplied with the sampled texture.
     pub tint: [f32; 3],
+    /// Optional position-dependent tint source.
+    pub tint_source: Option<TintSource>,
+    /// Optional vertical-strip animation.
+    pub animation: Option<MaterialAnimation>,
     /// Blending mode used by the fragment shader.
     pub alpha: AlphaMode,
 }
@@ -34,7 +38,7 @@ pub struct Surface {
 /// Materials used by one session, addressed by a small integer.
 #[derive(Clone, Debug)]
 pub struct Palette {
-    slots: BTreeMap<ContentKey, u16>,
+    slots: BTreeMap<(ContentKey, AlphaMode), u16>,
     surfaces: Vec<Surface>,
     mips: Vec<MipLevel>,
 }
@@ -47,7 +51,7 @@ impl Palette {
                 "content has more block states than a material slot index can carry".into(),
             );
         }
-        let mut materials: BTreeMap<ContentKey, AlphaMode> = BTreeMap::new();
+        let mut materials = BTreeSet::new();
         for index in 0..registry.state_count() {
             let Some(definition) = registry.definition(BlockStateId(index as u16)) else {
                 continue;
@@ -55,19 +59,9 @@ impl Palette {
             let profile = &definition.render_profile;
             for face in Face::ALL {
                 let material = profile.face_materials.resolve(face, &profile.material);
-                match materials.entry(material.clone()) {
-                    std::collections::btree_map::Entry::Occupied(entry) => {
-                        if *entry.get() != profile.alpha_mode {
-                            return Err(format!(
-                                "material `{material}` is declared with both {:?} and {:?} alpha modes",
-                                entry.get(),
-                                profile.alpha_mode
-                            ));
-                        }
-                    }
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(profile.alpha_mode);
-                    }
+                materials.insert((material.clone(), profile.alpha_mode));
+                if let Some(overlay) = profile.face_overlays.get(face) {
+                    materials.insert((overlay.material.clone(), overlay.alpha_mode));
                 }
             }
         }
@@ -88,21 +82,27 @@ impl Palette {
                 Surface {
                     rect: pack.missing_rect(),
                     tint: [1.0, 1.0, 1.0],
+                    tint_source: None,
+                    animation: None,
                     alpha,
                 },
                 |resolved| Surface {
                     rect: resolved.rect,
                     tint: resolved.tint,
+                    tint_source: resolved.tint_source,
+                    animation: resolved.animation,
                     alpha,
                 },
             );
-            slots.insert(key, surfaces.len() as u16);
+            slots.insert((key, alpha), surfaces.len() as u16);
             surfaces.push(surface);
         }
         // One extra surface draws entities and other tinted debug bodies.
         surfaces.push(Surface {
             rect: pack.white_rect(),
             tint: [0.78, 0.55, 0.35],
+            tint_source: None,
+            animation: None,
             alpha: AlphaMode::Opaque,
         });
 
@@ -113,9 +113,14 @@ impl Palette {
         })
     }
 
-    /// Slot of one material, if content references it.
-    pub fn slot(&self, material: &ContentKey) -> Option<u16> {
-        self.slots.get(material).copied()
+    /// Slot of one material declared with a specific alpha behavior.
+    pub fn slot_for(&self, material: &ContentKey, alpha: AlphaMode) -> Option<u16> {
+        self.slots.get(&(material.clone(), alpha)).copied()
+    }
+
+    /// Position tint source assigned to one material slot.
+    pub fn tint_source(&self, slot: u16) -> Option<TintSource> {
+        self.surfaces.get(usize::from(slot))?.tint_source
     }
 
     /// Material table written to the GPU.
@@ -157,16 +162,19 @@ pub fn base_pack() -> Result<TexturePack, String> {
                 key: "base:material/stone",
                 rect: [4, 4, 16, 16],
                 tint: None,
+                ..MaterialEntry::new("", [0; 4])
             },
             MaterialEntry {
                 key: "base:material/glass",
                 rect: [28, 4, 16, 16],
                 tint: None,
+                ..MaterialEntry::new("", [0; 4])
             },
             MaterialEntry {
                 key: "base:material/plant",
                 rect: [52, 4, 16, 16],
                 tint: None,
+                ..MaterialEntry::new("", [0; 4])
             },
         ],
         [76, 4, 16, 16],
@@ -197,7 +205,13 @@ impl Palette {
     pub fn single_for_tests(rect: [f32; 4], tint: [f32; 3], alpha: AlphaMode) -> Self {
         Self {
             slots: BTreeMap::new(),
-            surfaces: vec![Surface { rect, tint, alpha }],
+            surfaces: vec![Surface {
+                rect,
+                tint,
+                tint_source: None,
+                animation: None,
+                alpha,
+            }],
             mips: Self::test_mips(),
         }
     }
@@ -241,7 +255,14 @@ mod tests {
             "base:material/plant",
         ] {
             let slot = palette
-                .slot(&key(material))
+                .slot_for(
+                    &key(material),
+                    match material {
+                        "base:material/glass" => AlphaMode::Blend,
+                        "base:material/plant" => AlphaMode::Mask,
+                        _ => AlphaMode::Opaque,
+                    },
+                )
                 .unwrap_or_else(|| panic!("missing {material}"));
             let surface = palette.surfaces()[usize::from(slot)];
             assert_ne!(
@@ -251,13 +272,21 @@ mod tests {
             );
         }
         assert_eq!(
-            palette.surfaces()[usize::from(palette.slot(&key("base:material/glass")).unwrap())]
-                .alpha,
+            palette.surfaces()[usize::from(
+                palette
+                    .slot_for(&key("base:material/glass"), AlphaMode::Blend)
+                    .unwrap(),
+            )]
+            .alpha,
             AlphaMode::Blend
         );
         assert_eq!(
-            palette.surfaces()[usize::from(palette.slot(&key("base:material/plant")).unwrap())]
-                .alpha,
+            palette.surfaces()[usize::from(
+                palette
+                    .slot_for(&key("base:material/plant"), AlphaMode::Mask)
+                    .unwrap(),
+            )]
+            .alpha,
             AlphaMode::Mask
         );
         assert_eq!(palette.entity_slot() as usize, palette.surfaces().len() - 1);
@@ -274,14 +303,16 @@ mod tests {
             .expect("pack builds");
         let (_, registry) = registry();
         let palette = Palette::build(&registry, &pack).expect("palette builds");
-        let stone = palette.slot(&key("base:material/stone")).unwrap();
+        let stone = palette
+            .slot_for(&key("base:material/stone"), AlphaMode::Opaque)
+            .unwrap();
         let surface = palette.surfaces()[usize::from(stone)];
         assert_eq!(surface.rect, pack.missing_rect());
         assert_eq!(surface.tint, [1.0, 1.0, 1.0]);
     }
 
     #[test]
-    fn shared_material_with_two_alpha_modes_is_rejected() {
+    fn shared_material_has_independent_alpha_slots() {
         let (mut content, _) = registry();
         let stone_material = content
             .blocks
@@ -301,7 +332,17 @@ mod tests {
         let compiled = compile(content).expect("content compiles");
         let registry = BlockStateRegistry::build(&compiled).expect("registry builds");
         let pack = base_pack().expect("base pack decodes");
-        let error = Palette::build(&registry, &pack).unwrap_err();
-        assert!(error.contains("alpha modes"), "unexpected error: {error}");
+        let palette = Palette::build(&registry, &pack).expect("palette builds");
+        let opaque = palette
+            .slot_for(&key("base:material/stone"), AlphaMode::Opaque)
+            .unwrap();
+        let blended = palette
+            .slot_for(&key("base:material/stone"), AlphaMode::Blend)
+            .unwrap();
+        assert_ne!(opaque, blended);
+        assert_eq!(
+            palette.surfaces()[usize::from(opaque)].rect,
+            palette.surfaces()[usize::from(blended)].rect
+        );
     }
 }

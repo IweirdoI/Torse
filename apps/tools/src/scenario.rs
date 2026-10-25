@@ -323,9 +323,11 @@ fn sample_render(store: &SectionStore, registry: &BlockStateRegistry, pos: Block
             };
             MeshSample::Ready(RenderBlock {
                 bounds: render_box(definition),
+                cross: matches!(&definition.render_profile.shape, Shape::Cross),
                 occlusion: definition.occlusion_profile.face_mask,
                 material: state.0,
                 face_materials: None,
+                ..RenderBlock::EMPTY
             })
         }
         TerrainQuery::NotLoaded => MeshSample::NotLoaded,
@@ -344,6 +346,7 @@ fn render_box(definition: &BlockDefinition) -> Option<RenderBox> {
             min: [0.45, 0.0, 0.0],
             max: [0.55, 1.0, 1.0],
         }),
+        Shape::Cross => Some(RenderBox::FULL_CUBE),
         Shape::Corner | Shape::Stair => Some(RenderBox::FULL_CUBE),
         Shape::Box(bounds) => Some(RenderBox {
             min: bounds.min,
@@ -375,6 +378,7 @@ fn collision_boxes(shape: &Shape) -> Option<Vec<LocalBox>> {
             min: [0.45, 0.0, 0.0],
             max: [0.55, 1.0, 1.0],
         }]),
+        Shape::Cross => Some(vec![LocalBox::FULL_CUBE]),
         Shape::Corner | Shape::Stair => Some(vec![LocalBox::FULL_CUBE]),
         Shape::Box(bounds) => Some(vec![as_f64(bounds)]),
     }

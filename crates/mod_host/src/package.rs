@@ -865,6 +865,7 @@ fn parse_block(
             },
             interaction_profile: InteractionProfile {
                 action: interaction,
+                completes_to: None,
             },
             component_defaults: Vec::new(),
             capability_bindings: Vec::new(),

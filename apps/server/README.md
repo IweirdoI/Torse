@@ -13,6 +13,7 @@
 | [execution.rs](src/execution.rs) | 持久阶段工作、定时事件、动作结果、去重及完整执行恢复 |
 | [profiling.rs](src/profiling.rs) | 串行执行的可选计时接线 |
 | [planning.rs](src/planning.rs) | 冻结前的独立规则并行与稳定归并 |
+| [prevalidation.rs](src/prevalidation.rs) | 冻结后的有界移动预验证及串行提交前复核 |
 | [network.rs](src/network.rs) | 会话策略、输入适配、持久输出门槛、订阅与失效控制 |
 | [bootstrap.rs](src/bootstrap.rs) | 有限演示世界及显式容量配置 |
 | [main.rs](src/main.rs) | 非阻塞监听、固定逻辑Tick和有界关闭 |
@@ -34,6 +35,16 @@ cargo run --release -p torse-server --example serial_baseline --locked -- --outp
 请求与定时事件先按原次序规划，周期规则只在相邻且没有声明依赖时并行。工作线程借用同一阶段起点世界，批次全部结束后按原拓扑次序归并，再使用原稳定事务排序。每批最多max_in_flight项，原生规划器须遵守阶段和运行态预算。冻结缓存、逐项准备、日志接纳、发布、刷盘和恢复均沿用现有路径。
 
 借用批次通过torse-runtime的run_scoped执行，每批创建并回收有限线程；轻规划会增加开销，启用前应实测。`cargo run --release -p torse-server --example parallel_baseline -- --output .work/parallel-baseline`生成串行、1和4线程对照，详见[并行规划记录](../../benchmarks/M6-parallel-planning.md)。
+
+## 移动预验证
+
+`ExecutionHost::set_prevalidation(Some(PrevalidationConfig::default()))`启用冻结任务的只读碰撞预计算，Server提供同名入口。主程序使用`--prevalidate-workers 4`，默认关闭。默认最多4线程、16项在途任务，每项预留8MiB；预计扫掠体积不足512格的轻任务继续串行准备。
+
+只处理相邻、不同实体、单成员且仅含一次移动的任务。显式块前置、块写入、组件、生成、销毁与重复实体会截断批次。工作线程返回不可直接发布的MovementPrevalidation；宿主逐项检查阶段、兼容信息、碰撞读集、实体身份代数和精确前位置，再绑定当前提交序号。过期、超限或执行器失败均回到原串行准备，拒绝原因由原路径确定。
+
+缓存只在内存中存在，已发布任务立即释放，表或阶段变化时清空，文件恢复重新计算剩余冻结任务。日志Busy重试复用缓存；提交、事件结算、撤权、批量刷盘及持久输出继续串行。`prevalidation_stats`报告预计算数、命中、过期、跳过及预留和缓存峰值，命中计数包含未发布重试。
+
+大碰撞体负载有实测收益，小碰撞体默认跳过。完整路径、原始数据及真实单机器Mod对照见[移动预验证与投影](../../benchmarks/M6-movement-prevalidation.md)。
 
 ## 启动与连接
 

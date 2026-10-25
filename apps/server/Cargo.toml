@@ -26,3 +26,7 @@ torse-mod-host = { path = "../../crates/mod_host", optional = true }
 
 [dev-dependencies]
 torse-mod-api = { path = "../../crates/mod_api" }
+
+[[example]]
+name = "mod_baseline"
+required-features = ["mods"]

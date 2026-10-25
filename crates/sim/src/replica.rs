@@ -494,7 +494,20 @@ fn project(
 ) -> Result<ReplicaSnapshot, Fault> {
     let mut cost = Cost::default();
     cost.entries::<WorldReplicaSeed>(1)?;
-    let mut used = [false; u16::MAX as usize + 1];
+    // Scratch follows the actual registry; enumerate only observed symbols,
+    // avoiding two full identifier-space scans for every subscriber/commit.
+    let mut seen = vec![false; world.registry().state_count() as usize];
+    let mut used = Vec::new();
+    let mut mark = |state: torse_world::BlockStateId| -> Result<(), Fault> {
+        let slot = seen
+            .get_mut(state.0 as usize)
+            .ok_or_else(|| Fault::invalid_data("unregistered replica state"))?;
+        if !*slot && !state.is_empty() {
+            used.push(state);
+        }
+        *slot = true;
+        Ok(())
+    };
     // Borrow-only preflight. Inaccessible sections stay absent, never become air.
     for &pos in &scope.sections {
         if !readable(world, pos) {
@@ -503,11 +516,11 @@ fn project(
         let section = world.store().section(pos).expect("readable section");
         cost.entries::<SnapshotSection>(1)?;
         match section.storage() {
-            SectionStorage::Uniform(state) => used[state.0 as usize] = true,
+            SectionStorage::Uniform(state) => mark(*state)?,
             SectionStorage::Dense(cells) => {
                 cost.bytes(cells.len() * size_of::<u16>())?;
                 for state in cells {
-                    used[state.0 as usize] = true;
+                    mark(*state)?;
                 }
             }
         }
@@ -534,8 +547,8 @@ fn project(
             return Err(Fault::resource_limit("replica snapshot budget"));
         }
     }
-    for (id, _) in used.iter().enumerate().skip(1).filter(|(_, used)| **used) {
-        let id = torse_world::BlockStateId(id as u16);
+    used.sort_unstable();
+    for &id in &used {
         cost.entries::<StateEntry>(1)?;
         cost.key(
             world
@@ -552,20 +565,14 @@ fn project(
     }
     let states = used
         .iter()
-        .enumerate()
-        .skip(1)
-        .filter(|(_, used)| **used)
-        .map(|(id, _)| {
-            let id = torse_world::BlockStateId(id as u16);
-            StateEntry {
-                id,
-                block: world
-                    .registry()
-                    .definition_key(id)
-                    .expect("preflight resolved")
-                    .clone(),
-                values: world.registry().state_values(id).unwrap_or(&[]).to_vec(),
-            }
+        .map(|&id| StateEntry {
+            id,
+            block: world
+                .registry()
+                .definition_key(id)
+                .expect("preflight resolved")
+                .clone(),
+            values: world.registry().state_values(id).unwrap_or(&[]).to_vec(),
         })
         .collect();
     let sections = scope

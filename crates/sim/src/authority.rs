@@ -116,6 +116,30 @@ pub struct WorldAuthority {
 }
 
 impl WorldAuthority {
+    /// Compute a pure movement on a borrowed world. It still requires serial
+    /// refresh and the usual reservation/publication/durability path.
+    pub fn prevalidate_movement(
+        &self,
+        group: &crate::TransactionGroup,
+    ) -> Result<crate::MovementPrevalidation, PrepareError> {
+        self.coordinator.prevalidate_movement(
+            &self.store,
+            &self.entities,
+            &self.registry,
+            &self.schemas,
+            group,
+        )
+    }
+
+    /// Refresh only when the phase, terrain, identity generations and exact
+    /// source positions still match; otherwise callers must prepare normally.
+    pub fn refresh_movement(
+        &self,
+        token: &crate::MovementPrevalidation,
+    ) -> Result<PreparedChange, PrepareError> {
+        self.coordinator
+            .refresh_movement(&self.store, &self.entities, token)
+    }
     /// Prepare an empty world change carrying an atomic host execution-state update.
     pub fn prepare_barrier(&self) -> Result<PreparedChange, CommitFault> {
         self.coordinator.prepare_barrier()

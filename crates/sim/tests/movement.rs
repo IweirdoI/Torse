@@ -105,6 +105,113 @@ fn snapshot_meta(authority: &WorldAuthority) -> SnapshotMeta {
     }
 }
 
+fn group(tx: Transaction) -> torse_sim::TransactionGroup {
+    torse_sim::TransactionGroup::new(tx.id, tx.ordering, vec![tx]).unwrap()
+}
+
+#[test]
+fn movement_token_refreshes_after_independent_commit_without_changing_serial_output() {
+    let mut authority = authority();
+    let first = spawn(&mut authority, 2.0);
+    let second = spawn(&mut authority, 6.0);
+    let tx = group(movement(&authority, second, [1.0, 0.0, 0.0]));
+    let token = authority.prevalidate_movement(&tx).unwrap();
+    assert!(token.allocated_bytes() > 0);
+    committed(
+        authority
+            .commit(&movement(&authority, first, [0.5, 0.0, 0.0]))
+            .unwrap(),
+    );
+    let seq = authority.seq();
+    let fresh = authority.prepare_group(&tx).unwrap();
+    let cached = authority.refresh_movement(&token).unwrap();
+    assert_eq!(fresh.meta(), cached.meta());
+    assert_eq!(fresh.entity_moves(), cached.entity_moves());
+    assert_eq!(cached.meta().previous, seq);
+    assert_eq!(authority.seq(), seq);
+    authority.publish(cached).unwrap();
+    assert!(
+        authority.refresh_movement(&token).is_err(),
+        "old position was consumed"
+    );
+}
+
+#[test]
+fn movement_token_rejects_changed_terrain_identity_position_phase_and_compatibility() {
+    for change in 0..6 {
+        let mut authority = authority();
+        let handle = spawn(&mut authority, 2.0);
+        let tx = group(movement(&authority, handle, [1.0, 0.0, 0.0]));
+        let token = authority.prevalidate_movement(&tx).unwrap();
+        match change {
+            0 => {
+                let stone = authority
+                    .registry()
+                    .default_state(&key("base:stone"))
+                    .unwrap();
+                authority
+                    .store_mut()
+                    .edit(BlockPos::new(2, 2, 2), stone)
+                    .unwrap();
+            }
+            1 => {
+                authority.entities_mut().despawn(handle).unwrap();
+                let replacement = spawn(&mut authority, 2.0);
+                assert_eq!(replacement.slot, handle.slot);
+                assert_ne!(replacement.generation, handle.generation);
+            }
+            2 => {
+                committed(
+                    authority
+                        .commit(&movement(&authority, handle, [0.5, 0.0, 0.0]))
+                        .unwrap(),
+                );
+            }
+            3 => {
+                let advance = authority.prepare_phase_advance().unwrap();
+                authority.publish(advance).unwrap();
+            }
+            4 => {
+                let mut compatibility = authority.coordinator().compatibility();
+                compatibility.rules_digest = Digest([9; 32]);
+                authority.coordinator_mut().set_compatibility(compatibility);
+            }
+            _ => {
+                authority.store_mut().unload(SectionPos::ZERO).unwrap();
+            }
+        }
+        let before = authority.seq();
+        assert!(
+            authority.refresh_movement(&token).is_err(),
+            "change {change}"
+        );
+        assert_eq!(authority.seq(), before);
+    }
+}
+
+#[test]
+fn movement_tokens_exclude_explicit_reads_block_writes_and_multiple_movements() {
+    let mut authority = authority();
+    let handle = spawn(&mut authority, 2.0);
+    let second = spawn(&mut authority, 6.0);
+    for kind in 0..3 {
+        let mut tx = movement(&authority, handle, [1.0, 0.0, 0.0]);
+        match kind {
+            0 => {
+                tx.read_block(BlockPos::new(1, 1, 1), BlockStateId::EMPTY);
+            }
+            1 => {
+                tx.write_block(BlockPos::new(1, 1, 1), BlockStateId::EMPTY);
+            }
+            _ => {
+                tx.movements
+                    .push(movement(&authority, second, [1.0, 0.0, 0.0]).movements[0]);
+            }
+        }
+        assert!(authority.prevalidate_movement(&group(tx)).is_err());
+    }
+}
+
 #[test]
 fn dropped_preparation_preserves_position_sequence_and_spatial_index() {
     let mut authority = authority();

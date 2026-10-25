@@ -5,9 +5,9 @@
 //! graph, typed read/write transactions, a single coordinator that assigns the
 //! world's commit sequence, and a tick driver that runs systems in that order.
 //!
-//! The crate deliberately has no thread pool yet. A serial reference executor is
-//! required before parallel execution, because parallel results are only
-//! acceptable if they match the serial arbitration order exactly.
+//! Simulation retains the serial reference executor. Hosts may parallelize
+//! read-only planning and movement preparation, while publication retains the
+//! same serial arbitration order.
 
 #![forbid(unsafe_code)]
 
@@ -30,7 +30,8 @@ pub mod transaction;
 pub use authority::{AuthorityError, Recovery, RecoveryError, WorldAuthority};
 pub use clock::{TickClock, TickReport};
 pub use coordinator::{
-    CommitCoordinator, CommitFault, Committed, PrepareError, PreparedChange, Publication,
+    CommitCoordinator, CommitFault, Committed, MovementPrevalidation, PrepareError, PreparedChange,
+    Publication,
 };
 pub use payload::{changes_from_committed, changes_from_prepared};
 pub use phase::{OrderError, Phase, SystemSpec, next_resume_point, order_phase};

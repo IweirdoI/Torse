@@ -216,6 +216,11 @@ pub struct LightTransport {
 pub struct InteractionProfile {
     /// Registered action invoked by a normal interaction.
     pub action: Option<ContentKey>,
+    /// Block written when an identical block is placed into a cell that
+    /// already holds this one, filling the cell's remaining volume. A lower
+    /// slab completes into its full block; `None` keeps placement into an
+    /// occupied cell rejected.
+    pub completes_to: Option<ContentKey>,
 }
 
 /// One finite-valued state field such as orientation or growth stage.

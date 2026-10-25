@@ -129,23 +129,28 @@ pub fn m0_fixture_pack() -> ContentPack {
                     0b11_1111,
                     AlphaMode::Opaque,
                     inspect_action.clone(),
+                    None,
                 ),
             ),
-            sourced(
-                "fixtures/m0/glass_slab.json",
-                block(
+            sourced("fixtures/m0/glass_slab.json", {
+                let mut slab = block(
                     "base:glass_slab",
                     key("base:state/simple"),
                     Shape::LowerSlab,
                     Some(Shape::LowerSlab),
                     Some(Shape::LowerSlab),
-                    // Occlusion follows the shape: a lower slab touches its
-                    // bottom and four side boundaries but never its top.
-                    0b110100,
+                    // Occlusion claims only fully covered faces: mesh culling
+                    // removes whole neighbour faces, and the slab covers its
+                    // bottom boundary alone.
+                    0b000100,
                     AlphaMode::Blend,
                     inspect_action.clone(),
-                ),
-            ),
+                    Some(key("base:glass")),
+                );
+                // The slab and the full glass block share one material.
+                slab.render_profile.material = key("base:material/glass");
+                slab
+            }),
             sourced(
                 "fixtures/m0/plant.json",
                 BlockDefinition {
@@ -159,9 +164,24 @@ pub fn m0_fixture_pack() -> ContentPack {
                         Some(Shape::Panel),
                         0,
                         AlphaMode::Mask,
-                        inspect_action,
+                        inspect_action.clone(),
+                        None,
                     )
                 },
+            ),
+            sourced(
+                "fixtures/m0/glass.json",
+                block(
+                    "base:glass",
+                    key("base:state/simple"),
+                    Shape::FullCube,
+                    Some(Shape::FullCube),
+                    Some(Shape::FullCube),
+                    0b11_1111,
+                    AlphaMode::Blend,
+                    inspect_action,
+                    None,
+                ),
             ),
         ],
     }
@@ -177,6 +197,7 @@ fn block(
     face_mask: u8,
     alpha_mode: AlphaMode,
     action: ContentKey,
+    completes_to: Option<ContentKey>,
 ) -> BlockDefinition {
     // A helper keeps the fixture focused on deliberately different profiles.
     // Render, collision, selection, occlusion, and light are still populated as
@@ -208,6 +229,7 @@ fn block(
         },
         interaction_profile: InteractionProfile {
             action: Some(action),
+            completes_to,
         },
         component_defaults: Vec::new(),
         capability_bindings: Vec::<CapabilityBinding>::new(),

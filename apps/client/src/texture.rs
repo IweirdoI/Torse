@@ -159,7 +159,7 @@ pub fn base_pack() -> Result<TexturePack, String> {
                 tint: None,
             },
             MaterialEntry {
-                key: "base:material/glass_slab",
+                key: "base:material/glass",
                 rect: [28, 4, 16, 16],
                 tint: None,
             },
@@ -237,7 +237,7 @@ mod tests {
 
         for material in [
             "base:material/stone",
-            "base:material/glass_slab",
+            "base:material/glass",
             "base:material/plant",
         ] {
             let slot = palette
@@ -251,9 +251,8 @@ mod tests {
             );
         }
         assert_eq!(
-            palette.surfaces()
-                [usize::from(palette.slot(&key("base:material/glass_slab")).unwrap())]
-            .alpha,
+            palette.surfaces()[usize::from(palette.slot(&key("base:material/glass")).unwrap())]
+                .alpha,
             AlphaMode::Blend
         );
         assert_eq!(

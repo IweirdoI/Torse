@@ -5,8 +5,9 @@ fn builtin_fixture_compiles() {
     // The fixture is the minimum proof that all four contracts can coexist and
     // that authority and presentation summaries are independent values.
     let compiled = compile(m0_fixture_pack()).unwrap();
-    assert_eq!(compiled.blocks.len(), 3);
+    assert_eq!(compiled.blocks.len(), 4);
     assert!(compiled.blocks.contains_key(&key("base:stone")));
+    assert!(compiled.blocks.contains_key(&key("base:glass")));
     assert_ne!(compiled.authority_digest, compiled.presentation_digest);
 }
 
@@ -125,6 +126,39 @@ fn module_action_references_are_resolved() {
     let errors = compile(pack).unwrap_err();
     assert!(errors.iter().any(|error| {
         error.field == "registered_actions" && error.message.contains("base:action/missing")
+    }));
+}
+
+#[test]
+fn partial_occlusion_claims_are_rejected() {
+    // Mesh culling removes whole neighbour faces, so a slab claiming a side
+    // boundary would punch a see-through hole above its midline.
+    let mut pack = m0_fixture_pack();
+    let slab = pack
+        .blocks
+        .iter_mut()
+        .find(|block| block.value.id.to_string() == "base:glass_slab")
+        .unwrap();
+    slab.value.occlusion_profile.face_mask = 0b110100;
+    let errors = compile(pack).unwrap_err();
+    assert!(errors.iter().any(|error| {
+        error.field == "occlusion_profile.face_mask"
+            && error.message.contains("does not fully cover")
+    }));
+}
+
+#[test]
+fn completion_target_must_be_a_registered_block() {
+    let mut pack = m0_fixture_pack();
+    let slab = pack
+        .blocks
+        .iter_mut()
+        .find(|block| block.value.id.to_string() == "base:glass_slab")
+        .unwrap();
+    slab.value.interaction_profile.completes_to = Some(key("base:missing"));
+    let errors = compile(pack).unwrap_err();
+    assert!(errors.iter().any(|error| {
+        error.field == "interaction_profile.completes_to" && error.message.contains("base:missing")
     }));
 }
 

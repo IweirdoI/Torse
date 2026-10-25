@@ -229,13 +229,15 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
     // Normalize each block before insertion. Validation is order-insensitive,
     // and digest encoding must not depend on the order of source vectors.
     let mut blocks = BTreeMap::new();
+    let mut block_sources = BTreeMap::new();
     for sourced in pack.blocks {
+        let source = sourced.source;
         let mut block = sourced.value;
         normalize_block(&mut block);
         let id = block.id.clone();
         validate_block(
             &block,
-            &sourced.source,
+            &source,
             &state_schemas,
             &capabilities,
             &component_ids,
@@ -243,10 +245,29 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
         );
         if blocks.insert(id.clone(), block).is_some() {
             diagnostics.push(diagnostic(
-                sourced.source,
-                id,
+                source.clone(),
+                id.clone(),
                 "id",
                 "duplicate block definition",
+            ));
+        }
+        block_sources.insert(id, source);
+    }
+
+    // Completion targets are block references; check them after every block is
+    // collected so the rule does not depend on source order.
+    for (id, block) in &blocks {
+        if let Some(target) = &block.interaction_profile.completes_to
+            && !blocks.contains_key(target)
+        {
+            diagnostics.push(diagnostic(
+                block_sources
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| SourceRef::new("compiled-registry", 0)),
+                id.clone(),
+                "interaction_profile.completes_to",
+                format!("unknown completion target {target}"),
             ));
         }
     }
@@ -627,6 +648,15 @@ fn validate_block(
             "face mask may only contain six face bits",
         ));
     }
+    if block.occlusion_profile.face_mask & !claimable_occlusion(&block.render_profile.shape) != 0 {
+        diagnostics.push(diagnostic(
+            source.clone(),
+            block.id.clone(),
+            "occlusion_profile.face_mask",
+            "mask claims faces the render shape does not fully cover; \
+             culling would delete visible neighbour faces",
+        ));
+    }
     for (name, value) in [
         (
             "light_transport.absorption",
@@ -669,6 +699,48 @@ fn validate_block(
                 "capability_bindings.face_mask",
                 "capability face mask may only contain six face bits",
             ));
+        }
+    }
+}
+
+/// Faces a render shape may claim in an occlusion mask.
+///
+/// Mesh culling removes whole neighbour faces, so a claim is only sound where
+/// the shape reaches the boundary and spans the face's full cross-section.
+/// Partial coverage must stay unclaimed: the neighbour then keeps its face,
+/// which overdraws but never deletes a visible surface.
+fn claimable_occlusion(shape: &Shape) -> u8 {
+    match shape {
+        Shape::FullCube => 0b11_1111,
+        // A lower slab spans the cell footprint only at its bottom boundary.
+        Shape::LowerSlab => 0b000100,
+        Shape::Panel | Shape::Corner | Shape::Stair => 0,
+        Shape::Box(bounds) => {
+            let spans = |a: usize| bounds.min[a] <= 0.0 && bounds.max[a] >= 1.0;
+            let mut mask = 0u8;
+            for (bit, axis, negative) in [
+                (0u8, 0usize, true),
+                (1, 0, false),
+                (2, 1, true),
+                (3, 1, false),
+                (4, 2, true),
+                (5, 2, false),
+            ] {
+                let (first, second) = match axis {
+                    0 => (1, 2),
+                    1 => (0, 2),
+                    _ => (0, 1),
+                };
+                let touches = if negative {
+                    bounds.min[axis] <= 0.0
+                } else {
+                    bounds.max[axis] >= 1.0
+                };
+                if touches && spans(first) && spans(second) {
+                    mask |= 1 << bit;
+                }
+            }
+            mask
         }
     }
 }
@@ -926,6 +998,7 @@ fn authority_digest(
         writer.u32(block.light_transport.absorption.to_bits());
         writer.u32(block.light_transport.emission.to_bits());
         writer.optional_key(block.interaction_profile.action.as_ref());
+        writer.optional_key(block.interaction_profile.completes_to.as_ref());
         writer.u32(block.component_defaults.len() as u32);
         for component in &block.component_defaults {
             writer.key(component);

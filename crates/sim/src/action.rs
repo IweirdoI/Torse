@@ -236,6 +236,24 @@ impl ActionView<'_> {
     pub fn default_state(&self, block: &ContentKey) -> Option<BlockStateId> {
         self.world.registry().default_state(block)
     }
+    /// State written when an identical `block` is placed into a cell that
+    /// already holds it, or `None` when the occupied cell must stay rejected.
+    ///
+    /// Completion is content-defined: the held block names the block its
+    /// remaining volume turns into, which is how two half slabs become one
+    /// full block.
+    pub fn completion_state(
+        &self,
+        block: &ContentKey,
+        current: BlockStateId,
+    ) -> Option<BlockStateId> {
+        let definition = self.world.registry().definition(current)?;
+        if &definition.id != block {
+            return None;
+        }
+        let target = definition.interaction_profile.completes_to.as_ref()?;
+        self.world.registry().default_state(target)
+    }
 }
 
 /// Native handlers may observe authority but cannot mutate it through this API.

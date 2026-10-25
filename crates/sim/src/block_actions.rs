@@ -121,15 +121,19 @@ impl ActionHandler for BlockHandler {
             TerrainQuery::OutOfBounds => return Err(RejectCode::MissingTarget),
         };
         let state = if self.place {
-            if !current.is_empty() {
-                return Err(RejectCode::Conflict);
-            }
             let Some(ComponentValue::Content(block)) =
                 request.parameters.get(&key("world:field/block"))
             else {
                 return Err(RejectCode::InvalidData);
             };
-            view.default_state(block).ok_or(RejectCode::MissingTarget)?
+            if current.is_empty() {
+                view.default_state(block).ok_or(RejectCode::MissingTarget)?
+            } else {
+                // A cell that already holds the same block may complete into
+                // the block its content names, filling the remaining volume.
+                view.completion_state(block, current)
+                    .ok_or(RejectCode::Conflict)?
+            }
         } else {
             if current.is_empty() {
                 return Err(RejectCode::Conflict);

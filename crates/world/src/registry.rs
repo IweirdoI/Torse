@@ -400,8 +400,13 @@ mod tests {
     #[test]
     fn default_states_cover_every_block() {
         let registry = fixture_registry();
-        assert_eq!(registry.block_count(), 3);
-        for block in [key("base:stone"), key("base:glass_slab"), key("base:plant")] {
+        assert_eq!(registry.block_count(), 4);
+        for block in [
+            key("base:stone"),
+            key("base:glass_slab"),
+            key("base:plant"),
+            key("base:glass"),
+        ] {
             let state = registry
                 .default_state(&block)
                 .expect("block has a default state");
@@ -437,7 +442,12 @@ mod tests {
         let first = fixture_registry();
         let second = fixture_registry();
         assert_eq!(first.state_count(), second.state_count());
-        for block in [key("base:stone"), key("base:glass_slab"), key("base:plant")] {
+        for block in [
+            key("base:stone"),
+            key("base:glass_slab"),
+            key("base:plant"),
+            key("base:glass"),
+        ] {
             assert_eq!(first.default_state(&block), second.default_state(&block));
         }
     }

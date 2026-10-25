@@ -493,6 +493,25 @@ impl Scene {
         )
     }
 
+    /// Whether placing an identical block into `pos` completes its contents.
+    ///
+    /// A lower slab with a completion target fills its empty upper half; the
+    /// action service makes the final call, this only steers the aim.
+    pub fn completes_at(&self, pos: BlockPos) -> bool {
+        match self.authority.store().query(pos) {
+            TerrainQuery::Ready(state) => {
+                self.authority
+                    .registry()
+                    .definition(state)
+                    .is_some_and(|definition| {
+                        definition.render_profile.shape == Shape::LowerSlab
+                            && definition.interaction_profile.completes_to.is_some()
+                    })
+            }
+            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => false,
+        }
+    }
+
     /// Spawn the walk-mode player entity at a world position.
     ///
     /// The windowed client is a trusted local host, so it installs the player
@@ -1237,6 +1256,37 @@ mod tests {
         // Breaking air is a conflict, not a silent no-op.
         let empty = scene.apply_edit(false, &stone, target);
         assert!(empty.is_err());
+    }
+
+    #[test]
+    fn two_slabs_merge_into_one_full_block() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        let target = air_above_surface(&scene);
+
+        let slab = key("base:glass_slab");
+        scene.apply_edit(true, &slab, target).expect("first slab");
+        assert!(scene.completes_at(target));
+
+        // Placing the same slab into the occupied cell merges the pair into
+        // one full glass block, exactly what the top-face aim sends.
+        scene
+            .apply_edit(true, &slab, target)
+            .expect("second slab merges");
+        assert!(!scene.completes_at(target));
+        let state = scene
+            .authority()
+            .store()
+            .query(target)
+            .ready()
+            .expect("merged cell holds a block");
+        assert_eq!(
+            scene.authority().registry().definition_key(state),
+            Some(&key("base:glass"))
+        );
+
+        // The full block completes no further; a third slab is a conflict.
+        let third = scene.apply_edit(true, &slab, target);
+        assert!(third.is_err());
     }
 
     /// Highest and lowest world-space vertex Y inside one cell's footprint.

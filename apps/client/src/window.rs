@@ -498,6 +498,14 @@ impl WindowApp {
             intent = action_for(&aim, button);
             self.autoplay_break = !self.autoplay_break;
         }
+        // Aiming at the exposed top of a half block places into the same
+        // cell, where the action service merges the two halves into one
+        // full block.
+        if let Some((true, target)) = intent.as_mut()
+            && let Some(merged) = merged_target(self.scene.as_ref(), &aim)
+        {
+            *target = merged;
+        }
         if let Some((place, target)) = intent {
             if self.scene.as_ref().is_some_and(Scene::is_network) {
                 // Edits go to the server, not the local mirror. The guest
@@ -1300,6 +1308,17 @@ fn action_for(outcome: &PickOutcome, button: MouseButton) -> Option<(bool, Block
         }
         _ => None,
     }
+}
+
+/// Placement aimed at the exposed top of a completable half block targets
+/// the same cell instead of the cell above; the action service decides
+/// whether the pair merges into one full block.
+fn merged_target(scene: Option<&Scene>, outcome: &PickOutcome) -> Option<BlockPos> {
+    let PickOutcome::Hit(hit) = outcome else {
+        return None;
+    };
+    (hit.face == [0, 1, 0] && scene.is_some_and(|scene| scene.completes_at(hit.block)))
+        .then_some(hit.block)
 }
 
 fn create_depth(device: &Device, width: u32, height: u32) -> Texture {

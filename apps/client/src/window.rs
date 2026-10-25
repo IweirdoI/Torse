@@ -479,7 +479,7 @@ impl WindowApp {
                 false,
                 &self.materials[self.material],
                 BlockPos::new(200, 1, 1),
-                [0, 1, 0],
+                0,
             );
             match net.request(call) {
                 Ok(seq) => {
@@ -506,9 +506,9 @@ impl WindowApp {
                 scene.pick(camera.eye, camera.forward(), PICK_RANGE)
             };
             if let Some((place, target)) = action_for(&aim, MouseButton::Left) {
-                let material = placement_material(&aim, &self.materials[self.material]);
-                let face = aim_hit_face(&aim);
-                let call = crate::net::edit_call(place, &material, target, face);
+                let material = &self.materials[self.material];
+                let half = place_half(&aim);
+                let call = crate::net::edit_call(place, material, target, half);
                 if let Some(Ok(seq)) = self.net.as_mut().map(|net| net.request(call)) {
                     self.requests_sent += 1;
                     self.last_result = format!("seq {} sent", seq.0);
@@ -543,19 +543,19 @@ impl WindowApp {
                 // Edits go to the server, not the local mirror. The guest
                 // session has no edit grants, so the admission reply carries
                 // the rejection; the mirror never forks.
-                let material = placement_material(&aim, &self.materials[self.material]);
-                let face = aim_hit_face(&aim);
-                let call = crate::net::edit_call(place, &material, target, face);
+                let material = &self.materials[self.material];
+                let half = place_half(&aim);
+                let call = crate::net::edit_call(place, material, target, half);
                 match self.net.as_mut().map(|net| net.request(call)) {
                     Some(Ok(seq)) => self.last_result = format!("seq {} sent", seq.0),
                     Some(Err(error)) => self.last_result = format!("send failed: {error}"),
                     None => self.last_result = "offline".to_owned(),
                 }
             } else {
-                let material = placement_material(&aim, &self.materials[self.material]);
-                let face = aim_hit_face(&aim);
+                let material = &self.materials[self.material];
+                let half = place_half(&aim);
                 let result = match self.scene.as_mut() {
-                    Some(scene) => scene.apply_edit(place, &material, target, face),
+                    Some(scene) => scene.apply_edit(place, material, target, half),
                     None => return,
                 };
                 match result {
@@ -1390,35 +1390,22 @@ const fn demo_scope() -> [SectionPos; 2] {
 /// Left breaks the hit cell; right places the selected material against the
 /// entered face. A hit inside a solid cell carries no face, so placement is
 /// dropped rather than guessed.
-/// Mirror-half mapping: a lower slab offers an upper variant, placed when
-/// the click faces a ceiling or the underside of any block.
-fn upper_variant(block: &ContentKey) -> Option<ContentKey> {
-    match block.path() {
-        "glass_slab" => Some(ContentKey::parse("base:glass_slab_upper").expect("static key")),
-        _ => None,
+/// The half a placement produces, per Minecraft-style aim semantics: a click
+/// on a ceiling underside places the upper half, a click on a floor top the
+/// lower half, and a side click follows the aim point's height within the
+/// targeted cell.
+fn place_half(aim: &PickOutcome) -> u32 {
+    let PickOutcome::Hit(hit) = aim else {
+        return 0;
+    };
+    match hit.face {
+        [0, -1, 0] => 1,
+        [0, 1, 0] => 0,
+        _ => {
+            let fraction = hit.entry[1] - hit.block.y as f32;
+            u32::from(fraction > 0.5)
+        }
     }
-}
-
-/// The material key a placement actually uses. A click on a ceiling
-/// underside (entry face pointing down) swaps a lower slab for its upper
-/// variant; every other face keeps the selected material.
-/// Entry face of the aim hit, in engine face-index order; a miss falls back
-/// to the top face.
-fn aim_hit_face(aim: &PickOutcome) -> [i32; 3] {
-    match aim {
-        PickOutcome::Hit(hit) => hit.face,
-        PickOutcome::Miss => [0, 1, 0],
-    }
-}
-
-fn placement_material(aim: &PickOutcome, base: &ContentKey) -> ContentKey {
-    if let PickOutcome::Hit(hit) = aim
-        && hit.face == [0, 0, -1]
-        && let Some(upper) = upper_variant(base)
-    {
-        return upper;
-    }
-    base.clone()
 }
 
 fn action_for(outcome: &PickOutcome, button: MouseButton) -> Option<(bool, BlockPos)> {

@@ -69,10 +69,10 @@ pub fn register_content(pack: &mut ContentPack) {
                         field_type: ComponentFieldType::ContentReference,
                         required: true,
                     },
-                    // The entry face steers half-type blocks between their
+                    // The aim half steers half-type blocks between their
                     // lower and upper states.
                     ComponentField {
-                        id: key("world:field/face"),
+                        id: key("world:field/half"),
                         field_type: ComponentFieldType::Unsigned32,
                         required: false,
                     },
@@ -136,13 +136,13 @@ impl ActionHandler for BlockHandler {
                 return Err(RejectCode::InvalidData);
             };
             if current.is_empty() {
-                // The entry face picks the half for half-type blocks: a click
-                // on a ceiling underside (face -y) places the upper half.
-                let face = match request.parameters.get(&key("world:field/face")) {
-                    Some(ComponentValue::U32(value)) => *value,
-                    _ => 3,
+                // Half-type blocks take the half from the aim point: the
+                // client computes it from where the ray met the surface.
+                let half = match request.parameters.get(&key("world:field/half")) {
+                    Some(ComponentValue::U32(value)) => (*value % 2) as usize,
+                    _ => 0,
                 };
-                view.state_for_face(block, face)
+                view.state_with_half(block, half)
                     .ok_or(RejectCode::MissingTarget)?
             } else {
                 // A cell that already holds the same block may complete into

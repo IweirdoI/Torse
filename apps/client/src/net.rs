@@ -173,7 +173,7 @@ pub fn edit_call(
     place: bool,
     block: &ContentKey,
     target: BlockPos,
-    face: [i32; 3],
+    half: u32,
 ) -> torse_sim::durable::Call {
     let action = if place {
         "world:action/place"
@@ -186,17 +186,9 @@ pub fn edit_call(
             ContentKey::parse("world:field/block").expect("static key"),
             torse_world::ComponentValue::Content(block.clone()),
         );
-        let face_index = match face {
-            [-1, 0, 0] => 0u32,
-            [1, 0, 0] => 1,
-            [0, -1, 0] => 2,
-            [0, 1, 0] => 3,
-            [0, 0, -1] => 4,
-            _ => 5,
-        };
         parameters.insert(
-            ContentKey::parse("world:field/face").expect("static key"),
-            torse_world::ComponentValue::U32(face_index),
+            ContentKey::parse("world:field/half").expect("static key"),
+            torse_world::ComponentValue::U32(half),
         );
     }
     torse_sim::durable::Call {
@@ -228,7 +220,7 @@ mod tests {
             false,
             &ContentKey::parse("base:stone").expect("key"),
             BlockPos::new(1, 1, 1),
-            [0, 1, 0],
+            0,
         );
         let first = connection.request(call.clone()).expect("send");
         let second = connection.request(call).expect("send");

@@ -241,10 +241,9 @@ impl ActionView<'_> {
     /// Resolve the state a placement produces for one entry face.
     ///
     /// Blocks whose state schema carries a `base:field/half` field switch
-    /// between their lower and upper halves: a click on a ceiling underside
-    /// (face -y) places the upper half, anything else the default lower one.
-    /// Blocks without the field resolve to their default state.
-    pub fn state_for_face(&self, block: &ContentKey, face: u32) -> Option<BlockStateId> {
+    /// between their lower (0) and upper (1) halves. Blocks without the
+    /// field resolve to their default state.
+    pub fn state_with_half(&self, block: &ContentKey, half: usize) -> Option<BlockStateId> {
         let registry = self.world.registry();
         let state = registry.default_state(block)?;
         let values = registry.state_values(state)?;
@@ -257,11 +256,7 @@ impl ActionView<'_> {
             return Some(state);
         };
         let mut resolved = values.to_vec();
-        // A click on a ceiling underside places the upper half.
-        resolved[half_index] = u16::try_from(face)
-            .ok()
-            .filter(|v| *v == 2)
-            .map_or(0, |_| 1);
+        resolved[half_index] = u16::try_from(half).unwrap_or(0);
         registry.state_of(block, &resolved)
     }
 

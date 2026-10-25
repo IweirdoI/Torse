@@ -671,7 +671,7 @@ impl Scene {
         place: bool,
         block: &ContentKey,
         target: BlockPos,
-        face: [i32; 3],
+        half: u32,
     ) -> Result<(), String> {
         self.edit_counter += 1;
         let counter = self.edit_counter;
@@ -686,18 +686,8 @@ impl Scene {
                 key("world:field/block"),
                 ComponentValue::Content(block.clone()),
             );
-            // The entry face steers half-type blocks between their lower and
-            // upper states.
-            let face_index = match face {
-                [-1, 0, 0] => 0u32,
-                [1, 0, 0] => 1,
-                [0, -1, 0] => 2,
-                [0, 1, 0] => 3,
-                [0, 0, -1] => 4,
-                [0, 0, 1] => 5,
-                _ => 3,
-            };
-            parameters.insert(key("world:field/face"), ComponentValue::U32(face_index));
+            // Half-type blocks take their half from the requested half.
+            parameters.insert(key("world:field/half"), ComponentValue::U32(half));
         }
         let request = ActionRequest {
             action,
@@ -1340,7 +1330,7 @@ mod tests {
         // X sits in section (0,0,0) against the border, exposing a +x face
         // into neighbour (1,0,0).
         scene
-            .apply_edit(true, &stone, BlockPos::new(15, 15, 1), [0, 1, 0])
+            .apply_edit(true, &stone, BlockPos::new(15, 15, 1), 0)
             .expect("place X");
         scene.refresh_meshes();
         let faces_before = scene.mesh_face_count(SectionPos::ZERO).expect("cached");
@@ -1348,7 +1338,7 @@ mod tests {
         // Y lands in the neighbour and occludes that face; the border
         // section's own revision does not change.
         scene
-            .apply_edit(true, &stone, BlockPos::new(16, 15, 1), [0, 1, 0])
+            .apply_edit(true, &stone, BlockPos::new(16, 15, 1), 0)
             .expect("place Y");
         let rebuilt = scene.refresh_meshes();
         assert!(
@@ -1543,21 +1533,21 @@ mod tests {
 
         let stone = key("base:stone");
         scene
-            .apply_edit(true, &stone, target, [0, 1, 0])
+            .apply_edit(true, &stone, target, 0)
             .expect("place commits");
         assert!(query(&scene, target));
 
         // Placing into the now occupied cell is rejected without a commit.
-        let again = scene.apply_edit(true, &stone, target, [0, 1, 0]);
+        let again = scene.apply_edit(true, &stone, target, 0);
         assert!(again.is_err());
 
         scene
-            .apply_edit(false, &stone, target, [0, 1, 0])
+            .apply_edit(false, &stone, target, 0)
             .expect("break commits");
         assert!(!query(&scene, target));
 
         // Breaking air is a conflict, not a silent no-op.
-        let empty = scene.apply_edit(false, &stone, target, [0, 1, 0]);
+        let empty = scene.apply_edit(false, &stone, target, 0);
         assert!(empty.is_err());
     }
 
@@ -1568,14 +1558,14 @@ mod tests {
 
         let slab = key("base:glass_slab");
         scene
-            .apply_edit(true, &slab, target, [0, 1, 0])
+            .apply_edit(true, &slab, target, 0)
             .expect("first slab");
         assert!(scene.completes_at(target));
 
         // Placing the same slab into the occupied cell merges the pair into
         // one full glass block, exactly what the top-face aim sends.
         scene
-            .apply_edit(true, &slab, target, [0, 1, 0])
+            .apply_edit(true, &slab, target, 0)
             .expect("second slab merges");
         assert!(!scene.completes_at(target));
         let state = scene
@@ -1590,28 +1580,57 @@ mod tests {
         );
 
         // The full block completes no further; a third slab is a conflict.
-        let third = scene.apply_edit(true, &slab, target, [0, 1, 0]);
+        let third = scene.apply_edit(true, &slab, target, 0);
         assert!(third.is_err());
     }
 
-    /// Highest and lowest world-space vertex Y inside one cell's footprint.
-    fn cell_vertex_range(scene: &Scene, cell: BlockPos) -> (f32, f32) {
-        let (vertices, _, _) = scene.geometry();
-        let mut min_y = f32::MAX;
-        let mut max_y = f32::MIN;
-        for vertex in &vertices {
-            if vertex.position[0] >= cell.x as f32
-                && vertex.position[0] <= cell.x as f32 + 1.0
-                && vertex.position[2] >= cell.z as f32
-                && vertex.position[2] <= cell.z as f32 + 1.0
-                && vertex.position[1] >= cell.y as f32
-                && vertex.position[1] <= cell.y as f32 + 1.0
-            {
-                min_y = min_y.min(vertex.position[1]);
-                max_y = max_y.max(vertex.position[1]);
+    /// Render bounds of one cell's sampled block, in world space. This is the
+    /// shape the mesher receives, straight from the per-state registry query.
+    fn sampled_bounds(scene: &Scene, cell: BlockPos) -> (f32, f32) {
+        match scene.authority.store().query(cell) {
+            TerrainQuery::Ready(state) if !state.is_empty() => {
+                let shape = scene
+                    .authority
+                    .registry()
+                    .render_shape(state)
+                    .expect("known state has a shape");
+                let bounds = shape_box(&shape).expect("shape has bounds");
+                (cell.y as f32 + bounds.min[1], cell.y as f32 + bounds.max[1])
             }
+            _ => panic!("cell holds a shaped block"),
         }
-        (min_y, max_y)
+    }
+
+    #[test]
+    fn placement_half_parameter_selects_the_cell_half() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene.refresh_meshes();
+        let target = air_above_surface(&scene);
+        let glass = key("base:glass_slab");
+
+        // half=1 places the upper half: the sampled bounds sit above the
+        // midline.
+        scene
+            .apply_edit(true, &glass, target, 1)
+            .expect("place upper");
+        let (min_y, max_y) = sampled_bounds(&scene, target);
+        assert!(
+            (min_y - (target.y as f32 + 0.5)).abs() < 1e-4,
+            "upper slab floor {min_y} must sit at the midline"
+        );
+        assert!((max_y - (target.y as f32 + 1.0)).abs() < 1e-4);
+        scene.apply_edit(false, &glass, target, 0).expect("clear");
+
+        // half=0 places the lower half: the bounds sit below the midline.
+        scene
+            .apply_edit(true, &glass, target, 0)
+            .expect("place lower");
+        let (min_y, max_y) = sampled_bounds(&scene, target);
+        assert!((min_y - target.y as f32).abs() < 1e-4);
+        assert!(
+            (max_y - (target.y as f32 + 0.5)).abs() < 1e-4,
+            "lower slab top {max_y} must sit at the midline"
+        );
     }
 
     #[test]
@@ -1622,52 +1641,46 @@ mod tests {
 
         let glass = key("base:glass_slab");
         scene
-            .apply_edit(true, &glass, target, [0, 1, 0])
+            .apply_edit(true, &glass, target, 0)
             .expect("place slab");
-        scene.refresh_meshes();
-        let (min_y, max_y) = cell_vertex_range(&scene, target);
+        let (slab_min_y, slab_max_y) = sampled_bounds(&scene, target);
         // A lower slab fills only the bottom half of the cell.
-        assert!((min_y - target.y as f32).abs() < 1e-4);
+        assert!((slab_min_y - target.y as f32).abs() < 1e-4);
         assert!(
-            (max_y - (target.y as f32 + 0.5)).abs() < 1e-4,
-            "slab top {max_y} must sit at the cell midline"
+            (slab_max_y - (target.y as f32 + 0.5)).abs() < 1e-4,
+            "slab top {slab_max_y} must sit at the cell midline"
         );
 
         let plant = key("base:plant");
+        scene.apply_edit(false, &glass, target, 0).expect("clear");
         scene
-            .apply_edit(false, &glass, target, [0, 1, 0])
-            .expect("clear");
-        scene
-            .apply_edit(true, &plant, target, [0, 1, 0])
+            .apply_edit(true, &plant, target, 0)
             .expect("place plant");
-        scene.refresh_meshes();
-        // A panel is a thin vertical slab along x: vertices hug the cell's
-        // x midline while y spans the full cell.
-        let (min_x, max_x) = {
-            let (vertices, _, _) = scene.geometry();
-            let mut min_x = f32::MAX;
-            let mut max_x = f32::MIN;
-            for vertex in &vertices {
-                // Strictly inside the cell: the terrain block below shares
-                // the y boundary plane and its top face spans the cell.
-                if vertex.position[0] >= target.x as f32
-                    && vertex.position[0] <= target.x as f32 + 1.0
-                    && vertex.position[2] >= target.z as f32
-                    && vertex.position[2] <= target.z as f32 + 1.0
-                    && vertex.position[1] > target.y as f32
-                    && vertex.position[1] <= target.y as f32 + 1.0
-                {
-                    min_x = min_x.min(vertex.position[0]);
-                    max_x = max_x.max(vertex.position[0]);
+        // A panel is a thin vertical slab along x: its sampled bounds hug the
+        // cell's x midline while y spans the full cell.
+        let (plant_min_x, plant_max_x, _plant_min_y, plant_max_y) = {
+            match scene.authority.store().query(target) {
+                TerrainQuery::Ready(state) => {
+                    let shape = scene
+                        .authority
+                        .registry()
+                        .render_shape(state)
+                        .expect("plant shape");
+                    let bounds = shape_box(&shape).expect("plant bounds");
+                    (
+                        target.x as f32 + bounds.min[0],
+                        target.x as f32 + bounds.max[0],
+                        target.y as f32 + bounds.min[1],
+                        target.y as f32 + bounds.max[1],
+                    )
                 }
+                other => panic!("plant state: {other:?}"),
             }
-            (min_x, max_x)
         };
         assert!(
-            min_x >= target.x as f32 + 0.44 && max_x <= target.x as f32 + 0.56,
-            "plant x range [{min_x}, {max_x}] must hug the panel"
+            plant_min_x >= target.x as f32 + 0.44 && plant_max_x <= target.x as f32 + 0.56,
+            "plant x range [{plant_min_x}, {plant_max_x}] must hug the panel"
         );
-        let (_, plant_max_y) = cell_vertex_range(&scene, target);
         assert!((plant_max_y - (target.y as f32 + 1.0)).abs() < 1e-4);
     }
 
@@ -1677,19 +1690,19 @@ mod tests {
         let stone = key("base:stone");
         assert!(
             scene
-                .apply_edit(true, &stone, BlockPos::new(0, 64, 0), [0, 1, 0])
+                .apply_edit(true, &stone, BlockPos::new(0, 64, 0), 0)
                 .is_err()
         );
         assert!(
             scene
-                .apply_edit(true, &stone, BlockPos::new(0, -1, 0), [0, 1, 0])
+                .apply_edit(true, &stone, BlockPos::new(0, -1, 0), 0)
                 .is_err()
         );
         // Above the loaded layer the target is not loaded, which is also a
         // rejection rather than a silent drop.
         assert!(
             scene
-                .apply_edit(true, &stone, BlockPos::new(0, 40, 0), [0, 1, 0])
+                .apply_edit(true, &stone, BlockPos::new(0, 40, 0), 0)
                 .is_err()
         );
     }
@@ -1824,11 +1837,11 @@ mod tests {
         let base = air_above_surface(&scene);
         let glass = key("base:glass_slab");
         scene
-            .apply_edit(true, &glass, base, [0, 1, 0])
+            .apply_edit(true, &glass, base, 0)
             .expect("place lower");
         let upper = BlockPos::new(base.x, base.y + 1, base.z);
         scene
-            .apply_edit(true, &glass, upper, [0, 1, 0])
+            .apply_edit(true, &glass, upper, 0)
             .expect("place upper");
         scene.refresh_meshes();
 
@@ -1865,11 +1878,11 @@ mod tests {
         // Glass with a plant in the x-adjacent cell: different states keep
         // the shared face (the plant occludes nothing).
         scene
-            .apply_edit(true, &glass, base, [0, 1, 0])
+            .apply_edit(true, &glass, base, 0)
             .expect("place glass");
         let beside = BlockPos::new(base.x + 1, base.y, base.z);
         scene
-            .apply_edit(true, &plant, beside, [0, 1, 0])
+            .apply_edit(true, &plant, beside, 0)
             .expect("place plant");
         scene.refresh_meshes();
 

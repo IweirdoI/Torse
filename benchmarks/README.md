@@ -34,6 +34,7 @@
 | [运行态与批量提交](M6-runtime-commit.md) | 进度记录、共享预算缓存、批量同步、混合版本恢复与预验证成本 |
 | [移动预验证与投影](M6-movement-prevalidation.md) | 有界碰撞预计算、串行复核、完整路径测量与授权投影扫描优化 |
 | [授权增量投影](M6-incremental-projection.md) | 按提交目标更新订阅、状态引用计数、完整容量校验和对照测量 |
+| [组件预验证](M6-component-prevalidation.md) | 复用成员校验批次、可选组件并行、完整路径收益与保守预留 |
 | [交换载荷](M2-exchange.md) | 快照、变更记录与重放 |
 | [实体移动](M2-movement.md) | 碰撞结果、准备记录与移动恢复 |
 | [动作与库存](M2-inventory.md) | 统一授权、争用、守恒转移与组件事务 |

@@ -229,6 +229,133 @@ fn group_commits_both_sources_and_consumes_one_sequence() {
 }
 
 #[test]
+fn component_prevalidation_refreshes_after_independent_commit_and_matches_fresh_preparation() {
+    let (mut world, _, machine, store) = setup();
+    let group = grinding_group(machine, store, 700);
+    let token = world.prevalidate_components(&group).unwrap();
+    assert!(token.reserved_bytes() > 0);
+    let mut independent = member("machine", 701, vec![]);
+    independent.write_block(BlockPos::new(1, 1, 1), torse_world::BlockStateId(1));
+    world.commit(&independent).unwrap();
+    let seq = world.seq();
+    let prepared = world.refresh_components(token).unwrap();
+    assert_eq!(world.seq(), seq);
+    assert_eq!(prepared, world.prepare_group(&group).unwrap());
+    world.publish(prepared).unwrap();
+    assert_eq!(
+        component_of(&world, machine, &key("machine:schema/progress")),
+        1
+    );
+}
+
+#[test]
+fn component_prevalidation_rejects_changed_fields_identity_phase_and_compatibility() {
+    for change in 0..4 {
+        let (mut world, _, machine, store) = setup();
+        let token = world
+            .prevalidate_components(&grinding_group(machine, store, 710))
+            .unwrap();
+        match change {
+            0 => {
+                world
+                    .commit(&member("machine", 711, vec![progress_edit(machine, 0, 5)]))
+                    .unwrap();
+            }
+            1 => {
+                let handle = world.entities().handle_of(machine).unwrap();
+                world.entities_mut().despawn(handle).unwrap();
+                let next = world
+                    .entities_mut()
+                    .spawn(Position::new(2.0, 2.0, 2.0))
+                    .unwrap();
+                assert_eq!(next.slot, handle.slot);
+                assert_ne!(next.generation, handle.generation);
+            }
+            2 => {
+                let advance = world.prepare_phase_advance().unwrap();
+                world.publish(advance).unwrap();
+            }
+            _ => {
+                let mut c = world.coordinator().compatibility();
+                c.rules_digest = Digest([9; 32]);
+                world.coordinator_mut().set_compatibility(c);
+            }
+        }
+        let seq = world.seq();
+        assert!(world.refresh_components(token).is_err());
+        assert_eq!(world.seq(), seq);
+    }
+}
+
+#[test]
+fn component_prevalidation_keeps_ownership_checks_and_excludes_other_side_effects() {
+    let (world, _, machine, store) = setup();
+    for kind in 0..5 {
+        let mut group = grinding_group(machine, store, 720);
+        match kind {
+            0 => {
+                group.members[0]
+                    .read_block(BlockPos::new(1, 1, 1), torse_world::BlockStateId::EMPTY);
+            }
+            1 => {
+                group.members[0].write_block(BlockPos::new(1, 1, 1), torse_world::BlockStateId(1));
+            }
+            2 => {
+                group.members[0].spawn_entity(Position::new(2.0, 2.0, 2.0), Default::default());
+            }
+            3 => {
+                let handle = world.entities().handle_of(machine).unwrap();
+                group.members[0].move_entity(
+                    handle,
+                    machine,
+                    world.entities().get(handle).unwrap().position,
+                    [1.0, 0.0, 0.0],
+                    [0.3; 3],
+                );
+            }
+            _ => {
+                group.members[0].source = key("store:module");
+            }
+        }
+        assert!(world.prevalidate_components(&group).is_err());
+    }
+}
+
+#[test]
+fn aggregate_component_quota_preserves_member_error_order_and_leaves_all_fields_unchanged() {
+    let (mut world, schemas, machine, _) = setup();
+    let stores: Vec<_> = (0..256)
+        .map(|_| spawn_with(&mut world, &schemas, "store", "stock", 1))
+        .collect();
+    let mut group = grinding_group(machine, stores[0], 730);
+    group.members[1].components = stores.iter().map(|id| stock_edit(*id, 1, 0)).collect();
+    assert_eq!(
+        world.prepare_group(&group).unwrap_err(),
+        torse_sim::PrepareError::Rejected(RejectCode::InvalidData)
+    );
+    group.members[0].source = key("invalid:owner");
+    assert_eq!(
+        world.prepare_group(&group).unwrap_err(),
+        torse_sim::PrepareError::Rejected(RejectCode::PermissionDenied)
+    );
+    group.members[0].source = key("machine:module");
+    group.members[1].components[0].id = EntityId(9999);
+    assert_eq!(
+        world.prepare_group(&group).unwrap_err(),
+        torse_sim::PrepareError::Rejected(RejectCode::MissingTarget)
+    );
+    assert_eq!(
+        component_of(&world, machine, &key("machine:schema/progress")),
+        0
+    );
+    assert!(
+        stores
+            .iter()
+            .all(|id| component_of(&world, *id, &key("store:schema/stock")) == 1)
+    );
+}
+
+#[test]
 fn member_ownership_violation_rejects_the_whole_group() {
     let (mut world, _schemas, machine, store) = setup();
     let before = world.seq().0;

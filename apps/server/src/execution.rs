@@ -660,7 +660,7 @@ impl ExecutionHost {
     fn prepare_task(&self, task: &FrozenTask) -> Result<ExecutionPrepared, Fault> {
         let mut status = task.status.clone();
         let mut prepared = match &task.transaction {
-            Some(stored) => match self.cached_movement().map(Ok).unwrap_or_else(|| {
+            Some(stored) => match self.cached_prevalidation().map(Ok).unwrap_or_else(|| {
                 stored.restore(self.world()).and_then(|tx| {
                     self.source.world().prepare_group(&tx).map_err(|e| match e {
                         PrepareError::Rejected(c) => c,

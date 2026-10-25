@@ -116,6 +116,25 @@ pub struct WorldAuthority {
 }
 
 impl WorldAuthority {
+    pub fn prevalidate_components(
+        &self,
+        group: &crate::TransactionGroup,
+    ) -> Result<crate::ComponentPrevalidation, PrepareError> {
+        self.coordinator.prevalidate_components(
+            &self.store,
+            &self.entities,
+            &self.registry,
+            &self.schemas,
+            group,
+        )
+    }
+    pub fn refresh_components(
+        &self,
+        token: crate::ComponentPrevalidation,
+    ) -> Result<PreparedChange, PrepareError> {
+        self.coordinator.refresh_components(&self.entities, token)
+    }
+
     /// Compute a pure movement on a borrowed world. It still requires serial
     /// refresh and the usual reservation/publication/durability path.
     pub fn prevalidate_movement(

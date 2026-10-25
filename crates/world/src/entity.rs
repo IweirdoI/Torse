@@ -126,6 +126,35 @@ struct ComponentUpdate {
 pub const MAX_COMPONENT_EDITS: usize = 256;
 
 impl ComponentBatch {
+    /// Combine already shape-validated batches without cloning their values.
+    /// Identity, observations, duplicate targets and aggregate capacity are
+    /// checked again; no world data changes on either success or rejection.
+    pub fn combine(mut batches: Vec<Self>, entities: &EntityStore) -> Result<Self, EntityError> {
+        let total = batches
+            .iter()
+            .try_fold(0usize, |n, b| n.checked_add(b.updates.len()))
+            .filter(|n| *n <= MAX_COMPONENT_EDITS)
+            .ok_or(EntityError::InvalidComponents)?;
+        if batches.len() == 1 {
+            let batch = batches.pop().unwrap();
+            batch.validate(entities)?;
+            return Ok(batch);
+        }
+        let mut updates = Vec::with_capacity(total);
+        let mut seen = std::collections::BTreeSet::new();
+        for batch in batches {
+            for update in batch.updates {
+                if !seen.insert((update.edit.id, update.edit.schema.clone())) {
+                    return Err(EntityError::InvalidComponents);
+                }
+                updates.push(update);
+            }
+        }
+        let batch = Self { updates };
+        batch.validate(entities)?;
+        Ok(batch)
+    }
+
     /// Recheck observed fields and final object capacity before the first write.
     pub fn validate(&self, entities: &EntityStore) -> Result<(), EntityError> {
         let mut counts = BTreeMap::new();
@@ -642,6 +671,129 @@ mod tests {
 
     fn store() -> EntityStore {
         EntityStore::new(16).expect("side is valid")
+    }
+
+    fn batch_fixture(
+        count: usize,
+    ) -> (
+        EntityStore,
+        ComponentSchemas,
+        EntityHandle,
+        EntityId,
+        Vec<ContentKey>,
+    ) {
+        let mut pack = m0_fixture_pack();
+        let ids: Vec<_> = (0..count).map(|n| key(&format!("test:batch{n}"))).collect();
+        pack.state_schemas[0]
+            .value
+            .component_schemas
+            .extend(ids.iter().map(|id| torse_content::ComponentSchema {
+                id: id.clone(),
+                schema_version: 1,
+                owner_module: key("base:inventory"),
+                fields: vec![],
+                persistence: torse_content::PersistencePolicy::Always,
+                replication: torse_types::ReplicationDeclaration::SERVER_PRIVATE,
+                migration_binding: None,
+            }));
+        let schemas = ComponentSchemas::build(&compile(pack).unwrap());
+        let mut store = store();
+        let handle = store.spawn(Position::new(2.0, 2.0, 2.0)).unwrap();
+        let id = store.get(handle).unwrap().id;
+        (store, schemas, handle, id, ids)
+    }
+    fn addition(id: EntityId, schema: &ContentKey) -> ComponentEdit {
+        ComponentEdit {
+            id,
+            schema: schema.clone(),
+            previous: None,
+            fields: Some(BTreeMap::new()),
+        }
+    }
+
+    #[test]
+    fn combined_component_batches_equal_original_preparation_and_reject_duplicates_and_total_quota()
+    {
+        let (mut store, schemas, handle, id, ids) = batch_fixture(2);
+        let edits = [addition(id, &ids[0]), addition(id, &ids[1])];
+        let batches = edits
+            .iter()
+            .map(|edit| {
+                store
+                    .prepare_components(std::slice::from_ref(edit), &schemas)
+                    .unwrap()
+            })
+            .collect();
+        let combined = ComponentBatch::combine(batches, &store).unwrap();
+        assert_eq!(
+            combined,
+            store.prepare_components(&edits, &schemas).unwrap()
+        );
+        assert_eq!(store.get(handle).unwrap().components.len(), 0);
+        let single = store.prepare_components(&edits[..1], &schemas).unwrap();
+        assert_eq!(
+            ComponentBatch::combine(vec![single.clone(), single.clone()], &store),
+            Err(EntityError::InvalidComponents)
+        );
+        assert_eq!(
+            ComponentBatch::combine(vec![single; MAX_COMPONENT_EDITS + 1], &store),
+            Err(EntityError::InvalidComponents)
+        );
+        store.publish_components(combined).unwrap();
+        assert_eq!(store.get(handle).unwrap().components.len(), 2);
+    }
+
+    #[test]
+    fn combined_batches_recheck_component_capacity_fields_and_handle_generations_without_writes() {
+        let (mut store, schemas, handle, id, ids) = batch_fixture(MAX_COMPONENT_INSTANCES + 1);
+        for schema in &ids[..MAX_COMPONENT_INSTANCES - 1] {
+            store
+                .components_mut(handle)
+                .unwrap()
+                .insert(&schemas, schema, BTreeMap::new())
+                .unwrap();
+        }
+        let edits = [
+            addition(id, &ids[MAX_COMPONENT_INSTANCES - 1]),
+            addition(id, &ids[MAX_COMPONENT_INSTANCES]),
+        ];
+        let batches = edits
+            .iter()
+            .map(|e| {
+                store
+                    .prepare_components(std::slice::from_ref(e), &schemas)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ComponentBatch::combine(batches, &store),
+            Err(EntityError::InvalidComponents)
+        );
+        assert_eq!(
+            store.get(handle).unwrap().components.len(),
+            MAX_COMPONENT_INSTANCES - 1
+        );
+        let batch = store.prepare_components(&edits[..1], &schemas).unwrap();
+        store.publish_components(batch.clone()).unwrap();
+        assert_eq!(
+            ComponentBatch::combine(vec![batch], &store),
+            Err(EntityError::ComponentConflict)
+        );
+        let edit = ComponentEdit {
+            id,
+            schema: ids[0].clone(),
+            previous: Some(BTreeMap::new()),
+            fields: None,
+        };
+        let batch = store.prepare_components(&[edit], &schemas).unwrap();
+        store.despawn(handle).unwrap();
+        let next = store.spawn(Position::new(2.0, 2.0, 2.0)).unwrap();
+        assert_eq!(next.slot, handle.slot);
+        assert_eq!(
+            ComponentBatch::combine(vec![batch], &store),
+            Err(EntityError::StaleHandle)
+        );
+        assert!(store.get(next).unwrap().components.is_empty());
     }
 
     #[test]

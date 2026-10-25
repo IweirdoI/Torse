@@ -30,8 +30,8 @@ pub mod transaction;
 pub use authority::{AuthorityError, Recovery, RecoveryError, WorldAuthority};
 pub use clock::{TickClock, TickReport};
 pub use coordinator::{
-    CommitCoordinator, CommitFault, Committed, MovementPrevalidation, PrepareError, PreparedChange,
-    Publication,
+    CommitCoordinator, CommitFault, Committed, ComponentPrevalidation, ComponentWork,
+    MovementPrevalidation, PrepareError, PreparedChange, Publication,
 };
 pub use payload::{changes_from_committed, changes_from_prepared};
 pub use phase::{OrderError, Phase, SystemSpec, next_resume_point, order_phase};

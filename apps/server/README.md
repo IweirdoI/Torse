@@ -13,7 +13,7 @@
 | [execution.rs](src/execution.rs) | 持久阶段工作、定时事件、动作结果、去重及完整执行恢复 |
 | [profiling.rs](src/profiling.rs) | 串行执行的可选计时接线 |
 | [planning.rs](src/planning.rs) | 冻结前的独立规则并行与稳定归并 |
-| [prevalidation.rs](src/prevalidation.rs) | 冻结后的有界移动预验证及串行提交前复核 |
+| [prevalidation.rs](src/prevalidation.rs) | 冻结后的有界移动与组件预验证及串行提交前复核 |
 | [network.rs](src/network.rs) | 会话策略、输入适配、持久输出门槛、订阅与失效控制 |
 | [bootstrap.rs](src/bootstrap.rs) | 有限演示世界及显式容量配置 |
 | [main.rs](src/main.rs) | 非阻塞监听、固定逻辑Tick和有界关闭 |
@@ -45,6 +45,14 @@ cargo run --release -p torse-server --example serial_baseline --locked -- --outp
 缓存只在内存中存在，已发布任务立即释放，表或阶段变化时清空，文件恢复重新计算剩余冻结任务。日志Busy重试复用缓存；提交、事件结算、撤权、批量刷盘及持久输出继续串行。`prevalidation_stats`报告预计算数、命中、过期、跳过及预留和缓存峰值，命中计数包含未发布重试。
 
 大碰撞体负载有实测收益，小碰撞体默认跳过。完整路径、原始数据及真实单机器Mod对照见[移动预验证与投影](../../benchmarks/M6-movement-prevalidation.md)。
+
+## 组件预验证
+
+组件事务可通过`--prevalidate-workers 4 --prevalidate-components`显式启用，默认关闭。该CLI组合将每项工作及结果预留设为64MiB，默认窗口16项，最大预留1GiB；实际内存不等于预留。API对应`PrevalidationConfig.components`、`min_component_bytes`及`max_job_bytes`。默认跳过前后组件载荷合计不足16KiB的任务。
+
+支持仅含组件修改的单成员或跨模块组，各任务涉及的实体必须互不重叠。显式块前置、块写入、移动、生成和销毁截断窗口。工作线程按原所有权和模式约束准备，宿主提交前复核世界、阶段、兼容信息、身份代数、旧字段与最终组件容量。令牌按所有权移入准备项，避免再复制完整字段树；日志Busy导致未发布准备项丢弃后，该项按原串行路径重试。恢复丢弃缓存并处理剩余冻结任务。
+
+`prepare_group`同时复用成员已经完成形状校验的ComponentBatch，合并时继续检查重复目标、总量、旧值与最终容量，保留原成员拒绝次序。该优化始终启用。组件并行在完整路径中的收益有限，P95也可能变差，应按实际负载测量后启用。`peak_cached_bytes`对组件令牌记录保守工作计费，不表示实际常驻内存。对照与范围见[组件预验证记录](../../benchmarks/M6-component-prevalidation.md)。
 
 ## 授权增量投影
 

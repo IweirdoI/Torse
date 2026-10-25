@@ -81,6 +81,53 @@ impl MovementPrevalidation {
     }
 }
 
+/// Conservative peak charge for trusted component preparation, including
+/// restoration, sealed batches and retained values. This is not an allocator sandbox.
+#[derive(Clone, Copy, Debug)]
+pub struct ComponentWork {
+    pub payload_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// Owned, shape-validated component work. Serial refresh consumes the token;
+/// dropping an unreserved preparation is safe, but requires normal preparation on retry.
+pub struct ComponentPrevalidation {
+    prepared: PreparedChange,
+    charge: usize,
+}
+impl ComponentPrevalidation {
+    pub fn reserved_bytes(&self) -> usize {
+        self.charge
+    }
+
+    pub fn estimate<'a>(
+        edits: impl IntoIterator<Item = &'a ComponentEdit>,
+    ) -> Option<ComponentWork> {
+        let mut payload = 0usize;
+        let mut count = 0;
+        for edit in edits {
+            count += 1;
+            if count > torse_world::MAX_COMPONENT_EDITS {
+                return None;
+            }
+            for fields in [edit.previous.as_ref(), edit.fields.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                payload = payload.checked_add(
+                    usize::try_from(torse_world::component_size(fields).ok()?).ok()?,
+                )?;
+            }
+        }
+        // Covers recursive map nodes, clone peaks and native scratch with a
+        // deliberately conservative multiplier. Limits remain host-configurable.
+        Some(ComponentWork {
+            payload_bytes: payload,
+            peak_bytes: payload.checked_mul(512)?.checked_add(65536)?,
+        })
+    }
+}
+
 impl PreparedChange {
     /// Complete creation/removal records and proposed allocator state, before publication.
     pub fn entity_lifecycle(&self) -> Option<&EntityLifecycle> {
@@ -197,6 +244,56 @@ pub struct CommitCoordinator {
 }
 
 impl CommitCoordinator {
+    pub fn prevalidate_components(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        group: &crate::TransactionGroup,
+    ) -> Result<ComponentPrevalidation, PrepareError> {
+        let pure = !group.members.is_empty()
+            && group.members.len() <= crate::MAX_GROUP_MEMBERS
+            && group.members.iter().all(|m| {
+                m.preconditions.is_empty()
+                    && m.mutations.is_empty()
+                    && m.movements.is_empty()
+                    && m.spawns.is_empty()
+                    && m.despawns.is_empty()
+            })
+            && group.members.iter().any(|m| !m.components.is_empty());
+        if !pure {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        let estimate =
+            ComponentPrevalidation::estimate(group.members.iter().flat_map(|m| &m.components))
+                .ok_or(PrepareError::Rejected(RejectCode::InvalidData))?;
+        Ok(ComponentPrevalidation {
+            prepared: self.prepare_group(store, entities, registry, schemas, group)?,
+            charge: estimate.peak_bytes,
+        })
+    }
+
+    pub fn refresh_components(
+        &self,
+        entities: &EntityStore,
+        token: ComponentPrevalidation,
+    ) -> Result<PreparedChange, PrepareError> {
+        let mut p = token.prepared;
+        if p.meta.cursor.world != self.world
+            || p.meta.compatibility != self.compatibility
+            || p.observed_resume != self.resume
+            || p.meta.previous > self.seq
+            || p.component_batch.validate(entities).is_err()
+        {
+            return Err(PrepareError::Rejected(RejectCode::Conflict));
+        }
+        p.meta.previous = self.seq;
+        p.meta.cursor.seq = self.seq.next().ok_or(PrepareError::SequenceExhausted)?;
+        p.meta.resume_at = self.resume;
+        Ok(p)
+    }
+
     pub fn prevalidate_movement(
         &self,
         store: &SectionStore,
@@ -460,6 +557,14 @@ impl CommitCoordinator {
         let mut movement_reads = Vec::new();
         let mut movement_handles = Vec::new();
         let mut component_edits: Vec<ComponentEdit> = Vec::new();
+        let mut component_batches = Vec::new();
+        // Keep the established member error order, without retaining batches
+        // for a group that will exceed the final aggregate component limit.
+        let over_component_quota = group
+            .members
+            .iter()
+            .try_fold(0usize, |n, m| n.checked_add(m.components.len()))
+            .is_none_or(|n| n > torse_world::MAX_COMPONENT_EDITS);
         let mut lifecycle_batch = None;
         for member in &group.members {
             if has_duplicate_targets(member) {
@@ -506,9 +611,8 @@ impl CommitCoordinator {
                     return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
                 }
             }
-            // Shape-validate each member on its own; the merged batch is built
-            // once more from the concatenated edits below.
-            let _ = entities
+            // Preserve member validation order and reuse its owned, sealed batch.
+            let batch = entities
                 .prepare_components(&member.components, schemas)
                 .map_err(|error| {
                     PrepareError::Rejected(match error {
@@ -517,6 +621,11 @@ impl CommitCoordinator {
                         _ => RejectCode::InvalidData,
                     })
                 })?;
+            if !over_component_quota && !member.components.is_empty() {
+                component_batches.push(batch);
+            } else {
+                drop(batch);
+            }
 
             let resolved = crate::movement::prepare_movements(
                 store,
@@ -541,7 +650,12 @@ impl CommitCoordinator {
                     .iter()
                     .map(|request| (request.handle, request.id)),
             );
-            component_edits.extend(member.components.iter().cloned());
+            if !over_component_quota {
+                component_edits.extend(member.components.iter().cloned());
+            }
+        }
+        if over_component_quota {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
         if edits.is_empty()
             && entity_moves.is_empty()
@@ -550,9 +664,8 @@ impl CommitCoordinator {
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
-        let component_batch = entities
-            .prepare_components(&component_edits, schemas)
-            .map_err(|error| {
+        let component_batch =
+            ComponentBatch::combine(component_batches, entities).map_err(|error| {
                 PrepareError::Rejected(match error {
                     torse_world::EntityError::StaleHandle => RejectCode::MissingTarget,
                     torse_world::EntityError::ComponentConflict => RejectCode::Conflict,

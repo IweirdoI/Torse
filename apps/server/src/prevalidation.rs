@@ -1,18 +1,20 @@
-//! Bounded, optional collision work; journal and serial publication remain authoritative.
+//! Bounded, optional preparation; journal and serial publication remain authoritative.
 use super::*;
 use crate::{HostCheckpointStore, Server};
 use std::collections::BTreeSet;
 use torse_runtime::{ExecutorConfig, JobBudget, JobOutput, run_scoped};
-use torse_sim::MovementPrevalidation;
+use torse_sim::{ComponentPrevalidation, MovementPrevalidation};
 use torse_storage::CommitJournal;
 
-/// Limits a joined window of trusted, read-only movement preparation.
+/// Limits a joined window of trusted, read-only movement or component preparation.
 #[derive(Clone, Copy, Debug)]
 pub struct PrevalidationConfig {
     pub workers: usize,
     pub max_in_flight: usize,
     pub max_job_bytes: usize,
     pub min_cells: usize,
+    pub components: bool,
+    pub min_component_bytes: usize,
 }
 impl Default for PrevalidationConfig {
     fn default() -> Self {
@@ -21,6 +23,8 @@ impl Default for PrevalidationConfig {
             max_in_flight: 16,
             max_job_bytes: 8 * 1024 * 1024,
             min_cells: 512,
+            components: false,
+            min_component_bytes: 16 * 1024,
         }
     }
 }
@@ -33,7 +37,7 @@ pub struct PrevalidationStats {
     pub skipped: u64,
     pub peak_jobs: usize,
     pub peak_reserved_bytes: usize,
-    /// Sum of token-owned bytes, excluding the cache container and borrowed table.
+    /// Retained token charges; components include a conservative work allowance.
     pub peak_cached_bytes: usize,
 }
 #[derive(Default)]
@@ -42,11 +46,58 @@ pub(super) struct PrevalidationCache {
     point: Option<ResumePoint>,
     start: usize,
     end: usize,
-    entries: Vec<Option<MovementPrevalidation>>,
+    entries: Vec<Option<Prevalidated>>,
     stats: PrevalidationStats,
 }
 
-fn candidate(task: &FrozenTask, config: PrevalidationConfig) -> Option<EntityId> {
+enum Prevalidated {
+    Movement(MovementPrevalidation),
+    Components(ComponentPrevalidation),
+}
+impl Prevalidated {
+    fn charge(&self) -> usize {
+        match self {
+            Self::Movement(t) => t.allocated_bytes(),
+            Self::Components(t) => t.reserved_bytes(),
+        }
+    }
+}
+
+fn candidate(task: &FrozenTask, config: PrevalidationConfig) -> Option<BTreeSet<EntityId>> {
+    if let Some(id) = movement_candidate(task, config) {
+        return Some([id].into());
+    }
+    if !config.components || task.status != ReplyStatus::Committed {
+        return None;
+    }
+    let group = task.transaction.as_ref()?;
+    if group.members.is_empty()
+        || group.members.iter().any(|m| {
+            !m.reads.is_empty()
+                || !m.writes.is_empty()
+                || !m.moves.is_empty()
+                || !m.spawns.is_empty()
+                || !m.despawns.is_empty()
+        })
+    {
+        return None;
+    }
+    let estimate =
+        ComponentPrevalidation::estimate(group.members.iter().flat_map(|m| &m.components))?;
+    if estimate.payload_bytes < config.min_component_bytes
+        || estimate.peak_bytes > config.max_job_bytes
+    {
+        return None;
+    }
+    let ids: BTreeSet<_> = group
+        .members
+        .iter()
+        .flat_map(|m| m.components.iter().map(|e| e.id))
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn movement_candidate(task: &FrozenTask, config: PrevalidationConfig) -> Option<EntityId> {
     let group = task.transaction.as_ref()?;
     if task.status != ReplyStatus::Committed || group.members.len() != 1 {
         return None;
@@ -124,12 +175,13 @@ impl ExecutionHost {
         let mut ids = BTreeSet::new();
         let mut count = 0;
         for task in work.tasks.iter().skip(start).take(config.max_in_flight) {
-            let Some(id) = candidate(task, config) else {
+            let Some(targets) = candidate(task, config) else {
                 break;
             };
-            if !ids.insert(id) {
+            if targets.iter().any(|id| ids.contains(id)) {
                 break;
             }
+            ids.extend(targets);
             count += 1;
         }
         if count < 2 {
@@ -157,10 +209,20 @@ impl ExecutionHost {
                     .unwrap()
                     .restore(world)
                     .ok()
-                    .and_then(|tx| world.prevalidate_movement(&tx).ok());
-                let bytes = value
-                    .as_ref()
-                    .map_or(0, MovementPrevalidation::allocated_bytes);
+                    .and_then(|tx| {
+                        if tx.members.iter().any(|m| !m.movements.is_empty()) {
+                            world
+                                .prevalidate_movement(&tx)
+                                .ok()
+                                .map(Prevalidated::Movement)
+                        } else {
+                            world
+                                .prevalidate_components(&tx)
+                                .ok()
+                                .map(Prevalidated::Components)
+                        }
+                    });
+                let bytes = value.as_ref().map_or(0, Prevalidated::charge);
                 Ok(JobOutput { value, bytes })
             },
         );
@@ -178,13 +240,13 @@ impl ExecutionHost {
             .entries
             .iter()
             .flatten()
-            .map(MovementPrevalidation::allocated_bytes)
+            .map(Prevalidated::charge)
             .sum();
         cache.stats.peak_cached_bytes = cache.stats.peak_cached_bytes.max(bytes);
         cache.stats.prepared += cache.entries.iter().flatten().count() as u64;
     }
 
-    pub(super) fn cached_movement(&self) -> Option<torse_sim::PreparedChange> {
+    pub(super) fn cached_prevalidation(&self) -> Option<torse_sim::PreparedChange> {
         let work = self.runtime.work.as_ref()?;
         let index = work.next as usize;
         let mut cache = self.prevalidated.borrow_mut();
@@ -197,8 +259,19 @@ impl ExecutionHost {
             return None;
         }
         let offset = index.checked_sub(cache.start)?;
-        let token = cache.entries.get(offset)?.as_ref()?;
-        match self.world().refresh_movement(token) {
+        let entry = cache.entries.get_mut(offset)?;
+        let result = match entry.as_ref()? {
+            Prevalidated::Movement(token) => self.world().refresh_movement(token),
+            Prevalidated::Components(_) => {
+                let Some(Prevalidated::Components(token)) = entry.take() else {
+                    unreachable!()
+                };
+                // Transfer owned values instead of cloning a potentially large tree.
+                // If journal reservation blocks, its next attempt prepares normally.
+                self.world().refresh_components(token)
+            }
+        };
+        match result {
             Ok(prepared) => {
                 cache.stats.hits += 1;
                 Some(prepared)

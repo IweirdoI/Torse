@@ -14,13 +14,13 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--commit-batch N; default 16]"
+            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--commit-batch N; default 16]"
+            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     }
@@ -34,9 +34,11 @@ fn run() -> Result<(), Fault> {
     let mut machine_operators = false;
     let mut planning = None;
     let mut prevalidation = None;
+    let mut component_prevalidation = false;
     let mut commit_batch = 16;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--prevalidate-components" => component_prevalidation = true,
             "--prevalidate-workers" => {
                 let workers = args
                     .next()
@@ -92,6 +94,13 @@ fn run() -> Result<(), Fault> {
             }
             _ => return Err(Fault::invalid_data("unknown server argument")),
         }
+    }
+    if component_prevalidation {
+        let config = prevalidation.as_mut().ok_or_else(|| {
+            Fault::invalid_data("component prevalidation requires --prevalidate-workers")
+        })?;
+        config.components = true;
+        config.max_job_bytes = 64 * 1024 * 1024;
     }
     std::fs::create_dir_all(&path).map_err(|e| Fault::invalid_data(e.to_string()))?;
     if machine_operators && mod_dirs.is_empty() {

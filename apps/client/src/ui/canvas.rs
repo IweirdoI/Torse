@@ -159,19 +159,6 @@ impl Canvas {
             }
         }
     }
-    pub fn progress(&mut self, sprite: &Sprite, x: i32, y: i32, amount: f32, tint: [u8; 4]) {
-        let width = (sprite.width as f32 * amount.clamp(0.0, 1.0)).round() as u32;
-        for py in 0..sprite.height {
-            for px in 0..width {
-                let i = ((py * sprite.width + px) * 4) as usize;
-                let mut pixel = [0; 4];
-                for c in 0..4 {
-                    pixel[c] = (u16::from(sprite.pixels[i + c]) * u16::from(tint[c]) / 255) as u8;
-                }
-                self.blend(x + px as i32, y + py as i32, pixel);
-            }
-        }
-    }
 }
 
 struct Raster {
@@ -347,18 +334,6 @@ mod tests {
         assert_eq!(&canvas.pixels[160..164], &[40, 40, 40, 255]);
         assert_eq!(&canvas.pixels[36..40], &[0, 0, 0, 0]);
     }
-    #[test]
-    fn clipped_progress_does_not_stretch_the_fill() {
-        let sprite = Sprite {
-            width: 4,
-            height: 1,
-            pixels: [[255, 255, 255, 255]; 4].concat(),
-        };
-        let mut canvas = Canvas::new(4, 1, 1);
-        canvas.progress(&sprite, 0, 0, 0.5, [255; 4]);
-        assert_eq!(canvas.pixels.iter().filter(|p| **p == 255).count(), 8);
-    }
-
     #[test]
     fn scaled_canvas_maps_logical_pixels_to_blocks() {
         let mut canvas = Canvas::new(2, 1, 2);

@@ -65,6 +65,8 @@ cargo run --release -p torse-client -- --window --walk --autoplay --frames 2400 
 
 窗口默认绘制准星、快捷栏、当前方块和连接状态。菜单提供返回、机器面板预览和退出。面板打开时停止本地移动与编辑输入，网络接收继续运行；联网世界不会因客户端菜单暂停。
 
+界面为程序化绘制的深色扁平主题：半透明深灰面板加一像素边框，按钮分常态、悬停与按下三态，强调色只用于选中的槽位与按下的按钮；窗体、按钮、槽位、进度条与准星都由客户端主题绘制，不再使用皮肤图片。改版记录见[界面主题](../../benchmarks/M1-ui-style.md)。
+
 机器面板明确使用示例数据，目前不读取或修改真实机器与库存。服务端已有机器状态与动作模型，图形客户端对该模型的消费和操作仍待接入。截图及验证见[UI基础](../../benchmarks/M1-ui.md)。
 
 ```sh
@@ -72,7 +74,7 @@ cargo run -p torse-client -- --window --ui-preview machine
 cargo run -p torse-client -- --capture ui.png --width 960 --height 540 --ui-preview machine
 ```
 
-界面按可用空间选择1到4倍整数缩放。PNG和文案位于[基础游戏资源](../../games/base/assets/README.md)，编译时嵌入；修改后需重新编译。字体从操作系统读取，可用`TORSE_UI_FONT`指定TTF、OTF或TTC。缺少中文字形时使用英文文案，没有可用字体则报告错误。
+界面按可用空间选择1到4倍整数缩放。物品图标PNG和文案位于[基础游戏资源](../../games/base/assets/README.md)，编译时嵌入；修改后需重新编译。字体从操作系统读取，可用`TORSE_UI_FONT`指定TTF、OTF或TTC。缺少中文字形时使用英文文案，没有可用字体则报告错误。
 
 ## 贴图与材质
 

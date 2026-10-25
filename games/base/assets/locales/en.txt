@@ -17,7 +17,6 @@ machine_progress=Processing
 machine_status=Status: processing
 machine_notice=Sample data. This panel does not modify the world.
 empty=Empty
-close=Close
 sens_down=<
 sens_up=>
 menu_sensitivity=Mouse sensitivity

@@ -1,11 +1,16 @@
-//! Client UI foundation: asset skin, HUD, modal focus, and a clearly labeled
-//! machine preview. No UI control has access to authoritative mutation.
+//! Client UI foundation: a flat dark theme drawn on the canvas, HUD, modal
+//! focus, and a clearly labeled machine preview. No UI control has access to
+//! authoritative mutation.
 mod canvas;
 mod gpu;
+mod style;
 
 use canvas::{Canvas, Rect, Sprite, Text};
 use gpu::Overlay;
 use std::collections::BTreeMap;
+use style::{
+    BORDER, CHIP_BG, CHIP_BORDER, FIELD_BG, GROUP_BG, MUTED, SEPARATOR, TEXT, TITLE_TEXT, WINDOW_BG,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -74,9 +79,9 @@ impl Layout {
     }
     fn panel(&self, mode: Mode) -> Rect {
         let (w, h) = if mode == Mode::Pause {
-            (244, 200)
+            (236, 172)
         } else {
-            (316, 186)
+            (324, 140)
         };
         let w = w.min(self.width.saturating_sub(8));
         let h = h.min(self.height.saturating_sub(8));
@@ -90,44 +95,43 @@ impl Layout {
     fn buttons(&self, mode: Mode) -> Vec<(Action, Rect, &'static str)> {
         let p = self.panel(mode);
         match mode {
-            Mode::Game => Vec::new(),
+            Mode::Game | Mode::MachinePreview => Vec::new(),
             Mode::Pause => vec![
                 (
                     Action::Resume,
-                    Rect::new(p.x + 24, p.y + 44, p.w.saturating_sub(48), 24),
+                    Rect::new(p.x + 14, p.y + 34, p.w.saturating_sub(28), 22),
                     "menu_resume",
                 ),
                 (
                     Action::Preview,
-                    Rect::new(p.x + 24, p.y + 74, p.w.saturating_sub(48), 24),
+                    Rect::new(p.x + 14, p.y + 60, p.w.saturating_sub(28), 22),
                     "menu_preview",
                 ),
                 (
                     Action::Quit,
-                    Rect::new(p.x + 24, p.y + 104, p.w.saturating_sub(48), 24),
+                    Rect::new(p.x + 14, p.y + 86, p.w.saturating_sub(28), 22),
                     "menu_quit",
                 ),
                 (
                     Action::SensDown,
-                    Rect::new(p.x + 138, p.y + 140, 24, 20),
+                    Rect::new(p.x + p.w as i32 - 110, p.y + 130, 20, 20),
                     "sens_down",
                 ),
                 (
                     Action::SensUp,
-                    Rect::new(p.x + 194, p.y + 140, 24, 20),
+                    Rect::new(p.x + p.w as i32 - 34, p.y + 130, 20, 20),
                     "sens_up",
                 ),
             ],
-            Mode::MachinePreview => vec![(
-                Action::Resume,
-                Rect::new(p.x + p.w as i32 / 2 - 48, p.y + 150, 96, 24),
-                "close",
-            )],
         }
+    }
+    fn sensitivity_field(&self) -> Rect {
+        let p = self.panel(Mode::Pause);
+        Rect::new(p.x + p.w as i32 - 86, p.y + 130, 48, 20)
     }
     fn close(&self, mode: Mode) -> Rect {
         let p = self.panel(mode);
-        Rect::new(p.x + p.w as i32 - 26, p.y + 6, 20, 20)
+        Rect::new(p.x + p.w as i32 - 22, p.y + 3, 18, 16)
     }
     fn hit(&self, mode: Mode, cursor: [f64; 2]) -> Option<Action> {
         if mode == Mode::Game {
@@ -147,8 +151,9 @@ impl Layout {
     }
 }
 
+/// Content icons only; every piece of window chrome is drawn by `style`.
 struct Skin {
-    sprites: Vec<Sprite>,
+    icons: Vec<Sprite>,
 }
 impl Skin {
     fn load() -> Result<Self, String> {
@@ -162,30 +167,16 @@ impl Skin {
             };
         }
         let sources = [
-            (asset!("ui/panel_window.png"), (24, 24)),
-            (asset!("ui/panel_tooltip.png"), (16, 16)),
-            (asset!("ui/button_normal.png"), (24, 20)),
-            (asset!("ui/button_hover.png"), (24, 20)),
-            (asset!("ui/button_pressed.png"), (24, 20)),
-            (asset!("ui/slot_normal.png"), (24, 24)),
-            (asset!("ui/slot_selected.png"), (24, 24)),
-            (asset!("ui/progress_bg.png"), (64, 8)),
-            (asset!("ui/progress_fill.png"), (60, 4)),
-            (asset!("ui/crosshair.png"), (9, 9)),
-            (asset!("ui/icon_close.png"), (12, 12)),
             (asset!("icons/items/stone.png"), (16, 16)),
             (asset!("icons/items/glass_slab.png"), (16, 16)),
             (asset!("icons/items/plant.png"), (16, 16)),
         ];
         Ok(Self {
-            sprites: sources
+            icons: sources
                 .into_iter()
                 .map(|(bytes, size)| Sprite::decode(bytes, size))
                 .collect::<Result<_, _>>()?,
         })
-    }
-    fn draw(&self, canvas: &mut Canvas, index: usize, rect: Rect, border: u32) {
-        canvas.sprite(&self.sprites[index], rect, border);
     }
 }
 
@@ -200,6 +191,7 @@ struct View {
     sensitivity: u16,
     hover: Option<Action>,
     pressed: Option<Action>,
+    close_hot: bool,
 }
 
 pub struct Layer {
@@ -217,8 +209,6 @@ pub struct Hud<'a> {
     /// Captured-look sensitivity, shown and tuned in the pause menu.
     pub sensitivity: f64,
 }
-const DARK: [u8; 4] = [34, 40, 48, 255];
-const MUTED: [u8; 4] = [78, 86, 96, 255];
 impl Layer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Result<Self, String> {
         let text = Text::load()?;
@@ -263,6 +253,13 @@ impl Layer {
             sensitivity: (hud.sensitivity * 100.0).round() as u16,
             hover: layout.hit(state.mode, state.cursor),
             pressed: state.armed,
+            close_hot: {
+                let p = [
+                    (state.cursor[0] / f64::from(layout.scale)) as i32,
+                    (state.cursor[1] / f64::from(layout.scale)) as i32,
+                ];
+                state.mode != Mode::Game && layout.close(state.mode).contains(p)
+            },
         };
 
         let mut canvas = Canvas::new(layout.width, layout.height, layout.scale);
@@ -279,96 +276,46 @@ impl Layer {
         let value = self.labels.get(key).copied().unwrap_or("?");
         self.text.draw(canvas, value, rect, size, color);
     }
-    fn shadow_label(&mut self, canvas: &mut Canvas, key: &str, rect: Rect, size: u16) {
-        self.label(
+    /// One locale line centred horizontally inside a region.
+    fn centre(&mut self, canvas: &mut Canvas, key: &str, region: Rect, size: u16, color: [u8; 4]) {
+        let value = self.labels.get(key).copied().unwrap_or("?");
+        let tw = self.text.measure(value, size).min(region.w);
+        self.text.draw(
             canvas,
-            key,
+            value,
+            Rect::new(
+                region.x + (region.w - tw) as i32 / 2,
+                region.y,
+                tw,
+                u32::from(size) + 2,
+            ),
+            size,
+            color,
+        );
+    }
+    fn shadow_label(&mut self, canvas: &mut Canvas, key: &str, rect: Rect, size: u16) {
+        let value = self.labels.get(key).copied().unwrap_or("?");
+        self.text.draw(
+            canvas,
+            value,
             Rect::new(rect.x + 1, rect.y + 1, rect.w, rect.h),
             size,
-            [15, 19, 25, 240],
+            style::SHADOW,
         );
-        self.label(canvas, key, rect, size, [245, 247, 250, 255]);
+        self.text.draw(canvas, value, rect, size, TEXT);
     }
     fn paint(&mut self, c: &mut Canvas, l: &Layout, v: &View) {
         self.text.set_scale(u16::try_from(c.scale).unwrap_or(1));
         let w = l.width as i32;
         let h = l.height as i32;
-        let slot_x = w / 2 - 38;
-        let slot_y = h - 36;
-        for i in 0..3 {
-            let x = slot_x + i as i32 * 26;
-            self.skin.draw(
-                c,
-                if i == v.material { 6 } else { 5 },
-                Rect::new(x, slot_y, 24, 24),
-                0,
-            );
-            self.skin
-                .draw(c, 11 + i, Rect::new(x + 4, slot_y + 4, 16, 16), 0);
-            self.text.draw(
-                c,
-                &(i + 1).to_string(),
-                Rect::new(x + 2, slot_y + 1, 10, 10),
-                9,
-                DARK,
-            );
-        }
-        let selected = ["item_stone", "item_glass", "item_plant"][v.material];
-        let width = self.text.measure(self.labels[selected], 12);
-        self.shadow_label(
-            c,
-            selected,
-            Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
-            12,
-        );
-        let info = if !v.network {
-            "hud_local"
-        } else if v.ready {
-            "hud_online"
-        } else {
-            "hud_connecting"
-        };
-        let info_width = (self.text.measure(self.labels[info], 12) + 20).max(72);
-        self.skin.draw(c, 1, Rect::new(8, 8, info_width, 22), 3);
-        // Tooltip centres are intentionally transparent in the supplied skin.
-        c.fill(Rect::new(12, 12, info_width - 8, 14), [232, 236, 241, 255]);
-        self.label(c, info, Rect::new(16, 12, info_width - 16, 16), 12, DARK);
-        self.shadow_label(
-            c,
-            "hud_help",
-            Rect::new(10, h - 15, l.width.saturating_sub(20), 14),
-            10,
-        );
-        if !v.result.is_empty() {
-            c.fill(
-                Rect::new(8, 34, l.width.saturating_sub(16), 20),
-                [20, 24, 30, 210],
-            );
-            self.text.draw(
-                c,
-                &v.result,
-                Rect::new(13, 37, l.width.saturating_sub(26), 15),
-                11,
-                [245, 247, 250, 255],
-            );
-        }
+        self.paint_hud(c, l, v, w, h);
         if v.mode == Mode::Game {
-            self.skin
-                .draw(c, 9, Rect::new(w / 2 - 4, h / 2 - 4, 9, 9), 0);
+            style::crosshair(c, w / 2, h / 2);
             return;
         }
-        c.fill(Rect::new(0, 0, l.width, l.height), [0, 0, 0, 120]);
+        c.fill(Rect::new(0, 0, l.width, l.height), [8, 9, 11, 130]);
         let p = l.panel(v.mode);
-        c.fill(
-            Rect::new(
-                p.x + 3,
-                p.y + 3,
-                p.w.saturating_sub(6),
-                p.h.saturating_sub(6),
-            ),
-            [232, 236, 241, 255],
-        );
-        self.skin.draw(c, 0, p, 4);
+        style::frame(c, p, WINDOW_BG, BORDER);
         let title = if v.mode == Mode::Pause {
             "menu_title"
         } else {
@@ -377,120 +324,182 @@ impl Layer {
         self.label(
             c,
             title,
-            Rect::new(p.x + 16, p.y + 12, p.w.saturating_sub(48), 22),
-            16,
-            DARK,
+            Rect::new(p.x + 12, p.y + 4, p.w.saturating_sub(40), 16),
+            12,
+            TITLE_TEXT,
         );
-        let close = l.close(v.mode);
-        self.skin
-            .draw(c, 10, Rect::new(close.x + 4, close.y + 4, 12, 12), 0);
+        style::close_glyph(c, l.close(v.mode), v.close_hot);
+        style::hline(c, p.x, p.y + 21, p.w, SEPARATOR);
         if v.mode == Mode::Pause {
-            // Settings row: captured-look sensitivity with stepping buttons.
-            self.label(
-                c,
-                "menu_sensitivity",
-                Rect::new(p.x + 24, p.y + 144, 110, 16),
-                11,
-                DARK,
-            );
-            let value = format!("{:.2}", f64::from(v.sensitivity) / 100.0);
-            self.text
-                .draw(c, &value, Rect::new(p.x + 168, p.y + 144, 44, 16), 11, DARK);
-            self.label(
-                c,
-                "menu_note",
-                Rect::new(p.x + 16, p.y + 172, p.w.saturating_sub(32), 15),
-                10,
-                MUTED,
-            );
+            self.paint_pause(c, l, v, p);
         } else {
-            self.label(
-                c,
-                "machine_notice",
-                Rect::new(p.x + 16, p.y + 38, p.w.saturating_sub(32), 17),
-                11,
-                MUTED,
-            );
-            self.label(
-                c,
-                "machine_input",
-                Rect::new(p.x + 22, p.y + 63, 54, 17),
-                12,
-                DARK,
-            );
-            self.label(
-                c,
-                "machine_output",
-                Rect::new(p.x + 244, p.y + 63, 54, 17),
-                12,
-                DARK,
-            );
-            self.skin
-                .draw(c, 5, Rect::new(p.x + 26, p.y + 83, 24, 24), 0);
-            self.skin
-                .draw(c, 11, Rect::new(p.x + 30, p.y + 87, 16, 16), 0);
-            self.text
-                .draw(c, "1", Rect::new(p.x + 42, p.y + 98, 8, 10), 9, DARK);
-            self.skin
-                .draw(c, 5, Rect::new(p.x + 252, p.y + 83, 24, 24), 0);
-            self.label(
-                c,
-                "empty",
-                Rect::new(p.x + 252, p.y + 111, 38, 15),
-                10,
-                MUTED,
-            );
-            self.label(
-                c,
-                "machine_progress",
-                Rect::new(p.x + 106, p.y + 63, 100, 17),
-                12,
-                DARK,
-            );
-            self.skin
-                .draw(c, 7, Rect::new(p.x + 114, p.y + 87, 64, 8), 0);
-            c.fill(Rect::new(p.x + 116, p.y + 89, 60, 4), [197, 204, 213, 255]);
-            c.progress(
-                &self.skin.sprites[8],
-                p.x + 116,
-                p.y + 89,
-                0.75,
-                [83, 138, 164, 255],
-            );
-            self.text.draw(
-                c,
-                "3 / 4",
-                Rect::new(p.x + 134, p.y + 103, 64, 15),
-                11,
-                DARK,
-            );
-            self.label(
-                c,
-                "machine_status",
-                Rect::new(p.x + 16, p.y + 126, 140, 17),
-                12,
-                DARK,
-            );
+            self.paint_machine(c, p);
         }
         for (action, rect, key) in l.buttons(v.mode) {
-            let index = if v.pressed == Some(action) && v.hover == Some(action) {
-                4
-            } else if v.hover == Some(action) {
-                3
-            } else {
-                2
-            };
-            self.skin.draw(c, index, rect, 4);
+            style::button(
+                c,
+                rect,
+                v.hover == Some(action),
+                v.pressed == Some(action) && v.hover == Some(action),
+            );
             let label = self.labels.get(key).copied().unwrap_or("?");
-            let width = self.text.measure(label, 12).min(rect.w.saturating_sub(16));
+            let tw = self.text.measure(label, 12).min(rect.w.saturating_sub(12));
+            let color = if v.hover == Some(action) {
+                TITLE_TEXT
+            } else {
+                TEXT
+            };
             self.text.draw(
                 c,
                 label,
-                Rect::new(rect.x + (rect.w - width) as i32 / 2, rect.y + 5, width, 18),
+                Rect::new(
+                    rect.x + (rect.w - tw) as i32 / 2,
+                    rect.y + (rect.h as i32 - 12) / 2,
+                    tw,
+                    14,
+                ),
                 12,
-                DARK,
+                color,
             );
         }
+    }
+    /// HUD is shared by all modes: hotbar, status chip, result toast, help.
+    fn paint_hud(&mut self, c: &mut Canvas, l: &Layout, v: &View, w: i32, h: i32) {
+        let slot_x = w / 2 - 38;
+        let slot_y = h - 36;
+        for i in 0..3 {
+            let x = slot_x + i as i32 * 26;
+            style::slot(c, Rect::new(x, slot_y, 24, 24), i == v.material);
+            c.sprite(&self.skin.icons[i], Rect::new(x + 4, slot_y + 4, 16, 16), 0);
+            self.text.draw(
+                c,
+                &(i + 1).to_string(),
+                Rect::new(x + 3, slot_y + 2, 8, 8),
+                8,
+                MUTED,
+            );
+        }
+        // The selected item name would collide with the modal panels.
+        if v.mode == Mode::Game {
+            let selected = ["item_stone", "item_glass", "item_plant"][v.material];
+            let width = self.text.measure(self.labels[selected], 12);
+            self.shadow_label(
+                c,
+                selected,
+                Rect::new(w / 2 - width as i32 / 2, slot_y - 18, width, 16),
+                12,
+            );
+        }
+        let info = if !v.network {
+            "hud_local"
+        } else if v.ready {
+            "hud_online"
+        } else {
+            "hud_connecting"
+        };
+        let info_w = self.text.measure(self.labels[info], 11) + 12;
+        style::frame(c, Rect::new(8, 8, info_w, 20), CHIP_BG, CHIP_BORDER);
+        self.label(c, info, Rect::new(14, 11, info_w, 14), 11, TEXT);
+        self.shadow_label(
+            c,
+            "hud_help",
+            Rect::new(10, h - 14, l.width.saturating_sub(20), 13),
+            9,
+        );
+        if !v.result.is_empty() {
+            let rw = l.width.saturating_sub(16);
+            style::frame(c, Rect::new(8, 32, rw, 20), CHIP_BG, CHIP_BORDER);
+            self.text.draw(
+                c,
+                &v.result,
+                Rect::new(14, 35, rw.saturating_sub(12), 15),
+                10,
+                TEXT,
+            );
+        }
+    }
+    fn paint_pause(&mut self, c: &mut Canvas, l: &Layout, v: &View, p: Rect) {
+        style::hline(c, p.x, p.y + 118, p.w, SEPARATOR);
+        self.label(
+            c,
+            "menu_sensitivity",
+            Rect::new(p.x + 14, p.y + 134, 120, 14),
+            11,
+            TEXT,
+        );
+        let field = l.sensitivity_field();
+        style::frame(c, field, FIELD_BG, BORDER);
+        let value = format!("{:.2}", f64::from(v.sensitivity) / 100.0);
+        let tw = self.text.measure(&value, 11);
+        self.text.draw(
+            c,
+            &value,
+            Rect::new(field.x + (field.w - tw) as i32 / 2, field.y + 4, tw, 14),
+            11,
+            TEXT,
+        );
+        self.label(
+            c,
+            "menu_note",
+            Rect::new(p.x + 14, p.y + 156, p.w.saturating_sub(28), 12),
+            9,
+            MUTED,
+        );
+    }
+    fn paint_machine(&mut self, c: &mut Canvas, p: Rect) {
+        self.label(
+            c,
+            "machine_notice",
+            Rect::new(p.x + 14, p.y + 24, p.w.saturating_sub(28), 12),
+            9,
+            MUTED,
+        );
+        // Input group with the sample item; output group stays empty. The
+        // middle column keeps an eight-pixel gutter to both group frames.
+        let groups: [(i32, &str, Option<usize>, &str); 2] = [
+            (p.x + 14, "machine_input", Some(0), "item_stone"),
+            (p.x + p.w as i32 - 110, "machine_output", None, "empty"),
+        ];
+        for (gx, label, icon, caption) in groups {
+            style::frame(c, Rect::new(gx, p.y + 42, 96, 58), GROUP_BG, SEPARATOR);
+            self.centre(c, label, Rect::new(gx, p.y + 46, 96, 12), 10, TEXT);
+            style::slot(c, Rect::new(gx + 36, p.y + 58, 24, 24), false);
+            if let Some(index) = icon {
+                c.sprite(
+                    &self.skin.icons[index],
+                    Rect::new(gx + 40, p.y + 62, 16, 16),
+                    0,
+                );
+                self.text
+                    .draw(c, "1", Rect::new(gx + 37, p.y + 60, 8, 9), 8, MUTED);
+            }
+            self.centre(c, caption, Rect::new(gx, p.y + 86, 96, 12), 9, MUTED);
+        }
+        let mid = Rect::new(p.x + 118, p.y + 44, 88, 44);
+        self.centre(
+            c,
+            "machine_progress",
+            Rect::new(mid.x, p.y + 46, mid.w, 12),
+            10,
+            TEXT,
+        );
+        style::progress(c, Rect::new(mid.x, p.y + 62, mid.w, 8), 0.75);
+        let ratio = "3 / 4";
+        let tw = self.text.measure(ratio, 10) + 4;
+        self.text.draw(
+            c,
+            ratio,
+            Rect::new(mid.x + (mid.w - tw) as i32 / 2, p.y + 74, tw, 12),
+            10,
+            TEXT,
+        );
+        self.label(
+            c,
+            "machine_status",
+            Rect::new(p.x + 14, p.y + 118, p.w.saturating_sub(28), 13),
+            11,
+            TEXT,
+        );
     }
 }
 
@@ -498,8 +507,12 @@ impl Layer {
 mod tests {
     use super::*;
     #[test]
-    fn supplied_assets_decode_at_the_declared_dimensions() {
-        assert_eq!(Skin::load().unwrap().sprites.len(), 14);
+    fn content_icons_decode_at_the_declared_dimensions() {
+        let skin = Skin::load().unwrap();
+        assert_eq!(skin.icons.len(), 3);
+        for icon in &skin.icons {
+            assert_eq!((icon.width, icon.height), (16, 16));
+        }
     }
     #[test]
     fn modal_buttons_require_press_and_release_on_the_same_target() {

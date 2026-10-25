@@ -2727,6 +2727,10 @@ dependencies = [
 [[package]]
 name = "torse-assets"
 version = "0.1.0"
+dependencies = [
+ "png",
+ "torse-types",
+]
 
 [[package]]
 name = "torse-client"
@@ -2735,6 +2739,7 @@ dependencies = [
  "ab_glyph",
  "png",
  "pollster",
+ "torse-assets",
  "torse-codec",
  "torse-content",
  "torse-inventory",

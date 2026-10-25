@@ -8,7 +8,7 @@
 
 - 内容契约：`RenderProfile`新增逐面材质`face_materials`，缺失的面回落到方块材质；表达同一方块的顶面、侧面与底面使用不同材质。逐面材质进入表现摘要，不改变权威摘要。
 - 网格：`RenderBlock`携带六个面的材质槽，`MeshData`为每个顶点输出面内局部坐标与逐面材质；面剔除与修订校验语义不变。
-- 客户端：新增材质包与材质表。材质键解析为图集矩形、色调与混合模式，顶点携带材质槽位，片元按槽位采样图集并乘色调与方向光。
+- 客户端：新增材质包与材质表。图集解码与材质包校验在`torse-assets`，材质键解析为图集矩形、色调与混合模式，顶点携带材质槽位，片元按槽位采样图集并乘色调与方向光。
 - 混合模式：不透明、二值透明、半透明分别来自内容定义；二值透明按alpha阈值丢弃，半透明开启alpha混合。
 - 资源：基础游戏新增自绘图集`games/base/assets/textures/atlas.png`与生成脚本，客户端编译期嵌入。
 
@@ -77,7 +77,7 @@ cargo test -p torse-mod-host --features package,authority --all-targets
 cargo test -p torse-server --features mods --all-targets
 ```
 
-全工作区530项测试通过，格式、Clippy（含Mod宿主与服务器mods特性）与Rustdoc零告警。Mod相关测试需要`rustup target add wasm32-unknown-unknown`，本轮为本机首次安装。新增测试覆盖逐面材质选择、局部贴图坐标、材质表字节布局、图集矩形越界、重复材质、混合模式冲突、兜底表面与sRGB色调转换。
+全工作区533项测试通过，格式、Clippy（含Mod宿主与服务器mods特性）与Rustdoc零告警。Mod相关测试需要`rustup target add wasm32-unknown-unknown`，本轮为本机首次安装。新增测试覆盖逐面材质选择、局部贴图坐标、材质表字节布局、图集解码、矩形越界、重复材质、混合模式冲突、兜底表面与sRGB色调转换。
 
 ## 未覆盖
 

@@ -152,7 +152,7 @@ fn material_tables(
 impl Scene {
     /// Build a scene with a seeded hill terrain and the base game texture pack.
     pub fn new(radius: i64) -> Result<Self, String> {
-        Self::with_pack(radius, TexturePack::embedded()?)
+        Self::with_pack(radius, crate::texture::base_pack()?)
     }
 
     /// Build a scene from one authorized replica baseline.
@@ -161,7 +161,7 @@ impl Scene {
     /// the server projection only, and `load_around` keeps the subscribed
     /// section list as-is.
     pub fn from_snapshot(snapshot: &ReplicaSnapshot) -> Result<Self, String> {
-        Self::from_snapshot_with_pack(snapshot, TexturePack::embedded()?)
+        Self::from_snapshot_with_pack(snapshot, crate::texture::base_pack()?)
     }
 
     /// Build a scene with an explicit texture pack.

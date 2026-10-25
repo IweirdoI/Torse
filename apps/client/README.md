@@ -80,7 +80,7 @@ cargo run -p torse-client -- --capture ui.png --width 960 --height 540 --ui-prev
 
 材质表上限256项，内容用到的材质超过上限时启动失败。混合模式来自内容定义：不透明与二值透明在片元阶段处理，二值透明按alpha阈值丢弃；半透明面积进入同一绘制通道并开启alpha混合，因此透明面之间没有排序，交叠观感取决于绘制顺序。图集采样使用最近邻，当前没有mipmap、各向异性过滤与纹理数组。
 
-图集与材质条目位于[基础游戏贴图](../../games/base/assets/textures/README.md)，客户端在[texture.rs](src/texture.rs)编译期嵌入图集并声明材质矩形。其他游戏用自有内容键构造`TexturePack`，交给`Scene::with_pack`，再由`GpuContext::set_palette`上传；公开接口不依赖基础游戏的键名。证据与限制见[贴图记录](../../benchmarks/M1-textures.md)。
+图集与材质条目位于[基础游戏贴图](../../games/base/assets/textures/README.md)。公开的图集解码与材质包校验在[torse-assets](../../crates/assets/src/texture.rs)，客户端在[texture.rs](src/texture.rs)声明基础游戏的材质包、构建材质表，并在编译期嵌入图集。其他游戏用自有内容键构造`TexturePack`，交给`Scene::with_pack`，再由`GpuContext::set_palette`上传；公开接口不依赖基础游戏的键名。证据与限制见[贴图记录](../../benchmarks/M1-textures.md)。
 
 ## 实现入口
 
@@ -89,7 +89,7 @@ cargo run -p torse-client -- --capture ui.png --width 960 --height 540 --ui-prev
 | [scene.rs](src/scene.rs) | 内容与世界装配、流式分区、网格、动作提交与行走接入 |
 | [background.rs](src/scene/background.rs) | 有界生成与网格任务、取消、背压与结果依赖校验 |
 | [renderer.rs](src/renderer.rs) | GPU管线、材质表、图集上传、分区缓冲、离屏输出和截图 |
-| [texture.rs](src/texture.rs) | 图集解码、材质包校验、材质表与透明分类 |
+| [texture.rs](src/texture.rs) | 基础游戏材质包、材质表与透明分类；图集解码在[torse-assets](../../crates/assets/src/texture.rs) |
 | [window.rs](src/window.rs) | 窗口、帧循环、输入调度与网络轮询 |
 | [net.rs](src/net.rs) | 握手、订阅、授权镜像与编辑请求 |
 | [input.rs](src/input.rs)、[camera.rs](src/camera.rs) | 输入聚合与相机 |

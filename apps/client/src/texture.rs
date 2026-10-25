@@ -9,13 +9,16 @@
 use std::collections::BTreeMap;
 
 pub use torse_assets::texture::TexturePack;
-use torse_assets::texture::{Atlas, MaterialEntry};
+use torse_assets::texture::{Atlas, MaterialEntry, MipLevel};
 use torse_content::{AlphaMode, Face};
 use torse_types::ContentKey;
 use torse_world::{BlockStateId, BlockStateRegistry};
 
 /// Maximum materials addressable by one terrain vertex.
 pub const MAX_MATERIALS: usize = 256;
+
+/// Mip levels uploaded for the terrain atlas, including the base level.
+pub const MIP_LEVELS: u32 = 3;
 
 /// One material as consumed by the terrain shader.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,7 +36,7 @@ pub struct Surface {
 pub struct Palette {
     slots: BTreeMap<ContentKey, u16>,
     surfaces: Vec<Surface>,
-    atlas: Atlas,
+    mips: Vec<MipLevel>,
 }
 
 impl Palette {
@@ -79,10 +82,12 @@ impl Palette {
         let mut slots = BTreeMap::new();
         let mut surfaces = Vec::with_capacity(materials.len() + 1);
         for (key, alpha) in materials {
+            // Uncovered materials show the missing sprite so a pack that lags
+            // behind content is visible instead of silently grey.
             let surface = pack.surface(&key).map_or(
                 Surface {
-                    rect: pack.fallback_rect(),
-                    tint: [0.7, 0.7, 0.7],
+                    rect: pack.missing_rect(),
+                    tint: [1.0, 1.0, 1.0],
                     alpha,
                 },
                 |resolved| Surface {
@@ -91,14 +96,12 @@ impl Palette {
                     alpha,
                 },
             );
-            // The declared blending mode is a content decision; a pack entry
-            // only supplies the image.
             slots.insert(key, surfaces.len() as u16);
             surfaces.push(surface);
         }
-        // One extra surface draws entities and other debug bodies.
+        // One extra surface draws entities and other tinted debug bodies.
         surfaces.push(Surface {
-            rect: pack.fallback_rect(),
+            rect: pack.white_rect(),
             tint: [0.78, 0.55, 0.35],
             alpha: AlphaMode::Opaque,
         });
@@ -106,7 +109,7 @@ impl Palette {
         Ok(Self {
             slots,
             surfaces,
-            atlas: pack.atlas().clone(),
+            mips: pack.mips(MIP_LEVELS)?,
         })
     }
 
@@ -120,9 +123,9 @@ impl Palette {
         &self.surfaces
     }
 
-    /// Atlas sampled by the terrain shader.
-    pub fn atlas(&self) -> &Atlas {
-        &self.atlas
+    /// Uploaded mip chain; the first level is the base atlas.
+    pub fn mips(&self) -> &[MipLevel] {
+        &self.mips
     }
 
     /// Slot reserved for entity debug bodies.
@@ -133,8 +136,9 @@ impl Palette {
 
 /// Texture pack shipped with the base game.
 ///
-/// The atlas is self-drawn by `make-textures.py` next to it; the last pixel is
-/// white and serves materials that no pack entry covers.
+/// The atlas is self-drawn by `make-textures.py` next to it. Tiles sit on a
+/// 24-pixel pitch so mip extrusion has a gutter; the last two tiles are the
+/// missing sprite and a white sprite for tinted debug surfaces.
 pub fn base_pack() -> Result<TexturePack, String> {
     macro_rules! asset {
         ($name:literal) => {
@@ -151,32 +155,41 @@ pub fn base_pack() -> Result<TexturePack, String> {
         vec![
             MaterialEntry {
                 key: "base:material/stone",
-                rect: [0, 0, 16, 16],
+                rect: [4, 4, 16, 16],
                 tint: None,
             },
             MaterialEntry {
                 key: "base:material/glass_slab",
-                rect: [16, 0, 16, 16],
+                rect: [28, 4, 16, 16],
                 tint: None,
             },
             MaterialEntry {
                 key: "base:material/plant",
-                rect: [32, 0, 16, 16],
+                rect: [52, 4, 16, 16],
                 tint: None,
             },
         ],
-        [48, 0],
+        [76, 4, 16, 16],
+        [100, 4, 16, 16],
     )
 }
 
 #[cfg(test)]
 impl Palette {
+    fn test_mips() -> Vec<MipLevel> {
+        vec![MipLevel {
+            width: 1,
+            height: 1,
+            pixels: vec![255; 4],
+        }]
+    }
+
     /// Palette without materials, for table-shape tests.
     pub fn empty_for_tests() -> Self {
         Self {
             slots: BTreeMap::new(),
             surfaces: Vec::new(),
-            atlas: Atlas::white_pixel(),
+            mips: Self::test_mips(),
         }
     }
 
@@ -185,7 +198,7 @@ impl Palette {
         Self {
             slots: BTreeMap::new(),
             surfaces: vec![Surface { rect, tint, alpha }],
-            atlas: Atlas::white_pixel(),
+            mips: Self::test_mips(),
         }
     }
 }
@@ -208,6 +221,14 @@ mod tests {
         (content, registry)
     }
 
+    fn base_atlas() -> Atlas {
+        Atlas::decode(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../games/base/assets/textures/atlas.png"
+        )))
+        .expect("atlas decodes")
+    }
+
     #[test]
     fn base_pack_covers_the_base_materials() {
         let pack = base_pack().expect("base pack decodes");
@@ -225,8 +246,8 @@ mod tests {
             let surface = palette.surfaces()[usize::from(slot)];
             assert_ne!(
                 surface.rect,
-                pack.fallback_rect(),
-                "{material} used the fallback"
+                pack.missing_rect(),
+                "{material} used the missing sprite"
             );
         }
         assert_eq!(
@@ -241,17 +262,23 @@ mod tests {
             AlphaMode::Mask
         );
         assert_eq!(palette.entity_slot() as usize, palette.surfaces().len() - 1);
+        assert_eq!(palette.mips().len(), MIP_LEVELS as usize);
+        assert_eq!(
+            (palette.mips()[1].width, palette.mips()[1].height),
+            (palette.mips()[0].width / 2, palette.mips()[0].height / 2)
+        );
     }
 
     #[test]
-    fn uncovered_material_uses_the_grey_fallback_pixel() {
-        let pack = TexturePack::new(Atlas::white_pixel(), Vec::new(), [0, 0]).expect("pack builds");
+    fn uncovered_material_shows_the_missing_sprite() {
+        let pack = TexturePack::new(base_atlas(), Vec::new(), [76, 4, 16, 16], [100, 4, 16, 16])
+            .expect("pack builds");
         let (_, registry) = registry();
         let palette = Palette::build(&registry, &pack).expect("palette builds");
         let stone = palette.slot(&key("base:material/stone")).unwrap();
         let surface = palette.surfaces()[usize::from(stone)];
-        assert_eq!(surface.rect, [0.0, 0.0, 1.0, 1.0]);
-        assert_eq!(surface.tint, [0.7, 0.7, 0.7]);
+        assert_eq!(surface.rect, pack.missing_rect());
+        assert_eq!(surface.tint, [1.0, 1.0, 1.0]);
     }
 
     #[test]

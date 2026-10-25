@@ -1,8 +1,9 @@
 """Draw the base game's terrain atlas.
 
 Every pixel is generated here from a fixed seed, so the atlas is reproducible
-and the repository carries no third-party art. The atlas is 64x16: three 16x16
-tiles followed by the white fallback pixel used by materials without a tile.
+and the repository carries no third-party art. Tiles are 16x16 and sit on a
+24-pixel pitch, which leaves an 8-pixel gutter around each sprite for mipmap
+extrusion. The atlas is 120x24: stone, glass, plant, missing and white tiles.
 """
 
 from pathlib import Path
@@ -11,7 +12,9 @@ from random import Random
 from PIL import Image
 
 TILE = 16
-ATLAS = (64, 16)
+PITCH = 24
+MARGIN = 4
+ATLAS = (PITCH * 5, PITCH)
 HERE = Path(__file__).resolve().parent
 
 
@@ -53,13 +56,25 @@ def plant() -> Image.Image:
     return image
 
 
+def missing() -> Image.Image:
+    image = Image.new("RGBA", (TILE, TILE))
+    for y in range(TILE):
+        for x in range(TILE):
+            magenta = ((x // 2) + (y // 2)) % 2 == 0
+            image.putpixel((x, y), (255, 0, 255, 255) if magenta else (24, 0, 24, 255))
+    return image
+
+
+def white() -> Image.Image:
+    return Image.new("RGBA", (TILE, TILE), (255, 255, 255, 255))
+
+
 def main() -> None:
     rng = Random(20261025)
     atlas = Image.new("RGBA", ATLAS, (0, 0, 0, 0))
-    atlas.paste(stone(rng), (0, 0))
-    atlas.paste(glass(), (16, 0))
-    atlas.paste(plant(), (32, 0))
-    atlas.putpixel((48, 0), (255, 255, 255, 255))
+    tiles = [stone(rng), glass(), plant(), missing(), white()]
+    for index, tile in enumerate(tiles):
+        atlas.paste(tile, (MARGIN + index * PITCH, MARGIN))
     atlas.save(HERE / "atlas.png")
     print(f"wrote {HERE / 'atlas.png'} ({ATLAS[0]}x{ATLAS[1]})")
 

@@ -406,48 +406,52 @@ impl GpuContext {
         self.queue
             .write_buffer(&materials, 0, &surface_bytes(palette));
 
+        let mips = palette.mips();
+        let base = mips.first().expect("palette always carries the base level");
         let texture = self.device.create_texture(&TextureDescriptor {
             label: Some("client texture atlas"),
             size: Extent3d {
-                width: palette.atlas().width(),
-                height: palette.atlas().height(),
+                width: base.width,
+                height: base.height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: mips.len() as u32,
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba8UnormSrgb,
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let row_bytes = palette.atlas().width() * 4;
-        let padded = align_256(row_bytes);
-        let mut pixels = vec![0u8; (padded * palette.atlas().height()) as usize];
-        for row in 0..palette.atlas().height() {
-            let source = (row * row_bytes) as usize;
-            let target = (row * padded) as usize;
-            pixels[target..target + row_bytes as usize]
-                .copy_from_slice(&palette.atlas().pixels()[source..source + row_bytes as usize]);
+        for (level_index, level) in mips.iter().enumerate() {
+            let row_bytes = level.width * 4;
+            let padded = align_256(row_bytes);
+            let mut pixels = vec![0u8; (padded * level.height) as usize];
+            for row in 0..level.height {
+                let source = (row * row_bytes) as usize;
+                let target = (row * padded) as usize;
+                pixels[target..target + row_bytes as usize]
+                    .copy_from_slice(&level.pixels[source..source + row_bytes as usize]);
+            }
+            self.queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level_index as u32,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &pixels,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(level.height),
+                },
+                Extent3d {
+                    width: level.width,
+                    height: level.height,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
-        self.queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            &pixels,
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded),
-                rows_per_image: Some(palette.atlas().height()),
-            },
-            Extent3d {
-                width: palette.atlas().width(),
-                height: palette.atlas().height(),
-                depth_or_array_layers: 1,
-            },
-        );
 
         let view = texture.create_view(&TextureViewDescriptor::default());
         let sampler = self.device.create_sampler(&SamplerDescriptor {
@@ -455,9 +459,11 @@ impl GpuContext {
             address_mode_u: AddressMode::ClampToEdge,
             address_mode_v: AddressMode::ClampToEdge,
             address_mode_w: AddressMode::ClampToEdge,
+            // Nearest magnification keeps the pixel-art look; linear
+            // minification blends between the generated mip levels.
             mag_filter: FilterMode::Nearest,
-            min_filter: FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..SamplerDescriptor::default()
         });
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {

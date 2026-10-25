@@ -51,6 +51,36 @@ pub struct PreparedChange {
     lifecycle_batch: Option<LifecycleBatch>,
 }
 
+/// Read-only collision work for exactly one pure movement. This opaque token
+/// cannot be published directly; refresh rechecks all observations and binds
+/// a new prepared change to the current serial commit position.
+pub struct MovementPrevalidation {
+    prepared: PreparedChange,
+}
+impl MovementPrevalidation {
+    pub fn allocated_bytes(&self) -> usize {
+        let p = &self.prepared;
+        size_of::<Self>()
+            .saturating_add(
+                p.movement_reads
+                    .capacity()
+                    .saturating_mul(size_of::<(BlockPos, TerrainQuery)>()),
+            )
+            .saturating_add(
+                p.movement_handles
+                    .capacity()
+                    .saturating_mul(size_of::<(EntityHandle, EntityId)>()),
+            )
+            .saturating_add(
+                p.entity_moves
+                    .capacity()
+                    .saturating_mul(size_of::<EntityMove>()),
+            )
+            .saturating_add(p.source.namespace().len())
+            .saturating_add(p.source.path().len())
+    }
+}
+
 impl PreparedChange {
     /// Complete creation/removal records and proposed allocator state, before publication.
     pub fn entity_lifecycle(&self) -> Option<&EntityLifecycle> {
@@ -167,6 +197,65 @@ pub struct CommitCoordinator {
 }
 
 impl CommitCoordinator {
+    pub fn prevalidate_movement(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+        group: &crate::TransactionGroup,
+    ) -> Result<MovementPrevalidation, PrepareError> {
+        let pure = group.members.len() == 1
+            && group.members.iter().all(|m| {
+                m.movements.len() == 1
+                    && m.preconditions.is_empty()
+                    && m.mutations.is_empty()
+                    && m.components.is_empty()
+                    && m.spawns.is_empty()
+                    && m.despawns.is_empty()
+            });
+        if !pure {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        Ok(MovementPrevalidation {
+            prepared: self.prepare_group(store, entities, registry, schemas, group)?,
+        })
+    }
+
+    pub fn refresh_movement(
+        &self,
+        store: &SectionStore,
+        entities: &EntityStore,
+        token: &MovementPrevalidation,
+    ) -> Result<PreparedChange, PrepareError> {
+        let p = &token.prepared;
+        if p.meta.cursor.world != self.world
+            || p.meta.compatibility != self.compatibility
+            || p.observed_resume != self.resume
+            || p.meta.previous > self.seq
+        {
+            return Err(PrepareError::Rejected(RejectCode::Conflict));
+        }
+        // Keep this witness set aligned with movement preparation/publication.
+        // No collision calculation or identity allocation occurs during refresh.
+        if p.movement_reads
+            .iter()
+            .any(|(pos, value)| store.query(*pos) != *value)
+            || p.movement_handles
+                .iter()
+                .any(|(handle, id)| entities.get(*handle).is_none_or(|e| e.id != *id))
+            || entities.validate_moves(&p.entity_moves).is_err()
+        {
+            return Err(PrepareError::Rejected(RejectCode::Conflict));
+        }
+        let next = self.seq.next().ok_or(PrepareError::SequenceExhausted)?;
+        let mut prepared = p.clone();
+        prepared.meta.previous = self.seq;
+        prepared.meta.cursor.seq = next;
+        prepared.meta.resume_at = self.resume;
+        Ok(prepared)
+    }
+
     /// Create a coordinator at the baseline commit position.
     ///
     /// Compatibility digests start at zero until the host supplies the compiled

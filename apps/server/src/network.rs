@@ -92,6 +92,11 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.authority.set_runtime_optimization(enabled);
         Ok(())
     }
+    pub fn set_projection_optimization(&mut self, enabled: bool) -> Result<(), Fault> {
+        self.authority()?;
+        self.authority.set_projection_optimization(enabled);
+        Ok(())
+    }
     /// Finish one logical tick, including a recovered partial tick, within an
     /// explicit work budget. This never skips a tick or invokes future events.
     pub fn drive_tick(

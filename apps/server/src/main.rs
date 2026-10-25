@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use torse_net::{TcpTransport, TransportLimits};
 use torse_server::{
     HostAuthority, PlanningConfig, WorldDirectory, bootstrap as base,
-    execution::{ExecutionHost, ExecutionRecovery},
+    execution::{ExecutionHost, ExecutionRecovery, PrevalidationConfig},
     network::{NetworkHub, PeerPolicy},
 };
 use torse_sim::action::ActorContext;
@@ -14,13 +14,13 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--commit-batch N; default 16]"
+            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--commit-batch N; default 16]"
         );
         return Ok(());
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--commit-batch N; default 16]"
+            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--commit-batch N; default 16]"
         );
         return Ok(());
     }
@@ -33,9 +33,21 @@ fn run() -> Result<(), Fault> {
     let mut mod_dirs = Vec::new();
     let mut machine_operators = false;
     let mut planning = None;
+    let mut prevalidation = None;
     let mut commit_batch = 16;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--prevalidate-workers" => {
+                let workers = args
+                    .next()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| (1..=64).contains(n))
+                    .ok_or_else(|| Fault::invalid_data("prevalidation workers must be 1..64"))?;
+                prevalidation = Some(PrevalidationConfig {
+                    workers,
+                    ..Default::default()
+                });
+            }
             "--commit-batch" => {
                 commit_batch = args
                     .next()
@@ -137,6 +149,7 @@ fn run() -> Result<(), Fault> {
         })?
     };
     server.set_parallel_planning(planning)?;
+    server.set_prevalidation(prevalidation)?;
     server.set_commit_batch_limit(commit_batch)?;
     let listener = TcpListener::bind(&address).map_err(|e| Fault::invalid_data(e.to_string()))?;
     listener

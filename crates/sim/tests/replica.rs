@@ -56,8 +56,11 @@ fn tx(id: u128) -> Transaction {
 }
 
 fn world() -> WorldAuthority {
+    world_with_payload(false)
+}
+fn world_with_payload(payload: bool) -> WorldAuthority {
     let mut pack = m0_fixture_pack();
-    let schemas = [
+    let mut schemas: Vec<_> = [
         (
             "test:public",
             ReplicationVisibility::Public,
@@ -98,6 +101,12 @@ fn world() -> WorldAuthority {
         migration_binding: None,
     })
     .into();
+    if payload {
+        let mut schema = schemas[0].clone();
+        schema.id = key("test:payload");
+        schema.fields[0].field_type = ComponentFieldType::List { max_items: 8 };
+        schemas.push(schema);
+    }
     register_action_module(
         &mut pack,
         key("test:owner"),
@@ -153,6 +162,9 @@ fn world() -> WorldAuthority {
     world
 }
 
+#[path = "replica/incremental.rs"]
+mod incremental;
+
 fn source(limits: ReplicaLimits) -> (ReplicaSource, Binding) {
     let world = world();
     let binding = Binding {
@@ -176,6 +188,72 @@ fn open(source: &mut ReplicaSource, id: u128, authorized: bool) -> WorldReplicaS
 fn publish(source: &mut ReplicaSource, tx: &Transaction) -> torse_sim::Publication {
     let prepared = source.prepare(tx).unwrap();
     source.publish(prepared).unwrap()
+}
+
+#[test]
+fn observed_state_table_is_sorted_deduplicated_and_excludes_air_and_unused_symbols() {
+    let (mut source, binding) = source(limits());
+    let seed = open(&mut source, 1, false);
+    assert!(seed.state.states.is_empty());
+    let first = BlockStateId(1);
+    let last = BlockStateId((source.world().registry().state_count() - 1) as u16);
+    assert_ne!(first, last);
+    let mut change = tx(91);
+    for (x, state) in [(1, last), (2, first), (3, last)] {
+        let pos = BlockPos::new(x, 1, 1);
+        change
+            .read_block(pos, BlockStateId::EMPTY)
+            .write_block(pos, state);
+    }
+    publish(&mut source, &change);
+    let batches = source
+        .take_replica_batches(binding, seed.subscription, budget())
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .changes
+            .states
+            .iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>(),
+        vec![first, last]
+    );
+    let rebuilt = open(&mut source, 2, false);
+    assert_eq!(rebuilt.state.states, batches[0].changes.states);
+}
+
+#[test]
+fn unregistered_section_symbol_is_rejected_without_indexing_past_registry() {
+    let mut world = world();
+    world.store_mut().unload(SectionPos::ZERO).unwrap();
+    world.store_mut().request(SectionPos::ZERO).unwrap();
+    world
+        .store_mut()
+        .install(
+            SectionPos::ZERO,
+            Section::new(16, BlockStateId(u16::MAX)).unwrap(),
+        )
+        .unwrap();
+    world.store_mut().finish_load(SectionPos::ZERO).unwrap();
+    let binding = Binding {
+        world: world.world(),
+        epoch: WorldEpoch(1),
+        compatibility: world.coordinator().compatibility(),
+    };
+    let mut source = ReplicaSource::new(world, binding, limits()).unwrap();
+    assert_eq!(
+        source
+            .open_replica(
+                viewer(1),
+                ActorContext::new(key("test:player")),
+                scope(),
+                budget()
+            )
+            .unwrap_err()
+            .code,
+        FaultCode::InvalidData
+    );
 }
 fn edit(source: &ReplicaSource, schema: &str, value: u32, id: u128) -> Transaction {
     let entity = source

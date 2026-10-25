@@ -1,0 +1,15 @@
+format=1
+threads=1
+profiled=true
+ticks=30
+warmup=5
+backend=sink
+os=windows
+arch=x86_64
+debug_assertions=false
+runtime_optimization=true
+commit_batch=16
+logical_cpus=28
+rustc=rustc 1.93.1 (01f6ddf75 2026-02-11)
+revision=84df89ac0ccaff77c32c89640d9947d0a7d40386
+worktree=D  .github/ISSUE_TEMPLATE/bug_report.md;D  .github/ISSUE_TEMPLATE/feature_request.md

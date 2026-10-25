@@ -25,6 +25,9 @@ pub use planning::PlanningConfig;
 #[path = "runtime_budget.rs"]
 mod runtime_budget;
 use runtime_budget::RuntimeBudget;
+#[path = "prevalidation.rs"]
+mod prevalidation;
+pub use prevalidation::{PrevalidationConfig, PrevalidationStats};
 
 pub struct ExecutionModel;
 impl AuthorityData for ExecutionModel {
@@ -151,6 +154,8 @@ pub struct ExecutionHost {
     planning: Option<PlanningConfig>,
     compact_records: bool,
     budget_cache: RefCell<RuntimeBudget>,
+    prevalidation: Option<PrevalidationConfig>,
+    prevalidated: RefCell<prevalidation::PrevalidationCache>,
 }
 pub struct ExecutionPrepared {
     world: torse_sim::PreparedChange,
@@ -374,6 +379,8 @@ impl ExecutionHost {
             planning: None,
             compact_records: true,
             budget_cache: RefCell::default(),
+            prevalidation: None,
+            prevalidated: RefCell::default(),
         })
     }
     pub fn world(&self) -> &WorldAuthority {
@@ -386,6 +393,10 @@ impl ExecutionHost {
     /// Immutable table sharing remains enabled. Readers also accept old logs.
     pub fn set_runtime_optimization(&mut self, enabled: bool) {
         self.compact_records = enabled;
+    }
+
+    pub fn set_projection_optimization(&mut self, enabled: bool) {
+        self.source.set_projection_optimization(enabled);
     }
     fn validation_cache(&self) -> Option<&RefCell<RuntimeBudget>> {
         self.compact_records.then_some(&self.budget_cache)
@@ -649,10 +660,12 @@ impl ExecutionHost {
     fn prepare_task(&self, task: &FrozenTask) -> Result<ExecutionPrepared, Fault> {
         let mut status = task.status.clone();
         let mut prepared = match &task.transaction {
-            Some(stored) => match stored.restore(self.world()).and_then(|tx| {
-                self.source.world().prepare_group(&tx).map_err(|e| match e {
-                    PrepareError::Rejected(c) => c,
-                    PrepareError::SequenceExhausted => RejectCode::QuotaExceeded,
+            Some(stored) => match self.cached_movement().map(Ok).unwrap_or_else(|| {
+                stored.restore(self.world()).and_then(|tx| {
+                    self.source.world().prepare_group(&tx).map_err(|e| match e {
+                        PrepareError::Rejected(c) => c,
+                        PrepareError::SequenceExhausted => RejectCode::QuotaExceeded,
+                    })
                 })
             }) {
                 Ok(prepared) => prepared,
@@ -1043,6 +1056,7 @@ impl HostAuthority for ExecutionHost {
         }
         if let Some(work) = &self.runtime.work {
             if let Some(task) = work.tasks.get(work.next as usize) {
+                self.fill_prevalidation();
                 return self.prepare_task(task).map(Some);
             }
             let mut state = self.runtime.clone();
@@ -1127,6 +1141,7 @@ impl HostAuthority for ExecutionHost {
             live.completed = live.completed.max(request.id.seq.0);
         }
         self.runtime = prepared.runtime;
+        self.release_prevalidation();
         for r in self
             .runtime
             .windows

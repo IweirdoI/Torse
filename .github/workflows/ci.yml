@@ -32,6 +32,9 @@ jobs:
             cargo test -p torse-client scene::background::tests --locked
             cargo test -p torse-server --test parallel_planning --locked
             cargo test -p torse-server --test runtime_commit --locked
+            cargo test -p torse-server --test prevalidation --locked
+            cargo test -p torse-server --test projection --locked
+            cargo test -p torse-sim --test replica --locked
           done
       - name: Repeat checkpoint concurrency tests
         if: runner.os == 'Linux'
@@ -55,7 +58,7 @@ jobs:
       - name: Persistence scenario
         run: cargo run -p torse-tools -- persistence-scenario
       - name: Durable execution server smoke
-        run: cargo run -p torse-server -- .work/ci-execution-world --listen 127.0.0.1:0 --ticks 2 --planning-workers 4
+        run: cargo run -p torse-server -- .work/ci-execution-world --listen 127.0.0.1:0 --ticks 2 --planning-workers 4 --prevalidate-workers 4
       - name: Serial baseline smoke
         run: cargo run -p torse-server --example serial_baseline -- --output .work/ci-serial-baseline --ticks 2 --warmup 1 --batch 16
 

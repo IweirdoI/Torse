@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use torse_content::{
     AlphaMode, BlockDefinition, CollisionProfile, ComponentField, ComponentFieldType,
-    ComponentSchema as ContentComponentSchema, ContentPack, FaceMaterials, FiniteField,
-    InteractionProfile, LightTransport, ModuleDescriptor, ModuleSide, OcclusionProfile,
-    PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile, Shape, SourceRef,
-    Sourced, StateSchema, compile,
+    ComponentSchema as ContentComponentSchema, ContentPack, Face, FaceMaterials, FaceOverlay,
+    FaceOverlays, FiniteField, InteractionProfile, LightTransport, ModuleDescriptor, ModuleSide,
+    OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile,
+    Shape, SourceRef, Sourced, StateSchema, compile,
 };
 use torse_types::{ContentKey, ReplicationDeclaration};
 use torse_world::{BlockStateRegistry, ComponentSchemas};
@@ -715,6 +715,7 @@ fn parse_shape(text: &str) -> Option<Shape> {
         "full-cube" => Some(Shape::FullCube),
         "lower-slab" => Some(Shape::LowerSlab),
         "panel" => Some(Shape::Panel),
+        "cross" => Some(Shape::Cross),
         "corner" => Some(Shape::Corner),
         "stair" => Some(Shape::Stair),
         _ => None,
@@ -769,6 +770,83 @@ fn parse_block(
             AlphaMode::Opaque
         }
     };
+    let mut face_overlays = FaceOverlays::none();
+    if let Some(overlays) = render.and_then(|render| render.get("overlays")) {
+        let Some(overlays) = overlays.as_table() else {
+            errors.push(PackageError::new(
+                package,
+                "block.render.overlays",
+                "expected a table keyed by face name",
+            ));
+            return Err(errors);
+        };
+        for (face_name, value) in overlays {
+            let Some(face) = parse_face(face_name) else {
+                errors.push(PackageError::new(
+                    package,
+                    "block.render.overlays",
+                    format!("unknown face `{face_name}`"),
+                ));
+                continue;
+            };
+            let Some(value) = value.as_table() else {
+                errors.push(PackageError::new(
+                    package,
+                    "block.render.overlays",
+                    format!("`{face_name}` must be a table with material and alpha fields"),
+                ));
+                continue;
+            };
+            let Some(material_text) = value.get("material").and_then(toml::Value::as_str) else {
+                errors.push(PackageError::new(
+                    package,
+                    "block.render.overlays",
+                    format!("`{face_name}.material` must be a material key"),
+                ));
+                continue;
+            };
+            let material = match parse_key(material_text) {
+                Ok(key) => key,
+                Err(detail) => {
+                    errors.push(PackageError::new(
+                        package,
+                        "block.render.overlays",
+                        format!("`{face_name}.material`: {detail}"),
+                    ));
+                    continue;
+                }
+            };
+            let alpha_value = value.get("alpha");
+            if alpha_value.is_some_and(|alpha| alpha.as_str().is_none()) {
+                errors.push(PackageError::new(
+                    package,
+                    "block.render.overlays",
+                    format!("`{face_name}.alpha` must be a string"),
+                ));
+                continue;
+            }
+            let alpha = match alpha_value.and_then(toml::Value::as_str).unwrap_or("mask") {
+                "opaque" => AlphaMode::Opaque,
+                "mask" => AlphaMode::Mask,
+                "blend" => AlphaMode::Blend,
+                other => {
+                    errors.push(PackageError::new(
+                        package,
+                        "block.render.overlays",
+                        format!("`{face_name}.alpha` has unknown alpha mode `{other}`"),
+                    ));
+                    continue;
+                }
+            };
+            face_overlays.set(
+                face,
+                FaceOverlay {
+                    material,
+                    alpha_mode: alpha,
+                },
+            );
+        }
+    }
     let mut optional_shape = |section: &str| {
         entry
             .get(section)
@@ -854,6 +932,7 @@ fn parse_block(
                 shape,
                 material,
                 face_materials: FaceMaterials::none(),
+                face_overlays,
                 alpha_mode: alpha,
             },
             collision_profile: CollisionProfile { shape: collision },
@@ -879,6 +958,18 @@ fn parse_block(
         })
     } else {
         Err(errors)
+    }
+}
+
+fn parse_face(text: &str) -> Option<Face> {
+    match text {
+        "neg-x" => Some(Face::NegX),
+        "pos-x" => Some(Face::PosX),
+        "neg-y" => Some(Face::NegY),
+        "pos-y" => Some(Face::PosY),
+        "neg-z" => Some(Face::NegZ),
+        "pos-z" => Some(Face::PosZ),
+        _ => None,
     }
 }
 
@@ -1397,5 +1488,34 @@ mod tests {
         let exact = VersionReq::parse("0.1.3").unwrap();
         assert!(exact.accepts(Version::parse("0.1.3").unwrap()));
         assert!(!exact.accepts(Version::parse("0.1.4").unwrap()));
+    }
+
+    #[test]
+    fn block_parser_accepts_cross_shape_and_face_overlay() {
+        let value = toml::from_str::<toml::Value>(
+            r#"
+id = "example:plant"
+schema = "example:plant"
+
+[render]
+shape = "cross"
+material = "base:material/plant_base"
+
+[render.overlays.pos-x]
+material = "base:material/plant_overlay"
+alpha = "mask"
+"#,
+        )
+        .expect("block parses as TOML");
+        let block = parse_block("example", value.as_table().expect("block table"))
+            .expect("block descriptor parses");
+        assert_eq!(block.render_profile.shape, Shape::Cross);
+        let overlay = block
+            .render_profile
+            .face_overlays
+            .get(Face::PosX)
+            .expect("overlay exists");
+        assert_eq!(overlay.material.to_string(), "base:material/plant_overlay");
+        assert_eq!(overlay.alpha_mode, AlphaMode::Mask);
     }
 }

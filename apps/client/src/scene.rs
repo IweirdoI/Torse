@@ -7,6 +7,7 @@
 //! already enforces.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use torse_content::{BlockDefinition, Face, Shape, compile, m0_fixture_pack};
 use torse_render::{MeshData, MeshSample, RenderBlock, RenderBox, build_mesh};
@@ -54,11 +55,17 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// Material slot looked up in the client material table.
     pub material: u32,
+    /// Optional second material slot, or `u32::MAX` when absent.
+    pub overlay_material: u32,
+    /// Position tint for the base material.
+    pub tint: [f32; 3],
+    /// Position tint for the overlay material.
+    pub overlay_tint: [f32; 3],
 }
 
 impl Vertex {
     /// Bytes per interleaved vertex.
-    pub const STRIDE: usize = 36;
+    pub const STRIDE: usize = 64;
 
     fn write(&self, out: &mut Vec<u8>) {
         for value in self
@@ -70,7 +77,17 @@ impl Vertex {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&self.material.to_le_bytes());
+        out.extend_from_slice(&self.overlay_material.to_le_bytes());
+        for value in self.tint.iter().chain(self.overlay_tint.iter()) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+struct StateMaterials {
+    base: [u16; 6],
+    overlays: [Option<u16>; 6],
 }
 
 /// Terrain scene bound to one authoritative world.
@@ -94,7 +111,9 @@ pub struct Scene {
     background: Option<Background>,
     palette: Palette,
     /// Material slot per block state and face.
-    state_materials: BTreeMap<BlockStateId, [u16; 6]>,
+    state_materials: BTreeMap<BlockStateId, StateMaterials>,
+    tint_provider: Option<Arc<dyn torse_assets::texture::PositionTintProvider>>,
+    tint_provider_generation: u64,
 }
 
 /// One content pack for every client mode, matching the server demo assembly
@@ -128,7 +147,7 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
 fn material_tables(
     registry: &BlockStateRegistry,
     pack: &TexturePack,
-) -> Result<(Palette, BTreeMap<BlockStateId, [u16; 6]>), String> {
+) -> Result<(Palette, BTreeMap<BlockStateId, StateMaterials>), String> {
     let palette = Palette::build(registry, pack)?;
     let mut states = BTreeMap::new();
     for index in 0..registry.state_count() {
@@ -137,14 +156,31 @@ fn material_tables(
             continue;
         };
         let profile = &definition.render_profile;
-        let mut slots = [0u16; 6];
+        let mut materials = StateMaterials {
+            base: [0; 6],
+            overlays: [None; 6],
+        };
         for face in Face::ALL {
             let material = profile.face_materials.resolve(face, &profile.material);
-            slots[face.index()] = palette
-                .slot(material)
+            materials.base[face.index()] = palette
+                .slot_for(material, profile.alpha_mode)
                 .ok_or_else(|| format!("material `{material}` is missing from the palette"))?;
+            materials.overlays[face.index()] = profile
+                .face_overlays
+                .get(face)
+                .map(|overlay| {
+                    palette
+                        .slot_for(&overlay.material, overlay.alpha_mode)
+                        .ok_or_else(|| {
+                            format!(
+                                "overlay material `{}` is missing from the palette",
+                                overlay.material
+                            )
+                        })
+                })
+                .transpose()?;
         }
-        states.insert(state, slots);
+        states.insert(state, materials);
     }
     Ok((palette, states))
 }
@@ -206,6 +242,8 @@ impl Scene {
             background: None,
             palette,
             state_materials,
+            tint_provider: None,
+            tint_provider_generation: 0,
         };
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)
@@ -251,6 +289,8 @@ impl Scene {
             background: None,
             palette,
             state_materials,
+            tint_provider: None,
+            tint_provider_generation: 0,
         };
         scene.install_snapshot(snapshot)?;
         Ok(scene)
@@ -259,6 +299,22 @@ impl Scene {
     /// Material palette used by the terrain shader.
     pub fn palette(&self) -> &Palette {
         &self.palette
+    }
+
+    /// Replace the location-dependent tint data used while building meshes.
+    #[allow(dead_code)]
+    pub fn set_position_tint_provider(
+        &mut self,
+        provider: Option<Arc<dyn torse_assets::texture::PositionTintProvider>>,
+    ) -> Result<(), String> {
+        let generation = self
+            .tint_provider_generation
+            .checked_add(1)
+            .ok_or("position tint provider generation exhausted")?;
+        self.tint_provider = provider;
+        self.tint_provider_generation = generation;
+        self.meshes.clear();
+        Ok(())
     }
 
     /// Whether this scene mirrors a server projection instead of generating.
@@ -420,7 +476,13 @@ impl Scene {
                 let Some(definition) = self.authority.registry().definition(state) else {
                     return Some(None);
                 };
-                Some(render_box(definition))
+                Some(
+                    definition
+                        .selection_profile
+                        .shape
+                        .as_ref()
+                        .and_then(shape_box),
+                )
             }
             TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => None,
         }
@@ -436,7 +498,14 @@ impl Scene {
         let Some(definition) = self.authority.registry().definition(state) else {
             return Vec::new();
         };
-        let bounds = render_box(definition).unwrap_or(RenderBox::FULL_CUBE);
+        let Some(bounds) = definition
+            .selection_profile
+            .shape
+            .as_ref()
+            .and_then(shape_box)
+        else {
+            return Vec::new();
+        };
         const INFLATE: f32 = 0.004;
         let min = [
             hit.block.x as f32 + bounds.min[0] - INFLATE,
@@ -477,6 +546,9 @@ impl Scene {
                     normal: [0.0, 1.0, 0.0],
                     uv: [0.0, 0.0],
                     material: 0,
+                    overlay_material: u32::MAX,
+                    tint: [1.0; 3],
+                    overlay_tint: [1.0; 3],
                 });
             }
         }
@@ -763,7 +835,14 @@ impl Scene {
                 continue;
             };
             let mesh = build_mesh(self.side, *pos, |query| {
-                sample(store, registry, &self.state_materials, query)
+                sample(
+                    store,
+                    registry,
+                    &self.state_materials,
+                    &self.palette,
+                    self.tint_provider.as_deref(),
+                    query,
+                )
             });
             self.meshes.insert(*pos, (job, mesh));
             rebuilt.push(*pos);
@@ -851,6 +930,11 @@ impl Scene {
                 normal: mesh.normals[index],
                 uv: mesh.uvs[index],
                 material: u32::from(mesh.materials[index / 4]),
+                overlay_material: (mesh.overlays[index / 4] != u16::MAX)
+                    .then(|| u32::from(mesh.overlays[index / 4]))
+                    .unwrap_or(u32::MAX),
+                tint: mesh.tints[index],
+                overlay_tint: mesh.overlay_tints[index],
             });
         }
         indices.extend(mesh.indices.iter().copied());
@@ -896,6 +980,11 @@ impl Scene {
                     normal: mesh.normals[index],
                     uv: mesh.uvs[index],
                     material: u32::from(mesh.materials[index / 4]),
+                    overlay_material: (mesh.overlays[index / 4] != u16::MAX)
+                        .then(|| u32::from(mesh.overlays[index / 4]))
+                        .unwrap_or(u32::MAX),
+                    tint: mesh.tints[index],
+                    overlay_tint: mesh.overlay_tints[index],
                 });
             }
             indices.extend(mesh.indices.iter().map(|value| base + value));
@@ -992,6 +1081,9 @@ fn push_entity_box(
                 normal: [nx, ny, nz],
                 uv: [0.0, 0.0],
                 material,
+                overlay_material: u32::MAX,
+                tint: [1.0; 3],
+                overlay_tint: [1.0; 3],
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -1007,7 +1099,9 @@ fn key(value: &str) -> ContentKey {
 fn sample(
     store: &torse_world::SectionStore,
     registry: &BlockStateRegistry,
-    state_materials: &BTreeMap<BlockStateId, [u16; 6]>,
+    state_materials: &BTreeMap<BlockStateId, StateMaterials>,
+    palette: &Palette,
+    tint_provider: Option<&dyn torse_assets::texture::PositionTintProvider>,
     pos: BlockPos,
 ) -> MeshSample {
     match store.query(pos) {
@@ -1018,11 +1112,30 @@ fn sample(
             let Some(definition) = registry.definition(state) else {
                 return MeshSample::Ready(RenderBlock::EMPTY);
             };
+            let materials = state_materials
+                .get(&state)
+                .copied()
+                .unwrap_or(StateMaterials {
+                    base: [0; 6],
+                    overlays: [None; 6],
+                });
+            let face_tints = std::array::from_fn(|index| {
+                position_tint(palette, materials.base[index], pos, tint_provider)
+            });
+            let face_overlay_tints = std::array::from_fn(|index| {
+                materials.overlays[index].map_or([1.0; 3], |slot| {
+                    position_tint(palette, slot, pos, tint_provider)
+                })
+            });
             MeshSample::Ready(RenderBlock {
                 bounds: render_box(definition),
+                cross: matches!(&definition.render_profile.shape, Shape::Cross),
                 occlusion: definition.occlusion_profile.face_mask,
                 material: 0,
-                face_materials: Some(state_materials.get(&state).copied().unwrap_or([0; 6])),
+                face_materials: Some(materials.base),
+                face_overlays: Some(materials.overlays),
+                face_tints: Some(face_tints),
+                face_overlay_tints: Some(face_overlay_tints),
             })
         }
         TerrainQuery::NotLoaded => MeshSample::NotLoaded,
@@ -1031,7 +1144,11 @@ fn sample(
 }
 
 fn render_box(definition: &BlockDefinition) -> Option<RenderBox> {
-    match &definition.render_profile.shape {
+    shape_box(&definition.render_profile.shape)
+}
+
+fn shape_box(shape: &Shape) -> Option<RenderBox> {
+    match shape {
         Shape::FullCube => Some(RenderBox::FULL_CUBE),
         Shape::LowerSlab => Some(RenderBox {
             min: [0.0, 0.0, 0.0],
@@ -1041,6 +1158,7 @@ fn render_box(definition: &BlockDefinition) -> Option<RenderBox> {
             min: [0.45, 0.0, 0.0],
             max: [0.55, 1.0, 1.0],
         }),
+        Shape::Cross => Some(RenderBox::FULL_CUBE),
         Shape::Corner | Shape::Stair => Some(RenderBox::FULL_CUBE),
         Shape::Box(bounds) => Some(RenderBox {
             min: bounds.min,
@@ -1049,10 +1167,44 @@ fn render_box(definition: &BlockDefinition) -> Option<RenderBox> {
     }
 }
 
+fn position_tint(
+    palette: &Palette,
+    slot: u16,
+    position: BlockPos,
+    provider: Option<&dyn torse_assets::texture::PositionTintProvider>,
+) -> [f32; 3] {
+    let (Some(source), Some(provider)) = (palette.tint_source(slot), provider) else {
+        return [1.0; 3];
+    };
+    let color = provider.sample(source, position);
+    torse_assets::texture::srgb_to_linear(color.map(|channel| f32::from(channel) / 255.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use torse_types::EntityId;
+
+    struct RegionTint(AtomicU64);
+
+    impl torse_assets::texture::PositionTintProvider for RegionTint {
+        fn sample(
+            &self,
+            _source: torse_assets::texture::TintSource,
+            position: BlockPos,
+        ) -> [u8; 3] {
+            match self.0.load(Ordering::Relaxed) {
+                0 if position.x < 8 => [255, 0, 0],
+                0 => [0, 0, 255],
+                _ => [0, 255, 0],
+            }
+        }
+
+        fn revision(&self, _section: SectionPos) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
 
     #[test]
     fn scene_generates_and_meshes_its_radius() {
@@ -1199,11 +1351,51 @@ mod tests {
             normal: [0.0, 1.0, 0.0],
             uv: [0.25, 0.75],
             material: 3,
+            overlay_material: u32::MAX,
+            tint: [1.0; 3],
+            overlay_tint: [1.0; 3],
         }];
         let bytes = Scene::vertex_bytes(&vertices);
         assert_eq!(bytes.len(), Vertex::STRIDE);
-        // Material is the trailing little-endian u32.
+        // Material and overlay slots follow the position, normal, and UV.
         assert_eq!(&bytes[32..36], &3u32.to_le_bytes());
+        assert_eq!(&bytes[36..40], &u32::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn position_tints_vary_by_region_and_rebuild_on_provider_revision() {
+        let atlas = torse_assets::texture::Atlas::decode(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../games/base/assets/textures/atlas.png"
+        )))
+        .expect("atlas decodes");
+        let pack = TexturePack::new(
+            atlas,
+            vec![torse_assets::texture::MaterialEntry {
+                key: "base:material/stone",
+                rect: [4, 4, 16, 16],
+                tint_source: Some(torse_assets::texture::TintSource::Grass),
+                ..torse_assets::texture::MaterialEntry::new("", [0; 4])
+            }],
+            [76, 4, 16, 16],
+            [100, 4, 16, 16],
+        )
+        .expect("pack builds");
+        let provider = Arc::new(RegionTint(AtomicU64::new(0)));
+        let mut scene = Scene::with_pack(0, pack).expect("scene builds");
+        scene
+            .set_position_tint_provider(Some(provider.clone()))
+            .expect("provider installs");
+        assert_eq!(scene.refresh_meshes(), [SectionPos::ZERO]);
+
+        let vertices = scene.geometry().0;
+        assert!(vertices.iter().any(|vertex| vertex.tint == [1.0, 0.0, 0.0]));
+        assert!(vertices.iter().any(|vertex| vertex.tint == [0.0, 0.0, 1.0]));
+
+        provider.0.store(1, Ordering::Relaxed);
+        assert_eq!(scene.refresh_meshes(), [SectionPos::ZERO]);
+        let vertices = scene.geometry().0;
+        assert!(vertices.iter().all(|vertex| vertex.tint == [0.0, 1.0, 0.0]));
     }
 
     fn query(scene: &Scene, pos: BlockPos) -> bool {

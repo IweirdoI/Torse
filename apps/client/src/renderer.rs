@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::time::{Duration, Instant};
 
 use wgpu::{
     AddressMode, BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
@@ -38,10 +39,12 @@ struct Camera {
 struct Surface {
     rect: vec4<f32>,
     tint: vec4<f32>,
+    next_rect: vec4<f32>,
+    frame: vec4<f32>,
 };
 
 struct Materials {
-    entries: array<Surface, 256>,
+    entries: array<Surface, 512>,
 };
 
 @group(0) @binding(0)
@@ -61,6 +64,9 @@ struct VertexIn {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) material: u32,
+    @location(4) overlay_material: u32,
+    @location(5) tint: vec3<f32>,
+    @location(6) overlay_tint: vec3<f32>,
 };
 
 struct VertexOut {
@@ -68,7 +74,33 @@ struct VertexOut {
     @location(0) normal: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) @interpolate(flat) material: u32,
+    @location(3) @interpolate(flat) overlay_material: u32,
+    @location(4) tint: vec3<f32>,
+    @location(5) overlay_tint: vec3<f32>,
 };
+
+fn sample_surface(surface: Surface, uv: vec2<f32>) -> vec4<f32> {
+    let texel = 0.5 / vec2<f32>(textureDimensions(atlas, 0));
+    let minimum = surface.rect.xy + texel;
+    let maximum = surface.rect.xy + surface.rect.zw - texel;
+    let first_uv = clamp(surface.rect.xy + uv * surface.rect.zw, minimum, maximum);
+    var first: vec4<f32>;
+    if (surface.frame.y > 0.5) {
+        first = textureSampleLevel(atlas, atlas_sampler, first_uv, 0.0);
+    } else {
+        first = textureSample(atlas, atlas_sampler, first_uv);
+    }
+    if (surface.frame.x <= 0.0) {
+        return first;
+    }
+    let second_uv = clamp(
+        surface.next_rect.xy + uv * surface.next_rect.zw,
+        surface.next_rect.xy + texel,
+        surface.next_rect.xy + surface.next_rect.zw - texel,
+    );
+    let second = textureSampleLevel(atlas, atlas_sampler, second_uv, 0.0);
+    return mix(first, second, surface.frame.x);
+}
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
@@ -77,17 +109,23 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.normal = input.normal;
     out.uv = input.uv;
     out.material = input.material;
+    out.overlay_material = input.overlay_material;
+    out.tint = input.tint;
+    out.overlay_tint = input.overlay_tint;
     return out;
 }
 
 @fragment
-fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(
+    input: VertexOut,
+    @builtin(front_facing) front_facing: bool,
+) -> @location(0) vec4<f32> {
     let surface = materials.entries[input.material];
-    let atlas_uv = surface.rect.xy + input.uv * surface.rect.zw;
-    let texel = textureSample(atlas, atlas_sampler, atlas_uv);
+    let texel = sample_surface(surface, input.uv);
 
     let light = normalize(vec3<f32>(0.35, 0.9, 0.25));
-    let diffuse = max(dot(normalize(input.normal), light), 0.0);
+    let normal = select(-input.normal, input.normal, front_facing);
+    let diffuse = max(dot(normalize(normal), light), 0.0);
     let shade = 0.38 + 0.62 * diffuse;
 
     // tint.w encodes the alpha mode: 0 opaque, 1 mask, 2 blend.
@@ -95,8 +133,32 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (mode > 0.5 && mode < 1.5 && texel.a < 0.5) {
         discard;
     }
-    let alpha = select(1.0, texel.a, mode > 1.5);
-    return vec4<f32>(texel.rgb * surface.tint.rgb * shade, alpha);
+    var color = texel.rgb * surface.tint.rgb * input.tint;
+    var alpha = select(1.0, texel.a, mode > 1.5);
+    if (input.overlay_material != 0xffffffffu) {
+        let overlay = materials.entries[input.overlay_material];
+        let overlay_texel = sample_surface(overlay, input.uv);
+        let overlay_mode = overlay.tint.w;
+        let overlay_color = overlay_texel.rgb * overlay.tint.rgb * input.overlay_tint;
+        if (overlay_mode < 0.5) {
+            color = overlay_color;
+            alpha = 1.0;
+        } else if (overlay_mode < 1.5) {
+            if (overlay_texel.a >= 0.5) {
+                color = overlay_color;
+                alpha = 1.0;
+            }
+        } else {
+            let combined_alpha = overlay_texel.a + alpha * (1.0 - overlay_texel.a);
+            if (combined_alpha > 0.0) {
+                color = (overlay_color * overlay_texel.a
+                    + color * alpha * (1.0 - overlay_texel.a))
+                    / combined_alpha;
+            }
+            alpha = combined_alpha;
+        }
+    }
+    return vec4<f32>(color * shade, alpha);
 }
 "#;
 
@@ -131,10 +193,10 @@ pub const SKY: Color = Color {
 const MAX_LINE_VERTICES: usize = 24;
 
 /// Bytes per terrain vertex: position, normal, uv, and one material slot.
-const VERTEX_STRIDE: usize = 36;
+const VERTEX_STRIDE: usize = 64;
 
 /// Material table bytes: rect plus tint per surface.
-const SURFACE_BYTES: u64 = 32;
+const SURFACE_BYTES: u64 = 64;
 
 /// Synthetic key carrying the entity box buffers; retention never drops it.
 pub const ENTITY_SLOT: torse_types::SectionPos =
@@ -157,6 +219,7 @@ pub struct GpuContext {
     terrain: BTreeMap<torse_types::SectionPos, SectionBuffers>,
     line_buffer: Buffer,
     line_count: u32,
+    animation_origin: Instant,
 }
 
 /// GPU resources for the material table and atlas.
@@ -165,6 +228,7 @@ struct PaletteBinding {
     materials: Buffer,
     #[allow(dead_code)]
     texture: Texture,
+    surfaces: Vec<crate::texture::Surface>,
     bind: BindGroup,
 }
 
@@ -282,6 +346,21 @@ impl GpuContext {
                 offset: 32,
                 shader_location: 3,
             },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32,
+                offset: 36,
+                shader_location: 4,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 40,
+                shader_location: 5,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 52,
+                shader_location: 6,
+            },
         ];
         let terrain_vertex_state = VertexState {
             module: &terrain_shader,
@@ -383,6 +462,7 @@ impl GpuContext {
             terrain: BTreeMap::new(),
             line_buffer,
             line_count: 0,
+            animation_origin: Instant::now(),
         }
     }
 
@@ -397,14 +477,18 @@ impl GpuContext {
     /// vertex buffers because material slots are session-stable; content must
     /// be recompiled when the pack changes its material set.
     pub fn set_palette(&mut self, palette: &Palette) {
+        self.animation_origin = Instant::now();
         let materials = self.device.create_buffer(&BufferDescriptor {
             label: Some("client material table"),
             size: MAX_MATERIALS as u64 * SURFACE_BYTES,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue
-            .write_buffer(&materials, 0, &surface_bytes(palette));
+        self.queue.write_buffer(
+            &materials,
+            0,
+            &surface_bytes(palette.surfaces(), Duration::ZERO),
+        );
 
         let mips = palette.mips();
         let base = mips.first().expect("palette always carries the base level");
@@ -487,6 +571,7 @@ impl GpuContext {
         self.palette = Some(PaletteBinding {
             materials,
             texture,
+            surfaces: palette.surfaces().to_vec(),
             bind,
         });
     }
@@ -558,6 +643,13 @@ impl GpuContext {
         color: &TextureView,
         depth: &TextureView,
     ) {
+        if let Some(palette) = &self.palette {
+            self.queue.write_buffer(
+                &palette.materials,
+                0,
+                &surface_bytes(&palette.surfaces, self.animation_origin.elapsed()),
+            );
+        }
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("client terrain pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
@@ -815,10 +907,17 @@ fn by_index_bytes(indices: &[u32]) -> Vec<u8> {
     bytes
 }
 
-fn surface_bytes(palette: &Palette) -> Vec<u8> {
+fn surface_bytes(surfaces: &[crate::texture::Surface], elapsed: Duration) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(MAX_MATERIALS * SURFACE_BYTES as usize);
-    for surface in palette.surfaces() {
-        for value in surface.rect {
+    for surface in surfaces {
+        let resolved = torse_assets::texture::MaterialSurface {
+            rect: surface.rect,
+            tint: surface.tint,
+            tint_source: surface.tint_source,
+            animation: surface.animation,
+        };
+        let frames = resolved.frame_sample(elapsed);
+        for value in frames.current {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         for value in surface.tint {
@@ -830,6 +929,17 @@ fn surface_bytes(palette: &Palette) -> Vec<u8> {
             torse_content::AlphaMode::Blend => 2.0,
         };
         bytes.extend_from_slice(&mode.to_le_bytes());
+        for value in frames.next {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let animated = if surface.animation.is_some() {
+            1.0
+        } else {
+            0.0
+        };
+        for value in [frames.blend, animated, 0.0, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
     }
     bytes.resize(MAX_MATERIALS * SURFACE_BYTES as usize, 0);
     bytes
@@ -853,7 +963,7 @@ mod tests {
     #[test]
     fn surface_table_is_padded_to_the_budget() {
         let palette = Palette::empty_for_tests();
-        let bytes = surface_bytes(&palette);
+        let bytes = surface_bytes(palette.surfaces(), Duration::ZERO);
         assert_eq!(bytes.len(), MAX_MATERIALS * SURFACE_BYTES as usize);
     }
 
@@ -864,7 +974,7 @@ mod tests {
             [0.2, 0.4, 0.6],
             torse_content::AlphaMode::Blend,
         );
-        let bytes = surface_bytes(&palette);
+        let bytes = surface_bytes(palette.surfaces(), Duration::ZERO);
         let read =
             |offset: usize| f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         assert_eq!(read(0), 0.0);
@@ -873,5 +983,36 @@ mod tests {
         assert_eq!(read(16), 0.2);
         assert_eq!(read(24), 0.6);
         assert_eq!(read(28), 2.0);
+        assert_eq!(read(32), 0.0);
+        assert_eq!(read(48), 0.0);
+        assert_eq!(read(52), 0.0);
+    }
+
+    #[test]
+    fn animated_surface_table_updates_frame_rectangles_and_blend() {
+        const FRAME_DURATION: Duration = Duration::from_millis(100);
+        let surface = crate::texture::Surface {
+            rect: [0.25, 0.0, 0.5, 1.0],
+            tint: [1.0; 3],
+            tint_source: None,
+            animation: Some(torse_assets::texture::MaterialAnimation {
+                frame_count: 4,
+                frame_duration: FRAME_DURATION,
+                frame_order: None,
+                frame_durations: None,
+                interpolate: true,
+            }),
+            alpha: torse_content::AlphaMode::Opaque,
+        };
+        let initial = surface_bytes(&[surface], Duration::ZERO);
+        let halfway = surface_bytes(&[surface], Duration::from_millis(50));
+        let read = |bytes: &[u8], offset: usize| {
+            f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        assert_eq!(read(&initial, 12), 0.25);
+        assert_eq!(read(&initial, 44), 0.25);
+        assert_eq!(read(&initial, 48), 0.0);
+        assert_eq!(read(&initial, 52), 1.0);
+        assert!((read(&halfway, 48) - 0.5).abs() < 1e-6);
     }
 }

@@ -26,6 +26,8 @@ pub(super) struct MeshStamp {
     pub terrain: MeshJob,
     epoch: WorldEpoch,
     assets: u64,
+    tint_provider_generation: u64,
+    tint_provider_revision: u64,
     loads: [Option<u64>; 7],
 }
 
@@ -57,6 +59,11 @@ impl MeshStamp {
             }),
             epoch: scene.epoch,
             assets: scene.asset_generation,
+            tint_provider_generation: scene.tint_provider_generation,
+            tint_provider_revision: scene
+                .tint_provider
+                .as_ref()
+                .map_or(0, |provider| provider.revision(pos)),
             loads,
         }
     }
@@ -296,12 +303,12 @@ impl Background {
             }
             let side = scene.side as usize;
             let max_faces = side.pow(3) * 6;
-            // Four positions, four normals, four texture coordinates, six
-            // indices, and one material per face.
+            // Geometry, two per-vertex tint channels, indices, and two slots.
             let face_bytes = 8 * size_of::<[f32; 3]>()
                 + 4 * size_of::<[f32; 2]>()
+                + 8 * size_of::<[f32; 3]>()
                 + 6 * size_of::<u32>()
-                + size_of::<u16>();
+                + 2 * size_of::<u16>();
             let task_budget = JobBudget {
                 input_bytes: (side + 2).pow(3) * size_of::<MeshSample>() + size_of::<MeshInput>(),
                 output_bytes: size_of::<MeshData>() + max_faces * face_bytes * 2,
@@ -367,6 +374,8 @@ impl MeshInput {
                             scene.authority.store(),
                             scene.authority.registry(),
                             &scene.state_materials,
+                            &scene.palette,
+                            scene.tint_provider.as_deref(),
                             p,
                         ),
                         Err(_) => MeshSample::OutOfBounds,

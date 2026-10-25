@@ -17,7 +17,8 @@ pub use compiler::{
 pub use descriptor::{
     AlphaMode, BlockDefinition, BoxBounds, CapabilityBinding, CapabilityDescriptor,
     CollisionProfile, ComponentField, ComponentFieldType, ComponentSchema, ExecutionContract, Face,
-    FaceMaterials, FiniteField, InteractionProfile, LightTransport, MethodDescriptor,
-    ModuleDescriptor, ModuleSide, OcclusionProfile, PersistencePolicy, RenderProfile,
-    RequestedPermission, SelectionProfile, ServiceDescriptor, Shape, StateSchema, SystemDescriptor,
+    FaceMaterials, FaceOverlay, FaceOverlays, FiniteField, InteractionProfile, LightTransport,
+    MethodDescriptor, ModuleDescriptor, ModuleSide, OcclusionProfile, PersistencePolicy,
+    RenderProfile, RequestedPermission, SelectionProfile, ServiceDescriptor, Shape, StateSchema,
+    SystemDescriptor,
 };

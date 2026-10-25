@@ -10,7 +10,7 @@ use torse_types::{ContentKey, ReplicationDeclaration};
 
 use crate::{
     AlphaMode, BlockDefinition, CapabilityBinding, CapabilityDescriptor, CollisionProfile,
-    ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FiniteField,
+    ComponentSchema, ContentPack, ExecutionContract, FaceMaterials, FaceOverlays, FiniteField,
     InteractionProfile, LightTransport, MethodDescriptor, ModuleDescriptor, ModuleSide,
     OcclusionProfile, PersistencePolicy, RenderProfile, RequestedPermission, SelectionProfile,
     ServiceDescriptor, Shape, SourceRef, Sourced, StateSchema,
@@ -214,6 +214,7 @@ fn block(
             shape: render_shape,
             material,
             face_materials: FaceMaterials::none(),
+            face_overlays: FaceOverlays::none(),
             alpha_mode,
         },
         collision_profile: CollisionProfile {

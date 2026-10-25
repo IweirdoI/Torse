@@ -725,7 +725,7 @@ fn claimable_occlusion(shape: &Shape) -> u8 {
         Shape::FullCube => 0b11_1111,
         // A lower slab spans the cell footprint only at its bottom boundary.
         Shape::LowerSlab => 0b000100,
-        Shape::Panel | Shape::Corner | Shape::Stair => 0,
+        Shape::Panel | Shape::Cross | Shape::Corner | Shape::Stair => 0,
         Shape::Box(bounds) => {
             let spans = |a: usize| bounds.min[a] <= 0.0 && bounds.max[a] >= 1.0;
             let mut mask = 0u8;
@@ -1038,12 +1038,24 @@ fn presentation_digest(blocks: &BTreeMap<ContentKey, BlockDefinition>) -> Digest
     for block in blocks.values() {
         writer.key(&block.id);
         writer.key(&block.render_profile.material);
-        // One presence tag plus the key per face keeps the encoding explicit.
+        // Each face carries explicit base and overlay presence tags.
         for face in Face::ALL {
             match block.render_profile.face_materials.get(face) {
                 Some(material) => {
                     writer.u8(1);
                     writer.key(material);
+                }
+                None => writer.u8(0),
+            }
+            match block.render_profile.face_overlays.get(face) {
+                Some(overlay) => {
+                    writer.u8(1);
+                    writer.key(&overlay.material);
+                    writer.u8(match overlay.alpha_mode {
+                        AlphaMode::Opaque => 0,
+                        AlphaMode::Mask => 1,
+                        AlphaMode::Blend => 2,
+                    });
                 }
                 None => writer.u8(0),
             }
@@ -1160,6 +1172,7 @@ impl CanonicalWriter {
             Shape::Panel => self.u8(2),
             Shape::Corner => self.u8(3),
             Shape::Stair => self.u8(4),
+            Shape::Cross => self.u8(6),
             Shape::Box(bounds) => {
                 self.u8(5);
                 for value in bounds.min.iter().chain(bounds.max.iter()) {

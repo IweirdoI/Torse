@@ -163,30 +163,46 @@ impl RenderBox {
 pub struct RenderBlock {
     /// Geometry to emit, or `None` for a block with no visual.
     pub bounds: Option<RenderBox>,
+    /// Emit two crossed, double-sided quads instead of the box bounds.
+    pub cross: bool,
     /// Faces this block covers for neighbors, in mask order.
     pub occlusion: u8,
     /// Material identifier for faces without a per-face override.
     pub material: u16,
     /// Materials for the six faces in mask order; `None` uses `material`.
     pub face_materials: Option<[u16; 6]>,
+    /// Optional overlay material per face; `u16::MAX` is never a valid slot.
+    pub face_overlays: Option<[Option<u16>; 6]>,
+    /// Linear tint per base face; `None` uses white.
+    pub face_tints: Option<[[f32; 3]; 6]>,
+    /// Linear tint per overlay face; `None` uses white.
+    pub face_overlay_tints: Option<[[f32; 3]; 6]>,
 }
 
 impl RenderBlock {
     /// Block with no visual; used for empty cells.
     pub const EMPTY: Self = Self {
         bounds: None,
+        cross: false,
         occlusion: 0,
         material: 0,
         face_materials: None,
+        face_overlays: None,
+        face_tints: None,
+        face_overlay_tints: None,
     };
 
     /// Full cube using one material on every face.
     pub const fn uniform(material: u16) -> Self {
         Self {
             bounds: Some(RenderBox::FULL_CUBE),
+            cross: false,
             occlusion: 0b0011_1111,
             material,
             face_materials: None,
+            face_overlays: None,
+            face_tints: None,
+            face_overlay_tints: None,
         }
     }
 
@@ -196,6 +212,27 @@ impl RenderBlock {
             Some(materials) => materials[face.index() as usize],
             None => self.material,
         }
+    }
+
+    /// Overlay material of one face, if declared.
+    pub fn overlay_for(&self, face: Face) -> Option<u16> {
+        self.face_overlays
+            .as_ref()
+            .and_then(|materials| materials[face.index() as usize])
+    }
+
+    /// Base tint of one face, defaulting to white.
+    pub fn tint_for(&self, face: Face) -> [f32; 3] {
+        self.face_tints
+            .as_ref()
+            .map_or([1.0; 3], |tints| tints[face.index() as usize])
+    }
+
+    /// Overlay tint of one face, defaulting to white.
+    pub fn overlay_tint_for(&self, face: Face) -> [f32; 3] {
+        self.face_overlay_tints
+            .as_ref()
+            .map_or([1.0; 3], |tints| tints[face.index() as usize])
     }
 }
 
@@ -225,6 +262,12 @@ pub struct MeshData {
     pub indices: Vec<u32>,
     /// Material per emitted quad.
     pub materials: Vec<u16>,
+    /// Overlay material per emitted quad, with `u16::MAX` for no overlay.
+    pub overlays: Vec<u16>,
+    /// Base vertex tint per emitted vertex.
+    pub tints: Vec<[f32; 3]>,
+    /// Overlay vertex tint per emitted vertex.
+    pub overlay_tints: Vec<[f32; 3]>,
 }
 
 impl MeshData {
@@ -250,6 +293,9 @@ impl MeshData {
             + self.uvs.len() * size_of::<[f32; 2]>()
             + self.indices.len() * size_of::<u32>()
             + self.materials.len() * size_of::<u16>()
+            + self.overlays.len() * size_of::<u16>()
+            + self.tints.len() * size_of::<[f32; 3]>()
+            + self.overlay_tints.len() * size_of::<[f32; 3]>()
     }
 }
 
@@ -261,6 +307,9 @@ impl MeshData {
             + self.uvs.capacity() * size_of::<[f32; 2]>()
             + self.indices.capacity() * size_of::<u32>()
             + self.materials.capacity() * size_of::<u16>()
+            + self.overlays.capacity() * size_of::<u16>()
+            + self.tints.capacity() * size_of::<[f32; 3]>()
+            + self.overlay_tints.capacity() * size_of::<[f32; 3]>()
     }
 }
 
@@ -337,6 +386,15 @@ fn build_mesh_inner(
         mesh.materials
             .try_reserve_exact(faces)
             .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.overlays
+            .try_reserve_exact(faces)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.tints
+            .try_reserve_exact(faces * 4)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.overlay_tints
+            .try_reserve_exact(faces * 4)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
     }
 
     for y in 0..side {
@@ -354,6 +412,13 @@ fn build_mesh_inner(
                     MeshSample::Ready(block) => block,
                     MeshSample::NotLoaded | MeshSample::OutOfBounds => continue,
                 };
+                if block.cross {
+                    if max_faces.is_some_and(|limit| mesh.face_count() + 2 > limit) {
+                        return Err(MeshBuildError::OutputLimit);
+                    }
+                    emit_cross(&mut mesh, &block, [x as f32, y as f32, z as f32]);
+                    continue;
+                }
                 let Some(bounds) = block.bounds else {
                     continue;
                 };
@@ -370,6 +435,9 @@ fn build_mesh_inner(
                         bounds,
                         [x as f32, y as f32, z as f32],
                         block.material_for(face),
+                        block.overlay_for(face),
+                        block.tint_for(face),
+                        block.overlay_tint_for(face),
                     );
                 }
             }
@@ -381,6 +449,9 @@ fn build_mesh_inner(
         mesh.uvs.shrink_to_fit();
         mesh.indices.shrink_to_fit();
         mesh.materials.shrink_to_fit();
+        mesh.overlays.shrink_to_fit();
+        mesh.tints.shrink_to_fit();
+        mesh.overlay_tints.shrink_to_fit();
     }
     Ok(mesh)
 }
@@ -413,6 +484,8 @@ fn face_culled(
             // sections cull both sides, which removes the coincident glass
             // panes between same-material neighbours.
             if let Some(neighbor_bounds) = neighbor_block.bounds
+                && !block.cross
+                && !neighbor_block.cross
                 && neighbor_bounds.touches(opposite)
                 && neighbor_block.material_for(opposite) == block.material_for(face)
                 && section_within(face, bounds, neighbor_bounds)
@@ -451,7 +524,16 @@ fn section_within(face: Face, bounds: RenderBox, neighbor: RenderBox) -> bool {
         && bounds.max[second] <= neighbor.max[second]
 }
 
-fn emit_face(mesh: &mut MeshData, face: Face, bounds: RenderBox, cell: [f32; 3], material: u16) {
+fn emit_face(
+    mesh: &mut MeshData,
+    face: Face,
+    bounds: RenderBox,
+    cell: [f32; 3],
+    material: u16,
+    overlay: Option<u16>,
+    tint: [f32; 3],
+    overlay_tint: [f32; 3],
+) {
     let (origin, edge_u, edge_v) = face_quad(face, bounds, cell);
     let normal = face.normal();
     let base = mesh.positions.len() as u32;
@@ -463,17 +545,102 @@ fn emit_face(mesh: &mut MeshData, face: Face, bounds: RenderBox, cell: [f32; 3],
     ];
     // Local face coordinates. The origin corner is the bottom left of the face
     // image, and v grows towards the first row of the texture.
-    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let uvs = corners.map(|corner| face_uv(face, corner, cell));
     for (corner, uv) in corners.into_iter().zip(uvs) {
         mesh.positions.push(corner);
         mesh.normals.push(normal);
         mesh.uvs.push(uv);
+        mesh.tints.push(tint);
+        mesh.overlay_tints.push(overlay_tint);
     }
     // Two triangles: (0, 1, 2) and (0, 2, 3). The corner order is chosen so the
     // cross product points along the face normal.
     mesh.indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(material);
+    mesh.overlays.push(overlay.unwrap_or(u16::MAX));
+}
+
+fn emit_cross(mesh: &mut MeshData, block: &RenderBlock, cell: [f32; 3]) {
+    let planes = [
+        (
+            Face::NegX,
+            [
+                add(cell, [0.0, 0.0, 0.0]),
+                add(cell, [1.0, 0.0, 1.0]),
+                add(cell, [1.0, 1.0, 1.0]),
+                add(cell, [0.0, 1.0, 0.0]),
+            ],
+            [-1.0, 0.0, 1.0],
+        ),
+        (
+            Face::PosX,
+            [
+                add(cell, [1.0, 0.0, 0.0]),
+                add(cell, [0.0, 0.0, 1.0]),
+                add(cell, [0.0, 1.0, 1.0]),
+                add(cell, [1.0, 1.0, 0.0]),
+            ],
+            [-1.0, 0.0, -1.0],
+        ),
+    ];
+    let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    for (face, corners, normal) in planes {
+        let material = block.material_for(face);
+        let overlay = block.overlay_for(face);
+        let tint = block.tint_for(face);
+        let overlay_tint = block.overlay_tint_for(face);
+        emit_quad(
+            mesh,
+            corners,
+            uv,
+            normal,
+            material,
+            overlay,
+            tint,
+            overlay_tint,
+        );
+    }
+}
+
+fn emit_quad(
+    mesh: &mut MeshData,
+    corners: [[f32; 3]; 4],
+    uvs: [[f32; 2]; 4],
+    normal: [f32; 3],
+    material: u16,
+    overlay: Option<u16>,
+    tint: [f32; 3],
+    overlay_tint: [f32; 3],
+) {
+    let base = mesh.positions.len() as u32;
+    for (corner, uv) in corners.into_iter().zip(uvs) {
+        mesh.positions.push(corner);
+        mesh.normals.push(normal);
+        mesh.uvs.push(uv);
+        mesh.tints.push(tint);
+        mesh.overlay_tints.push(overlay_tint);
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    mesh.materials.push(material);
+    mesh.overlays.push(overlay.unwrap_or(u16::MAX));
+}
+
+fn face_uv(face: Face, position: [f32; 3], cell: [f32; 3]) -> [f32; 2] {
+    let local = [
+        position[0] - cell[0],
+        position[1] - cell[1],
+        position[2] - cell[2],
+    ];
+    match face {
+        Face::NegX => [local[2], 1.0 - local[1]],
+        Face::PosX => [1.0 - local[2], 1.0 - local[1]],
+        Face::NegY => [local[0], 1.0 - local[2]],
+        Face::PosY => [local[0], local[2]],
+        Face::NegZ => [1.0 - local[0], 1.0 - local[1]],
+        Face::PosZ => [local[0], 1.0 - local[1]],
+    }
 }
 
 /// Corner and edge vectors for a face, chosen so `u x v` equals the normal.
@@ -699,6 +866,7 @@ mod tests {
             occlusion,
             material: 1,
             face_materials: None,
+            ..RenderBlock::EMPTY
         }
     }
 
@@ -715,6 +883,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         }
@@ -740,12 +909,103 @@ mod tests {
     }
 
     #[test]
+    fn slab_side_uses_the_projected_half_of_the_texture() {
+        let block = RenderBlock {
+            bounds: Some(RenderBox {
+                min: [0.0, 0.0, 0.0],
+                max: [1.0, 0.5, 1.0],
+            }),
+            ..cube(0b11_1111)
+        };
+        let mesh = build_mesh(4, SectionPos::ZERO, single(Some(block)));
+        let side = mesh
+            .normals
+            .chunks(4)
+            .zip(mesh.uvs.chunks(4))
+            .find(|(normals, _)| normals[0] == Face::NegX.normal())
+            .map(|(_, uvs)| uvs)
+            .expect("slab side exists");
+        assert_eq!(side, &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.5], [0.0, 0.5]]);
+        for (normals, uvs) in mesh.normals.chunks(4).zip(mesh.uvs.chunks(4)) {
+            if normals[0] == Face::PosY.normal() || normals[0] == Face::NegY.normal() {
+                assert_eq!(uvs, [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+            }
+        }
+    }
+
+    #[test]
+    fn face_overlay_and_tints_are_carried_per_quad() {
+        let block = RenderBlock {
+            bounds: Some(RenderBox::FULL_CUBE),
+            face_overlays: Some([None, None, None, Some(7), None, None]),
+            face_tints: Some([[0.25, 0.5, 0.75]; 6]),
+            face_overlay_tints: Some([[0.8, 0.6, 0.4]; 6]),
+            ..cube(0b11_1111)
+        };
+        let mesh = build_mesh(4, SectionPos::ZERO, single(Some(block)));
+        assert_eq!(
+            mesh.overlays,
+            [u16::MAX, u16::MAX, u16::MAX, 7, u16::MAX, u16::MAX]
+        );
+        assert!(
+            mesh.tints
+                .chunks(4)
+                .all(|quad| quad == [[0.25, 0.5, 0.75]; 4])
+        );
+        assert!(
+            mesh.overlay_tints
+                .chunks(4)
+                .all(|quad| quad == [[0.8, 0.6, 0.4]; 4])
+        );
+    }
+
+    #[test]
+    fn crossed_planes_emit_two_double_sided_faces_without_occlusion() {
+        let block = RenderBlock {
+            cross: true,
+            material: 5,
+            occlusion: 0,
+            ..RenderBlock::EMPTY
+        };
+        let mesh = build_mesh(4, SectionPos::ZERO, single(Some(block)));
+        assert_eq!(mesh.face_count(), 2);
+        assert_eq!(mesh.positions.len(), 8);
+        assert_eq!(mesh.triangle_count(), 4);
+        assert_eq!(mesh.materials, [5, 5]);
+    }
+
+    #[test]
+    fn crossed_planes_and_neighbors_never_cull_each_other() {
+        let cross = RenderBlock {
+            bounds: Some(RenderBox::FULL_CUBE),
+            cross: true,
+            material: 5,
+            occlusion: 0,
+            ..RenderBlock::EMPTY
+        };
+        let cube = RenderBlock {
+            bounds: Some(RenderBox::FULL_CUBE),
+            material: 5,
+            occlusion: 0,
+            ..RenderBlock::EMPTY
+        };
+        let sample = |pos: BlockPos| match pos {
+            BlockPos { x: 1, y: 1, z: 1 } => MeshSample::Ready(cross),
+            BlockPos { x: 2, y: 1, z: 1 } => MeshSample::Ready(cube),
+            _ => MeshSample::Ready(RenderBlock::EMPTY),
+        };
+        let mesh = build_mesh(4, SectionPos::ZERO, sample);
+        assert_eq!(mesh.face_count(), 8);
+    }
+
+    #[test]
     fn per_face_materials_select_by_face_order() {
         let block = RenderBlock {
             bounds: Some(RenderBox::FULL_CUBE),
             occlusion: 0b11_1111,
             material: 9,
             face_materials: Some([10, 11, 12, 13, 14, 15]),
+            ..RenderBlock::EMPTY
         };
         let mesh = build_mesh(4, SectionPos::ZERO, single(Some(block)));
         assert_eq!(mesh.materials, vec![10, 11, 12, 13, 14, 15]);
@@ -768,6 +1028,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         };
@@ -799,6 +1060,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         };
@@ -816,6 +1078,7 @@ mod tests {
             occlusion: 0b11_1111,
             material: 1,
             face_materials: None,
+            ..RenderBlock::EMPTY
         };
         let sample = |pos: BlockPos| {
             if pos == BlockPos::new(1, 1, 1) {
@@ -828,6 +1091,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         };
@@ -859,6 +1123,7 @@ mod tests {
                     occlusion: 0,
                     material: 2,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             } else {
                 MeshSample::Ready(RenderBlock {
@@ -866,6 +1131,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         };
@@ -889,6 +1155,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         };
@@ -911,6 +1178,7 @@ mod tests {
                     occlusion: 0,
                     material: 1,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             } else if pos == BlockPos::new(2, 1, 1) {
                 MeshSample::Ready(cube(0))
@@ -920,6 +1188,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         };
@@ -940,6 +1209,7 @@ mod tests {
                     occlusion: 0,
                     material: 0,
                     face_materials: None,
+                    ..RenderBlock::EMPTY
                 })
             }
         };

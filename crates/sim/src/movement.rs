@@ -156,7 +156,7 @@ fn boxes(shape: &Shape) -> Vec<LocalBox> {
     // Corner/stair collision uses the same conservative enclosing cube as the
     // M1 reference scenario. State-dependent multi-box geometry is deferred.
     vec![match shape {
-        Shape::FullCube | Shape::Corner | Shape::Stair => LocalBox::FULL_CUBE,
+        Shape::FullCube | Shape::Corner | Shape::Stair | Shape::Cross => LocalBox::FULL_CUBE,
         Shape::LowerSlab => LocalBox {
             min: [0.0; 3],
             max: [1.0, 0.5, 1.0],

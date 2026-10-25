@@ -238,6 +238,8 @@ impl RenderBlock {
 
 /// Result of sampling one cell.
 #[derive(Clone, Copy, Debug, PartialEq)]
+// Sampling returns inline, copyable data in the meshing loop without a heap allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum MeshSample {
     /// The cell has authoritative data.
     Ready(RenderBlock),
@@ -434,10 +436,7 @@ fn build_mesh_inner(
                         face,
                         bounds,
                         [x as f32, y as f32, z as f32],
-                        block.material_for(face),
-                        block.overlay_for(face),
-                        block.tint_for(face),
-                        block.overlay_tint_for(face),
+                        FaceAppearance::new(&block, face),
                     );
                 }
             }
@@ -524,15 +523,30 @@ fn section_within(face: Face, bounds: RenderBox, neighbor: RenderBox) -> bool {
         && bounds.max[second] <= neighbor.max[second]
 }
 
+struct FaceAppearance {
+    material: u16,
+    overlay: Option<u16>,
+    tint: [f32; 3],
+    overlay_tint: [f32; 3],
+}
+
+impl FaceAppearance {
+    fn new(block: &RenderBlock, face: Face) -> Self {
+        Self {
+            material: block.material_for(face),
+            overlay: block.overlay_for(face),
+            tint: block.tint_for(face),
+            overlay_tint: block.overlay_tint_for(face),
+        }
+    }
+}
+
 fn emit_face(
     mesh: &mut MeshData,
     face: Face,
     bounds: RenderBox,
     cell: [f32; 3],
-    material: u16,
-    overlay: Option<u16>,
-    tint: [f32; 3],
-    overlay_tint: [f32; 3],
+    appearance: FaceAppearance,
 ) {
     let (origin, edge_u, edge_v) = face_quad(face, bounds, cell);
     let normal = face.normal();
@@ -550,15 +564,15 @@ fn emit_face(
         mesh.positions.push(corner);
         mesh.normals.push(normal);
         mesh.uvs.push(uv);
-        mesh.tints.push(tint);
-        mesh.overlay_tints.push(overlay_tint);
+        mesh.tints.push(appearance.tint);
+        mesh.overlay_tints.push(appearance.overlay_tint);
     }
     // Two triangles: (0, 1, 2) and (0, 2, 3). The corner order is chosen so the
     // cross product points along the face normal.
     mesh.indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    mesh.materials.push(material);
-    mesh.overlays.push(overlay.unwrap_or(u16::MAX));
+    mesh.materials.push(appearance.material);
+    mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
 }
 
 fn emit_cross(mesh: &mut MeshData, block: &RenderBlock, cell: [f32; 3]) {
@@ -586,20 +600,7 @@ fn emit_cross(mesh: &mut MeshData, block: &RenderBlock, cell: [f32; 3]) {
     ];
     let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
     for (face, corners, normal) in planes {
-        let material = block.material_for(face);
-        let overlay = block.overlay_for(face);
-        let tint = block.tint_for(face);
-        let overlay_tint = block.overlay_tint_for(face);
-        emit_quad(
-            mesh,
-            corners,
-            uv,
-            normal,
-            material,
-            overlay,
-            tint,
-            overlay_tint,
-        );
+        emit_quad(mesh, corners, uv, normal, FaceAppearance::new(block, face));
     }
 }
 
@@ -608,23 +609,20 @@ fn emit_quad(
     corners: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     normal: [f32; 3],
-    material: u16,
-    overlay: Option<u16>,
-    tint: [f32; 3],
-    overlay_tint: [f32; 3],
+    appearance: FaceAppearance,
 ) {
     let base = mesh.positions.len() as u32;
     for (corner, uv) in corners.into_iter().zip(uvs) {
         mesh.positions.push(corner);
         mesh.normals.push(normal);
         mesh.uvs.push(uv);
-        mesh.tints.push(tint);
-        mesh.overlay_tints.push(overlay_tint);
+        mesh.tints.push(appearance.tint);
+        mesh.overlay_tints.push(appearance.overlay_tint);
     }
     mesh.indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    mesh.materials.push(material);
-    mesh.overlays.push(overlay.unwrap_or(u16::MAX));
+    mesh.materials.push(appearance.material);
+    mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
 }
 
 fn face_uv(face: Face, position: [f32; 3], cell: [f32; 3]) -> [f32; 2] {

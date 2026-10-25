@@ -930,9 +930,11 @@ impl Scene {
                 normal: mesh.normals[index],
                 uv: mesh.uvs[index],
                 material: u32::from(mesh.materials[index / 4]),
-                overlay_material: (mesh.overlays[index / 4] != u16::MAX)
-                    .then(|| u32::from(mesh.overlays[index / 4]))
-                    .unwrap_or(u32::MAX),
+                overlay_material: if mesh.overlays[index / 4] != u16::MAX {
+                    u32::from(mesh.overlays[index / 4])
+                } else {
+                    u32::MAX
+                },
                 tint: mesh.tints[index],
                 overlay_tint: mesh.overlay_tints[index],
             });
@@ -980,9 +982,11 @@ impl Scene {
                     normal: mesh.normals[index],
                     uv: mesh.uvs[index],
                     material: u32::from(mesh.materials[index / 4]),
-                    overlay_material: (mesh.overlays[index / 4] != u16::MAX)
-                        .then(|| u32::from(mesh.overlays[index / 4]))
-                        .unwrap_or(u32::MAX),
+                    overlay_material: if mesh.overlays[index / 4] != u16::MAX {
+                        u32::from(mesh.overlays[index / 4])
+                    } else {
+                        u32::MAX
+                    },
                     tint: mesh.tints[index],
                     overlay_tint: mesh.overlay_tints[index],
                 });

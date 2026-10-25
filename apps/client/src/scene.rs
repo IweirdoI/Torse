@@ -23,7 +23,7 @@ use torse_world::{
     ComponentValue, Position, Section, SnapshotCells, SnapshotSection, StateEntry, TerrainQuery,
     WorldBounds,
 };
-use torse_world_services::{GenerationParams, HillTerrain};
+use torse_world_services::{GenerationParams, HillTerrain, SectionGenerator};
 
 use crate::pick::{PickHit, PickOutcome, cast_ray};
 use crate::texture::{Palette, TexturePack};
@@ -98,6 +98,8 @@ pub struct Scene {
     edit_counter: u64,
     walker: Option<torse_sim::player::WalkerState>,
     generator: Option<HillTerrain>,
+    /// Data-driven terrain used when the scene comes from a content pack.
+    layered: Option<Arc<crate::game::LayeredTerrain>>,
     side: u32,
     radius: i64,
     /// Cached mesh plus the dependency revisions it was built against;
@@ -231,6 +233,7 @@ impl Scene {
             edit_counter: 0,
             walker: None,
             generator: Some(generator),
+            layered: None,
             side,
             radius,
             meshes: BTreeMap::new(),
@@ -278,6 +281,7 @@ impl Scene {
             edit_counter: 0,
             walker: None,
             generator: None,
+            layered: None,
             side: snapshot.side,
             radius: 0,
             meshes: BTreeMap::new(),
@@ -319,7 +323,7 @@ impl Scene {
 
     /// Whether this scene mirrors a server projection instead of generating.
     pub const fn is_network(&self) -> bool {
-        self.generator.is_none()
+        self.generator.is_none() && self.layered.is_none()
     }
 
     /// Handshake compatibility of the shared content pack.
@@ -723,7 +727,7 @@ impl Scene {
     /// Splitting generation across frames keeps a crossing from stalling the
     /// frame; callers re-invoke until the window is complete.
     pub fn stream_around(&mut self, center: SectionPos, budget: usize) -> Result<(), String> {
-        if self.generator.is_none() {
+        if self.generator.is_none() && self.layered.is_none() {
             return Ok(());
         }
         let wanted = self.wanted_sections(center)?;
@@ -739,12 +743,15 @@ impl Scene {
                     break;
                 }
                 generated += 1;
-                let section = self
-                    .generator
-                    .as_ref()
-                    .expect("generator checked")
-                    .generate(*pos)
-                    .map_err(|error| error.to_string())?;
+                let section = match self.layered.as_ref() {
+                    Some(terrain) => terrain.generate(*pos),
+                    None => self
+                        .generator
+                        .as_ref()
+                        .expect("generator checked")
+                        .generate(*pos),
+                }
+                .map_err(|error| error.to_string())?;
                 self.install_generated(*pos, section)?;
             }
         }
@@ -862,10 +869,75 @@ impl Scene {
         Ok(scene)
     }
 
+    /// Build a scene from a data-driven content pack directory.
+    ///
+    /// The directory holds the atlas index, its image and a world description.
+    /// Content is compiled here, so a game renders its own texture set without
+    /// the client carrying game-specific code.
+    pub fn new_game(radius: i64, directory: &std::path::Path) -> Result<Self, String> {
+        if !(0..=16).contains(&radius) {
+            return Err("scene radius must be 0..=16".to_owned());
+        }
+        let game = crate::game::GamePack::load(directory)?;
+        let mut pack = game.content.clone();
+        block_actions::register_content(&mut pack);
+        torse_inventory::register_content(&mut pack);
+        let content = compile(pack).map_err(|errors| format!("content failed: {errors:?}"))?;
+        let registry = BlockStateRegistry::build(&content)
+            .map_err(|error| format!("registry failed: {error}"))?;
+        let schemas = ComponentSchemas::build(&content);
+        let compatibility = Compatibility {
+            authority_schema: 4,
+            rules_digest: content.authority_digest,
+            content_digest: content.presentation_digest,
+        };
+        let (palette, state_materials) = material_tables(&registry, &game.texture)?;
+        let side = 16;
+        let bounds = WorldBounds::new(0, 64).map_err(|error| error.to_string())?;
+        let terrain = game.terrain(&registry, side, bounds)?;
+        let service = ActionService::bind(
+            block_actions::descriptors(),
+            block_actions::handlers(),
+            &schemas,
+        )
+        .map_err(|error| format!("actions failed: {error}"))?;
+        let authority =
+            WorldAuthority::new(WorldId(1), registry, schemas, side, bounds, compatibility)
+                .map_err(|error| error.to_string())?;
+        let mut scene = Self {
+            authority,
+            service,
+            principal: key("client:player"),
+            edit_counter: 0,
+            walker: None,
+            generator: None,
+            layered: Some(Arc::new(terrain)),
+            side,
+            radius,
+            meshes: BTreeMap::new(),
+            sections: Vec::new(),
+            epoch: scene_epoch()?,
+            asset_generation: 1,
+            next_load_generation: 1,
+            load_generations: BTreeMap::new(),
+            background: None,
+            palette,
+            state_materials,
+            tint_provider: None,
+            tint_provider_generation: 0,
+        };
+        scene.set_position_tint_provider(Some(game.tint_provider()))?;
+        scene.load_around(SectionPos::ZERO)?;
+        Ok(scene)
+    }
+
     pub fn enable_background(
         &mut self,
         config: torse_runtime::ExecutorConfig,
     ) -> Result<(), String> {
+        if self.layered.is_some() {
+            return Err("background streaming needs the built-in generator".to_owned());
+        }
         let next = Background::new(config)?;
         self.background = Some(next);
         Ok(())

@@ -69,6 +69,8 @@ pub struct WindowConfig {
     pub probe_outside: bool,
     /// Initial UI screen; machine mode is explicitly a sample-data preview.
     pub ui_mode: crate::ui::Mode,
+    /// Data-driven content pack directory; `None` keeps the fixture content.
+    pub content: Option<String>,
 }
 
 /// Measurements reported when the window closes.
@@ -995,7 +997,15 @@ impl ApplicationHandler for WindowApp {
             // empty until then.
             None
         } else {
-            match Scene::new_background(self.config.radius) {
+            // A pack scene generates on the foreground thread; the built-in
+            // fixture scene keeps the bounded background pool.
+            let built = match self.config.content.as_deref() {
+                Some(directory) => {
+                    Scene::new_game(self.config.radius, std::path::Path::new(directory))
+                }
+                None => Scene::new_background(self.config.radius),
+            };
+            match built {
                 Ok(scene) => Some(scene),
                 Err(error) => {
                     self.failure = Some(error);
@@ -1007,10 +1017,19 @@ impl ApplicationHandler for WindowApp {
         let mut camera = FlyCamera::new([8.0, 26.0, 8.0]);
         if let Some(scene) = scene.as_ref() {
             camera = FlyCamera::new(scene.eye());
-            // Only the y = 0 section layer is loaded, and picking terminates at
-            // the first unloaded cell. Keep the starting eye inside that layer
-            // so the aim works no matter how high the spawn surface is.
-            camera.eye[1] = camera.eye[1].min(14.0);
+            if self.config.content.is_some() {
+                // A pack scene is a landscape overview: stand above the spawn
+                // column and look across the terrain instead of into it.
+                camera.eye[1] = (camera.eye[1] + 12.0).min(56.0);
+                camera.eye[2] = (camera.eye[2] - 26.0).max(2.0);
+                camera.pitch = -0.28;
+                camera.yaw = 0.0;
+            } else {
+                // Only the y = 0 section layer is loaded, and picking terminates
+                // at the first unloaded cell. Keep the starting eye inside that
+                // layer so the aim works no matter how high the spawn surface is.
+                camera.eye[1] = camera.eye[1].min(14.0);
+            }
         } else {
             // Overlook the subscribed scope until the baseline lands.
             camera.pitch = -0.7;

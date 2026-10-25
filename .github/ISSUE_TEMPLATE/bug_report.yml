@@ -1,0 +1,48 @@
+name: 问题报告
+description: 报告可复现的缺陷
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 简述缺陷，以及它与预期行为的差别。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 逐条列出操作。能用命令复现的直接给出命令。
+      placeholder: |
+        cargo run -p torse-client -- --window
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 输出与截图
+      description: 命令输出和截图直接粘贴。恢复类问题请用存档副本复现，并附上副本。输出中请去掉口令和个人信息。
+  - type: input
+    id: version
+    attributes:
+      label: 提交版本
+      description: git log -1 --oneline 的输出
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      description: 每行一项。
+      placeholder: |
+        Windows 11
+        RTX 4080 / Vulkan

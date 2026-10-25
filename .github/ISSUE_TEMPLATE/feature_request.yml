@@ -1,0 +1,41 @@
+name: 功能建议
+description: 新能力或行为调整
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关区域
+      options:
+        - 世界与地形
+        - 模拟与事务
+        - 图形客户端
+        - 持久化
+        - 联机
+        - Mod扩展
+        - 工具链与文档
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题
+      description: 遇到的限制，或缺失的能力。
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 建议的方案
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代做法
+  - type: textarea
+    id: context
+    attributes:
+      label: 其他背景
+      description: 涉及公共接口、存档或网络格式的改动，会先在这里确认范围再实现。

@@ -1,30 +1,28 @@
-## 改动内容
+<!--
+  一次PR处理一个问题。新功能、公共接口以及存档、网络格式的变更，请先在Issue确认范围。
+  验证要求见 CONTRIBUTING.md。
+-->
 
-做了什么，为什么这样做。一次PR集中处理一个问题。
+## 说明
 
 ## 关联Issue
 
-关联的Issue编号，或说明无需先行讨论的原因。
+Fixes #
 
 ## 验证
 
-- [ ] `cargo fmt --all -- --check`通过
-- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`零告警
-- [ ] `cargo test --workspace --all-targets --locked`通过
-- [ ] 修改Mod宿主、包工具或服务端Mod接入时，对应特性检查已执行
-- [ ] Bug修复附上能复现原问题的回归测试
-- [ ] 涉及授权、事务、持久化或恢复的改动覆盖了拒绝与失败路径
-- [ ] 图形改动附实际截图
-- [ ] 涉及持久状态的行为验证了保存与恢复
+<!--
+  说明怎么验证的：复现命令、覆盖到的拒绝与失败路径；
+  图形改动附截图；涉及持久状态的行为说明保存与恢复的验证。
+-->
+
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- [ ] `cargo test --workspace --all-targets --locked`
+- [ ] 新增二进制素材已在说明中登记来源，或本PR未新增素材
 
 ## 场景记录
 
-新增或更新了哪些`benchmarks/`记录（复现命令、运行环境与未覆盖范围）：
-
-## 契约与格式
-
-公共接口、存档格式或网络协议是否有变化；有变化时如何兼容旧数据：
-
-## 素材
-
-新增二进制素材（贴图、音效、模型、字体）的来源与授权；没有新增则填无：
+<!--
+  新增或更新了 benchmarks/ 下的记录时在此列出。
+-->

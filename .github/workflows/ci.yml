@@ -29,6 +29,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             cargo test -p torse-runtime --lib --locked
+            cargo test -p torse-client scene::background::tests --locked
             cargo test -p torse-server --test parallel_planning --locked
             cargo test -p torse-server --test runtime_commit --locked
             cargo test -p torse-server --test prevalidation --locked
@@ -70,6 +71,8 @@ jobs:
         run: rustup show
       - name: Check optional experiments
         run: cargo check -p torse-tools --features experiments --all-targets
+      - name: Check client
+        run: cargo check -p torse-client --all-targets
       - name: Test runtime probes
         run: |
           cargo test -p torse-runtime --features ecs-probe

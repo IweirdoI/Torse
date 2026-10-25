@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/client",
     "apps/server",
     "apps/tools",
     "crates/types",

@@ -1,0 +1,311 @@
+//! Torse client.
+//!
+//! Two modes share the scene, mesher, and pipeline. `--capture` renders one
+//! frame offscreen into a PNG without a window; `--window` opens an interactive
+//! winit window with a fly camera, streaming sections, and continuous
+//! rendering.
+
+mod camera;
+mod game;
+mod input;
+mod net;
+mod pick;
+mod renderer;
+mod scene;
+mod texture;
+mod ui;
+mod window;
+
+use std::process::ExitCode;
+use std::time::Instant;
+
+use camera::Camera;
+use renderer::Renderer;
+use scene::Scene;
+use window::{WindowConfig, run_window};
+
+const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
+                    [--place KEY:X,Y,Z]...\n\
+       torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
+                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]\n\
+       both modes accept [--content <dir>] to load a data-driven pack (atlas.toml,\n\
+       atlas.png, world.toml) instead of the built-in fixture content";
+
+fn main() -> ExitCode {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let mut capture: Option<String> = None;
+    let mut window = false;
+    let mut width = 960u32;
+    let mut height = 540u32;
+    let mut radius = 2i64;
+    let mut radius_set = false;
+    let mut view = String::from("overview");
+    let mut frames: Option<u32> = None;
+    let mut screenshot: Option<String> = None;
+    let mut autoplay = false;
+    let mut walk = false;
+    let mut connect: Option<String> = None;
+    let mut sensitivity = 1.0f64;
+    let mut probe_outside = false;
+    let mut ui_preview = None;
+    let mut places: Vec<(String, [i64; 3])> = Vec::new();
+    let mut content: Option<String> = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].clone();
+        let mut value = || -> Option<String> {
+            index += 1;
+            arguments.get(index).cloned()
+        };
+        match argument.as_str() {
+            "--capture" => capture = value(),
+            "--window" => window = true,
+            "--width" => {
+                // Zero-size targets panic in wgpu texture creation; clamp.
+                if let Some(parsed) = value().and_then(|v| v.parse::<u32>().ok()) {
+                    width = parsed.max(1);
+                }
+            }
+            "--height" => {
+                if let Some(parsed) = value().and_then(|v| v.parse::<u32>().ok()) {
+                    height = parsed.max(1);
+                }
+            }
+            "--radius" => {
+                // A negative radius yields an empty window; treat it as 0.
+                if let Some(parsed) = value().and_then(|v| v.parse::<i64>().ok()) {
+                    radius = parsed.max(0);
+                    radius_set = true;
+                }
+            }
+            "--view" => view = value().unwrap_or(view),
+            "--frames" => {
+                if let Some(parsed) = value().and_then(|v| v.parse().ok()) {
+                    frames = Some(parsed);
+                }
+            }
+            "--screenshot" => screenshot = value(),
+            "--autoplay" => autoplay = true,
+            "--walk" => walk = true,
+            "--connect" => connect = value(),
+            "--content" => content = value(),
+            "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            "--probe-outside" => probe_outside = true,
+            "--place" => match value().as_deref().map(parse_place) {
+                Some(Ok(place)) => places.push(place),
+                Some(Err(error)) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
+                }
+                None => {
+                    eprintln!("--place expects MATERIAL:X,Y,Z");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--ui-preview" => match value().as_deref().map(ui::Mode::parse) {
+                Some(Ok(mode)) => ui_preview = Some(mode),
+                _ => {
+                    eprintln!("--ui-preview requires hud, pause or machine");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                return ExitCode::FAILURE;
+            }
+        }
+        index += 1;
+    }
+
+    if window {
+        if !places.is_empty() {
+            eprintln!("--place is only available with --capture");
+            return ExitCode::FAILURE;
+        }
+        let config = WindowConfig {
+            radius: if radius_set { radius } else { 4 },
+            width,
+            height,
+            frames,
+            screenshot,
+            autoplay,
+            walk,
+            connect,
+            probe_outside,
+            sensitivity: sensitivity.clamp(0.2, 5.0),
+            ui_mode: ui_preview.unwrap_or_default(),
+            content: content.clone(),
+        };
+        match run_window(config) {
+            Ok(summary) => {
+                println!(
+                    "adapter={} backend={} format={} frames={} streams={} rebuilds={} \
+                     uploads={} screenshots={} actions_ok={} actions_rejected={} walk_ticks={} \
+                     walker=({:.1},{:.1},{:.1}) session={} batches={} requests_sent={} requests_rejected={} baseline_sections={} \
+                     sections={} meshes={} vertices={} faces={} elapsed_ms={} \n                     mean_frame_us={} max_frame_us={} stream_frame_us={} rebuild_frame_us={}",
+                    summary.adapter,
+                    summary.backend,
+                    summary.format,
+                    summary.frames,
+                    summary.streams,
+                    summary.rebuilds,
+                    summary.uploads,
+                    summary.screenshots,
+                    summary.actions_ok,
+                    summary.actions_rejected,
+                    summary.walk_ticks,
+                    summary.walker.map_or(0.0, |p| p[0]),
+                    summary.walker.map_or(0.0, |p| p[1]),
+                    summary.walker.map_or(0.0, |p| p[2]),
+                    summary.session.map_or(0, |session| session),
+                    summary.batches,
+                    summary.requests_sent,
+                    summary.requests_rejected,
+                    summary.baseline_sections,
+                    summary.sections,
+                    summary.meshes,
+                    summary.vertices,
+                    summary.faces,
+                    summary.elapsed_ms,
+                    summary.mean_frame_us,
+                    summary.max_frame_us,
+                    summary.stream_frame_us,
+                    summary.rebuild_frame_us,
+                );
+                println!(
+                    "cpu_admitted={} cpu_cancelled={} cpu_stale={} cpu_backpressure={} cpu_peak_jobs={} cpu_peak_input_bytes={} cpu_peak_output_bytes={}",
+                    summary.cpu.admitted,
+                    summary.cpu.cancelled,
+                    summary.cpu.stale,
+                    summary.cpu.backpressure,
+                    summary.cpu.peak_jobs,
+                    summary.cpu.peak_input_bytes,
+                    summary.cpu.peak_output_bytes,
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("client failed: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    } else if let Some(path) = capture {
+        match run(
+            &path,
+            width,
+            height,
+            radius,
+            &view,
+            ui_preview,
+            &places,
+            content.as_deref(),
+        ) {
+            Ok(summary) => {
+                println!("{summary}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("client failed: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        println!("{USAGE}");
+        ExitCode::SUCCESS
+    }
+}
+
+/// Render one offscreen frame and write it as a PNG.
+///
+/// Every parameter comes straight from the command line, so the list is long by
+/// construction rather than by accident.
+#[allow(clippy::too_many_arguments)]
+fn run(
+    path: &str,
+    width: u32,
+    height: u32,
+    radius: i64,
+    view: &str,
+    ui_preview: Option<ui::Mode>,
+    places: &[(String, [i64; 3])],
+    content: Option<&str>,
+) -> Result<String, String> {
+    let start = Instant::now();
+    let mut scene = match content {
+        Some(directory) => Scene::new_game(radius, std::path::Path::new(directory))?,
+        None => Scene::new(radius)?,
+    };
+    for (material, [x, y, z]) in places {
+        let key = torse_types::ContentKey::parse(material)
+            .map_err(|error| format!("--place `{material}`: {error}"))?;
+        scene
+            .apply_edit(true, &key, torse_types::BlockPos::new(*x, *y, *z))
+            .map_err(|error| format!("--place `{material}`: {error}"))?;
+    }
+    scene.refresh_meshes();
+    let (vertices, indices, faces) = scene.geometry();
+    if indices.is_empty() {
+        return Err("scene produced no geometry".to_owned());
+    }
+    let vertex_bytes = Scene::vertex_bytes(&vertices);
+
+    let mut renderer = Renderer::new(width, height)?;
+    renderer.set_palette(scene.palette());
+    renderer.upload_section(torse_types::SectionPos::ZERO, &vertex_bytes, &indices);
+
+    let (eye, target) = match view {
+        "player" => {
+            let eye = scene.eye();
+            (eye, [eye[0], eye[1] - 1.5, eye[2] - 12.0])
+        }
+        _ => ([40.0, 18.0, 40.0], [0.0, 6.0, 0.0]),
+    };
+    let camera = Camera::new(eye, target);
+    renderer.render(
+        camera.view_projection(width as f32 / height as f32),
+        camera.eye,
+    );
+    if let Some(mode) = ui_preview {
+        renderer.render_ui(mode)?;
+    }
+    renderer.save_png(path)?;
+
+    let elapsed = start.elapsed();
+    Ok(format!(
+        "sections={} meshes={} entities={} seq={} vertices={} indices={} faces={} eye=({:.1},{:.1},{:.1}) elapsed_ms={}",
+        scene.sections().len(),
+        scene.mesh_count(),
+        scene.authority().entities().len(),
+        scene.authority().seq().0,
+        vertices.len(),
+        indices.len(),
+        faces,
+        eye[0],
+        eye[1],
+        eye[2],
+        elapsed.as_millis()
+    ))
+}
+
+/// Parse one `MATERIAL:X,Y,Z` placement argument.
+fn parse_place(spec: &str) -> Result<(String, [i64; 3]), String> {
+    let (material, coordinates) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| format!("--place expects MATERIAL:X,Y,Z, got `{spec}`"))?;
+    let parts: Vec<&str> = coordinates.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!("--place expects three coordinates in `{spec}`"));
+    }
+    let mut values = [0i64; 3];
+    for (slot, part) in values.iter_mut().zip(parts) {
+        *slot = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("--place coordinate `{part}` is not an integer"))?;
+    }
+    Ok((material.to_string(), values))
+}

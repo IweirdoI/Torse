@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use torse_content::Shape;
-use torse_types::{BlockPos, RejectCode};
+use torse_types::{BlockPos, EntityHandle, EntityId, RejectCode};
 use torse_world::{
     BlockEdit, BlockStateRegistry, EntityMove, EntityStore, Position, SectionStore, TerrainQuery,
 };
@@ -32,12 +32,127 @@ pub(crate) struct ResolvedMovements {
     pub reads: Vec<(BlockPos, TerrainQuery)>,
 }
 
+/// Escape directions: up first (the common burial), then sideways.
+const ESCAPE_DIRECTIONS: [[f64; 3]; 8] = [
+    [0.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0],
+];
+/// Escape step budget per direction.
+const ESCAPE_STEPS: usize = 8;
+
+/// Resolve one stuck entity: find the nearest free position by stepping
+/// along the escape directions and report the relocation as a movement.
+///
+/// Unlike [`prepare_movements`], the start position is allowed to overlap
+/// terrain -- that is the condition being escaped. The destination must be
+/// free, offsets are bounded, and entity identity is validated exactly like
+/// a normal move. `None` means no free neighbour was reachable; the entity
+/// stays wedged and the caller reports the failure.
+pub fn prepare_escape(
+    store: &SectionStore,
+    entities: &EntityStore,
+    registry: &BlockStateRegistry,
+    handle: EntityHandle,
+    id: EntityId,
+    half: [f64; 3],
+) -> Result<Option<EntityMove>, RejectCode> {
+    if entities.side() != store.side() {
+        return Err(RejectCode::InvalidData);
+    }
+    let entity = entities.get(handle).ok_or(RejectCode::MissingTarget)?;
+    if entity.id != id {
+        return Err(RejectCode::MissingTarget);
+    }
+    let position = entity.position;
+    if !bounded_position(position) || half.iter().any(|v| *v <= 0.0 || *v > MAX_COLLIDER_HALF) {
+        return Err(RejectCode::InvalidData);
+    }
+    let view = CollisionView {
+        store,
+        registry,
+        overlay: BTreeMap::new(),
+        reads: RefCell::new(BTreeMap::new()),
+        unknown: RefCell::new(false),
+    };
+    let step = half[1] / 2.0;
+    for step_index in 1..=ESCAPE_STEPS {
+        let offset = f64::from(step_index as u32) * step;
+        for direction in ESCAPE_DIRECTIONS {
+            let candidate_center = [
+                position.x + direction[0] * offset,
+                position.y + direction[1] * offset,
+                position.z + direction[2] * offset,
+            ];
+            let Some(candidate) = bounded_center(candidate_center, half) else {
+                continue;
+            };
+            let candidate_aabb = Aabb::from_center(candidate, half);
+            let blocked = collides(&view, &candidate_aabb);
+            if std::env::var_os("TORSE_ESCAPE_DEBUG").is_some() {
+                eprintln!(
+                    "escape step {step_index} dir {direction:?} center {candidate:?} blocked={blocked} unknown={}",
+                    view.unknown.borrow()
+                );
+            }
+            if blocked {
+                continue;
+            }
+            if *view.unknown.borrow() {
+                return Err(RejectCode::InvalidData);
+            }
+            return Ok(Some(EntityMove {
+                id,
+                previous_bits: position.to_bits(),
+                position_bits: Position::new(
+                    candidate_aabb.center()[0],
+                    candidate_aabb.center()[1],
+                    candidate_aabb.center()[2],
+                )
+                .to_bits(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Centre of an escape candidate; `None` when its collider would leave the
+/// bounded region.
+fn bounded_center(center: [f64; 3], half: [f64; 3]) -> Option<[f64; 3]> {
+    if !center.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let aabb = Aabb::from_center(center, half);
+    if !bounded_position(Position::new(aabb.min[0], aabb.min[1], aabb.min[2]))
+        || !bounded_position(Position::new(aabb.max[0], aabb.max[1], aabb.max[2]))
+    {
+        return None;
+    }
+    Some(center)
+}
+
+/// Start-position policy for movement preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MovementMode {
+    /// The start must not overlap terrain; overlap is a conflict.
+    Normal,
+    /// The start may overlap terrain (a wedged entity escaping); every
+    /// destination must be free, and each request moves exactly one entity.
+    Escape,
+}
+
 pub(crate) fn prepare_movements(
     store: &SectionStore,
     entities: &EntityStore,
     registry: &BlockStateRegistry,
     edits: &[BlockEdit],
     requests: &[Movement],
+    mode: MovementMode,
 ) -> Result<ResolvedMovements, RejectCode> {
     if requests.len() > MAX_TRANSACTION_MOVEMENTS {
         return Err(RejectCode::QuotaExceeded);
@@ -92,14 +207,33 @@ pub(crate) fn prepare_movements(
         if *view.unknown.borrow() {
             return Err(RejectCode::InvalidData);
         }
-        if overlapping {
-            return Err(RejectCode::Conflict);
+        // Escape moves are the one path that may start overlapped -- that is
+        // the state being escaped -- but they carry a single entity per
+        // request and the destination must be free. No sweep: the caller
+        // already resolved the destination through prepare_escape.
+        if mode == MovementMode::Escape {
+            let _ = overlapping;
+            let target = position.translated(delta);
+            let target_aabb = Aabb::from_center([target.x, target.y, target.z], half);
+            if collides(&view, &target_aabb) || *view.unknown.borrow() {
+                return Err(RejectCode::Conflict);
+            }
+            moves.push(EntityMove {
+                id: request.id,
+                previous_bits: request.previous_bits,
+                position_bits: target.to_bits(),
+            });
+            continue;
         }
         let result = sweep(&view, collider, delta);
         if *view.unknown.borrow() {
             return Err(RejectCode::InvalidData);
         }
-        let center = result.aabb.center();
+        let result_aabb = result.aabb;
+        if collides(&view, &result_aabb) {
+            return Err(RejectCode::Conflict);
+        }
+        let center = result_aabb.center();
         moves.push(EntityMove {
             id: request.id,
             previous_bits: request.previous_bits,

@@ -14,6 +14,7 @@ use torse_world::{
     BlockStateId, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue, TerrainQuery,
     component_size,
 };
+use torse_world_services::Aabb;
 
 use crate::{OrderingKey, Phase, Transaction, WorldAuthority};
 
@@ -235,6 +236,36 @@ impl ActionView<'_> {
     }
     pub fn default_state(&self, block: &ContentKey) -> Option<BlockStateId> {
         self.world.registry().default_state(block)
+    }
+
+    /// Whether placing `state` into `pos` would overlap an entity's collider.
+    ///
+    /// Burying a walker wedges it: movement refuses colliders that already
+    /// overlap terrain, so the placement must refuse first. The cell's
+    /// collision shape for `state` is tested against every entity collider.
+    pub fn cell_blockers(&self, pos: BlockPos, state: BlockStateId) -> Result<bool, RejectCode> {
+        if state.is_empty() {
+            // Removing a block never buries anyone.
+            return Ok(false);
+        }
+        let Some(definition) = self.world.registry().definition(state) else {
+            return Err(RejectCode::InvalidData);
+        };
+        let Some(shape) = definition.collision_profile.shape.as_ref() else {
+            // No collision shape: air-like, can never bury anyone.
+            return Ok(false);
+        };
+        let cell_boxes = crate::movement::boxes(shape);
+        let overlapping = self.world.entities().iter().any(|(_, entity)| {
+            let collider = Aabb::from_center(
+                [entity.position.x, entity.position.y, entity.position.z],
+                crate::player::WALKER_HALF,
+            );
+            cell_boxes
+                .iter()
+                .any(|local| local.at(pos).overlaps(&collider))
+        });
+        Ok(overlapping)
     }
     /// State written when an identical `block` is placed into a cell that
     /// already holds it, or `None` when the occupied cell must stay rejected.

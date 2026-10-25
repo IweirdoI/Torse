@@ -194,6 +194,31 @@ fn section_grants_have_a_registration_budget() {
 }
 
 #[test]
+fn placement_into_an_occupied_collider_is_refused() {
+    let (mut world, service) = setup();
+    let actor = editor();
+    // Spawn an entity standing in cell (5, 1, 5) with the walker extents.
+    let handle = world
+        .entities_mut()
+        .spawn(torse_world::Position::new(5.5, 1.9, 5.5))
+        .expect("spawn");
+    let _ = handle;
+    let stone = key("base:stone");
+    let mut request = request(true, BlockPos::new(5, 1, 5), 1);
+    request.parameters.insert(
+        key("world:field/block"),
+        torse_world::ComponentValue::Content(stone),
+    );
+    // The cell holds the walker's collider: the placement is refused and
+    // the world stays untouched.
+    assert_eq!(
+        mutation(&service, &world, &actor, &request),
+        Err(RejectCode::Conflict)
+    );
+    assert_eq!(world.seq().0, 0);
+}
+
+#[test]
 fn exact_cell_grants_keep_working_alongside_sections() {
     let (world, service) = setup();
     let mixed = ActorContext::new(key("test:editor"))

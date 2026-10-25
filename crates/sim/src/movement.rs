@@ -152,7 +152,7 @@ impl CollisionSource for CollisionView<'_> {
     }
 }
 
-fn boxes(shape: &Shape) -> Vec<LocalBox> {
+pub fn boxes(shape: &Shape) -> Vec<LocalBox> {
     // Corner/stair collision uses the same conservative enclosing cube as the
     // M1 reference scenario. State-dependent multi-box geometry is deferred.
     vec![match shape {

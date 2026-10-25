@@ -165,8 +165,10 @@ struct WindowApp {
     net: Option<crate::net::Connection<torse_net::TcpTransport>>,
     session: Option<u128>,
     grabbed: bool,
+    focused: bool,
     last_cursor: Option<(f64, f64)>,
     look_sensitivity: f64,
+    recentring: bool,
     probe_sent: bool,
     batches: u32,
     requests_sent: u32,
@@ -174,6 +176,10 @@ struct WindowApp {
     walk: bool,
     tick_accumulator: f32,
     walk_ticks: u32,
+    /// Camera position at the last completed walk tick.
+    walk_prev: [f32; 3],
+    /// Camera position at the next walk tick target.
+    walk_next: [f32; 3],
     /// Autoplay sets this when the walker stopped against a terrain step.
     walk_blocked: bool,
     last_result: String,
@@ -232,8 +238,10 @@ impl WindowApp {
             net: None,
             session: None,
             grabbed: false,
+            focused: true,
             last_cursor: None,
             look_sensitivity: 1.0,
+            recentring: false,
             probe_sent: false,
             batches: 0,
             requests_sent: 0,
@@ -241,6 +249,8 @@ impl WindowApp {
             walk: false,
             tick_accumulator: 0.0,
             walk_ticks: 0,
+            walk_prev: [0.0; 3],
+            walk_next: [0.0; 3],
             walk_blocked: false,
             last_result: String::new(),
             adapter: String::new(),
@@ -384,7 +394,11 @@ impl WindowApp {
                         let drifted =
                             (position.x - before.0).abs() + (position.z - before.1).abs() > 0.02;
                         self.walk_blocked = wanted && !drifted;
-                        camera.eye = [
+                        // Interpolation endpoints: the camera glides from the
+                        // previous tick position to this one across the tick
+                        // interval instead of snapping once per tick.
+                        self.walk_prev = self.walk_next;
+                        self.walk_next = [
                             position.x as f32,
                             (position.y + WALKER_EYE_OFFSET) as f32,
                             position.z as f32,
@@ -396,6 +410,13 @@ impl WindowApp {
                         return;
                     }
                 }
+            }
+            // Between ticks the camera glides from the last tick position to
+            // the next: frames no longer wait for a 20 Hz step to move.
+            let alpha = (self.tick_accumulator / TICK).clamp(0.0, 1.0);
+            for axis in 0..3 {
+                camera.eye[axis] =
+                    self.walk_prev[axis] + (self.walk_next[axis] - self.walk_prev[axis]) * alpha;
             }
         } else {
             camera.advance(motion, step);
@@ -607,6 +628,16 @@ impl WindowApp {
             && let Some(scene) = self.scene.as_ref()
         {
             gpu.context.retain_sections(scene.sections());
+        }
+        // Belt and braces: some focus transitions skip the Focused event, and
+        // a captured look with no focus moves the camera from outside.
+        if self.grabbed
+            && let Some(gpu) = self.gpu.as_ref()
+            && !gpu.window.has_focus()
+        {
+            self.focused = false;
+            self.input.reset();
+            self.set_grab(false);
         }
 
         if self.input.take_screenshot() {
@@ -830,6 +861,9 @@ impl WindowApp {
     }
 
     fn set_grab(&mut self, grab: bool) {
+        // Never capture while the window is unfocused; the next focus event
+        // or the per-frame check re-arms capture.
+        let grab = grab && self.focused;
         self.grabbed = grab;
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.set_cursor_visible(!grab);
@@ -840,11 +874,13 @@ impl WindowApp {
                 ));
                 let _ = gpu.window.set_cursor_position(center);
                 // Deltas are measured from this baseline until real motion
-                // or the drift allowance moves the cursor.
+                // or the drift allowance moves the cursor. The first event
+                // after the programmatic jump is synthetic and skipped.
                 self.last_cursor = Some((
                     f64::from(gpu.config.width / 2),
                     f64::from(gpu.config.height / 2),
                 ));
+                self.recentring = true;
             } else {
                 self.last_cursor = None;
             }
@@ -875,6 +911,15 @@ impl WindowApp {
         }
         self.walk = true;
         self.tick_accumulator = 0.0;
+        // Seed the interpolation endpoints with the spawn position so the
+        // first frames do not glide in from the origin.
+        let start = [
+            under.x as f32,
+            (under.y + WALKER_EYE_OFFSET) as f32,
+            under.z as f32,
+        ];
+        self.walk_prev = start;
+        self.walk_next = start;
     }
 
     /// F5 flips between fly and walk; the walker entity stays in the world.
@@ -1241,7 +1286,7 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.cursor = [position.x, position.y];
-                if self.grabbed && !self.ui.modal() {
+                if self.grabbed && self.focused && !self.ui.modal() {
                     if let Some(gpu) = self.gpu.as_ref() {
                         let center = (
                             f64::from(gpu.config.width / 2),
@@ -1251,14 +1296,20 @@ impl ApplicationHandler for WindowApp {
                         // per-event re-centring would feed rounding jitter
                         // into the camera every event.
                         let (last_x, last_y) = self.last_cursor.unwrap_or(center);
+                        // The OS cursor lands a pixel off after re-centring;
+                        // that synthetic jump must not reach the camera.
+                        let recentred = self.recentring;
+                        self.recentring = false;
                         let dx = position.x - last_x;
                         let dy = position.y - last_y;
-                        if dx.abs() + dy.abs() > 0.0 {
+                        if !recentred && dx.abs() + dy.abs() > 0.5 {
                             self.input
                                 .mouse_look(dx * self.look_sensitivity, dy * self.look_sensitivity);
                         }
                         // Recentre only on real drift; the hidden cursor may
-                        // wander a little without anyone noticing.
+                        // wander a little without anyone noticing. The next
+                        // CursorMoved after a recentre is the synthetic jump,
+                        // so it is skipped above.
                         if (position.x - center.0).abs() > 24.0
                             || (position.y - center.1).abs() > 24.0
                         {
@@ -1269,6 +1320,7 @@ impl ApplicationHandler for WindowApp {
                                 ));
                             let _ = gpu.window.set_cursor_position(point);
                             self.last_cursor = Some(center);
+                            self.recentring = true;
                         } else {
                             self.last_cursor = Some((position.x, position.y));
                         }
@@ -1296,10 +1348,12 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::Focused(false) => {
+                self.focused = false;
                 self.input.reset();
                 self.set_grab(false);
             }
             WindowEvent::Focused(true) => {
+                self.focused = true;
                 if !self.ui.modal() {
                     self.set_grab(true);
                 }

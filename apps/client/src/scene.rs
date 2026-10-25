@@ -350,10 +350,19 @@ impl Scene {
         &self.authority
     }
 
-    /// Classify one cell for picking: solid, empty, or outside the loaded world.
-    fn solid_at(&self, pos: BlockPos) -> Option<bool> {
+    /// Shape of one cell for picking: empty, or the block's render bounds.
+    /// `None` marks cells the ray must not traverse (unloaded or outside).
+    fn shape_at(&self, pos: BlockPos) -> Option<Option<RenderBox>> {
         match self.authority.store().query(pos) {
-            TerrainQuery::Ready(state) => Some(!state.is_empty()),
+            TerrainQuery::Ready(state) => {
+                if state.is_empty() {
+                    return Some(None);
+                }
+                let Some(definition) = self.authority.registry().definition(state) else {
+                    return Some(None);
+                };
+                Some(render_box(definition))
+            }
             TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => None,
         }
     }
@@ -416,7 +425,12 @@ impl Scene {
 
     /// Cast a ray through loaded terrain and report the first solid cell.
     pub fn pick(&self, origin: [f32; 3], direction: [f32; 3], max_distance: f32) -> PickOutcome {
-        cast_ray(|pos| self.solid_at(pos), origin, direction, max_distance)
+        cast_ray(
+            &mut |pos| self.shape_at(pos),
+            origin,
+            direction,
+            max_distance,
+        )
     }
 
     /// Spawn the walk-mode player entity at a world position.

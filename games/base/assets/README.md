@@ -13,7 +13,7 @@ ui目录保存面板、按钮三态、槽位、进度条、准星和关闭图标
 | crosshair | 9x9 | 不拉伸 |
 | icon_close | 12x12 | 不拉伸 |
 | icons/items内图标 | 16x16 | 不拉伸 |
-| textures/atlas.png | 64x16 | 地形图集，见[贴图说明](textures/README.md) |
+| textures/atlas.png | 120x24 | 地形图集，五张图块带留白，见[贴图说明](textures/README.md) |
 
 透明面板中心由UI主题提供底色。进度填充保留原图明暗并乘以主题色，素材文件保持原样。locale资源采用每行key=value，zh-Hans与en的键对应；用户界面文案不写入Rust源码。地形图集由脚本生成，修改脚本后重新运行并提交产物。
 

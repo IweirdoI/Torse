@@ -1392,6 +1392,68 @@ mod tests {
     }
 
     #[test]
+    fn stacked_slabs_merge_and_drop_the_shared_plane() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene.refresh_meshes();
+        let base = air_above_surface(&scene);
+        let glass = key("base:glass_slab");
+        scene.apply_edit(true, &glass, base).expect("place lower");
+        let upper = BlockPos::new(base.x, base.y + 1, base.z);
+        scene.apply_edit(true, &glass, upper).expect("place upper");
+        scene.refresh_meshes();
+
+        // Same-material neighbours merge: no face lies flat on the shared
+        // plane (side quads touch it with their bottom edge only).
+        let boundary = base.y as f32 + 1.0;
+        let (vertices, _, _) = scene.geometry();
+        let flat_on_plane = vertices
+            .iter()
+            .filter(|v| {
+                (v.position[1] - boundary).abs() < 1e-4
+                    && v.normal[1].abs() > 0.5
+                    && v.position[0] >= base.x as f32
+                    && v.position[0] <= base.x as f32 + 1.0
+                    && v.position[2] >= base.z as f32
+                    && v.position[2] <= base.z as f32 + 1.0
+            })
+            .count();
+        assert_eq!(
+            flat_on_plane, 0,
+            "the shared plane must be culled on both sides"
+        );
+    }
+
+    #[test]
+    fn glass_keeps_its_face_against_a_different_transparent_block() {
+        let mut scene = Scene::new(1).expect("scene builds");
+        scene.refresh_meshes();
+        let base = air_above_surface(&scene);
+        let glass = key("base:glass_slab");
+        let plant = key("base:plant");
+        // Glass with a plant in the x-adjacent cell: different states keep
+        // the shared face (the plant occludes nothing).
+        scene.apply_edit(true, &glass, base).expect("place glass");
+        let beside = BlockPos::new(base.x + 1, base.y, base.z);
+        scene.apply_edit(true, &plant, beside).expect("place plant");
+        scene.refresh_meshes();
+
+        let plane = base.x as f32 + 1.0;
+        let (vertices, _, _) = scene.geometry();
+        let on_plane = vertices
+            .iter()
+            .filter(|v| {
+                (v.position[0] - plane).abs() < 1e-4
+                    && v.normal[0].abs() > 0.5
+                    && v.position[2] >= base.z as f32
+                    && v.position[2] <= base.z as f32 + 1.0
+                    && v.position[1] >= base.y as f32
+                    && v.position[1] <= base.y as f32 + 0.5
+            })
+            .count();
+        assert!(on_plane > 0, "differing neighbours must keep the face");
+    }
+
+    #[test]
     fn walker_spawns_mid_air_walks_and_ends_standing() {
         let mut scene = Scene::new(3).expect("scene");
         scene

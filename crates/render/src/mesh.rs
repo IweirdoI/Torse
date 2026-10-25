@@ -351,7 +351,17 @@ fn face_culled(
         return false;
     };
     match sample(neighbor) {
-        MeshSample::Ready(neighbor_block) => neighbor_block.occlusion & face.bit() != 0,
+        MeshSample::Ready(neighbor_block) => {
+            // Two cells of the same transparent state merge: both sides of
+            // the shared plane disappear together. Culling only one side
+            // (the occlusion mask alone) left asymmetric holes inside glass
+            // stacks. Opaque and differing neighbors keep the mask rule.
+            if neighbor_block.material == block.material {
+                true
+            } else {
+                neighbor_block.occlusion & face.bit() != 0
+            }
+        }
         // Missing data must keep the face visible. Treating it as covered would
         // punch holes in the world exactly where the client has no data.
         MeshSample::NotLoaded | MeshSample::OutOfBounds => false,
@@ -721,7 +731,13 @@ mod tests {
             if pos == BlockPos::new(1, 1, 1) {
                 MeshSample::Ready(cube(0b11_1111))
             } else if pos == BlockPos::new(2, 1, 1) {
-                MeshSample::Ready(cube(0))
+                // A different state: the mask rule applies, not the
+                // same-material merge.
+                MeshSample::Ready(RenderBlock {
+                    bounds: Some(RenderBox::FULL_CUBE),
+                    occlusion: 0,
+                    material: 2,
+                })
             } else {
                 MeshSample::Ready(RenderBlock {
                     bounds: None,
@@ -735,6 +751,25 @@ mod tests {
         // +x face. The second cube's -x face is still culled by the first cube,
         // which does claim full coverage.
         assert_eq!(mesh.face_count(), 11);
+    }
+
+    #[test]
+    fn same_material_neighbors_merge_both_sides() {
+        let sample = |pos: BlockPos| {
+            if (1..=2).contains(&pos.x) && pos.y == 1 && pos.z == 1 {
+                MeshSample::Ready(cube(0))
+            } else {
+                MeshSample::Ready(RenderBlock {
+                    bounds: None,
+                    occlusion: 0,
+                    material: 0,
+                })
+            }
+        };
+        let mesh = build_mesh(4, SectionPos::ZERO, sample);
+        // Two adjacent cells of one state share two interior faces (one per
+        // side); the merge rule drops both regardless of the mask.
+        assert_eq!(mesh.face_count(), 10);
     }
 
     #[test]

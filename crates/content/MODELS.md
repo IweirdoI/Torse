@@ -13,6 +13,9 @@ Each authoritative box retains the existing unit-cell validation. An empty
 compound explicitly contributes no surfaces. Render complexity does not create
 implicit physics geometry or cross-cell collision indexing.
 
+The model variant holds an `Arc<RenderModel>`, so cloned descriptors and registry
+entries share immutable quad storage. Pointer addresses never enter identity.
+
 Finite state render-shape overrides select complete models, including their
 material and UV assignments. `BlockStateRegistry` exposes borrowed effective
 shape queries so extraction need not clone a model or a compound per cell.

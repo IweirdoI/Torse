@@ -125,7 +125,7 @@ pub enum Shape {
     Stair,
     Box(BoxBounds),
     /// Visual-only precompiled surfaces. Physics must be declared independently.
-    Model(RenderModel),
+    Model(std::sync::Arc<RenderModel>),
     /// Non-nested collection of independently validated cell-local boxes.
     Compound(Vec<BoxBounds>),
 }

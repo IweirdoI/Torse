@@ -39,15 +39,18 @@ fn visual_quad() -> crate::RenderQuad {
 fn model_uv_changes_only_presentation_and_physics_rejects_visual_models() {
     let mut pack = m0_fixture_pack();
     let block = &mut pack.blocks[0].value;
-    block.render_profile.shape = Shape::Model(crate::RenderModel {
-        quads: vec![visual_quad()],
-    });
+    block.render_profile.shape = Shape::Model(
+        crate::RenderModel {
+            quads: vec![visual_quad()],
+        }
+        .into(),
+    );
     block.occlusion_profile.face_mask = 0;
     let before = compile(pack.clone()).unwrap();
     let Shape::Model(model) = &mut pack.blocks[0].value.render_profile.shape else {
         unreachable!()
     };
-    model.quads[0].uvs[0][0] = 0.25;
+    std::sync::Arc::make_mut(model).quads[0].uvs[0][0] = 0.25;
     let after = compile(pack.clone()).unwrap();
     assert_eq!(before.authority_digest, after.authority_digest);
     assert_ne!(before.presentation_digest, after.presentation_digest);

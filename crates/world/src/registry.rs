@@ -264,35 +264,50 @@ impl BlockStateRegistry {
 
     /// Render shape effective for one state, after any per-state override.
     pub fn render_shape(&self, state: BlockStateId) -> Option<Shape> {
+        self.render_shape_ref(state).cloned()
+    }
+
+    /// Borrow the effective visual shape without cloning static model data.
+    pub fn render_shape_ref(&self, state: BlockStateId) -> Option<&Shape> {
         let definition = self.definition(state)?;
         if let Some(profile) = self.state_override(state)
             && let Some(shape) = &profile.render_shape
         {
-            return Some(shape.clone());
+            return Some(shape);
         }
-        Some(definition.render_profile.shape.clone())
+        Some(&definition.render_profile.shape)
     }
 
     /// Collision shape effective for one state, after any per-state override.
     pub fn collision_shape(&self, state: BlockStateId) -> Option<Shape> {
+        self.collision_shape_ref(state).cloned()
+    }
+
+    /// Borrow the effective collision shape without copying compound boxes.
+    pub fn collision_shape_ref(&self, state: BlockStateId) -> Option<&Shape> {
         let definition = self.definition(state)?;
         if let Some(profile) = self.state_override(state)
             && let Some(shape) = &profile.collision_shape
         {
-            return Some(shape.clone());
+            return Some(shape);
         }
-        definition.collision_profile.shape.clone()
+        definition.collision_profile.shape.as_ref()
     }
 
     /// Selection shape effective for one state, after any per-state override.
     pub fn selection_shape(&self, state: BlockStateId) -> Option<Shape> {
+        self.selection_shape_ref(state).cloned()
+    }
+
+    /// Borrow the effective selection shape without copying compound boxes.
+    pub fn selection_shape_ref(&self, state: BlockStateId) -> Option<&Shape> {
         let definition = self.definition(state)?;
         if let Some(profile) = self.state_override(state)
             && let Some(shape) = &profile.selection_shape
         {
-            return Some(shape.clone());
+            return Some(shape);
         }
-        definition.selection_profile.shape.clone()
+        definition.selection_profile.shape.as_ref()
     }
 
     /// The definition's state override matching this state's exact values.

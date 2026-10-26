@@ -33,6 +33,84 @@ pub struct BoxBounds {
     pub max: [f32; 3],
 }
 
+/// Maximum precompiled surface count in one static visual model.
+pub const MAX_MODEL_QUADS: usize = 1024;
+/// Maximum independent boxes in an authoritative compound shape.
+pub const MAX_COMPOUND_BOXES: usize = 64;
+
+/// A complete static visual model selected by one finite state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderModel {
+    pub quads: Vec<RenderQuad>,
+}
+
+/// A pretransformed outward-facing quad, with independent material and UVs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderQuad {
+    pub positions: [[f32; 3]; 4],
+    pub uvs: [[f32; 2]; 4],
+    pub normal: [f32; 3],
+    pub material: ContentKey,
+    pub alpha_mode: AlphaMode,
+    pub overlay: Option<FaceOverlay>,
+    pub cull_face: Option<Face>,
+    pub tint_channel: Option<u8>,
+    pub shade: bool,
+    pub double_sided: bool,
+}
+
+impl RenderModel {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.quads.len() > MAX_MODEL_QUADS {
+            return Err("visual model exceeds the quad limit");
+        }
+        for quad in &self.quads {
+            if quad
+                .positions
+                .iter()
+                .flatten()
+                .any(|v| !v.is_finite() || !(-1.0..=2.0).contains(v))
+                || quad
+                    .uvs
+                    .iter()
+                    .flatten()
+                    .any(|v| !v.is_finite() || v.abs() > 16.0)
+                || quad.normal.iter().any(|v| !v.is_finite())
+                || quad.tint_channel.is_some_and(|value| value > 7)
+            {
+                return Err("visual quad contains invalid coordinates, UVs, or tint channel");
+            }
+            let normal_length: f32 = quad.normal.iter().map(|v| v * v).sum();
+            if (normal_length - 1.0).abs() > 0.001 {
+                return Err("visual quad normal must have unit length");
+            }
+            for triangle in [[0, 1, 2], [0, 2, 3]] {
+                let a = std::array::from_fn::<_, 3, _>(|i| {
+                    quad.positions[triangle[1]][i] - quad.positions[triangle[0]][i]
+                });
+                let b = std::array::from_fn::<_, 3, _>(|i| {
+                    quad.positions[triangle[2]][i] - quad.positions[triangle[0]][i]
+                });
+                let cross = [
+                    a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0],
+                ];
+                if cross
+                    .iter()
+                    .zip(quad.normal)
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    <= 1e-10
+                {
+                    return Err("visual quad triangles must have outward nondegenerate winding");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Static geometry preset available to block definitions.
 ///
 /// Presets compile to deterministic shape data. Arbitrary meshes and moving
@@ -46,6 +124,10 @@ pub enum Shape {
     Corner,
     Stair,
     Box(BoxBounds),
+    /// Visual-only precompiled surfaces. Physics must be declared independently.
+    Model(RenderModel),
+    /// Non-nested collection of independently validated cell-local boxes.
+    Compound(Vec<BoxBounds>),
 }
 
 impl Shape {
@@ -57,6 +139,16 @@ impl Shape {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Box(bounds) => validate_box(bounds),
+            Self::Model(model) => model.validate(),
+            Self::Compound(boxes) => {
+                if boxes.len() > MAX_COMPOUND_BOXES {
+                    return Err("compound shape exceeds the box limit");
+                }
+                for bounds in boxes {
+                    validate_box(bounds)?;
+                }
+                Ok(())
+            }
             Self::FullCube
             | Self::LowerSlab
             | Self::Panel

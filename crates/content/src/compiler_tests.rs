@@ -15,6 +15,105 @@ fn builtin_fixture_compiles() {
     assert_ne!(compiled.authority_digest, compiled.presentation_digest);
 }
 
+fn visual_quad() -> crate::RenderQuad {
+    crate::RenderQuad {
+        positions: [
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+        uvs: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        normal: [0.0, 0.0, 1.0],
+        material: key("sample:tile"),
+        alpha_mode: AlphaMode::Opaque,
+        overlay: None,
+        cull_face: Some(Face::PosZ),
+        tint_channel: None,
+        shade: true,
+        double_sided: false,
+    }
+}
+
+#[test]
+fn model_uv_changes_only_presentation_and_physics_rejects_visual_models() {
+    let mut pack = m0_fixture_pack();
+    let block = &mut pack.blocks[0].value;
+    block.render_profile.shape = Shape::Model(crate::RenderModel {
+        quads: vec![visual_quad()],
+    });
+    block.occlusion_profile.face_mask = 0;
+    let before = compile(pack.clone()).unwrap();
+    let Shape::Model(model) = &mut pack.blocks[0].value.render_profile.shape else {
+        unreachable!()
+    };
+    model.quads[0].uvs[0][0] = 0.25;
+    let after = compile(pack.clone()).unwrap();
+    assert_eq!(before.authority_digest, after.authority_digest);
+    assert_ne!(before.presentation_digest, after.presentation_digest);
+    pack.blocks[0].value.collision_profile.shape =
+        Some(pack.blocks[0].value.render_profile.shape.clone());
+    assert!(
+        compile(pack)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.message.contains("visual models"))
+    );
+}
+
+#[test]
+fn model_limits_finite_coordinates_winding_and_independent_compounds_are_validated() {
+    let mut model = crate::RenderModel {
+        quads: vec![visual_quad()],
+    };
+    assert!(model.validate().is_ok());
+    model.quads[0].positions[0][0] = f32::NAN;
+    assert!(model.validate().is_err());
+    model.quads[0] = visual_quad();
+    model.quads[0].positions.swap(0, 1);
+    assert!(model.validate().is_err());
+    model.quads = vec![visual_quad(); crate::MAX_MODEL_QUADS + 1];
+    assert!(model.validate().is_err());
+    let bounds = BoxBounds {
+        min: [0.0; 3],
+        max: [1.0, 0.5, 1.0],
+    };
+    assert!(Shape::Compound(vec![bounds; 2]).validate().is_ok());
+    assert!(
+        Shape::Compound(vec![bounds; crate::MAX_COMPOUND_BOXES + 1])
+            .validate()
+            .is_err()
+    );
+}
+
+#[test]
+fn state_profile_geometry_is_validated_hashed_and_order_independent() {
+    let mut pack = m0_fixture_pack();
+    let index = pack
+        .blocks
+        .iter()
+        .position(|block| !block.value.state_overrides.is_empty())
+        .unwrap();
+    let before = compile(pack.clone()).unwrap();
+    pack.blocks[index].value.state_overrides.reverse();
+    assert_eq!(
+        before.authority_digest,
+        compile(pack.clone()).unwrap().authority_digest
+    );
+    let profile = &mut pack.blocks[index].value.state_overrides[0];
+    profile.collision_shape = Some(Shape::Compound(Vec::new()));
+    let after = compile(pack.clone()).unwrap();
+    assert_ne!(before.authority_digest, after.authority_digest);
+    assert_eq!(before.presentation_digest, after.presentation_digest);
+    pack.blocks[index].value.state_overrides[0].values = vec![65535];
+    assert!(
+        compile(pack)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.field == "state_overrides")
+    );
+}
+
 #[test]
 fn block_instance_schema_is_reserved_and_defaults_must_be_unique() {
     let mut pack = m0_fixture_pack();

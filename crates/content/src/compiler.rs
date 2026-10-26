@@ -623,6 +623,61 @@ fn validate_block(
             format!("unknown state schema {}", block.state_schema),
         ));
     }
+    if let Some(schema) = schemas.get(&block.state_schema) {
+        let mut fields: Vec<_> = schema.value.finite_fields.iter().collect();
+        fields.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut seen = BTreeSet::new();
+        for profile in &block.state_overrides {
+            if profile.values.len() != fields.len()
+                || profile
+                    .values
+                    .iter()
+                    .zip(&fields)
+                    .any(|(value, field)| !field.values.contains(value))
+                || !seen.insert(&profile.values)
+            {
+                diagnostics.push(diagnostic(
+                    source.clone(),
+                    block.id.clone(),
+                    "state_overrides",
+                    "state override values must be legal, canonical, and unique",
+                ));
+            }
+            for (shape, field) in [
+                (
+                    profile.render_shape.as_ref(),
+                    "state_overrides.render_shape",
+                ),
+                (
+                    profile.collision_shape.as_ref(),
+                    "state_overrides.collision_shape",
+                ),
+                (
+                    profile.selection_shape.as_ref(),
+                    "state_overrides.selection_shape",
+                ),
+            ] {
+                if let Some(shape) = shape {
+                    validate_shape(shape, source, &block.id, field, diagnostics);
+                }
+            }
+            if profile.occlusion.is_some_and(|mask| {
+                mask & !claimable_occlusion(
+                    profile
+                        .render_shape
+                        .as_ref()
+                        .unwrap_or(&block.render_profile.shape),
+                ) != 0
+            }) {
+                diagnostics.push(diagnostic(
+                    source.clone(),
+                    block.id.clone(),
+                    "state_overrides.occlusion",
+                    "state occlusion exceeds proven boundary coverage",
+                ));
+            }
+        }
+    }
     validate_shape(
         &block.render_profile.shape,
         source,
@@ -746,7 +801,12 @@ fn claimable_occlusion(shape: &Shape) -> u8 {
         Shape::FullCube => 0b11_1111,
         // A lower slab spans the cell footprint only at its bottom boundary.
         Shape::LowerSlab => 0b000100,
-        Shape::Panel | Shape::Cross | Shape::Corner | Shape::Stair => 0,
+        Shape::Panel
+        | Shape::Cross
+        | Shape::Corner
+        | Shape::Stair
+        | Shape::Model(_)
+        | Shape::Compound(_) => 0,
         Shape::Box(bounds) => {
             let spans = |a: usize| bounds.min[a] <= 0.0 && bounds.max[a] >= 1.0;
             let mut mask = 0u8;
@@ -785,6 +845,14 @@ fn validate_shape(
     field: &str,
     diagnostics: &mut Vec<ContentDiagnostic>,
 ) {
+    if matches!(shape, Shape::Model(_)) && !field.contains("render") {
+        diagnostics.push(diagnostic(
+            source.clone(),
+            content_id.clone(),
+            field,
+            "visual models cannot be used for collision or selection",
+        ));
+    }
     if let Err(message) = shape.validate() {
         diagnostics.push(diagnostic(
             source.clone(),
@@ -797,6 +865,9 @@ fn validate_shape(
 
 /// Put semantically unordered block collections into canonical order.
 fn normalize_block(block: &mut BlockDefinition) {
+    block
+        .state_overrides
+        .sort_by(|left, right| left.values.cmp(&right.values));
     block.component_defaults.sort();
     block
         .capability_bindings
@@ -1045,6 +1116,7 @@ fn authority_digest(
             writer.u8(binding.face_mask);
         }
     }
+    hash_state_profiles(&mut writer, blocks, false);
     writer.finish()
 }
 
@@ -1092,7 +1164,60 @@ fn presentation_digest(blocks: &BTreeMap<ContentKey, BlockDefinition>) -> Digest
             writer.key(tag);
         }
     }
+    hash_state_profiles(&mut writer, blocks, true);
     writer.finish()
+}
+
+/// Append only when effective state overrides exist, preserving streams without them.
+fn hash_state_profiles(
+    writer: &mut CanonicalWriter,
+    blocks: &BTreeMap<ContentKey, BlockDefinition>,
+    visual: bool,
+) {
+    let selected: Vec<_> = blocks
+        .values()
+        .filter_map(|block| {
+            let profiles: Vec<_> = block
+                .state_overrides
+                .iter()
+                .filter(|profile| {
+                    if visual {
+                        profile.render_shape.is_some()
+                    } else {
+                        profile.collision_shape.is_some()
+                            || profile.selection_shape.is_some()
+                            || profile.occlusion.is_some()
+                    }
+                })
+                .collect();
+            (!profiles.is_empty()).then_some((block, profiles))
+        })
+        .collect();
+    if selected.is_empty() {
+        return;
+    }
+    writer.u8(0xf1);
+    writer.u32(selected.len() as u32);
+    for (block, profiles) in selected {
+        writer.key(&block.id);
+        writer.u32(profiles.len() as u32);
+        for profile in profiles {
+            writer.u32(profile.values.len() as u32);
+            for value in &profile.values {
+                writer.u32(u32::from(*value));
+            }
+            if visual {
+                writer.optional_shape(profile.render_shape.as_ref());
+            } else {
+                writer.optional_shape(profile.collision_shape.as_ref());
+                writer.optional_shape(profile.selection_shape.as_ref());
+                writer.bool(profile.occlusion.is_some());
+                if let Some(mask) = profile.occlusion {
+                    writer.u8(mask);
+                }
+            }
+        }
+    }
 }
 
 /// Minimal append-only writer for a platform-independent canonical byte stream.
@@ -1188,6 +1313,41 @@ impl CanonicalWriter {
 
     fn shape(&mut self, shape: &Shape) {
         match shape {
+            Shape::Compound(boxes) => {
+                self.u8(7);
+                self.u32(boxes.len() as u32);
+                for bounds in boxes {
+                    for value in bounds.min.iter().chain(&bounds.max) {
+                        self.u32(value.to_bits());
+                    }
+                }
+            }
+            Shape::Model(model) => {
+                self.u8(8);
+                self.u32(model.quads.len() as u32);
+                for quad in &model.quads {
+                    for value in quad
+                        .positions
+                        .iter()
+                        .flatten()
+                        .chain(quad.uvs.iter().flatten())
+                        .chain(&quad.normal)
+                    {
+                        self.u32(value.to_bits());
+                    }
+                    self.key(&quad.material);
+                    self.u8(quad.alpha_mode as u8);
+                    self.bool(quad.overlay.is_some());
+                    if let Some(overlay) = &quad.overlay {
+                        self.key(&overlay.material);
+                        self.u8(overlay.alpha_mode as u8);
+                    }
+                    self.u8(quad.cull_face.map_or(255, |face| face.index() as u8));
+                    self.u8(quad.tint_channel.unwrap_or(255));
+                    self.bool(quad.shade);
+                    self.bool(quad.double_sided);
+                }
+            }
             Shape::FullCube => self.u8(0),
             Shape::LowerSlab => self.u8(1),
             Shape::Panel => self.u8(2),

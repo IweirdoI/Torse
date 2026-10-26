@@ -433,9 +433,19 @@ impl CollisionSource for CollisionView<'_> {
 }
 
 pub fn boxes(shape: &Shape) -> Vec<LocalBox> {
+    if let Shape::Compound(boxes) = shape {
+        return boxes
+            .iter()
+            .map(|bounds| LocalBox {
+                min: bounds.min.map(f64::from),
+                max: bounds.max.map(f64::from),
+            })
+            .collect();
+    }
     // Corner/stair collision uses the same conservative enclosing cube as the
     // M1 reference scenario. State-dependent multi-box geometry is deferred.
     vec![match shape {
+        Shape::Model(_) | Shape::Compound(_) => return Vec::new(),
         Shape::FullCube | Shape::Corner | Shape::Stair | Shape::Cross => LocalBox::FULL_CUBE,
         Shape::LowerSlab => LocalBox {
             min: [0.0; 3],
@@ -450,4 +460,39 @@ pub fn boxes(shape: &Shape) -> Vec<LocalBox> {
             max: bounds.max.map(f64::from),
         },
     }]
+}
+
+#[cfg(test)]
+mod compound_tests {
+    use super::*;
+
+    #[test]
+    fn compound_collision_preserves_the_open_gap_between_parts() {
+        struct Source(Vec<LocalBox>);
+        impl torse_world_services::CollisionSource for Source {
+            fn collision(&self, pos: BlockPos) -> torse_world_services::CollisionCell {
+                if pos == BlockPos::new(0, 0, 0) {
+                    torse_world_services::CollisionCell::Solid(self.0.clone())
+                } else {
+                    torse_world_services::CollisionCell::Empty
+                }
+            }
+        }
+        let shape = Shape::Compound(vec![
+            torse_content::BoxBounds {
+                min: [0.0; 3],
+                max: [0.2, 1.0, 1.0],
+            },
+            torse_content::BoxBounds {
+                min: [0.8, 0.0, 0.0],
+                max: [1.0; 3],
+            },
+        ]);
+        let source = Source(boxes(&shape));
+        assert!(!collides(&source, &Aabb::from_center([0.5; 3], [0.1; 3])));
+        assert!(collides(
+            &source,
+            &Aabb::from_center([0.1, 0.5, 0.5], [0.05; 3])
+        ));
+    }
 }

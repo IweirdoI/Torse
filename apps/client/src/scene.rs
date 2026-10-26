@@ -1260,6 +1260,7 @@ fn render_box(shape: &Shape) -> Option<RenderBox> {
 
 fn shape_box(shape: &Shape) -> Option<RenderBox> {
     match shape {
+        Shape::Model(_) | Shape::Compound(_) => None,
         Shape::FullCube => Some(RenderBox::FULL_CUBE),
         Shape::LowerSlab => Some(RenderBox {
             min: [0.0, 0.0, 0.0],

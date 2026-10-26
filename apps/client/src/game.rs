@@ -547,7 +547,13 @@ fn parse_alpha(value: &str) -> Result<AlphaMode, String> {
 fn collision_shape(shape: &Shape) -> Option<Shape> {
     match shape {
         Shape::FullCube | Shape::LowerSlab => Some(shape.clone()),
-        Shape::Panel | Shape::Cross | Shape::Stair | Shape::Corner | Shape::Box(_) => None,
+        Shape::Panel
+        | Shape::Cross
+        | Shape::Stair
+        | Shape::Corner
+        | Shape::Box(_)
+        | Shape::Model(_)
+        | Shape::Compound(_) => None,
     }
 }
 

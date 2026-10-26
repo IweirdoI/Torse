@@ -337,6 +337,7 @@ fn sample_render(store: &SectionStore, registry: &BlockStateRegistry, pos: Block
 
 fn render_box(definition: &BlockDefinition) -> Option<RenderBox> {
     match &definition.render_profile.shape {
+        Shape::Model(_) | Shape::Compound(_) => None,
         Shape::FullCube => Some(RenderBox::FULL_CUBE),
         Shape::LowerSlab => Some(RenderBox {
             min: [0.0, 0.0, 0.0],
@@ -369,6 +370,8 @@ fn collision_boxes(shape: &Shape) -> Option<Vec<LocalBox>> {
         ],
     };
     match shape {
+        Shape::Model(_) => None,
+        Shape::Compound(boxes) => Some(boxes.iter().map(as_f64).collect()),
         Shape::FullCube => Some(vec![LocalBox::FULL_CUBE]),
         Shape::LowerSlab => Some(vec![LocalBox {
             min: [0.0, 0.0, 0.0],

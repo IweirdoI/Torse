@@ -270,6 +270,8 @@ pub struct MeshData {
     pub tints: Vec<[f32; 3]>,
     /// Overlay vertex tint per emitted vertex.
     pub overlay_tints: Vec<[f32; 3]>,
+    /// Directional face shading policy per vertex: one enables it, zero disables it.
+    pub shades: Vec<f32>,
 }
 
 impl MeshData {
@@ -298,6 +300,7 @@ impl MeshData {
             + self.overlays.len() * size_of::<u16>()
             + self.tints.len() * size_of::<[f32; 3]>()
             + self.overlay_tints.len() * size_of::<[f32; 3]>()
+            + self.shades.len() * size_of::<f32>()
     }
 }
 
@@ -312,6 +315,7 @@ impl MeshData {
             + self.overlays.capacity() * size_of::<u16>()
             + self.tints.capacity() * size_of::<[f32; 3]>()
             + self.overlay_tints.capacity() * size_of::<[f32; 3]>()
+            + self.shades.capacity() * size_of::<f32>()
     }
 }
 
@@ -397,6 +401,9 @@ fn build_mesh_inner(
         mesh.overlay_tints
             .try_reserve_exact(faces * 4)
             .map_err(|_| MeshBuildError::OutputLimit)?;
+        mesh.shades
+            .try_reserve_exact(faces * 4)
+            .map_err(|_| MeshBuildError::OutputLimit)?;
     }
 
     for y in 0..side {
@@ -451,6 +458,7 @@ fn build_mesh_inner(
         mesh.overlays.shrink_to_fit();
         mesh.tints.shrink_to_fit();
         mesh.overlay_tints.shrink_to_fit();
+        mesh.shades.shrink_to_fit();
     }
     Ok(mesh)
 }
@@ -573,6 +581,7 @@ fn emit_face(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
+    mesh.shades.extend([1.0; 4]);
 }
 
 fn emit_cross(mesh: &mut MeshData, block: &RenderBlock, cell: [f32; 3]) {
@@ -623,6 +632,161 @@ fn emit_quad(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
+    mesh.shades.extend([1.0; 4]);
+}
+
+/// Resolved visual surface ready for a mesh; no content registry access is needed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelQuad {
+    pub positions: [[f32; 3]; 4],
+    pub uvs: [[f32; 2]; 4],
+    pub normal: [f32; 3],
+    pub material: u16,
+    pub overlay: Option<u16>,
+    pub tint: [f32; 3],
+    pub overlay_tint: [f32; 3],
+    pub cull_face: Option<Face>,
+    pub shade: bool,
+    pub double_sided: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelMeshError {
+    InvalidQuad,
+    OutputLimit,
+}
+
+/// Append bounded precompiled surfaces atomically; a rejected append leaves the mesh unchanged.
+pub fn append_model(
+    mesh: &mut MeshData,
+    cell: [f32; 3],
+    quads: &[ModelQuad],
+    occluded: impl Fn(Face) -> bool,
+    max_faces: usize,
+) -> Result<(), ModelMeshError> {
+    if quads.len() > 1024 || cell.iter().any(|value| !value.is_finite()) {
+        return Err(ModelMeshError::InvalidQuad);
+    }
+    let mut visible = Vec::new();
+    let mut faces = 0usize;
+    for quad in quads {
+        if quad
+            .positions
+            .iter()
+            .flatten()
+            .chain(quad.uvs.iter().flatten())
+            .chain(&quad.normal)
+            .chain(&quad.tint)
+            .chain(&quad.overlay_tint)
+            .any(|value| !value.is_finite())
+        {
+            return Err(ModelMeshError::InvalidQuad);
+        }
+        if quad.cull_face.is_some_and(&occluded) {
+            continue;
+        }
+        faces += if quad.double_sided { 2 } else { 1 };
+        visible.push(quad);
+    }
+    if mesh
+        .face_count()
+        .checked_add(faces)
+        .is_none_or(|count| count > max_faces)
+        || mesh
+            .positions
+            .len()
+            .checked_add(faces * 4)
+            .is_none_or(|count| count > u32::MAX as usize)
+    {
+        return Err(ModelMeshError::OutputLimit);
+    }
+    for quad in visible {
+        for back in 0..if quad.double_sided { 2 } else { 1 } {
+            let order = if back == 0 {
+                [0, 1, 2, 3]
+            } else {
+                [3, 2, 1, 0]
+            };
+            let positions = order.map(|index| add(cell, quad.positions[index]));
+            let uvs = order.map(|index| quad.uvs[index]);
+            let normal = quad.normal.map(|v| if back == 0 { v } else { -v });
+            emit_quad(
+                mesh,
+                positions,
+                uvs,
+                normal,
+                FaceAppearance {
+                    material: quad.material,
+                    overlay: quad.overlay,
+                    tint: quad.tint,
+                    overlay_tint: quad.overlay_tint,
+                },
+            );
+            let begin = mesh.shades.len() - 4;
+            mesh.shades[begin..].fill(if quad.shade { 1.0 } else { 0.0 });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn quad() -> ModelQuad {
+        ModelQuad {
+            positions: [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [0.0, 1.0, 1.0],
+            ],
+            uvs: [[0.2, 0.8], [0.9, 0.8], [0.9, 0.1], [0.2, 0.1]],
+            normal: [0.0, 0.0, 1.0],
+            material: 7,
+            overlay: Some(8),
+            tint: [0.7; 3],
+            overlay_tint: [0.4; 3],
+            cull_face: Some(Face::PosZ),
+            shade: false,
+            double_sided: true,
+        }
+    }
+
+    #[test]
+    fn model_mesh_preserves_uv_winding_layers_and_atomic_budget() {
+        let mut mesh = MeshData::default();
+        let quad = quad();
+        append_model(
+            &mut mesh,
+            [2.0, 3.0, 4.0],
+            std::slice::from_ref(&quad),
+            |_| false,
+            2,
+        )
+        .unwrap();
+        assert_eq!(mesh.face_count(), 2);
+        assert_eq!(mesh.positions[0], [2.0, 3.0, 5.0]);
+        assert_eq!(&mesh.uvs[..4], &quad.uvs);
+        assert_eq!(mesh.normals[4], [0.0, 0.0, -1.0]);
+        assert_eq!(mesh.materials, [7, 7]);
+        assert_eq!(mesh.overlays, [8, 8]);
+        assert_eq!(mesh.shades, [0.0; 8]);
+        let before = mesh.clone();
+        assert_eq!(
+            append_model(
+                &mut mesh,
+                [0.0; 3],
+                std::slice::from_ref(&quad),
+                |_| false,
+                3
+            ),
+            Err(ModelMeshError::OutputLimit)
+        );
+        assert_eq!(mesh, before);
+        append_model(&mut mesh, [0.0; 3], &[quad], |_| true, 2).unwrap();
+        assert_eq!(mesh, before);
+    }
 }
 
 fn face_uv(face: Face, position: [f32; 3], cell: [f32; 3]) -> [f32; 2] {

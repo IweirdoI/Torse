@@ -603,7 +603,10 @@ impl Drop for Directory {
         for entry in fs::read_dir(&self.0).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_dir() {
-                assert_eq!(entry.file_name(), "checkpoints");
+                assert!(matches!(
+                    entry.file_name().to_str(),
+                    Some("checkpoints" | "sections")
+                ));
                 for file in fs::read_dir(entry.path()).unwrap() {
                     fs::remove_file(file.unwrap().path()).unwrap();
                 }

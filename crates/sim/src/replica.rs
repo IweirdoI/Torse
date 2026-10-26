@@ -100,6 +100,26 @@ pub struct ReplicaSource {
 }
 
 impl ReplicaSource {
+    /// Residency invalidates affected subscriptions before any further output.
+    pub fn publish_section(
+        &mut self,
+        prepared: crate::streaming::PreparedSection,
+    ) -> Result<Publication, CommitFault> {
+        let pos = prepared.position();
+        let mut publication = self.world.publish_section(prepared)?;
+        for (&id, sub) in &mut self.subscriptions {
+            if sub.scope.sections.contains(&pos) && sub.state.is_some() {
+                reset(sub);
+                self.pending_invalidations.insert(id);
+            }
+        }
+        publication.invalidated_replicas = std::mem::take(&mut self.pending_invalidations)
+            .into_iter()
+            .map(SubscriptionId)
+            .collect();
+        Ok(publication)
+    }
+
     pub fn new(
         world: WorldAuthority,
         binding: Binding,

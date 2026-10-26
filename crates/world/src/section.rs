@@ -54,6 +54,16 @@ pub struct Section {
 }
 
 impl Section {
+    pub(crate) fn resume_revision(&mut self, after: Revision) -> Result<(), SectionError> {
+        self.revision = Revision(
+            self.revision
+                .0
+                .max(after.0)
+                .checked_add(1)
+                .ok_or(SectionError::RevisionExhausted)?,
+        );
+        Ok(())
+    }
     /// Create a section filled with one state.
     pub fn new(side: u32, fill: BlockStateId) -> Result<Self, SectionError> {
         let _ = checked_cell_count(side)?;

@@ -169,6 +169,7 @@ pub struct SectionStore {
     side: u32,
     bounds: WorldBounds,
     sections: BTreeMap<SectionPos, Entry>,
+    retired: BTreeMap<SectionPos, Revision>,
 }
 
 impl SectionStore {
@@ -179,6 +180,7 @@ impl SectionStore {
             side,
             bounds,
             sections: BTreeMap::new(),
+            retired: BTreeMap::new(),
         })
     }
 
@@ -222,12 +224,35 @@ impl SectionStore {
     }
 
     /// Install generated or read data for a requested section.
-    pub fn install(&mut self, pos: SectionPos, section: Section) -> Result<(), StoreError> {
+    pub fn retired_revision(&self, pos: SectionPos) -> Option<Revision> {
+        self.retired.get(&pos).copied()
+    }
+
+    pub fn validate_install_revision(
+        &self,
+        pos: SectionPos,
+        section: &Section,
+    ) -> Result<(), StoreError> {
+        if let Some(old) = self.retired.get(&pos) {
+            section
+                .revision()
+                .0
+                .max(old.0)
+                .checked_add(1)
+                .ok_or(SectionError::RevisionExhausted)?;
+        }
+        Ok(())
+    }
+
+    pub fn install(&mut self, pos: SectionPos, mut section: Section) -> Result<(), StoreError> {
         if section.side() != self.side {
             return Err(StoreError::SectionSideMismatch {
                 expected: self.side,
                 actual: section.side(),
             });
+        }
+        if let Some(revision) = self.retired.get(&pos) {
+            section.resume_revision(*revision)?;
         }
         let entry = self
             .sections
@@ -510,6 +535,7 @@ impl SectionStore {
         }
         match entry.phase {
             SectionPhase::Ready => {
+                self.retired.insert(pos, entry.section.revision());
                 self.sections.remove(&pos);
                 Ok(())
             }
@@ -526,7 +552,10 @@ impl SectionStore {
     /// Out-of-order teardown is explicit: normal operation goes through
     /// `release_ticket` and `unload`, which enforce the lifecycle rules.
     pub fn discard(&mut self, pos: SectionPos) -> Option<Section> {
-        self.sections.remove(&pos).map(|entry| entry.section)
+        self.sections.remove(&pos).map(|entry| {
+            self.retired.insert(pos, entry.section.revision());
+            entry.section
+        })
     }
 
     /// Number of sections tracked by the store, in any phase.

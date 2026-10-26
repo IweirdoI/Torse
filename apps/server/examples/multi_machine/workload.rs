@@ -158,6 +158,7 @@ pub fn state(host: &ExecutionHost) -> Result<Vec<u8>, Fault> {
     let snapshot = WorldSnapshot {
         meta,
         state: torse_sim::durable::ExecutionSnapshot {
+            parked: Default::default(),
             world: host
                 .world()
                 .capture_snapshot(meta)

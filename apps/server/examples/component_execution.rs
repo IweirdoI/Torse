@@ -135,6 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let snapshot = WorldSnapshot {
                     meta,
                     state: ExecutionSnapshot {
+                        parked: Default::default(),
                         world: host.world().capture_snapshot(meta)?,
                         runtime: host.runtime().clone(),
                     },

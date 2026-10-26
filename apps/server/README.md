@@ -1,6 +1,6 @@
 # 服务端
 
-包名：`torse-server`。提供有限世界的持久执行、文件恢复、授权网络和可选Mod装配，可在无GPU环境中运行。主程序通过ExecutionHost驱动阶段任务，WorldHost保留可信本地事务示例。范围与证据见[执行与网络验证](../../benchmarks/B6-B7-execution-network.md)。
+包名：`torse-server`。提供权威世界的持久执行、文件恢复、授权网络和可选Mod装配，可在无GPU环境中运行。主程序通过ExecutionHost驱动阶段任务，WorldHost保留可信本地事务示例。范围与证据见[执行与网络验证](../../benchmarks/B6-B7-execution-network.md)。
 
 | 文件 | 职责 |
 |---|---|
@@ -73,7 +73,7 @@ ExecutionHost独占ReplicaSource，使用纯DurableRule规划系统和事件。�
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本2、读版本1和2，快照版本仍为1，应用协议为版本2。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。世界仍有限驻留，未进行硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本3、读版本1至3，快照写版本2、读版本1和2，应用协议为版本2。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。主程序仍使用有限范围，显式装卸接口另见下文，未进行硬件断电验收。
 
 ## 运行态与批量刷盘
 
@@ -200,3 +200,11 @@ cargo run -p torse-server --features mods --example headless_client -- 127.0.0.1
 握手后Ping只刷新接收活跃时间，不回复、不占请求序号，也不写入世界日志。握手前Ping关闭对应连接，旧应用协议版本1在Hello时拒绝。wire版本与存档布局保持不变。
 
 图形客户端每10秒发送一次，从渲染帧和等待钩子驱动，最小化窗口仍轮询网络。演示启动检查`idle_ticks * tick_period >= 3 * heartbeat_interval`：默认1200个Tick、50毫秒一个Tick，空闲窗口60秒。NetworkLimits::validate_timing供其他真实时间宿主在装配时核对配置；使用虚拟时钟的测试可自行安排节奏。静默连接继续回收。验证见[心跳记录](../../benchmarks/B7-heartbeat.md)。
+
+## 持久分区装卸
+
+ExecutionHost已接入Server::unload_section、reload_section和install_section。调用方先持有世界目录锁，再装配SectionPages；恢复器使用with_section_pages接入同一页目录。页先同步发布，装卸记录再走原日志门槛；受影响的授权Peer通过独立控制失效，未相交连接保持。
+
+装卸限于没有已接纳输入或冻结规划的Tick起点，未来事件保守阻止卸载，票据继续生效。未驻留页保留实体身份和持久字段，活动表移除对象，重新装回后水位不变。分区页与未驻留索引均有容量限制，当前不自动回收孤立页。备份须包含日志、检查点及被引用的sections页；便携归档要求先装回全部分区。
+
+可运行durable_stream示例逐次验证park、load和grow，命令、格式与场景证据见[持久分区装卸](../../benchmarks/M3-section-streaming.md)。自动选区、异步I/O及生成版本迁移另行实现。

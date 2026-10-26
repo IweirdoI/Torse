@@ -39,6 +39,11 @@ pub(crate) fn capture(
     budget: OutputBudget,
     limits: CodecLimits,
 ) -> Result<ExecutionArchive, Fault> {
+    if !snapshot.parked.is_empty() {
+        return Err(Fault::incompatible(
+            "portable archive requires all parked sections to be loaded",
+        ));
+    }
     let archive = ExecutionArchive {
         world: SnapshotArchive::capture(&snapshot.world, source, budget)?,
         runtime: snapshot.runtime,
@@ -121,6 +126,7 @@ impl ExecutionRecovery<'_> {
             state: ExecutionSnapshot {
                 world: archive.world.snapshot.clone(),
                 runtime: archive.runtime.clone(),
+                parked: Default::default(),
             },
         })
     }

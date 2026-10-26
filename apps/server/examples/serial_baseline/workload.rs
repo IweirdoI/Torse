@@ -127,6 +127,7 @@ pub fn state_bytes(host: &ExecutionHost) -> Result<Vec<u8>, Fault> {
             resume_at: host.resume_point(),
         },
         state: torse_sim::durable::ExecutionSnapshot {
+            parked: Default::default(),
             world: snapshot(host),
             runtime: host.runtime().clone(),
         },

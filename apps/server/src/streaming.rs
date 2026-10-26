@@ -1,0 +1,249 @@
+//! Durable residency assembly for the execution host. File I/O precedes pure preparation.
+use super::*;
+use crate::{
+    CommitStep, HostCheckpointStore, InvalidationSink, Server, section_pages::SectionPages,
+};
+use torse_storage::CommitJournal;
+use torse_world::Snapshot;
+
+const MAX_PARKED: usize = 4096;
+const MAX_RESIDENT: usize = 4096;
+
+impl ExecutionHost {
+    pub fn parked_sections(&self) -> &BTreeMap<SectionPos, ParkedSection> {
+        &self.parked
+    }
+
+    fn prepare_residency(&self, change: SectionChange) -> Result<ExecutionPrepared, Fault> {
+        if !self.at_tick_boundary()
+            || !self.pending.is_empty()
+            || self.frozen.is_some()
+            || self.stopping.is_some()
+            || self.section_pending.is_some()
+            || (!change.load && !self.runtime.events.is_empty())
+        {
+            return Err(Fault::invalid_data(
+                "section transition requires an idle tick boundary; pending events pin unloads",
+            ));
+        }
+        check_reference(&change, &self.parked)?;
+        if change.load && self.world().store().len() >= MAX_RESIDENT {
+            return Err(Fault::resource_limit("resident section capacity"));
+        }
+        if !change.load {
+            let mut candidate = self.parked.clone();
+            candidate.insert(change.page.sections[0].pos, change.reference.clone());
+            wire::measure_inner(&candidate, self.limits.runtime, self.limits.codec)?;
+        }
+        let world = self
+            .world()
+            .prepare_section(&change.page, change.load, self.limits.runtime)?;
+        let meta = world.meta();
+        let changes = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        let prepared = ExecutionPrepared {
+            world: PreparedWorld {
+                normal: None,
+                section: Some(Box::new(world)),
+            },
+            runtime: self.runtime.clone(),
+            remove_pending: Vec::new(),
+            record: CommitRecord {
+                meta,
+                changes: ExecutionChanges {
+                    world: changes,
+                    runtime: RuntimeUpdate::Full(self.runtime.clone()),
+                    outcome: None,
+                    cancelled: None,
+                    section: Some(change),
+                },
+            },
+        };
+        wire::measure_inner(&prepared.record, self.limits.runtime, self.limits.codec)?;
+        Ok(prepared)
+    }
+}
+
+fn reference(page: &Snapshot, digest: Digest) -> ParkedSection {
+    ParkedSection {
+        digest,
+        entities: page.entities.iter().map(|e| e.id).collect(),
+    }
+}
+fn check_reference(
+    change: &SectionChange,
+    parked: &BTreeMap<SectionPos, ParkedSection>,
+) -> Result<(), Fault> {
+    if change.page.sections.len() != 1
+        || change.reference != reference(&change.page, change.reference.digest)
+    {
+        return Err(Fault::invalid_data("section reference differs from page"));
+    }
+    let pos = change.page.sections[0].pos;
+    let valid = if change.fresh {
+        change.load && !parked.contains_key(&pos) && change.page.entities.is_empty()
+    } else if change.load {
+        parked.get(&pos) == Some(&change.reference)
+    } else {
+        !parked.contains_key(&pos) && parked.len() < MAX_PARKED
+    };
+    if !valid {
+        return Err(Fault::invalid_data("invalid section residency history"));
+    }
+    Ok(())
+}
+
+impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
+    Server<ExecutionHost, J, S>
+{
+    pub fn unload_section(
+        &mut self,
+        pages: &SectionPages,
+        pos: SectionPos,
+        sink: &mut impl InvalidationSink,
+    ) -> Result<CommitStep, Fault> {
+        let host = self.authority()?;
+        let page = host.world().capture_section(pos, host.limits.runtime)?;
+        let digest = pages.digest(&page)?;
+        let change = SectionChange {
+            reference: reference(&page, digest),
+            page,
+            load: false,
+            fresh: false,
+        };
+        let prepared = self.authority.prepare_residency(change)?;
+        pages.put(
+            &prepared
+                .record
+                .changes
+                .section
+                .as_ref()
+                .expect("section record")
+                .page,
+        )?;
+        self.authority.section_pending = Some(prepared);
+        self.drive_one(sink)
+    }
+    pub fn reload_section(
+        &mut self,
+        pages: &SectionPages,
+        pos: SectionPos,
+        sink: &mut impl InvalidationSink,
+    ) -> Result<CommitStep, Fault> {
+        let old = self
+            .authority()?
+            .parked
+            .get(&pos)
+            .ok_or_else(|| Fault::invalid_data("section has no parked page"))?
+            .clone();
+        let page = pages.get(old.digest)?;
+        let change = SectionChange {
+            page,
+            load: true,
+            fresh: false,
+            reference: old,
+        };
+        self.authority.section_pending = Some(self.authority.prepare_residency(change)?);
+        self.drive_one(sink)
+    }
+    /// Install trusted generated terrain. Fresh pages cannot introduce entity identities.
+    pub fn install_section(
+        &mut self,
+        pages: &SectionPages,
+        page: Snapshot,
+        sink: &mut impl InvalidationSink,
+    ) -> Result<CommitStep, Fault> {
+        self.authority()?;
+        let digest = pages.digest(&page)?;
+        let change = SectionChange {
+            reference: reference(&page, digest),
+            page,
+            load: true,
+            fresh: true,
+        };
+        self.authority.section_pending = Some(self.authority.prepare_residency(change)?);
+        self.drive_one(sink)
+    }
+}
+
+impl ExecutionRecovery<'_> {
+    pub fn with_section_pages(mut self, pages: SectionPages) -> Self {
+        self.section_pages = Some(pages);
+        self
+    }
+
+    pub(super) fn replay_section(
+        &mut self,
+        record: CommitRecord<ExecutionChanges>,
+    ) -> Result<(), Fault> {
+        let change = record.changes.section.as_ref().expect("section replay");
+        let before = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Fault::invalid_data("missing execution snapshot"))?;
+        let point = self
+            .point
+            .ok_or_else(|| Fault::invalid_data("missing execution point"))?;
+        if record.meta != record.changes.world.meta
+            || record.meta.compatibility != self.binding.compatibility
+            || record.meta.resume_at != point
+            || point.next_phase != 0
+            || point.next_step != 0
+            || before.work.is_some()
+            || (!change.load && !before.events.is_empty())
+            || record.changes.outcome.is_some()
+            || record.changes.cancelled.is_some()
+            || !matches!(&record.changes.runtime, RuntimeUpdate::Full(state) if state == before)
+        {
+            return Err(Fault::invalid_data(
+                "section record changes execution semantics",
+            ));
+        }
+        check_reference(change, &self.parked)?;
+        let pages = self
+            .section_pages
+            .as_ref()
+            .ok_or_else(|| Fault::invalid_data("section recovery requires page store"))?;
+        if pages.digest(&change.page)? != change.reference.digest {
+            return Err(Fault::invalid_data("journal page digest mismatch"));
+        }
+        self.recovery.replay_section(
+            &record.changes.world,
+            &change.page,
+            change.load,
+            self.limits.runtime,
+        )?;
+        let pos = change.page.sections[0].pos;
+        if change.load {
+            self.parked.remove(&pos);
+        } else {
+            self.parked.insert(pos, change.reference.clone());
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_parked(&self) -> Result<(), Fault> {
+        if self.parked.is_empty() {
+            return Ok(());
+        }
+        if self.parked.len() > MAX_PARKED {
+            return Err(Fault::resource_limit("parked section capacity"));
+        }
+        let pages = self
+            .section_pages
+            .as_ref()
+            .ok_or_else(|| Fault::invalid_data("parked pages require a section store"))?;
+        let mut ids = std::collections::BTreeSet::new();
+        for (pos, expected) in &self.parked {
+            let page = pages.get(expected.digest)?;
+            if page.sections[0].pos != *pos
+                || reference(&page, expected.digest) != *expected
+                || expected.entities.iter().any(|id| !ids.insert(*id))
+            {
+                return Err(Fault::invalid_data("invalid parked page index"));
+            }
+            self.recovery.parked_page_valid(&page)?;
+        }
+        Ok(())
+    }
+}

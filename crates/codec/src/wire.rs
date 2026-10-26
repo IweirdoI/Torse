@@ -12,10 +12,23 @@ use torse_types::*;
 use torse_world::*;
 
 pub const EXECUTION_VERSION: u16 = 1;
-pub const EXECUTION_COMMIT_VERSION: u16 = 2;
+pub const EXECUTION_COMMIT_VERSION: u16 = 3;
+pub const EXECUTION_SNAPSHOT_VERSION: u16 = 2;
 pub trait Wire: Sized {
     fn write(&self, out: &mut Encoder<'_>) -> EncodeResult<()>;
     fn read(input: &mut Decoder<'_>) -> EncodeResult<Self>;
+}
+impl Wire for bool {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        u8::from(*self).write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        match u8::read(d)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(invalid("invalid boolean")),
+        }
+    }
 }
 
 /// Cost of a field body, excluding its root envelope. Uses the actual bounded
@@ -681,7 +694,18 @@ fields!(RuntimeState {
     windows,
     work
 });
-fields!(ExecutionSnapshot { world, runtime });
+fields!(ExecutionSnapshot {
+    world,
+    runtime,
+    parked
+});
+fields!(ParkedSection { digest, entities });
+fields!(SectionChange {
+    page,
+    load,
+    fresh,
+    reference
+});
 fields!(RuntimeProgress {
     next,
     next_event,
@@ -713,7 +737,8 @@ fields!(ExecutionChanges {
     world,
     runtime,
     outcome,
-    cancelled
+    cancelled,
+    section
 });
 fields!(torse_sim::SystemSpec {
     id,
@@ -780,10 +805,39 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
         if v.meta != v.state.world.meta {
             return Err(invalid("execution snapshot metadata"));
         }
-        encode(v, out, b, self.limits)
+        let b = OutputBudget {
+            max_bytes: b.max_bytes.min(u64::from(self.limits.max_frame_bytes)),
+            ..b
+        };
+        let mut e = Encoder::new(out, b, self.limits);
+        e.count_items(1)?;
+        e.write_u16(EXECUTION_SNAPSHOT_VERSION)?;
+        v.write(&mut e)?;
+        e.finish();
+        Ok(())
     }
     fn decode_snapshot(&self, v: &[u8], b: OutputBudget) -> EncodeResult<ModelSnapshot<M>> {
-        let v: ModelSnapshot<M> = decode(v, b, self.limits)?;
+        if v.len() > self.limits.max_frame_bytes as usize {
+            return Err(Fault::resource_limit("execution snapshot too large"));
+        }
+        let mut d = Decoder::new(v, b, self.limits);
+        d.charge_items(1)?;
+        d.charge_bytes(size_of::<ModelSnapshot<M>>() as u64)?;
+        let v = match d.read_u16()? {
+            1 => WorldSnapshot {
+                meta: Wire::read(&mut d)?,
+                state: ExecutionSnapshot {
+                    world: Wire::read(&mut d)?,
+                    runtime: Wire::read(&mut d)?,
+                    parked: BTreeMap::new(),
+                },
+            },
+            EXECUTION_SNAPSHOT_VERSION => ModelSnapshot::<M>::read(&mut d)?,
+            _ => return Err(Fault::incompatible("execution snapshot version")),
+        };
+        if !d.is_complete() {
+            return Err(invalid("trailing execution snapshot bytes"));
+        }
         if v.meta != v.state.world.meta {
             return Err(invalid("execution snapshot metadata"));
         }
@@ -824,6 +878,17 @@ impl<M: AuthorityData<Snapshot = ExecutionSnapshot, Changes = ExecutionChanges>>
                     runtime: RuntimeUpdate::Full(Wire::read(&mut d)?),
                     outcome: Wire::read(&mut d)?,
                     cancelled: Wire::read(&mut d)?,
+                    section: None,
+                },
+            },
+            2 => CommitRecord {
+                meta: Wire::read(&mut d)?,
+                changes: ExecutionChanges {
+                    world: Wire::read(&mut d)?,
+                    runtime: Wire::read(&mut d)?,
+                    outcome: Wire::read(&mut d)?,
+                    cancelled: Wire::read(&mut d)?,
+                    section: None,
                 },
             },
             EXECUTION_COMMIT_VERSION => ModelCommit::<M>::read(&mut d)?,

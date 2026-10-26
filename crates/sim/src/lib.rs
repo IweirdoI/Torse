@@ -26,6 +26,7 @@ mod placement;
 pub mod player;
 pub mod replica;
 pub mod simulation;
+pub mod streaming;
 pub mod system;
 pub mod transaction;
 

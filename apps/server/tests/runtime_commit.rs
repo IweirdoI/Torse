@@ -100,7 +100,10 @@ fn full_and_compact_records_recover_identical_state_at_every_prefix_and_reject_f
             );
         }
         let bytes = codec_bytes(b.record());
-        assert_eq!(&bytes[..2], &2u16.to_le_bytes());
+        assert_eq!(
+            &bytes[..2],
+            &torse_codec::wire::EXECUTION_COMMIT_VERSION.to_le_bytes()
+        );
         for end in 0..bytes.len() {
             assert!(codec.decode_commit(&bytes[..end], base::budget()).is_err());
         }

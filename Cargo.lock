@@ -2908,6 +2908,7 @@ name = "torse-server"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "sha2",
  "torse-codec",
  "torse-content",
  "torse-diagnostics",

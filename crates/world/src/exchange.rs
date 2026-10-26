@@ -277,12 +277,27 @@ impl Snapshot {
         registry: &BlockStateRegistry,
         schemas: Option<&ComponentSchemas>,
     ) -> Result<Self, ExchangeError> {
+        Self::capture_region(meta, store, entities, registry, schemas, None)
+    }
+
+    pub(crate) fn capture_region(
+        meta: SnapshotMeta,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: Option<&ComponentSchemas>,
+        selected: Option<SectionPos>,
+    ) -> Result<Self, ExchangeError> {
         let side = store.side();
         let bounds = store.bounds();
-        let mut sections: Vec<SnapshotSection> = Vec::with_capacity(store.len());
+        let mut sections: Vec<SnapshotSection> =
+            Vec::with_capacity(selected.map_or(store.len(), |_| 1));
         let mut used: BTreeMap<BlockStateId, ()> = BTreeMap::new();
 
-        for pos in store.positions() {
+        for pos in store
+            .positions()
+            .filter(|pos| selected.is_none_or(|s| s == *pos))
+        {
             if !matches!(
                 store.phase(pos),
                 Some(crate::store::SectionPhase::Ready | crate::store::SectionPhase::Active)
@@ -332,8 +347,15 @@ impl Snapshot {
             });
         }
 
-        let mut entity_list = Vec::with_capacity(entities.len());
-        for (_, entity) in entities.iter() {
+        let mut entity_list = Vec::with_capacity(if selected.is_some() {
+            0
+        } else {
+            entities.len()
+        });
+        for (_, entity) in entities
+            .iter()
+            .filter(|(_, e)| selected.is_none_or(|s| e.position.section(side) == Some(s)))
+        {
             if let Some(schemas) = schemas {
                 for schema in entity.components.ids() {
                     schemas

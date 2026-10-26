@@ -184,6 +184,7 @@ fn bytes(host: &ExecutionHost) -> Vec<u8> {
     let snapshot = WorldSnapshot {
         meta,
         state: ExecutionSnapshot {
+            parked: Default::default(),
             world: host.world().capture_snapshot(meta).unwrap(),
             runtime: host.runtime().clone(),
         },

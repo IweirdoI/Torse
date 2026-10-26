@@ -220,6 +220,21 @@ pub struct RuntimeState {
 pub struct ExecutionSnapshot {
     pub world: Snapshot,
     pub runtime: RuntimeState,
+    pub parked: std::collections::BTreeMap<torse_types::SectionPos, ParkedSection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParkedSection {
+    pub digest: torse_types::Digest,
+    pub entities: Vec<torse_types::EntityId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SectionChange {
+    pub page: Snapshot,
+    pub load: bool,
+    pub fresh: bool,
+    pub reference: ParkedSection,
 }
 
 /// Portable checkpoint data with explicit source versions and untouched runtime.
@@ -234,6 +249,7 @@ pub struct ExecutionChanges {
     pub runtime: RuntimeUpdate,
     pub outcome: Option<ReplyStatus>,
     pub cancelled: Option<Accepted>,
+    pub section: Option<SectionChange>,
 }
 
 /// Full state freezes/finishes a phase. Progress reuses its immutable rule and

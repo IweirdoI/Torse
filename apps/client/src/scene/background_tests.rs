@@ -233,17 +233,16 @@ fn completed_meshes_reject_terrain_neighbor_reload_epoch_and_asset_changes() {
                         &symbols,
                     )
                     .unwrap();
-                assert_eq!(
-                    scene.authority.store().revision(SectionPos::ZERO),
-                    before,
-                    "same-revision reload exercises ABA protection"
+                assert!(
+                    scene.authority.store().revision(SectionPos::ZERO) > before,
+                    "reload advances the terrain revision"
                 );
             }
             3 => {
                 let neighbor = SectionPos::new(1, 0, 0);
                 let before = scene.authority.store().revision(neighbor);
                 replace(&mut scene, neighbor);
-                assert_eq!(scene.authority.store().revision(neighbor), before);
+                assert!(scene.authority.store().revision(neighbor) > before);
             }
             4 => scene.epoch = scene_epoch().unwrap(),
             _ => scene.asset_generation += 1,

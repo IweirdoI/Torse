@@ -21,7 +21,7 @@ impl Snapshot {
         registry: &BlockStateRegistry,
         budget: OutputBudget,
     ) -> Result<Self, Fault> {
-        Self::capture_selected_with_budget(meta, store, entities, registry, budget, None)
+        Self::capture_selected_with_budget(meta, store, entities, registry, budget, (None, None))
     }
 
     /// Preflight and capture only the persistent projection of the world.
@@ -33,7 +33,37 @@ impl Snapshot {
         schemas: &crate::ComponentSchemas,
         budget: OutputBudget,
     ) -> Result<Self, Fault> {
-        Self::capture_selected_with_budget(meta, store, entities, registry, budget, Some(schemas))
+        Self::capture_selected_with_budget(
+            meta,
+            store,
+            entities,
+            registry,
+            budget,
+            (Some(schemas), None),
+        )
+    }
+
+    /// Capture one readable section and its entities without cloning unrelated data.
+    pub fn capture_section_with_budget(
+        meta: SnapshotMeta,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: Option<&crate::ComponentSchemas>,
+        pos: torse_types::SectionPos,
+        budget: OutputBudget,
+    ) -> Result<Self, Fault> {
+        if store.section(pos).is_none() {
+            return Err(Fault::invalid_data("section is not readable"));
+        }
+        Self::capture_selected_with_budget(
+            meta,
+            store,
+            entities,
+            registry,
+            budget,
+            (schemas, Some(pos)),
+        )
     }
 
     fn capture_selected_with_budget(
@@ -42,13 +72,20 @@ impl Snapshot {
         entities: &EntityStore,
         registry: &BlockStateRegistry,
         budget: OutputBudget,
-        schemas: Option<&crate::ComponentSchemas>,
+        selection: (
+            Option<&crate::ComponentSchemas>,
+            Option<torse_types::SectionPos>,
+        ),
     ) -> Result<Self, Fault> {
+        let (schemas, selected) = selection;
         let mut remaining = Remaining(budget);
         remaining.entries::<Self>(1)?;
-        remaining.entries::<SnapshotSection>(store.len())?;
+        remaining.entries::<SnapshotSection>(selected.map_or(store.len(), |_| 1))?;
         let mut used = [false; u16::MAX as usize + 1];
-        for pos in store.positions() {
+        for pos in store
+            .positions()
+            .filter(|pos| selected.is_none_or(|s| s == *pos))
+        {
             let section = store
                 .section(pos)
                 .ok_or_else(|| Fault::invalid_data("snapshot section is not readable"))?;
@@ -73,7 +110,10 @@ impl Snapshot {
             remaining
                 .bytes(std::mem::size_of_val(registry.state_values(state).unwrap_or(&[])) as u64)?;
         }
-        for (_, entity) in entities.iter() {
+        for (_, entity) in entities
+            .iter()
+            .filter(|(_, e)| selected.is_none_or(|s| e.position.section(store.side()) == Some(s)))
+        {
             remaining.entries::<SnapshotEntity>(1)?;
             for schema in entity.components.ids() {
                 if let Some(schemas) = schemas
@@ -94,7 +134,7 @@ impl Snapshot {
                 }
             }
         }
-        Self::capture_selected(meta, store, entities, registry, schemas)
+        Self::capture_region(meta, store, entities, registry, schemas, selected)
             .map_err(|error| Fault::invalid_data(error.to_string()))
     }
 }

@@ -28,6 +28,8 @@ use runtime_budget::RuntimeBudget;
 #[path = "prevalidation.rs"]
 mod prevalidation;
 pub use prevalidation::{PrevalidationConfig, PrevalidationStats};
+#[path = "streaming.rs"]
+mod streaming;
 
 pub struct ExecutionModel;
 impl AuthorityData for ExecutionModel {
@@ -139,6 +141,8 @@ struct Queued {
     tick: Tick,
 }
 pub struct ExecutionHost {
+    parked: BTreeMap<SectionPos, ParkedSection>,
+    section_pending: Option<ExecutionPrepared>,
     source: ReplicaSource,
     runtime: RuntimeState,
     rules: Vec<Box<dyn DurableRule>>,
@@ -158,10 +162,14 @@ pub struct ExecutionHost {
     prevalidated: RefCell<prevalidation::PrevalidationCache>,
 }
 pub struct ExecutionPrepared {
-    world: torse_sim::PreparedChange,
+    world: PreparedWorld,
     record: CommitRecord<ExecutionChanges>,
     remove_pending: Vec<RequestId>,
     runtime: RuntimeState,
+}
+struct PreparedWorld {
+    normal: Option<torse_sim::PreparedChange>,
+    section: Option<Box<torse_sim::streaming::PreparedSection>>,
 }
 impl PreparedChange for ExecutionPrepared {
     type Model = ExecutionModel;
@@ -375,6 +383,8 @@ impl ExecutionHost {
         )?;
         Ok(Self {
             source: ReplicaSource::new(world, binding, limits.replicas)?,
+            parked: BTreeMap::new(),
+            section_pending: None,
             runtime,
             rules,
             actions,
@@ -683,9 +693,13 @@ impl ExecutionHost {
                     runtime: update,
                     outcome,
                     cancelled: None,
+                    section: None,
                 },
             },
-            world: prepared,
+            world: PreparedWorld {
+                normal: Some(prepared),
+                section: None,
+            },
             remove_pending,
             runtime,
         })
@@ -1080,6 +1094,9 @@ impl HostAuthority for ExecutionHost {
         }
     }
     fn prepare_next(&mut self) -> Result<Option<ExecutionPrepared>, Fault> {
+        if let Some(prepared) = self.section_pending.take() {
+            return Ok(Some(prepared));
+        }
         if self.shutdown_ready() {
             return Ok(None);
         }
@@ -1184,7 +1201,21 @@ impl HostAuthority for ExecutionHost {
         .map(Some)
     }
     fn publish(&mut self, prepared: ExecutionPrepared) -> Result<Publication, Fault> {
-        let publication = self.source.publish(prepared.world).map_err(commit_fault)?;
+        let publication = if let Some(section) = prepared.world.section {
+            self.source.publish_section(*section)
+        } else {
+            self.source
+                .publish(prepared.world.normal.expect("normal preparation"))
+        }
+        .map_err(commit_fault)?;
+        if let Some(section) = &prepared.record.changes.section {
+            let pos = section.page.sections[0].pos;
+            if section.load {
+                self.parked.remove(&pos);
+            } else {
+                self.parked.insert(pos, section.reference.clone());
+            }
+        }
         if let Some(request) = &prepared.record.changes.cancelled
             && let Some(live) = self.sessions.get_mut(&request.id.session.0)
         {
@@ -1232,15 +1263,18 @@ impl HostAuthority for ExecutionHost {
                 "execution checkpoint requires tick start",
             ));
         }
+        let parked_cost = wire::measure_inner(&self.parked, budget, self.limits.codec)?;
         let world_budget = OutputBudget {
             max_items: budget
                 .max_items
                 .checked_sub(self.limits.runtime.max_items)
+                .and_then(|items| items.checked_sub(parked_cost.items))
                 .ok_or_else(|| Fault::resource_limit("runtime snapshot reservation"))?,
             max_bytes: budget
                 .max_bytes
                 .checked_sub(
                     self.limits.runtime.max_bytes
+                        + parked_cost.owned_bytes.max(parked_cost.encoded_bytes)
                         + size_of::<WorldSnapshot<ExecutionSnapshot>>() as u64,
                 )
                 .ok_or_else(|| Fault::resource_limit("runtime snapshot reservation"))?,
@@ -1258,6 +1292,7 @@ impl HostAuthority for ExecutionHost {
             state: ExecutionSnapshot {
                 world,
                 runtime: self.runtime.clone(),
+                parked: self.parked.clone(),
             },
         })
     }
@@ -1276,6 +1311,8 @@ impl HostAuthority for ExecutionHost {
 }
 
 pub struct ExecutionRecovery<'a> {
+    parked: BTreeMap<SectionPos, ParkedSection>,
+    section_pages: Option<crate::section_pages::SectionPages>,
     binding: Binding,
     recovery: Recovery<'a>,
     runtime: Option<RuntimeState>,
@@ -1295,6 +1332,8 @@ impl<'a> ExecutionRecovery<'a> {
         limits: ExecutionLimits,
     ) -> Self {
         Self {
+            parked: BTreeMap::new(),
+            section_pages: None,
             binding,
             recovery: Recovery::new(binding.world, registry, schemas),
             runtime: None,
@@ -1341,9 +1380,13 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
         self.point = Some(snapshot.meta.resume_at);
         self.runtime = Some(snapshot.state.runtime);
+        self.parked = snapshot.state.parked;
         Ok(())
     }
     fn replay(&mut self, record: CommitRecord<ExecutionChanges>) -> Result<(), Fault> {
+        if record.changes.section.is_some() {
+            return self.replay_section(record);
+        }
         let previous = self
             .point
             .ok_or_else(|| Fault::invalid_data("missing execution snapshot"))?;
@@ -1465,6 +1508,7 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
         Ok(())
     }
     fn finish(self, expected: CommitCursor) -> Result<ExecutionHost, Fault> {
+        self.validate_parked()?;
         if self.recovery.cursor() != expected {
             return Err(Fault::invalid_data("execution recovery cursor"));
         }
@@ -1472,7 +1516,7 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
             .recovery
             .finish()
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
-        ExecutionHost::from_state(
+        let mut host = ExecutionHost::from_state(
             self.binding,
             world,
             self.actions,
@@ -1480,6 +1524,8 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
             self.limits,
             self.runtime
                 .ok_or_else(|| Fault::invalid_data("missing runtime"))?,
-        )
+        )?;
+        host.parked = self.parked;
+        Ok(host)
     }
 }

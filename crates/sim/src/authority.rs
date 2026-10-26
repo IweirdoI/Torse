@@ -117,6 +117,80 @@ pub struct WorldAuthority {
 }
 
 impl WorldAuthority {
+    pub fn capture_section(
+        &self,
+        pos: torse_types::SectionPos,
+        budget: torse_types::OutputBudget,
+    ) -> Result<Snapshot, torse_types::Fault> {
+        Snapshot::capture_section_with_budget(
+            crate::streaming::page_meta(self),
+            &self.store,
+            &self.entities,
+            &self.registry,
+            Some(&self.schemas),
+            pos,
+            budget,
+        )
+    }
+
+    pub fn prepare_section(
+        &self,
+        page: &Snapshot,
+        load: bool,
+        budget: torse_types::OutputBudget,
+    ) -> Result<crate::streaming::PreparedSection, torse_types::Fault> {
+        crate::streaming::prepare(self, page, load, budget)
+    }
+
+    pub fn publish_section(
+        &mut self,
+        mut prepared: crate::streaming::PreparedSection,
+    ) -> Result<Publication, CommitFault> {
+        prepared.validate(self)?;
+        let pos = prepared.position();
+        let mut publication = self.coordinator.publish_with_entities(
+            &mut self.store,
+            &mut self.entities,
+            prepared.barrier,
+        )?;
+        if prepared.load {
+            self.store
+                .request(pos)
+                .map_err(|_| CommitFault::Invariant("section request failed"))?;
+            self.store
+                .install(pos, prepared.section.take().expect("validated page"))
+                .map_err(|_| CommitFault::Invariant("section install failed"))?;
+            self.store
+                .finish_load(pos)
+                .map_err(|_| CommitFault::Invariant("section activation failed"))?;
+            for entity in prepared.entities {
+                self.entities
+                    .insert_restored(entity.id, entity.position, entity.components)
+                    .map_err(|_| CommitFault::Invariant("section entity activation failed"))?;
+            }
+        } else {
+            self.store
+                .unload(pos)
+                .map_err(|_| CommitFault::Invariant("section unload failed"))?;
+            for entity in prepared.entities {
+                let handle = self
+                    .entities
+                    .handle_of(entity.id)
+                    .ok_or(CommitFault::Invariant("section entity vanished"))?;
+                self.entities
+                    .despawn(handle)
+                    .ok_or(CommitFault::Invariant("section entity removal failed"))?;
+            }
+        }
+        publication.touched.push((
+            pos,
+            self.store
+                .section(pos)
+                .map_or(torse_types::Revision::INITIAL, |s| s.revision()),
+        ));
+        Ok(publication)
+    }
+
     pub fn prevalidate_components(
         &self,
         group: &crate::TransactionGroup,
@@ -392,6 +466,98 @@ pub struct Recovery<'a> {
 }
 
 impl<'a> Recovery<'a> {
+    /// Apply an isolated residency record without executing gameplay or generation.
+    pub fn replay_section(
+        &mut self,
+        changes: &ChangeSet,
+        page: &Snapshot,
+        load: bool,
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), torse_types::Fault> {
+        let invalid = || torse_types::Fault::invalid_data("illegal section recovery transition");
+        if changes.meta.cursor.world != self.world
+            || changes.meta.previous != self.seq
+            || self.seq.next() != Some(changes.meta.cursor.seq)
+            || changes.meta.resume_at != self.resume
+            || changes.meta.compatibility != self.compatibility
+            || !changes.edits.is_empty()
+            || !changes.entity_moves.is_empty()
+            || !changes.component_edits.is_empty()
+            || changes.entity_lifecycle.is_some()
+        {
+            return Err(invalid());
+        }
+        let restored = self.restored.take().ok_or_else(invalid)?;
+        let mut coordinator = CommitCoordinator::new(self.world).resumed_at(self.seq);
+        coordinator.set_compatibility(self.compatibility);
+        coordinator.set_resume_point(self.resume);
+        let mut world = WorldAuthority {
+            world: self.world,
+            registry: self.registry.clone(),
+            schemas: self.schemas.clone(),
+            store: restored.store,
+            entities: restored.entities,
+            coordinator,
+        };
+        let prepared = world.prepare_section(page, load, budget)?;
+        if prepared.meta() != changes.meta {
+            return Err(invalid());
+        }
+        world
+            .publish_section(prepared)
+            .map_err(crate::streaming::fault)?;
+        self.seq = changes.meta.cursor.seq;
+        self.restored = Some(RestoredWorld {
+            store: world.store,
+            entities: world.entities,
+            resume: self.resume,
+        });
+        Ok(())
+    }
+
+    pub fn parked_page_valid(&self, page: &Snapshot) -> Result<(), torse_types::Fault> {
+        let restored = self
+            .restored
+            .as_ref()
+            .ok_or_else(|| torse_types::Fault::invalid_data("missing snapshot"))?;
+        if page.sections.len() != 1
+            || restored.store.phase(page.sections[0].pos).is_some()
+            || page.side != restored.store.side()
+            || page.bounds != restored.store.bounds()
+            || page.meta.cursor.world != self.world
+            || page.meta.compatibility != self.compatibility
+            || page.meta.cursor.seq > self.seq
+            || page.next_entity_id > restored.entities.next_entity_id()
+            || page
+                .entities
+                .iter()
+                .any(|e| restored.entities.handle_of(e.id).is_some())
+        {
+            return Err(torse_types::Fault::invalid_data(
+                "parked page conflicts with resident world",
+            ));
+        }
+        let data = page
+            .restore(self.registry, self.schemas)
+            .map_err(crate::streaming::fault)?;
+        crate::block_instances::validate(&data.store, &data.entities, self.registry)
+            .map_err(crate::streaming::fault)?;
+        if page.entities.iter().any(|e| {
+            torse_world::Position::new(
+                f64::from_bits(e.position_bits[0]),
+                f64::from_bits(e.position_bits[1]),
+                f64::from_bits(e.position_bits[2]),
+            )
+            .section(page.side)
+                != Some(page.sections[0].pos)
+        }) {
+            return Err(torse_types::Fault::invalid_data(
+                "parked entity outside section",
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a recovery bound to one world's registry.
     pub fn new(
         world: WorldId,

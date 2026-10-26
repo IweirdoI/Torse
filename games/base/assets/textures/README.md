@@ -18,7 +18,7 @@
 
 ## 与内容的绑定
 
-客户端在[texture.rs](../../../apps/client/src/texture.rs)的`base_pack`中把内容材质键映射到图集矩形：
+客户端在[texture.rs](../../../../apps/client/src/texture.rs)的`base_pack`中把内容材质键映射到图集矩形：
 
 | 材质键 | 图集矩形 |
 |---|---|

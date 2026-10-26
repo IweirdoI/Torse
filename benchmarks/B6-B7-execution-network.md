@@ -1,6 +1,6 @@
 # B6持久执行与B7网络验收
 
-日期：2026-10-24。环境：Windows本地，Rust1.93.1，默认features，真实文件系统与回环TCP。范围是有限世界与同步日志的正确性，非性能承诺。设计登记见TorseDesign/contracts/05-durable-execution-network.md。
+日期：2026-10-24。环境：Windows本地，Rust1.93.1，默认features，真实文件系统与回环TCP。范围是有限世界与同步日志的正确性，非性能承诺。
 
 ## 入口
 

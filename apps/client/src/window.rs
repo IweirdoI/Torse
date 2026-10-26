@@ -1401,10 +1401,10 @@ const fn demo_scope() -> [SectionPos; 2] {
 /// Left breaks the hit cell; right places the selected material against the
 /// entered face. A hit inside a solid cell carries no face, so placement is
 /// dropped rather than guessed.
-/// The half a placement produces, per Minecraft-style aim semantics: a click
-/// on a ceiling underside places the upper half, a click on a floor top the
-/// lower half, and a side click follows the aim point's height within the
-/// targeted cell.
+/// The half a placement produces, decided by the aimed face: a click on a
+/// ceiling underside places the upper half, a click on a floor top the lower
+/// half, and a side click follows the aim point's height within the targeted
+/// cell.
 fn place_half(aim: &PickOutcome) -> u32 {
     let PickOutcome::Hit(hit) = aim else {
         return 0;

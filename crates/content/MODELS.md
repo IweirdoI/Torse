@@ -24,7 +24,18 @@ The CPU renderer accepts resolved `ModelQuad` values through `append_model`.
 The caller resolves material identities and supplies its conservative boundary
 culling policy. The operation checks its face budget before changing the mesh,
 preserves UVs and layers, and emits reversed winding and normals for back faces.
-The mesh carries one shading-policy value per vertex in `shades`.
+The mesh carries one shading-policy value per vertex in `shades`: -1 uses the
+geometric normal, while [0,1] overrides directional face brightness. Disabling
+model shading selects 1. An optional authored direction stays independent of
+the geometric normal used for illumination and picking.
+
+A model may include at most 64 independent weighted parts, with up to 64 choices
+per part. Positive u32 weights and bounded shared quad arrays preserve each
+part without multiplying alternatives into a Cartesian product. At most 1024
+quads can be active, and at most 65536 can be stored. `selected_quads(seed)`
+chooses each part independently and deterministically. Every alternative and
+weight contributes to presentation identity. Conservative occlusion permits
+only complete opaque boundary quads present in every alternative of a part.
 
 ## Identity and compatibility
 

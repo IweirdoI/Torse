@@ -39,9 +39,22 @@ pub const MAX_MODEL_QUADS: usize = 1024;
 pub const MAX_COMPOUND_BOXES: usize = 64;
 
 /// A complete static visual model selected by one finite state.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RenderModel {
     pub quads: Vec<RenderQuad>,
+    /// Independent parts, each selecting one positive-weight alternative.
+    pub parts: Vec<ModelPart>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelPart {
+    pub choices: Vec<ModelChoice>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelChoice {
+    pub weight: u32,
+    pub quads: std::sync::Arc<Vec<RenderQuad>>,
 }
 
 /// A pretransformed outward-facing quad, with independent material and UVs.
@@ -56,15 +69,121 @@ pub struct RenderQuad {
     pub cull_face: Option<Face>,
     pub tint_channel: Option<u8>,
     pub shade: bool,
+    pub shade_direction: Option<Face>,
     pub double_sided: bool,
 }
 
 impl RenderModel {
+    /// Conservative whole-face coverage common to every weighted alternative.
+    pub fn occlusion_mask(&self) -> u8 {
+        fn mask(quads: &[RenderQuad]) -> u8 {
+            quads.iter().fold(0, |mask, quad| {
+                if quad.alpha_mode != AlphaMode::Opaque {
+                    return mask;
+                }
+                for face in Face::ALL {
+                    let axis = face.index() / 2;
+                    let boundary = (face.index() % 2) as f32;
+                    let other: Vec<_> = (0..3).filter(|i| *i != axis).collect();
+                    if (quad.normal[axis] - (boundary * 2.0 - 1.0)).abs() < 1e-6
+                        && quad
+                            .positions
+                            .iter()
+                            .all(|p| (p[axis] - boundary).abs() < 1e-6)
+                        && [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)]
+                            .iter()
+                            .all(|(a, b)| {
+                                quad.positions.iter().any(|p| {
+                                    (p[other[0]] - *a).abs() < 1e-6
+                                        && (p[other[1]] - *b).abs() < 1e-6
+                                })
+                            })
+                    {
+                        return mask | (1 << face.index());
+                    }
+                }
+                mask
+            })
+        }
+        self.parts.iter().fold(mask(&self.quads), |coverage, part| {
+            coverage
+                | if part.choices.is_empty() {
+                    0
+                } else {
+                    part.choices
+                        .iter()
+                        .fold(0b11_1111, |common, c| common & mask(&c.quads))
+                }
+        })
+    }
+
+    /// Deterministic independent selection from an application-owned position seed.
+    pub fn selected_quads(&self, seed: u64) -> impl Iterator<Item = &RenderQuad> {
+        self.quads.iter().chain(
+            self.parts
+                .iter()
+                .enumerate()
+                .flat_map(move |(index, part)| {
+                    let mut hash =
+                        seed.wrapping_add((index as u64).wrapping_mul(0x9e3779b97f4a7c15));
+                    hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d049bb133111eb);
+                    hash ^= hash >> 31;
+                    let total: u64 = part.choices.iter().map(|c| u64::from(c.weight)).sum();
+                    let mut value = if total == 0 { 0 } else { hash % total };
+                    part.choices
+                        .iter()
+                        .find(|choice| {
+                            if value < u64::from(choice.weight) {
+                                true
+                            } else {
+                                value -= u64::from(choice.weight);
+                                false
+                            }
+                        })
+                        .into_iter()
+                        .flat_map(|choice| choice.quads.iter())
+                }),
+        )
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.quads.len() > MAX_MODEL_QUADS {
+        if self.parts.len() > 64
+            || self.parts.iter().any(|part| {
+                part.choices.is_empty()
+                    || part.choices.len() > 64
+                    || part.choices.iter().any(|choice| choice.weight == 0)
+            })
+        {
+            return Err("visual model has invalid weighted parts");
+        }
+        let active = self.quads.len()
+            + self
+                .parts
+                .iter()
+                .map(|part| {
+                    part.choices
+                        .iter()
+                        .map(|choice| choice.quads.len())
+                        .max()
+                        .unwrap_or(0)
+                })
+                .sum::<usize>();
+        let stored = self.quads.len()
+            + self
+                .parts
+                .iter()
+                .flat_map(|p| &p.choices)
+                .map(|choice| choice.quads.len())
+                .sum::<usize>();
+        if active > MAX_MODEL_QUADS || stored > MAX_MODEL_QUADS * 64 {
             return Err("visual model exceeds the quad limit");
         }
-        for quad in &self.quads {
+        for quad in self.quads.iter().chain(
+            self.parts
+                .iter()
+                .flat_map(|part| part.choices.iter().flat_map(|choice| choice.quads.iter())),
+        ) {
             if quad
                 .positions
                 .iter()

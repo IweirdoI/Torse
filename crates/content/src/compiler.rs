@@ -799,14 +799,10 @@ fn validate_block(
 fn claimable_occlusion(shape: &Shape) -> u8 {
     match shape {
         Shape::FullCube => 0b11_1111,
+        Shape::Model(model) => model.occlusion_mask(),
         // A lower slab spans the cell footprint only at its bottom boundary.
         Shape::LowerSlab => 0b000100,
-        Shape::Panel
-        | Shape::Cross
-        | Shape::Corner
-        | Shape::Stair
-        | Shape::Model(_)
-        | Shape::Compound(_) => 0,
+        Shape::Panel | Shape::Cross | Shape::Corner | Shape::Stair | Shape::Compound(_) => 0,
         Shape::Box(bounds) => {
             let spans = |a: usize| bounds.min[a] <= 0.0 && bounds.max[a] >= 1.0;
             let mut mask = 0u8;
@@ -1311,6 +1307,30 @@ impl CanonicalWriter {
         });
     }
 
+    fn model_quad(&mut self, quad: &crate::RenderQuad) {
+        for value in quad
+            .positions
+            .iter()
+            .flatten()
+            .chain(quad.uvs.iter().flatten())
+            .chain(&quad.normal)
+        {
+            self.u32(value.to_bits());
+        }
+        self.key(&quad.material);
+        self.u8(quad.alpha_mode as u8);
+        self.bool(quad.overlay.is_some());
+        if let Some(overlay) = &quad.overlay {
+            self.key(&overlay.material);
+            self.u8(overlay.alpha_mode as u8);
+        }
+        self.u8(quad.cull_face.map_or(255, |face| face.index() as u8));
+        self.u8(quad.tint_channel.unwrap_or(255));
+        self.bool(quad.shade);
+        self.u8(quad.shade_direction.map_or(255, |face| face.index() as u8));
+        self.bool(quad.double_sided);
+    }
+
     fn shape(&mut self, shape: &Shape) {
         match shape {
             Shape::Compound(boxes) => {
@@ -1326,26 +1346,18 @@ impl CanonicalWriter {
                 self.u8(8);
                 self.u32(model.quads.len() as u32);
                 for quad in &model.quads {
-                    for value in quad
-                        .positions
-                        .iter()
-                        .flatten()
-                        .chain(quad.uvs.iter().flatten())
-                        .chain(&quad.normal)
-                    {
-                        self.u32(value.to_bits());
+                    self.model_quad(quad);
+                }
+                self.u32(model.parts.len() as u32);
+                for part in &model.parts {
+                    self.u32(part.choices.len() as u32);
+                    for choice in &part.choices {
+                        self.u32(choice.weight);
+                        self.u32(choice.quads.len() as u32);
+                        for quad in choice.quads.iter() {
+                            self.model_quad(quad);
+                        }
                     }
-                    self.key(&quad.material);
-                    self.u8(quad.alpha_mode as u8);
-                    self.bool(quad.overlay.is_some());
-                    if let Some(overlay) = &quad.overlay {
-                        self.key(&overlay.material);
-                        self.u8(overlay.alpha_mode as u8);
-                    }
-                    self.u8(quad.cull_face.map_or(255, |face| face.index() as u8));
-                    self.u8(quad.tint_channel.unwrap_or(255));
-                    self.bool(quad.shade);
-                    self.bool(quad.double_sided);
                 }
             }
             Shape::FullCube => self.u8(0),

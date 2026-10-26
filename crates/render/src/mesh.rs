@@ -581,7 +581,7 @@ fn emit_face(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
-    mesh.shades.extend([1.0; 4]);
+    mesh.shades.extend([-1.0; 4]);
 }
 
 fn emit_cross(mesh: &mut MeshData, block: &RenderBlock, cell: [f32; 3]) {
@@ -632,7 +632,7 @@ fn emit_quad(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
-    mesh.shades.extend([1.0; 4]);
+    mesh.shades.extend([-1.0; 4]);
 }
 
 /// Resolved visual surface ready for a mesh; no content registry access is needed.
@@ -647,6 +647,7 @@ pub struct ModelQuad {
     pub overlay_tint: [f32; 3],
     pub cull_face: Option<Face>,
     pub shade: bool,
+    pub shade_override: Option<f32>,
     pub double_sided: bool,
 }
 
@@ -671,14 +672,17 @@ pub fn append_model(
     let mut faces = 0usize;
     for quad in quads {
         if quad
-            .positions
-            .iter()
-            .flatten()
-            .chain(quad.uvs.iter().flatten())
-            .chain(&quad.normal)
-            .chain(&quad.tint)
-            .chain(&quad.overlay_tint)
-            .any(|value| !value.is_finite())
+            .shade_override
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+            || quad
+                .positions
+                .iter()
+                .flatten()
+                .chain(quad.uvs.iter().flatten())
+                .chain(&quad.normal)
+                .chain(&quad.tint)
+                .chain(&quad.overlay_tint)
+                .any(|value| !value.is_finite())
         {
             return Err(ModelMeshError::InvalidQuad);
         }
@@ -723,7 +727,11 @@ pub fn append_model(
                 },
             );
             let begin = mesh.shades.len() - 4;
-            mesh.shades[begin..].fill(if quad.shade { 1.0 } else { 0.0 });
+            mesh.shades[begin..].fill(if quad.shade {
+                quad.shade_override.unwrap_or(-1.0)
+            } else {
+                1.0
+            });
         }
     }
     Ok(())
@@ -749,6 +757,7 @@ mod model_tests {
             overlay_tint: [0.4; 3],
             cull_face: Some(Face::PosZ),
             shade: false,
+            shade_override: None,
             double_sided: true,
         }
     }
@@ -771,7 +780,7 @@ mod model_tests {
         assert_eq!(mesh.normals[4], [0.0, 0.0, -1.0]);
         assert_eq!(mesh.materials, [7, 7]);
         assert_eq!(mesh.overlays, [8, 8]);
-        assert_eq!(mesh.shades, [0.0; 8]);
+        assert_eq!(mesh.shades, [1.0; 8]);
         let before = mesh.clone();
         assert_eq!(
             append_model(

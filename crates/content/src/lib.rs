@@ -18,8 +18,8 @@ pub use descriptor::{
     AlphaMode, BlockDefinition, BoxBounds, CapabilityBinding, CapabilityDescriptor,
     CollisionProfile, ComponentField, ComponentFieldType, ComponentSchema, ExecutionContract, Face,
     FaceMaterials, FaceOverlay, FaceOverlays, FiniteField, InteractionProfile, LightTransport,
-    MAX_COMPOUND_BOXES, MAX_MODEL_QUADS, MethodDescriptor, ModuleDescriptor, ModuleSide,
-    OcclusionProfile, PersistencePolicy, RenderModel, RenderProfile, RenderQuad,
-    RequestedPermission, SelectionProfile, ServiceDescriptor, Shape, StateProfile, StateSchema,
-    SystemDescriptor,
+    MAX_COMPOUND_BOXES, MAX_MODEL_QUADS, MethodDescriptor, ModelChoice, ModelPart,
+    ModuleDescriptor, ModuleSide, OcclusionProfile, PersistencePolicy, RenderModel, RenderProfile,
+    RenderQuad, RequestedPermission, SelectionProfile, ServiceDescriptor, Shape, StateProfile,
+    StateSchema, SystemDescriptor,
 };

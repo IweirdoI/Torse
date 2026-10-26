@@ -1629,21 +1629,21 @@ mod tests {
     #[test]
     fn publish_memory_charges_reserved_capacity_of_a_nonempty_mesh() {
         let mesh = quad_with_reserved_positions(1024);
-        assert_eq!(mesh.byte_size(), 252);
-        assert_eq!(mesh.allocated_bytes(), 12_492);
+        assert_eq!(mesh.byte_size(), 268);
+        assert_eq!(mesh.allocated_bytes(), 12_508);
 
         let mut cache = MeshCache::new(1);
         let job = MeshJob::capture(1, SectionPos::ZERO, |_| None);
         cache.insert(job, mesh, |_| None);
 
-        let mut tight = MemoryLedger::new(MemoryBudget::new(252));
+        let mut tight = MemoryLedger::new(MemoryBudget::new(268));
         let error = cache.publish_memory(&mut tight, &[]).unwrap_err();
         assert_eq!(error.code, torse_types::FaultCode::ResourceLimit);
         assert_eq!(tight.total_usage(), 0);
 
-        let mut ledger = MemoryLedger::new(MemoryBudget::new(12_492));
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(12_508));
         cache.publish_memory(&mut ledger, &[]).unwrap();
-        assert_eq!(ledger.usage(torse_types::MemoryClass::Mesh), 12_492);
+        assert_eq!(ledger.usage(torse_types::MemoryClass::Mesh), 12_508);
     }
 
     #[test]
@@ -1681,6 +1681,7 @@ mod tests {
             overlays: vec![u16::MAX],
             tints: vec![[1.0, 1.0, 1.0]; 4],
             overlay_tints: vec![[1.0, 1.0, 1.0]; 4],
+            shades: vec![1.0; 4],
         }
     }
 
@@ -1695,6 +1696,7 @@ mod tests {
             overlays: Vec::new(),
             tints: Vec::new(),
             overlay_tints: Vec::new(),
+            shades: Vec::new(),
         }
     }
 }

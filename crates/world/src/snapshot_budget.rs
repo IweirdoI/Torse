@@ -21,6 +21,29 @@ impl Snapshot {
         registry: &BlockStateRegistry,
         budget: OutputBudget,
     ) -> Result<Self, Fault> {
+        Self::capture_selected_with_budget(meta, store, entities, registry, budget, None)
+    }
+
+    /// Preflight and capture only the persistent projection of the world.
+    pub fn capture_persistent_with_budget(
+        meta: SnapshotMeta,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &crate::ComponentSchemas,
+        budget: OutputBudget,
+    ) -> Result<Self, Fault> {
+        Self::capture_selected_with_budget(meta, store, entities, registry, budget, Some(schemas))
+    }
+
+    fn capture_selected_with_budget(
+        meta: SnapshotMeta,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        budget: OutputBudget,
+        schemas: Option<&crate::ComponentSchemas>,
+    ) -> Result<Self, Fault> {
         let mut remaining = Remaining(budget);
         remaining.entries::<Self>(1)?;
         remaining.entries::<SnapshotSection>(store.len())?;
@@ -53,6 +76,13 @@ impl Snapshot {
         for (_, entity) in entities.iter() {
             remaining.entries::<SnapshotEntity>(1)?;
             for schema in entity.components.ids() {
+                if let Some(schemas) = schemas
+                    && !schemas
+                        .persists(schema)
+                        .map_err(|e| Fault::invalid_data(e.to_string()))?
+                {
+                    continue;
+                }
                 remaining.entries::<SnapshotComponent>(1)?;
                 remaining.key(schema)?;
                 if let Some(fields) = entity.components.component(schema) {
@@ -64,7 +94,7 @@ impl Snapshot {
                 }
             }
         }
-        Self::capture(meta, store, entities, registry)
+        Self::capture_selected(meta, store, entities, registry, schemas)
             .map_err(|error| Fault::invalid_data(error.to_string()))
     }
 }

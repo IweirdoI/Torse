@@ -179,6 +179,13 @@ pub(crate) fn prepare_movements(
         if entity.id != request.id {
             return Err(RejectCode::MissingTarget);
         }
+        if entity
+            .components
+            .component(&torse_world::block_instance_schema())
+            .is_some()
+        {
+            return Err(RejectCode::PermissionDenied);
+        }
         if entity.position.to_bits() != request.previous_bits {
             return Err(RejectCode::Conflict);
         }

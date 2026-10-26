@@ -514,7 +514,9 @@ impl CommitCoordinator {
             let schema = schemas
                 .get(&edit.schema)
                 .ok_or(PrepareError::Rejected(RejectCode::InvalidData))?;
-            if schema.owner_module != transaction.source {
+            if schema.owner_module != transaction.source
+                || edit.schema == torse_world::block_instance_schema()
+            {
                 return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
             }
         }
@@ -530,7 +532,19 @@ impl CommitCoordinator {
         let mut prepared = self.prepare_world(store, entities, registry, transaction)?;
         prepared.component_edits = transaction.components.clone();
         prepared.component_batch = batch;
-        prepared.lifecycle_batch = lifecycle;
+        prepared.lifecycle_batch = crate::block_instances::prepare(
+            store,
+            entities,
+            registry,
+            schemas,
+            crate::block_instances::Writes {
+                edits: &prepared.edits,
+                components: &prepared.component_edits,
+                movements: &prepared.entity_moves,
+            },
+            lifecycle,
+        )
+        .map_err(PrepareError::Rejected)?;
         Ok(prepared)
     }
 
@@ -607,7 +621,9 @@ impl CommitCoordinator {
                 let schema = schemas
                     .get(&edit.schema)
                     .ok_or(PrepareError::Rejected(RejectCode::InvalidData))?;
-                if schema.owner_module != member.source {
+                if schema.owner_module != member.source
+                    || edit.schema == torse_world::block_instance_schema()
+                {
                     return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
                 }
             }
@@ -677,6 +693,19 @@ impl CommitCoordinator {
         let Some(next) = self.seq.next() else {
             return Err(PrepareError::SequenceExhausted);
         };
+        let lifecycle_batch = crate::block_instances::prepare(
+            store,
+            entities,
+            registry,
+            schemas,
+            crate::block_instances::Writes {
+                edits: &edits,
+                components: &component_edits,
+                movements: &entity_moves,
+            },
+            lifecycle_batch,
+        )
+        .map_err(PrepareError::Rejected)?;
         let cursor = CommitCursor {
             world: self.world,
             seq: next,
@@ -1010,6 +1039,15 @@ impl CommitCoordinator {
         transaction: &crate::Transaction,
         lifecycle: Result<Option<LifecycleBatch>, torse_types::RejectCode>,
     ) -> Result<PreparedChange, PrepareError> {
+        if transaction.movements.len() != 1
+            || !transaction.mutations.is_empty()
+            || !transaction.components.is_empty()
+            || !transaction.spawns.is_empty()
+            || !transaction.despawns.is_empty()
+        {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        let lifecycle = lifecycle.map_err(PrepareError::Rejected)?;
         let mut prepared = self.prepare_blocks(store, transaction)?;
         let resolved = crate::movement::prepare_movements(
             store,
@@ -1038,7 +1076,7 @@ impl CommitCoordinator {
             })?;
         prepared.component_edits = transaction.components.clone();
         prepared.component_batch = batch;
-        prepared.lifecycle_batch = lifecycle.ok().flatten();
+        prepared.lifecycle_batch = lifecycle;
         Ok(prepared)
     }
 

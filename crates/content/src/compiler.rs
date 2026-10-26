@@ -205,6 +205,14 @@ pub fn compile(pack: ContentPack) -> Result<CompiledContent, Vec<ContentDiagnost
     let mut component_ids = BTreeMap::<ContentKey, ContentKey>::new();
     for sourced in state_schemas.values() {
         for component in &sourced.value.component_schemas {
+            if component.id.to_string() == "core:schema/block_instance" {
+                diagnostics.push(diagnostic(
+                    sourced.source.clone(),
+                    sourced.value.id.clone(),
+                    "component_schemas.id",
+                    "block instance bindings are reserved by the kernel",
+                ));
+            }
             if let Some(previous) =
                 component_ids.insert(component.id.clone(), sourced.value.id.clone())
             {
@@ -693,6 +701,19 @@ fn validate_block(
                 format!("unknown component schema {component}"),
             ));
         }
+    }
+    if block
+        .component_defaults
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+        || block.component_defaults.len() >= 64
+    {
+        diagnostics.push(diagnostic(
+            source.clone(),
+            block.id.clone(),
+            "component_defaults",
+            "block defaults must be unique and leave room for the instance binding",
+        ));
     }
     for binding in &block.capability_bindings {
         if !capabilities.contains_key(&binding.capability) {

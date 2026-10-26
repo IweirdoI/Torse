@@ -988,7 +988,12 @@ impl Scene {
         let mut indices = Vec::new();
         for (handle, entity) in self.authority.entities().iter() {
             // The walker is the camera; drawing its body would fill the view.
-            if Some(handle) == self.walker.map(|walker| walker.handle) {
+            if Some(handle) == self.walker.map(|walker| walker.handle)
+                || entity
+                    .components
+                    .component(&torse_world::block_instance_schema())
+                    .is_some()
+            {
                 continue;
             }
             push_entity_box(
@@ -1091,7 +1096,12 @@ impl Scene {
         }
         for (handle, entity) in self.authority.entities().iter() {
             // The walker is the camera; drawing its body would fill the view.
-            if Some(handle) == self.walker.map(|walker| walker.handle) {
+            if Some(handle) == self.walker.map(|walker| walker.handle)
+                || entity
+                    .components
+                    .component(&torse_world::block_instance_schema())
+                    .is_some()
+            {
                 continue;
             }
             faces += push_entity_box(
@@ -1788,6 +1798,28 @@ mod tests {
         // Streaming must not fabricate terrain around the mirror.
         scene.load_around(SectionPos::new(5, 0, 5)).expect("noop");
         assert_eq!(scene.sections().len(), 2);
+    }
+
+    #[test]
+    fn attached_block_instances_do_not_add_entity_placeholder_geometry() {
+        let mut snapshot = replica_snapshot();
+        let mut ordinary = Scene::from_snapshot(&snapshot).expect("ordinary scene");
+        ordinary.refresh_meshes();
+        let binding = torse_world::BlockInstance {
+            pos: BlockPos::new(2, 0, 0),
+            block: key("base:stone"),
+        };
+        snapshot.entities.push(ReplicaEntity {
+            id: EntityId(10),
+            position_bits: binding.position().to_bits(),
+            components: [(torse_world::block_instance_schema(), binding.fields())].into(),
+        });
+        let mut attached = Scene::from_snapshot(&snapshot).expect("attached scene");
+        attached.refresh_meshes();
+        assert_eq!(attached.authority().entities().len(), 2);
+        assert_eq!(attached.entity_geometry().1, ordinary.entity_geometry().1);
+        assert_eq!(attached.geometry().1, ordinary.geometry().1);
+        assert_eq!(attached.geometry().2, ordinary.geometry().2);
     }
 
     #[test]

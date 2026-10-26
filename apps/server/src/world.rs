@@ -8,8 +8,8 @@
 use std::convert::Infallible;
 
 use torse_sim::{
-    Phase, PrepareError, Recovery, Transaction, WorldAuthority, changes_from_prepared,
-    next_resume_point,
+    Phase, PrepareError, Recovery, Transaction, WorldAuthority, next_resume_point,
+    persistent_changes_from_prepared,
 };
 use torse_storage::CommitJournal;
 use torse_types::{
@@ -84,8 +84,9 @@ impl WorldHost {
     }
 
     fn wrap(&self, change: torse_sim::PreparedChange) -> Result<WorldPrepared, Fault> {
-        let changes = changes_from_prepared(self.world.registry(), &change)
-            .map_err(|error| invariant(error.to_string()))?;
+        let changes =
+            persistent_changes_from_prepared(self.world.registry(), self.world.schemas(), &change)
+                .map_err(|error| invariant(error.to_string()))?;
         Ok(WorldPrepared {
             record: CommitRecord {
                 meta: changes.meta,

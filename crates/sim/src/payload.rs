@@ -6,9 +6,22 @@
 //! update, or a different process. This module is the single place that
 //! conversion happens.
 
-use torse_world::{BlockStateRegistry, ChangeSet, ExchangeError};
+use torse_world::{BlockStateRegistry, ChangeSet, ComponentSchemas, ExchangeError};
 
 use crate::coordinator::{Committed, PreparedChange};
+
+/// Build the durable projection while keeping the prepared in-memory change
+/// intact for publication and replication. Empty projections still carry the
+/// commit position so recovery never skips a sequence.
+pub fn persistent_changes_from_prepared(
+    registry: &BlockStateRegistry,
+    schemas: &ComponentSchemas,
+    prepared: &PreparedChange,
+) -> Result<ChangeSet, ExchangeError> {
+    let mut changes = changes_from_prepared(registry, prepared)?;
+    changes.retain_persistent(schemas)?;
+    Ok(changes)
+}
 
 /// Build a complete domain payload before publication, for journal reservation.
 ///

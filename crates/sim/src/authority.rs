@@ -325,9 +325,16 @@ impl WorldAuthority {
         )
     }
 
-    /// Capture the whole world at its current commit position.
+    /// Capture durable world state, omitting runtime-only attached components.
     pub fn capture_snapshot(&self, meta: SnapshotMeta) -> Result<Snapshot, ExchangeError> {
-        Snapshot::capture(meta, &self.store, &self.entities, &self.registry)
+        crate::block_instances::validate(&self.store, &self.entities, &self.registry)?;
+        Snapshot::capture_persistent(
+            meta,
+            &self.store,
+            &self.entities,
+            &self.registry,
+            &self.schemas,
+        )
     }
 
     /// Check the complete owned output budget before allocating a world snapshot.
@@ -336,7 +343,16 @@ impl WorldAuthority {
         meta: SnapshotMeta,
         budget: torse_types::OutputBudget,
     ) -> Result<Snapshot, torse_types::Fault> {
-        Snapshot::capture_with_budget(meta, &self.store, &self.entities, &self.registry, budget)
+        crate::block_instances::validate(&self.store, &self.entities, &self.registry)
+            .map_err(|error| torse_types::Fault::invalid_data(error.to_string()))?;
+        Snapshot::capture_persistent_with_budget(
+            meta,
+            &self.store,
+            &self.entities,
+            &self.registry,
+            &self.schemas,
+            budget,
+        )
     }
 
     /// Start building a recovered world.
@@ -414,6 +430,9 @@ impl<'a> Recovery<'a> {
                 actual: snapshot.meta.cursor.world,
             });
         }
+        let snapshot = snapshot
+            .persistent_view(self.schemas)
+            .map_err(RecoveryError::Payload)?;
         let restored = snapshot
             .restore(self.registry, self.schemas)
             .map_err(RecoveryError::Payload)?;
@@ -452,6 +471,9 @@ impl<'a> Recovery<'a> {
                 expected,
             });
         }
+        let changes = changes
+            .persistent_view(self.schemas)
+            .map_err(RecoveryError::Payload)?;
         changes
             .apply_with_components(
                 &mut restored.store,
@@ -471,9 +493,100 @@ impl<'a> Recovery<'a> {
         self.seq
     }
 
+    /// Check kernel-derived block instance effects during execution replay.
+    /// Explicit lifecycle prefixes have already been matched to the frozen
+    /// plan by the host. This does not execute actions, collision, or module code.
+    pub fn validate_derived_lifecycle(
+        &self,
+        changes: &ChangeSet,
+        spawns: usize,
+        despawns: usize,
+    ) -> Result<(), ExchangeError> {
+        let invalid = || ExchangeError::Store {
+            detail: "block instance lifecycle differs from cell writes".into(),
+        };
+        let restored = self.restored.as_ref().ok_or_else(invalid)?;
+        let projected = changes.persistent_view(self.schemas)?;
+        let changes = projected.as_ref();
+        let existing = if spawns == 0 && despawns == 0 {
+            None
+        } else {
+            let life = changes.entity_lifecycle.as_ref().ok_or_else(invalid)?;
+            let spawned = life.spawned.get(..spawns).ok_or_else(invalid)?.to_vec();
+            let despawned = life.despawned.get(..despawns).ok_or_else(invalid)?.to_vec();
+            if spawned.iter().chain(&despawned).any(|e| {
+                e.components
+                    .contains_key(&torse_world::block_instance_schema())
+            }) {
+                return Err(invalid());
+            }
+            let explicit = torse_world::EntityLifecycle {
+                previous_next_id: life.previous_next_id,
+                next_id: life
+                    .previous_next_id
+                    .checked_add(spawns as u128)
+                    .ok_or_else(invalid)?,
+                spawned,
+                despawned,
+            };
+            Some(
+                restored
+                    .entities
+                    .prepare_lifecycle(&explicit, self.schemas)
+                    .map_err(|_| invalid())?,
+            )
+        };
+        let edits = changes
+            .edits
+            .iter()
+            .map(|edit| {
+                let state = match &edit.content {
+                    torse_world::CellContent::Empty => torse_world::BlockStateId::EMPTY,
+                    torse_world::CellContent::Block { block, values } => {
+                        self.registry.state_of(block, values).ok_or_else(invalid)?
+                    }
+                };
+                Ok(torse_world::BlockEdit {
+                    pos: edit.pos,
+                    state,
+                })
+            })
+            .collect::<Result<Vec<_>, ExchangeError>>()?;
+        let expected = crate::block_instances::prepare(
+            &restored.store,
+            &restored.entities,
+            self.registry,
+            self.schemas,
+            crate::block_instances::Writes {
+                edits: &edits,
+                components: &changes.component_edits,
+                movements: &changes.entity_moves,
+            },
+            existing,
+        )
+        .map_err(|_| invalid())?;
+        let mut expected = expected.map(|b| b.change().clone());
+        if let Some(life) = &mut expected {
+            for entity in life.spawned.iter_mut().chain(&mut life.despawned) {
+                entity.retain_persistent(self.schemas)?;
+            }
+        }
+        if expected != changes.entity_lifecycle {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    /// Immutable schema configuration used by durable projection validation.
+    pub fn schemas(&self) -> &ComponentSchemas {
+        self.schemas
+    }
+
     /// Finish the builder and produce a usable authority.
     pub fn finish(self) -> Result<WorldAuthority, RecoveryError> {
         let restored = self.restored.ok_or(RecoveryError::MissingSnapshot)?;
+        crate::block_instances::validate(&restored.store, &restored.entities, self.registry)
+            .map_err(RecoveryError::Payload)?;
         let mut coordinator = CommitCoordinator::new(self.world);
         coordinator.set_compatibility(self.compatibility);
         coordinator.set_resume_point(self.resume);

@@ -14,6 +14,7 @@
 pub mod action;
 pub mod authority;
 pub mod block_actions;
+mod block_instances;
 pub mod clock;
 pub mod coordinator;
 pub mod durable;
@@ -33,7 +34,9 @@ pub use coordinator::{
     CommitCoordinator, CommitFault, Committed, ComponentPrevalidation, ComponentWork,
     MovementPrevalidation, PrepareError, PreparedChange, Publication,
 };
-pub use payload::{changes_from_committed, changes_from_prepared};
+pub use payload::{
+    changes_from_committed, changes_from_prepared, persistent_changes_from_prepared,
+};
 pub use phase::{OrderError, Phase, SystemSpec, next_resume_point, order_phase};
 pub use simulation::{
     DEFAULT_PHASE_TRANSACTION_LIMIT, Simulation, SimulationError, SimulationLimits, TickOutcome,

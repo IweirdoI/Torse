@@ -2914,6 +2914,7 @@ dependencies = [
  "torse-inventory",
  "torse-mod-api",
  "torse-mod-host",
+ "torse-modules",
  "torse-net",
  "torse-protocol",
  "torse-runtime",

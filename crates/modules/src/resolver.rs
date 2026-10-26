@@ -143,6 +143,7 @@ fn validate_registered_content(
     let mut schemas = BTreeMap::<ContentKey, ContentKey>::new();
     let mut capabilities = BTreeMap::<ContentKey, ContentKey>::new();
     let mut actions = BTreeMap::<ContentKey, ContentKey>::new();
+    let mut systems = BTreeMap::<ContentKey, ContentKey>::new();
     for module in modules.values() {
         for key in &module.registered_schemas {
             register(errors, &mut schemas, module, key, "registered_schemas");
@@ -158,6 +159,23 @@ fn validate_registered_content(
         }
         for key in &module.registered_actions {
             register(errors, &mut actions, module, key, "registered_actions");
+        }
+        for system in &module.registered_systems {
+            register(
+                errors,
+                &mut systems,
+                module,
+                &system.id,
+                "registered_systems",
+            );
+            if system.phase > 5 || system.max_items == 0 || system.max_bytes == 0 {
+                error(
+                    errors,
+                    Some(module.id.clone()),
+                    "registered_systems",
+                    format!("{} has an invalid phase or empty output budget", system.id),
+                );
+            }
         }
     }
 }

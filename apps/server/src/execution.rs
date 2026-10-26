@@ -53,7 +53,7 @@ pub struct ExecutionLimits {
     pub codec: CodecLimits,
 }
 impl ExecutionLimits {
-    fn validate(self) -> Result<(), Fault> {
+    pub(crate) fn validate(self) -> Result<(), Fault> {
         if [
             self.pending_requests,
             self.sessions,

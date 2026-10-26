@@ -13,6 +13,7 @@ mod lifecycle;
 pub mod mods;
 pub mod network;
 mod profiling;
+pub mod systems;
 pub use execution::PlanningConfig;
 mod world;
 

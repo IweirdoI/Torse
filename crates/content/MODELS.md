@@ -9,7 +9,11 @@ transforms before content assembly.
 
 Models are visual-only. Collision and selection reject visual models and may
 instead use `Shape::Compound`, a non-nested collection of at most 64 boxes.
-Each authoritative box retains the existing unit-cell validation. An empty
+The original `Box` retains unit-cell validation. Compound boxes may extend into
+the immediate neighboring cells, within `[-1,2]`. Registry construction derives
+the required owner-cell search distance from every collision override. Collision
+sources opt into that bounded reach; old sources default to zero. Unloaded owner
+cells conservatively block queries. An empty
 compound explicitly contributes no surfaces. Render complexity does not create
 implicit physics geometry or cross-cell collision indexing.
 

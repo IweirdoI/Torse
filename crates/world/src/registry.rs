@@ -79,6 +79,7 @@ pub struct BlockStateRegistry {
     slots: Vec<u32>,
     /// Number of allocated state identifiers including the empty sentinel.
     state_count: u32,
+    collision_reach: ([u8; 3], [u8; 3]),
 }
 
 impl BlockStateRegistry {
@@ -157,6 +158,23 @@ impl BlockStateRegistry {
                     needed: combinations,
                 }
             })?;
+            for shape in definition.collision_profile.shape.iter().chain(
+                definition
+                    .state_overrides
+                    .iter()
+                    .filter_map(|p| p.collision_shape.as_ref()),
+            ) {
+                if let Shape::Compound(boxes) = shape {
+                    for bounds in boxes {
+                        for axis in 0..3 {
+                            registry.collision_reach.0[axis] = registry.collision_reach.0[axis]
+                                .max((bounds.max[axis] - 1.0).max(0.0).ceil() as u8);
+                            registry.collision_reach.1[axis] = registry.collision_reach.1[axis]
+                                .max((-bounds.min[axis]).max(0.0).ceil() as u8);
+                        }
+                    }
+                }
+            }
             registry.by_key.insert(key.clone(), index);
             registry.keys.push(key.clone());
             registry
@@ -180,6 +198,11 @@ impl BlockStateRegistry {
             });
         }
         Ok(registry)
+    }
+
+    /// Extra owner-cell search distance below/above each axis for compound shapes.
+    pub fn collision_reach(&self) -> ([u8; 3], [u8; 3]) {
+        self.collision_reach
     }
 
     /// Number of distinct state identifiers, including the empty sentinel.

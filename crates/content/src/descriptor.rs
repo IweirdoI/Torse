@@ -264,7 +264,15 @@ impl Shape {
                     return Err("compound shape exceeds the box limit");
                 }
                 for bounds in boxes {
-                    validate_box(bounds)?;
+                    if !(0..3).all(|axis| {
+                        bounds.min[axis].is_finite()
+                            && bounds.max[axis].is_finite()
+                            && bounds.min[axis] >= -1.0
+                            && bounds.max[axis] <= 2.0
+                            && bounds.min[axis] < bounds.max[axis]
+                    }) {
+                        return Err("compound boxes must be finite and bounded by [-1,2]");
+                    }
                 }
                 Ok(())
             }

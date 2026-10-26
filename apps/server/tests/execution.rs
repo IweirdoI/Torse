@@ -357,6 +357,130 @@ fn add(
 }
 
 #[test]
+fn heartbeat_keeps_observer_alive_without_requests_and_silent_peer_expires() {
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    let mut limits = base::network_limits();
+    limits.idle_ticks = 3;
+    let mut hub = NetworkHub::new(server.binding(), limits).unwrap();
+    let (live, mut observer) = add(&mut hub, &server, actor());
+    let (silent, mut quiet) = add(&mut hub, &server, actor());
+    for client in [&mut observer, &mut quiet] {
+        hello(client, server.binding());
+    }
+    hub.poll(&mut server).unwrap();
+    receive(&mut observer);
+    receive(&mut quiet);
+    send(
+        &mut observer,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.into_iter().collect(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    let _mirror = seed(receive(&mut observer));
+    for _ in 0..16 {
+        server.drive_tick(&mut hub, 1024).unwrap();
+        let cursor = server.authority().unwrap().cursor();
+        let runtime = server.authority().unwrap().runtime().clone();
+        send(&mut observer, ClientMessage::Ping);
+        hub.poll(&mut server).unwrap();
+        assert!(hub.contains(live));
+        assert!(receive(&mut observer).is_empty());
+        assert_eq!(server.authority().unwrap().cursor(), cursor);
+        assert_eq!(server.authority().unwrap().runtime(), &runtime);
+    }
+    assert!(!hub.contains(silent));
+    // Heartbeats neither consume the request sequence nor its per-tick quota.
+    send(
+        &mut observer,
+        ClientMessage::Request {
+            seq: RequestSeq(1),
+            call: transfer(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    assert!(receive(&mut observer).iter().any(|m| matches!(
+        m,
+        ServerMessage::Admission {
+            seq: RequestSeq(1),
+            admission: Admission::Queued { .. }
+        }
+    )));
+    // Stopping heartbeats restores normal resource reclamation.
+    for _ in 0..4 {
+        server.drive_tick(&mut hub, 1024).unwrap();
+        hub.poll(&mut server).unwrap();
+    }
+    assert!(!hub.contains(live));
+}
+
+#[test]
+fn heartbeat_before_hello_and_old_or_future_protocols_cannot_hold_a_peer_slot() {
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    let mut limits = base::network_limits();
+    limits.peers = 1;
+    let mut hub = NetworkHub::new(server.binding(), limits).unwrap();
+    for message in [
+        ClientMessage::Ping,
+        ClientMessage::Hello {
+            version: 1,
+            compatibility: server.binding().compatibility,
+        },
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION + 1,
+            compatibility: server.binding().compatibility,
+        },
+    ] {
+        let (id, mut client) = add(&mut hub, &server, actor());
+        let before = server.authority().unwrap().cursor();
+        send(&mut client, message);
+        hub.poll(&mut server).unwrap();
+        assert!(!hub.contains(id));
+        assert_eq!(server.authority().unwrap().cursor(), before);
+    }
+    let (id, mut client) = add(&mut hub, &server, actor());
+    hello(&mut client, server.binding());
+    hub.poll(&mut server).unwrap();
+    assert!(hub.contains(id));
+    assert!(matches!(
+        receive(&mut client)[0],
+        ServerMessage::Welcome { .. }
+    ));
+}
+
+#[test]
+fn heartbeat_tag_appends_to_wire_v1_and_idle_timing_has_three_interval_margin() {
+    assert_eq!(PROTOCOL_VERSION, 2);
+    let mut bytes = Vec::new();
+    wire::encode(
+        &ClientMessage::Ping,
+        &mut bytes,
+        base::budget(),
+        base::codec_limits(),
+    )
+    .unwrap();
+    assert_eq!(bytes, [1, 0, 5]);
+    assert!(matches!(
+        wire::decode::<ClientMessage>(&bytes, base::budget(), base::codec_limits()).unwrap(),
+        ClientMessage::Ping
+    ));
+    for bad in [vec![1, 0, 6], vec![1, 0, 5, 0], vec![1, 0]] {
+        assert!(wire::decode::<ClientMessage>(&bad, base::budget(), base::codec_limits()).is_err());
+    }
+    let mut limits = base::network_limits();
+    limits.validate_timing(base::TICK_PERIOD).unwrap();
+    limits.idle_ticks = 600;
+    limits.validate_timing(base::TICK_PERIOD).unwrap();
+    limits.idle_ticks = 599;
+    assert!(limits.validate_timing(base::TICK_PERIOD).is_err());
+    assert!(limits.validate_timing(std::time::Duration::ZERO).is_err());
+    limits.idle_ticks = u64::MAX;
+    assert!(limits.validate_timing(std::time::Duration::MAX).is_err());
+}
+
+#[test]
 fn two_clients_share_durable_authority_without_leaking_inventory() {
     let dir = Directory::new();
     let mut server = create(&dir, Vec::new());

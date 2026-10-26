@@ -145,6 +145,22 @@ pub struct NetworkLimits {
     pub budget: OutputBudget,
     pub codec: CodecLimits,
 }
+impl NetworkLimits {
+    /// Validate an application's wall-clock schedule. Tests and virtual-time
+    /// hosts may use smaller tick windows with their own heartbeat schedule.
+    pub fn validate_timing(&self, tick_period: std::time::Duration) -> Result<(), Fault> {
+        let window = tick_period
+            .as_nanos()
+            .checked_mul(u128::from(self.idle_ticks));
+        let minimum = torse_protocol::HEARTBEAT_INTERVAL.as_nanos() * 3;
+        if tick_period.is_zero() || window.is_none_or(|window| window < minimum) {
+            return Err(Fault::invalid_data(
+                "idle window requires three heartbeat intervals",
+            ));
+        }
+        Ok(())
+    }
+}
 /// Trusted application policy, constructed before an unauthenticated peer can
 /// submit data. Authentication plugins may construct a different policy per peer.
 pub struct PeerPolicy {
@@ -337,6 +353,11 @@ impl<T: Transport> NetworkHub<T> {
                     );
                 }
                 server.close_replica(subscription)
+            }
+            ClientMessage::Ping => {
+                peer.viewer
+                    .ok_or_else(|| Fault::invalid_data("handshake required"))?;
+                Ok(())
             }
             ClientMessage::Close => {
                 peer.closed = true;

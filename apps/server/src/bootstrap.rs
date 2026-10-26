@@ -10,6 +10,7 @@ use torse_sim::{WorldAuthority, block_actions};
 use torse_types::*;
 use torse_world::*;
 pub const WORLD: WorldId = WorldId(7);
+pub const TICK_PERIOD: std::time::Duration = std::time::Duration::from_millis(50);
 pub type Codec = ExecutionCodec<ExecutionModel>;
 pub type Files = FileServer<ExecutionHost, Codec>;
 pub fn key(value: &str) -> ContentKey {

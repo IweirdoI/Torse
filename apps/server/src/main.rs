@@ -172,7 +172,9 @@ fn run() -> Result<(), Fault> {
         server.binding().epoch.0,
         server.authority()?.resume_point().tick.0
     );
-    let mut hub = NetworkHub::new(server.binding(), base::network_limits())?;
+    let limits = base::network_limits();
+    limits.validate_timing(base::TICK_PERIOD)?;
+    let mut hub = NetworkHub::new(server.binding(), limits)?;
     let mut peers: Vec<u128> = Vec::new();
     // Anchor the demo revocation to the first connection, not process start.
     let mut revoke_at: Option<u64> = None;
@@ -182,7 +184,7 @@ fn run() -> Result<(), Fault> {
         queued_bytes: 16_777_216,
         poll_bytes: 262_144,
     };
-    let interval = Duration::from_millis(50);
+    let interval = base::TICK_PERIOD;
     let mut next = Instant::now();
     let mut done = 0u64;
     loop {

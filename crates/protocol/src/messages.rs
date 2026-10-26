@@ -1,6 +1,8 @@
 use torse_codec::{Decoder, EncodeResult, Encoder, wire::Wire};
 use torse_types::*;
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+/// Wall-clock interval for authenticated client liveness, independent of rendering.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 #[derive(Debug)]
 pub enum ClientMessage<I> {
     Hello {
@@ -18,6 +20,7 @@ pub enum ClientMessage<I> {
         subscription: SubscriptionId,
     },
     Close,
+    Ping,
 }
 #[derive(Debug)]
 pub enum ServerMessage<O, S, C> {
@@ -65,6 +68,7 @@ impl<I: Wire> Wire for ClientMessage<I> {
                 subscription.write(e)
             }
             Self::Close => 4u8.write(e),
+            Self::Ping => 5u8.write(e),
         }
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
@@ -84,6 +88,7 @@ impl<I: Wire> Wire for ClientMessage<I> {
                 subscription: Wire::read(d)?,
             }),
             4 => Ok(Self::Close),
+            5 => Ok(Self::Ping),
             _ => Err(invalid()),
         }
     }

@@ -11,7 +11,7 @@
 
 传输不参与世界发布。TcpTransport的长度检查发生在正文分配前，socket非阻塞，每次poll限制字节和最多64次读/64次写尝试。配置显式限制单帧、排队帧数、累计字节和每poll工作量。Partial/WouldBlock保留到下一次poll，错误只关闭对应连接。
 
-MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据。NetworkHub还限制连接、空闲Tick、请求与订阅，按宿主PeerPolicy绑定权限；权威ExecutionHost负责持久请求去重。
+MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据。NetworkHub还限制连接、空闲Tick、请求与订阅，按宿主PeerPolicy绑定权限；权威ExecutionHost负责持久请求去重。应用协议版本2新增握手后Ping，客户端每10秒发送，默认空闲上限仍为60秒。心跳由应用连接层驱动，传输本身不生成存活帧。
 
 ReplicaMirror先校验完整新状态再替换，拒绝错误Binding、重复/缺失ReplicaSeq、无效字典、Section尺寸或实体位置。连接关闭后应用应丢弃镜像并重新获取基线，不能继续使用旧权限状态。
 

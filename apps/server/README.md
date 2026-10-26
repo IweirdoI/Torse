@@ -73,7 +73,7 @@ ExecutionHost独占ReplicaSource，使用纯DurableRule规划系统和事件。�
 
 WorkPlan支持携带TransactionGroup。Mod机器自有状态与库存规划器返回的事务按来源组成一个任务，连同新唤醒共同预留、发布和刷盘。冻结任务保存稳定成员，恢复不重跑已规划或已结算的Guest。库存拒绝保留机器完成前的进度，不登记该计划的新唤醒；陷阱重试次数由持久事件载荷记录，停机以没有后续唤醒表示。ModStats只供诊断，不影响恢复后的执行。验证见[Mod原子执行](../../benchmarks/M4-mod-atomic.md)。
 
-持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本2、读版本1和2，快照及协议仍为版本1。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。世界仍有限驻留，未进行硬件断电验收。
+持久数据使用ExecutionCodec<ExecutionModel>，格式见[EXECUTION.md](../../crates/codec/EXECUTION.md)。原WorldCodec世界目录不自动迁移；不兼容数据会报错并保留。提交载荷写版本2、读版本1和2，快照版本仍为1，应用协议为版本2。冻结列表只在完整记录中保存，后续进度记录替换有界事件与请求窗口。世界仍有限驻留，未进行硬件断电验收。
 
 ## 运行态与批量刷盘
 
@@ -87,7 +87,7 @@ Server的Tick驱动默认每批1条，可用`set_commit_batch_limit`设置1到10
 
 复现对照与故障验证见[运行态与批量提交](../../benchmarks/M6-runtime-commit.md)。当前简单事务的并行预验证实验未显示收益，因此继续使用串行事务准备与发布。
 
-NetworkHub通过泛型协议接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线和增量都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权世界与编辑请求；真实用户认证、TLS，以及服务端移动结算和客户端校正尚未接入。
+NetworkHub通过应用协议版本2接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线和增量都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权世界与编辑请求；真实用户认证、TLS，以及服务端移动结算和客户端校正尚未接入。
 
 ## 本地世界示例
 
@@ -194,3 +194,9 @@ cargo run -p torse-server --features mods --example headless_client -- 127.0.0.1
 以上两条命令分终端运行；首次使用前按[Mod说明](../../examples/mods/README.md)安装Wasm目标。重新打开同一世界时须保留相同包与内容。
 
 公共模型从授权镜像构建进度与库存摘要，按钮复用`inventory:action/transfer`。`DurableRule::action_events`在冻结动作时规划方块通知，通知与动作共同持久结算，冲突和重发不重复派发。绑定方式为包数据的`[[block]] behavior = true`。复现、真实进程退出验证及限制见[机器UI验证](../../benchmarks/M4-machine-ui.md)。
+
+## 客户端心跳
+
+握手后Ping只刷新接收活跃时间，不回复、不占请求序号，也不写入世界日志。握手前Ping关闭对应连接，旧应用协议版本1在Hello时拒绝。wire版本与存档布局保持不变。
+
+图形客户端每10秒发送一次，从渲染帧和等待钩子驱动，最小化窗口仍轮询网络。演示启动检查`idle_ticks * tick_period >= 3 * heartbeat_interval`：默认1200个Tick、50毫秒一个Tick，空闲窗口60秒。NetworkLimits::validate_timing供其他真实时间宿主在装配时核对配置；使用虚拟时钟的测试可自行安排节奏。静默连接继续回收。验证见[心跳记录](../../benchmarks/B7-heartbeat.md)。

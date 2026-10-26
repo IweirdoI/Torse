@@ -1,10 +1,11 @@
-//! Client side of the version 1 protocol: connect, mirror, and request.
+//! Client side of the version 2 protocol: connect, mirror, and request.
 //!
 //! The connection owns one transport and one [`ReplicaMirror`]. The window
 //! polls it every frame; inbound frames decode into [`NetEvent`]s and the
 //! caller applies world data through the scene. Frames are bounded by the
 //! same limits the headless client uses.
 
+use std::time::Instant;
 use torse_codec::CodecLimits;
 use torse_codec::wire;
 use torse_net::{ReplicaMirror, Transport};
@@ -48,6 +49,7 @@ pub struct Connection<T: Transport> {
     request_seq: u64,
     budget: OutputBudget,
     limits: CodecLimits,
+    last_ping: Option<Instant>,
 }
 
 impl<T: Transport> Connection<T> {
@@ -62,6 +64,7 @@ impl<T: Transport> Connection<T> {
                 max_bytes: 8_388_608,
             },
             limits: codec_limits(),
+            last_ping: None,
         }
     }
 
@@ -94,21 +97,35 @@ impl<T: Transport> Connection<T> {
 
     /// Poll the transport and translate every completed frame.
     pub fn poll(&mut self) -> Result<Vec<NetEvent>, Fault> {
+        self.poll_at(Instant::now())
+    }
+
+    fn poll_at(&mut self, now: Instant) -> Result<Vec<NetEvent>, Fault> {
         self.transport.poll()?;
         let mut events = Vec::new();
         while let Some(bytes) = self.transport.receive()? {
             let message: ServerMessage = wire::decode(&bytes, self.budget, self.limits)?;
-            match self.handle(message)? {
+            match self.handle(message, now)? {
                 Some(event) => events.push(event),
                 None => continue,
             }
         }
+        if self.last_ping.is_some_and(|last| {
+            now.saturating_duration_since(last) >= torse_protocol::HEARTBEAT_INTERVAL
+        }) {
+            self.send(ClientMessage::Ping)?;
+            self.last_ping = Some(now);
+            self.transport.poll()?;
+        }
         Ok(events)
     }
 
-    fn handle(&mut self, message: ServerMessage) -> Result<Option<NetEvent>, Fault> {
+    fn handle(&mut self, message: ServerMessage, now: Instant) -> Result<Option<NetEvent>, Fault> {
         match message {
-            ServerMessage::Welcome { session, .. } => Ok(Some(NetEvent::Welcomed { session })),
+            ServerMessage::Welcome { session, .. } => {
+                self.last_ping = Some(now);
+                Ok(Some(NetEvent::Welcomed { session }))
+            }
             ServerMessage::Seed(seed) => {
                 // Clone the snapshot first; from_seed consumes the envelope.
                 let snapshot = seed.state.clone();
@@ -143,6 +160,7 @@ impl<T: Transport> Connection<T> {
                 Ok(Some(NetEvent::Finished { seq, committed }))
             }
             ServerMessage::Rejected(reason) => {
+                self.last_ping = None;
                 Ok(Some(NetEvent::Closed(format!("rejected: {reason:?}"))))
             }
         }
@@ -211,6 +229,56 @@ fn codec_limits() -> CodecLimits {
 mod tests {
     use super::*;
     use torse_net::{MemoryTransport, TransportLimits};
+
+    #[test]
+    fn heartbeat_waits_for_welcome_and_sends_once_per_interval_without_catchup() {
+        let (client, mut server) = MemoryTransport::pair(default_limits()).unwrap();
+        let mut connection = Connection::new(client);
+        let start = Instant::now();
+        let interval = torse_protocol::HEARTBEAT_INTERVAL;
+        connection.poll_at(start + interval * 5).unwrap();
+        assert!(server.receive().unwrap().is_none());
+        let binding = torse_types::Binding {
+            world: torse_types::WorldId(7),
+            epoch: torse_types::WorldEpoch(1),
+            compatibility: Compatibility {
+                authority_schema: 1,
+                rules_digest: torse_types::Digest([0; 32]),
+                content_digest: torse_types::Digest([0; 32]),
+            },
+        };
+        let mut bytes = Vec::new();
+        wire::encode(
+            &ServerMessage::Welcome {
+                binding,
+                session: SessionId(1),
+            },
+            &mut bytes,
+            connection.budget,
+            connection.limits,
+        )
+        .unwrap();
+        server.send(bytes).unwrap();
+        connection.poll_at(start).unwrap();
+        connection
+            .poll_at(start + interval - std::time::Duration::from_nanos(1))
+            .unwrap();
+        assert!(server.receive().unwrap().is_none());
+        for now in [start + interval, start + interval * 10] {
+            connection.poll_at(now).unwrap();
+            let bytes = server.receive().unwrap().unwrap();
+            assert!(matches!(
+                wire::decode::<ClientMessage>(&bytes, connection.budget, connection.limits)
+                    .unwrap(),
+                ClientMessage::Ping
+            ));
+            connection.poll_at(now).unwrap();
+            assert!(server.receive().unwrap().is_none());
+        }
+        assert_eq!(connection.request_seq, 0);
+        server.close();
+        assert!(connection.poll_at(start + interval * 11).is_err());
+    }
 
     #[test]
     fn request_sequences_start_at_one_and_increase() {

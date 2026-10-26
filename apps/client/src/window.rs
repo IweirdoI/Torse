@@ -274,6 +274,29 @@ impl WindowApp {
         }
     }
 
+    fn poll_network(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        // Drain the connection first: the baseline creates the scene and
+        // increments refresh it before this frame's meshes are captured.
+        let events = match self.net.as_mut().map(crate::net::Connection::poll) {
+            Some(Ok(events)) => events,
+            Some(Err(error)) => {
+                self.failure = Some(format!("connection failed: {error}"));
+                event_loop.exit();
+                return false;
+            }
+            None => Vec::new(),
+        };
+        for event in events {
+            if let Err(error) = self.apply_net_event(event, event_loop) {
+                self.failure = Some(error);
+                event_loop.exit();
+                return false;
+            }
+        }
+
+        true
+    }
+
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
         // The HUD needs the pack labels before the GPU borrow starts.
         let names = self.hotbar_names();
@@ -287,23 +310,8 @@ impl WindowApp {
             .clamp(0.0001, 0.25);
         self.last_frame = Some(now);
 
-        // Drain the connection first: the baseline creates the scene and
-        // increments refresh it before this frame's meshes are captured.
-        let events = match self.net.as_mut().map(crate::net::Connection::poll) {
-            Some(Ok(events)) => events,
-            Some(Err(error)) => {
-                self.failure = Some(format!("connection failed: {error}"));
-                event_loop.exit();
-                return;
-            }
-            None => Vec::new(),
-        };
-        for event in events {
-            if let Err(error) = self.apply_net_event(event, event_loop) {
-                self.failure = Some(error);
-                event_loop.exit();
-                return;
-            }
+        if !self.poll_network(event_loop) {
+            return;
         }
 
         let Some(camera) = self.camera.as_mut() else {
@@ -1373,7 +1381,10 @@ impl ApplicationHandler for WindowApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.poll_network(event_loop) {
+            return;
+        }
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.request_redraw();
         }

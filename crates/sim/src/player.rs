@@ -258,13 +258,13 @@ fn wedged(world: &WorldAuthority, handle: EntityHandle, id: EntityId) -> Result<
         world: &'a WorldAuthority,
     }
     impl CollisionSource for View<'_> {
+        fn shape_reach(&self) -> ([u8; 3], [u8; 3]) {
+            self.world.registry().collision_reach()
+        }
         fn collision(&self, pos: torse_types::BlockPos) -> CollisionCell {
             match self.world.store().query(pos) {
                 torse_world::TerrainQuery::Ready(state) => {
-                    let Some(definition) = self.world.registry().definition(state) else {
-                        return CollisionCell::Empty;
-                    };
-                    match &definition.collision_profile.shape {
+                    match self.world.registry().collision_shape_ref(state) {
                         None => CollisionCell::Empty,
                         Some(shape) => CollisionCell::Solid(crate::movement::boxes(shape)),
                     }

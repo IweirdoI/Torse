@@ -403,6 +403,9 @@ struct CollisionView<'a> {
 }
 
 impl CollisionSource for CollisionView<'_> {
+    fn shape_reach(&self) -> ([u8; 3], [u8; 3]) {
+        self.registry.collision_reach()
+    }
     fn collision(&self, pos: BlockPos) -> CollisionCell {
         let observed = self.store.query(pos);
         self.reads.borrow_mut().insert(pos, observed);

@@ -146,8 +146,53 @@ pub enum CollisionCell {
 
 /// Read-only access to block collision data.
 pub trait CollisionSource {
+    /// Extra owner-cell search distance on the negative and positive side.
+    /// Each component is bounded to one cell; default preserves unit-cell queries.
+    fn shape_reach(&self) -> ([u8; 3], [u8; 3]) {
+        ([0; 3], [0; 3])
+    }
+
     /// Collision content of one block cell.
     fn collision(&self, pos: BlockPos) -> CollisionCell;
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::*;
+    struct Tall;
+    impl CollisionSource for Tall {
+        fn shape_reach(&self) -> ([u8; 3], [u8; 3]) {
+            ([0, 1, 0], [0; 3])
+        }
+        fn collision(&self, pos: BlockPos) -> CollisionCell {
+            if pos == BlockPos::new(0, 0, 0) {
+                CollisionCell::Solid(vec![LocalBox {
+                    min: [0.25, 0.0, 0.25],
+                    max: [0.75, 1.5, 0.75],
+                }])
+            } else {
+                CollisionCell::Empty
+            }
+        }
+    }
+    #[test]
+    fn overhanging_owner_is_found_from_the_adjacent_cell() {
+        assert!(collides(
+            &Tall,
+            &Aabb::from_center([0.5, 1.25, 0.5], [0.1; 3])
+        ));
+        assert!(!collides(
+            &Tall,
+            &Aabb::from_center([0.5, 1.75, 0.5], [0.1; 3])
+        ));
+        let moved = sweep(
+            &Tall,
+            Aabb::from_center([1.2, 1.25, 0.5], [0.1; 3]),
+            [-1.0, 0.0, 0.0],
+        );
+        assert!(moved.blocked[0]);
+        assert!(moved.aabb.min[0] >= 0.75 - 2.0 * CONTACT_EPSILON);
+    }
 }
 
 /// Result of a swept move.
@@ -172,12 +217,20 @@ impl SweepResult {
 /// inside such a cell is reported as colliding, which is the correct answer for
 /// movement even though the server will also refuse to edit the region.
 pub fn collides(source: &impl CollisionSource, collider: &Aabb) -> bool {
-    let min_x = collider.min[0].floor() as i64;
-    let min_y = collider.min[1].floor() as i64;
-    let min_z = collider.min[2].floor() as i64;
-    let max_x = (collider.max[0] - CONTACT_EPSILON).floor() as i64;
-    let max_y = (collider.max[1] - CONTACT_EPSILON).floor() as i64;
-    let max_z = (collider.max[2] - CONTACT_EPSILON).floor() as i64;
+    let (negative, positive) = source.shape_reach();
+    let lower = |axis: usize| {
+        (collider.min[axis].floor() as i64).saturating_sub(i64::from(negative[axis].min(1)))
+    };
+    let upper = |axis: usize| {
+        ((collider.max[axis] - CONTACT_EPSILON).floor() as i64)
+            .saturating_add(i64::from(positive[axis].min(1)))
+    };
+    let min_x = lower(0);
+    let min_y = lower(1);
+    let min_z = lower(2);
+    let max_x = upper(0);
+    let max_y = upper(1);
+    let max_z = upper(2);
 
     for y in min_y..=max_y {
         for z in min_z..=max_z {

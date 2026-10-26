@@ -443,6 +443,23 @@ impl<'a> Recovery<'a> {
         Ok(())
     }
 
+    /// Validate archive versions before rebuilding an isolated world.
+    pub fn restore_archive(
+        &mut self,
+        archive: &torse_world::SnapshotArchive,
+        content: &torse_content::CompiledContent,
+        budget: torse_types::OutputBudget,
+    ) -> Result<(), RecoveryError> {
+        archive
+            .validate_for_restore(content, budget)
+            .map_err(|error| {
+                RecoveryError::Payload(ExchangeError::Store {
+                    detail: error.to_string(),
+                })
+            })?;
+        self.restore_snapshot(&archive.snapshot)
+    }
+
     /// Apply one committed change set onto the restored world.
     ///
     /// The change must continue the current commit position exactly. Applying a

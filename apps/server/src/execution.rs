@@ -322,6 +322,16 @@ fn receipt_bounds(state: &RuntimeState, cursor: CommitCursor) -> Result<(), Faul
 }
 
 impl ExecutionHost {
+    /// Export a tick-boundary archive with source versions and complete runtime.
+    pub fn capture_archive(
+        &mut self,
+        content: &torse_content::CompiledContent,
+        budget: OutputBudget,
+    ) -> Result<ExecutionArchive, Fault> {
+        let snapshot = HostAuthority::capture_snapshot(self, budget)?;
+        crate::archive::capture(snapshot.state, content, budget, self.limits.codec)
+    }
+
     pub fn new(
         binding: Binding,
         world: WorldAuthority,

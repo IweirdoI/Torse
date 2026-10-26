@@ -221,6 +221,13 @@ pub struct ExecutionSnapshot {
     pub world: Snapshot,
     pub runtime: RuntimeState,
 }
+
+/// Portable checkpoint data with explicit source versions and untouched runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionArchive {
+    pub world: SnapshotArchive,
+    pub runtime: RuntimeState,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionChanges {
     pub world: ChangeSet,

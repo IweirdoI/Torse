@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+mod archive;
 mod block_instance;
 mod component;
 mod entity;
@@ -28,6 +29,10 @@ mod section;
 mod snapshot_budget;
 mod store;
 
+pub use archive::{
+    ArchiveIssue, ArchiveManifest, BlockStamp, ComponentStamp, MigrateFields, MigrationPlan,
+    SnapshotArchive,
+};
 pub use block_instance::{BlockInstance, block_instance_schema};
 pub use component::{
     ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue,

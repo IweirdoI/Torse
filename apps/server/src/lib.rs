@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 mod authority;
 pub mod bootstrap;
 mod checkpoint;

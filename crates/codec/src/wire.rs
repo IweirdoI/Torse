@@ -178,7 +178,7 @@ impl<T: Wire> Wire for Option<T> {
         }
     }
 }
-impl<V: Wire> Wire for BTreeMap<ContentKey, V> {
+impl<K: Wire + Ord, V: Wire> Wire for BTreeMap<K, V> {
     fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
         write_items(e, self.len(), "wire map")?;
         for (k, v) in self {
@@ -189,10 +189,10 @@ impl<V: Wire> Wire for BTreeMap<ContentKey, V> {
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
         let n = read_items(d, 2, "wire map")?;
-        charge_vec::<(ContentKey, V)>(d, n)?;
+        charge_vec::<(K, V)>(d, n)?;
         let mut out = BTreeMap::new();
         for _ in 0..n {
-            let key = ContentKey::read(d)?;
+            let key = K::read(d)?;
             ascending(out.last_key_value().map(|(k, _)| k), &key, "wire map")?;
             out.insert(key, V::read(d)?);
         }
@@ -328,6 +328,47 @@ impl Wire for Snapshot {
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
         crate::snapshot::read_snapshot(d)
+    }
+}
+fields!(BlockStamp {
+    definition_version,
+    schema,
+    schema_version
+});
+fields!(ComponentStamp { owner, version });
+fields!(ArchiveManifest { blocks, components });
+impl Wire for SnapshotArchive {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        e.write(b"TORSEAR1")?;
+        self.origin.write(e)?;
+        self.manifest.write(e)?;
+        self.snapshot.write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        if d.read(8)? != b"TORSEAR1" {
+            return Err(Fault::incompatible("world archive version"));
+        }
+        Ok(Self {
+            origin: Wire::read(d)?,
+            manifest: Wire::read(d)?,
+            snapshot: Wire::read(d)?,
+        })
+    }
+}
+impl Wire for ExecutionArchive {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        e.write(b"TORSEEX1")?;
+        self.world.write(e)?;
+        self.runtime.write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        if d.read(8)? != b"TORSEEX1" {
+            return Err(Fault::incompatible("execution archive version"));
+        }
+        Ok(Self {
+            world: Wire::read(d)?,
+            runtime: Wire::read(d)?,
+        })
     }
 }
 impl Wire for ChangeSet {

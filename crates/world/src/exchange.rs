@@ -691,7 +691,7 @@ fn store_error(error: StoreError) -> ExchangeError {
     }
 }
 
-fn to_snapshot_value(value: &ComponentValue) -> SnapshotValue {
+pub(crate) fn to_snapshot_value(value: &ComponentValue) -> SnapshotValue {
     match value {
         ComponentValue::Bool(flag) => SnapshotValue::Bool(*flag),
         ComponentValue::U32(number) => SnapshotValue::U32(*number),
@@ -711,7 +711,7 @@ fn to_snapshot_value(value: &ComponentValue) -> SnapshotValue {
     }
 }
 
-fn from_snapshot_value(value: &SnapshotValue) -> ComponentValue {
+pub(crate) fn from_snapshot_value(value: &SnapshotValue) -> ComponentValue {
     match value {
         SnapshotValue::Bool(flag) => ComponentValue::Bool(*flag),
         SnapshotValue::U32(number) => ComponentValue::U32(*number),

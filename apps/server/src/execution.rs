@@ -13,8 +13,8 @@ use torse_sim::replica::{
     ReplicaLimits, ReplicaScope, ReplicaSource, WorldReplicaBatch, WorldReplicaSeed,
 };
 use torse_sim::{
-    Phase, PrepareError, Recovery, SystemSpec, Transaction, WorldAuthority, changes_from_prepared,
-    next_resume_point, order_phase,
+    Phase, PrepareError, Recovery, SystemSpec, Transaction, WorldAuthority, next_resume_point,
+    order_phase, persistent_changes_from_prepared,
 };
 use torse_types::*;
 use torse_world::{BlockStateRegistry, ComponentFields, ComponentSchemas};
@@ -649,8 +649,12 @@ impl ExecutionHost {
             self.validation_cache(),
         )?;
         receipt_bounds(&runtime, prepared.meta().cursor)?;
-        let changes = changes_from_prepared(self.world().registry(), &prepared)
-            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        let changes = persistent_changes_from_prepared(
+            self.world().registry(),
+            self.world().schemas(),
+            &prepared,
+        )
+        .map_err(|e| Fault::invalid_data(e.to_string()))?;
         let update = if self.compact_records && outcome.is_some() {
             RuntimeUpdate::Progress(RuntimeProgress {
                 next: runtime.work.as_ref().expect("settled work").next,
@@ -727,7 +731,17 @@ impl ExecutionHost {
         self.record_outcome(prepared, state, Vec::new(), Some(status))
     }
 }
-fn matches_plan(task: &FrozenTask, status: &ReplyStatus, world: &torse_world::ChangeSet) -> bool {
+fn matches_plan(
+    task: &FrozenTask,
+    status: &ReplyStatus,
+    world: &torse_world::ChangeSet,
+    recovery: &Recovery<'_>,
+) -> bool {
+    let schemas = recovery.schemas();
+    let Ok(projected) = world.persistent_view(schemas) else {
+        return false;
+    };
+    let world = projected.as_ref();
     let empty = world.edits.is_empty()
         && world.entity_moves.is_empty()
         && world.component_edits.is_empty()
@@ -746,6 +760,31 @@ fn matches_plan(task: &FrozenTask, status: &ReplyStatus, world: &torse_world::Ch
         merged.spawns.extend(member.spawns.clone());
         merged.despawns.extend(member.despawns.clone());
     }
+    for component in &merged.components {
+        if schemas.persists(&component.schema).is_err() {
+            return false;
+        }
+    }
+    merged
+        .components
+        .retain(|e| schemas.persists(&e.schema).expect("checked schema"));
+    for spawn in &mut merged.spawns {
+        if spawn
+            .components
+            .keys()
+            .any(|key| schemas.persists(key).is_err())
+        {
+            return false;
+        }
+        spawn
+            .components
+            .retain(|key, _| schemas.persists(key).expect("checked schema"));
+    }
+    for despawn in &mut merged.despawns {
+        if despawn.retain_persistent(schemas).is_err() {
+            return false;
+        }
+    }
     let plan = &merged;
     if world.edits.len() != plan.writes.len()
         || !world
@@ -763,18 +802,22 @@ fn matches_plan(task: &FrozenTask, status: &ReplyStatus, world: &torse_world::Ch
     {
         return false;
     }
-    match &world.entity_lifecycle {
+    let explicit_matches = match &world.entity_lifecycle {
         None => plan.spawns.is_empty() && plan.despawns.is_empty(),
         Some(life) => {
-            life.despawned == plan.despawns
-                && life.spawned.len() == plan.spawns.len()
+            life.despawned.get(..plan.despawns.len()) == Some(plan.despawns.as_slice())
+                && life.spawned.len() >= plan.spawns.len()
                 && life
                     .spawned
                     .iter()
                     .zip(&plan.spawns)
                     .all(|(a, b)| a.position_bits == b.position && a.components == b.components)
         }
-    }
+    };
+    explicit_matches
+        && recovery
+            .validate_derived_lifecycle(world, plan.spawns.len(), plan.despawns.len())
+            .is_ok()
 }
 fn commit_fault(e: torse_sim::CommitFault) -> Fault {
     Fault::new(FaultCode::InvalidState, e.to_string())
@@ -1377,7 +1420,7 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
                             .as_ref()
                             .ok_or_else(|| Fault::invalid_data("missing task outcome"))?;
                         let task = &old.tasks[old.next as usize];
-                        matches_plan(task, status, world)
+                        matches_plan(task, status, world, &self.recovery)
                             && settle(
                                 before,
                                 task,

@@ -16,6 +16,40 @@ fn builtin_fixture_compiles() {
 }
 
 #[test]
+fn block_instance_schema_is_reserved_and_defaults_must_be_unique() {
+    let mut pack = m0_fixture_pack();
+    let component = pack
+        .state_schemas
+        .iter_mut()
+        .flat_map(|s| &mut s.value.component_schemas)
+        .next()
+        .unwrap();
+    component.id = key("core:schema/block_instance");
+    assert!(
+        compile(pack)
+            .unwrap_err()
+            .iter()
+            .any(|d| d.message.contains("reserved"))
+    );
+    let mut pack = m0_fixture_pack();
+    let component = pack
+        .state_schemas
+        .iter()
+        .flat_map(|s| &s.value.component_schemas)
+        .next()
+        .unwrap()
+        .id
+        .clone();
+    pack.blocks[0].value.component_defaults = vec![component.clone(), component];
+    assert!(
+        compile(pack)
+            .unwrap_err()
+            .iter()
+            .any(|d| d.field == "component_defaults")
+    );
+}
+
+#[test]
 fn pack_order_does_not_change_digest() {
     // Reversing top-level vectors and reordering legal finite values must not
     // affect compiled identity. This protects content hashes from filesystem and

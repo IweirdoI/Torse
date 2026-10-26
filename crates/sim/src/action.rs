@@ -270,15 +270,23 @@ impl ActionView<'_> {
             // Removing a block never buries anyone.
             return Ok(false);
         }
-        let Some(definition) = self.world.registry().definition(state) else {
+        let registry = self.world.registry();
+        if registry.definition(state).is_none() {
             return Err(RejectCode::InvalidData);
-        };
-        let Some(shape) = definition.collision_profile.shape.as_ref() else {
+        }
+        let Some(shape) = registry.collision_shape(state) else {
             // No collision shape: air-like, can never bury anyone.
             return Ok(false);
         };
-        let cell_boxes = crate::movement::boxes(shape);
+        let cell_boxes = crate::movement::boxes(&shape);
         let overlapping = self.world.entities().iter().any(|(_, entity)| {
+            if entity
+                .components
+                .component(&torse_world::block_instance_schema())
+                .is_some()
+            {
+                return false;
+            }
             let collider = Aabb::from_center(
                 [entity.position.x, entity.position.y, entity.position.z],
                 crate::player::WALKER_HALF,

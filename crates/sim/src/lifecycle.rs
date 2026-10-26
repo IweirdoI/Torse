@@ -57,6 +57,9 @@ pub(crate) fn prepare_lifecycle(
                 .map(|despawn| &despawn.previous.components),
         )
     {
+        if components.contains_key(&torse_world::block_instance_schema()) {
+            return Err(RejectCode::PermissionDenied);
+        }
         for schema in components.keys() {
             let schema = schemas.get(schema).ok_or(RejectCode::InvalidData)?;
             if schema.owner_module != transaction.source {

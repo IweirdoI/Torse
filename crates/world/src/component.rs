@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use torse_content::{CompiledContent, ComponentFieldType, ComponentSchema};
+use torse_content::{CompiledContent, ComponentFieldType, ComponentSchema, PersistencePolicy};
 use torse_types::{ContentKey, EntityId};
 
 /// Maximum nesting depth accepted inside a list or record value.
@@ -53,6 +53,8 @@ pub enum ComponentValue {
 #[derive(Clone, Debug, Default)]
 pub struct ComponentSchemas {
     schemas: BTreeMap<ContentKey, ComponentSchema>,
+    persistence: BTreeMap<ContentKey, bool>,
+    block_defaults: BTreeMap<ContentKey, BTreeMap<ContentKey, ComponentFields>>,
 }
 
 impl ComponentSchemas {
@@ -64,7 +66,77 @@ impl ComponentSchemas {
                 schemas.insert(schema.id.clone(), schema.clone());
             }
         }
-        Self { schemas }
+        let binding = crate::block_instance::binding_schema();
+        schemas.insert(binding.id.clone(), binding);
+        Self {
+            schemas,
+            persistence: BTreeMap::new(),
+            block_defaults: BTreeMap::new(),
+        }
+    }
+
+    /// Resolve an owner-defined save policy during trusted startup. Unresolved
+    /// policies preserve data. Hosts must include this choice in their rules version.
+    pub fn resolve_persistence(
+        &mut self,
+        owner: &ContentKey,
+        id: &ContentKey,
+        persist: bool,
+    ) -> Result<(), ComponentError> {
+        let schema = self
+            .get(id)
+            .ok_or_else(|| ComponentError::UnknownSchema { id: id.clone() })?;
+        if &schema.owner_module != owner || schema.persistence != PersistencePolicy::OwnerDefined {
+            return Err(ComponentError::InvalidConfiguration { id: id.clone() });
+        }
+        self.persistence.insert(id.clone(), persist);
+        Ok(())
+    }
+
+    /// Whether attached state belongs in durable world payloads. Replication
+    /// uses its own visibility policy and is independent of this decision.
+    pub fn persists(&self, id: &ContentKey) -> Result<bool, ComponentError> {
+        let schema = self
+            .get(id)
+            .ok_or_else(|| ComponentError::UnknownSchema { id: id.clone() })?;
+        Ok(match schema.persistence {
+            PersistencePolicy::Never => false,
+            PersistencePolicy::Always => true,
+            PersistencePolicy::OwnerDefined => self.persistence.get(id).copied().unwrap_or(true),
+        })
+    }
+
+    /// Supply one component's initial fields for a block during trusted startup.
+    /// Each component owner registers its own data; content selects the schemas
+    /// through `component_defaults`. Required fields have no inferred values.
+    pub fn set_block_default(
+        &mut self,
+        owner: &ContentKey,
+        block: ContentKey,
+        schema: ContentKey,
+        fields: ComponentFields,
+    ) -> Result<(), ComponentError> {
+        let definition = self
+            .get(&schema)
+            .ok_or_else(|| ComponentError::UnknownSchema { id: schema.clone() })?;
+        if &definition.owner_module != owner || schema == crate::block_instance_schema() {
+            return Err(ComponentError::InvalidConfiguration { id: schema });
+        }
+        ComponentSet::validate(self, &schema, &fields)?;
+        self.block_defaults
+            .entry(block)
+            .or_default()
+            .insert(schema, fields);
+        Ok(())
+    }
+
+    /// Initial fields selected by a block declaration, if its owner supplied any.
+    pub fn block_default(
+        &self,
+        block: &ContentKey,
+        schema: &ContentKey,
+    ) -> Option<&ComponentFields> {
+        self.block_defaults.get(block)?.get(schema)
     }
 
     /// Return a schema by identity.
@@ -352,6 +424,11 @@ fn validate_element(
 /// Failure produced by component validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComponentError {
+    /// Startup configuration did not come from the declared owner or policy.
+    InvalidConfiguration {
+        /// Component schema being configured.
+        id: ContentKey,
+    },
     /// The aggregate byte, value-count, or nesting budget was exceeded.
     BudgetExceeded,
     /// The schema identity is not registered.
@@ -401,6 +478,7 @@ pub enum ComponentError {
 impl std::fmt::Display for ComponentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidConfiguration { id } => write!(f, "invalid owner configuration for {id}"),
             Self::BudgetExceeded => write!(f, "component aggregate budget exceeded"),
             Self::UnknownSchema { id } => write!(f, "component schema {id} is not registered"),
             Self::UnknownField { schema, field } => {
@@ -451,7 +529,8 @@ mod tests {
     #[test]
     fn known_schema_is_registered_from_compiled_content() {
         let (schemas, id) = schemas();
-        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas.len(), 2);
+        assert!(schemas.get(&crate::block_instance_schema()).is_some());
         assert!(schemas.get(&id).is_some());
     }
 

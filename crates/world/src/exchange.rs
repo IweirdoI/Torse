@@ -256,6 +256,27 @@ impl Snapshot {
         entities: &EntityStore,
         registry: &BlockStateRegistry,
     ) -> Result<Self, ExchangeError> {
+        Self::capture_selected(meta, store, entities, registry, None)
+    }
+
+    /// Capture saveable components without cloning runtime-only payloads.
+    pub fn capture_persistent(
+        meta: SnapshotMeta,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: &ComponentSchemas,
+    ) -> Result<Self, ExchangeError> {
+        Self::capture_selected(meta, store, entities, registry, Some(schemas))
+    }
+
+    pub(crate) fn capture_selected(
+        meta: SnapshotMeta,
+        store: &SectionStore,
+        entities: &EntityStore,
+        registry: &BlockStateRegistry,
+        schemas: Option<&ComponentSchemas>,
+    ) -> Result<Self, ExchangeError> {
         let side = store.side();
         let bounds = store.bounds();
         let mut sections: Vec<SnapshotSection> = Vec::with_capacity(store.len());
@@ -313,9 +334,19 @@ impl Snapshot {
 
         let mut entity_list = Vec::with_capacity(entities.len());
         for (_, entity) in entities.iter() {
+            if let Some(schemas) = schemas {
+                for schema in entity.components.ids() {
+                    schemas
+                        .persists(schema)
+                        .map_err(|error| ExchangeError::Store {
+                            detail: error.to_string(),
+                        })?;
+                }
+            }
             let mut components: Vec<SnapshotComponent> = entity
                 .components
                 .ids()
+                .filter(|id| schemas.is_none_or(|s| s.persists(id).expect("checked schema")))
                 .map(|schema| SnapshotComponent {
                     schema: schema.clone(),
                     fields: entity

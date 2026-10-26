@@ -16,16 +16,19 @@
 
 #![forbid(unsafe_code)]
 
+mod block_instance;
 mod component;
 mod entity;
 mod exchange;
 mod handles;
 mod lifecycle;
+mod persistence;
 mod registry;
 mod section;
 mod snapshot_budget;
 mod store;
 
+pub use block_instance::{BlockInstance, block_instance_schema};
 pub use component::{
     ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue,
     MAX_COMPONENT_BYTES, MAX_COMPONENT_INSTANCES, MAX_COMPONENT_NODES, MAX_VALUE_DEPTH,

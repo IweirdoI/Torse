@@ -62,7 +62,9 @@ pub(crate) fn prepare_lifecycle(
         }
         for schema in components.keys() {
             let schema = schemas.get(schema).ok_or(RejectCode::InvalidData)?;
-            if schema.owner_module != transaction.source {
+            if schema.owner_module != transaction.source
+                && schema.id != torse_world::collider_schema()
+            {
                 return Err(RejectCode::PermissionDenied);
             }
         }

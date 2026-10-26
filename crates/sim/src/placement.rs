@@ -47,23 +47,21 @@ pub(crate) fn prepare(
 }
 
 /// Test the complete resulting entity set, including sibling moves and spawns.
-/// Attached block instances have no implied collider. Ordinary entities
-/// currently use the walker bounds until generic declarations are available.
+/// Explicit bodies override the compatibility walker bounds. Attached block
+/// instances have no implied collider.
 pub(crate) fn clear(
     volumes: &[Volume],
     entities: &EntityStore,
     moves: &[EntityMove],
     lifecycle: Option<&EntityLifecycle>,
+    components: &[torse_world::ComponentEdit],
 ) -> bool {
     if volumes.is_empty() {
         return true;
     }
     let binding = torse_world::block_instance_schema();
-    let overlaps = |position: Position| {
-        let collider = Aabb::from_center(
-            [position.x, position.y, position.z],
-            crate::player::WALKER_HALF,
-        );
+    let overlaps = |position: Position, half| {
+        let collider = Aabb::from_center([position.x, position.y, position.z], half);
         volumes.iter().any(|volume| {
             Aabb {
                 min: volume.min.map(f64::from_bits),
@@ -73,22 +71,33 @@ pub(crate) fn clear(
         })
     };
     for (_, entity) in entities.iter() {
-        if entity.components.component(&binding).is_some()
-            || lifecycle.is_some_and(|l| l.despawned.iter().any(|e| e.id == entity.id))
-        {
+        if lifecycle.is_some_and(|l| l.despawned.iter().any(|e| e.id == entity.id)) {
             continue;
         }
         let position = moves
             .iter()
             .find(|m| m.id == entity.id)
             .map_or(entity.position, |m| Position::from_bits(m.position_bits));
-        if overlaps(position) {
+        let half = match crate::body::of(entity, components, crate::player::WALKER_HALF) {
+            Ok(Some(half)) => half,
+            Ok(None) => continue,
+            Err(_) => return false,
+        };
+        if overlaps(position, half) {
             return false;
         }
     }
     !lifecycle.is_some_and(|l| {
         l.spawned.iter().any(|e| {
-            !e.components.contains_key(&binding) && overlaps(Position::from_bits(e.position_bits))
+            match crate::body::half(
+                e.components.get(&torse_world::collider_schema()),
+                e.components.contains_key(&binding),
+                crate::player::WALKER_HALF,
+            ) {
+                Ok(Some(half)) => overlaps(Position::from_bits(e.position_bits), half),
+                Ok(None) => false,
+                Err(_) => true,
+            }
         })
     })
 }

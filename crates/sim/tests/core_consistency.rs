@@ -20,6 +20,361 @@ fn key(value: &str) -> ContentKey {
     ContentKey::parse(value).unwrap()
 }
 
+fn body(half: [u32; 3]) -> EntityCollider {
+    EntityCollider::Box { half }
+}
+
+fn declare_body(world: &mut WorldAuthority, handle: EntityHandle, body: EntityCollider) {
+    let schemas = world.schemas().clone();
+    world
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(&schemas, &collider_schema(), body.fields())
+        .unwrap();
+}
+
+fn resize(
+    world: &WorldAuthority,
+    handle: EntityHandle,
+    body: Option<EntityCollider>,
+) -> Transaction {
+    let entity = world.entities().get(handle).unwrap();
+    let mut change = tx(90, "core:module/physics");
+    change.components.push(ComponentEdit {
+        id: entity.id,
+        schema: collider_schema(),
+        previous: entity.components.component(&collider_schema()).cloned(),
+        fields: body.map(EntityCollider::fields),
+    });
+    change
+}
+
+fn translate(
+    world: &WorldAuthority,
+    handle: EntityHandle,
+    delta: [f64; 3],
+    hint: [f64; 3],
+) -> Transaction {
+    let entity = world.entities().get(handle).unwrap();
+    let mut change = tx(91, "test:module");
+    change.move_entity(handle, entity.id, entity.position, delta, hint);
+    change
+}
+
+#[test]
+fn declared_bodies_control_planned_and_prepared_placement() {
+    for (collider, blocked) in [
+        (body([100_000; 3]), false),
+        (body([800_000; 3]), true),
+        (EntityCollider::Disabled, false),
+    ] {
+        let (mut world, service) = setup(false, false);
+        let pos = BlockPos::new(4, 4, 4);
+        let planned = action(&world, &service, pos, Some("base:stone"), 0).unwrap();
+        let h = world
+            .entities_mut()
+            .spawn(Position::new(3.5, 4.5, 4.5))
+            .unwrap();
+        declare_body(&mut world, h, collider);
+        assert_eq!(
+            action(&world, &service, pos, Some("base:stone"), 0).is_err(),
+            blocked
+        );
+        assert_eq!(world.prepare(&planned).is_err(), blocked);
+        if !blocked {
+            apply(&mut world, &planned);
+        }
+    }
+}
+
+#[test]
+fn movement_uses_declared_dimensions_instead_of_request_hint() {
+    for (half, end) in [(100_000, 3.9), (800_000, 3.2)] {
+        let (mut world, _) = setup(false, false);
+        let stone = world.registry().default_state(&key("base:stone")).unwrap();
+        world
+            .store_mut()
+            .edit(BlockPos::new(4, 4, 4), stone)
+            .unwrap();
+        let h = world
+            .entities_mut()
+            .spawn(Position::new(2.5, 4.5, 4.5))
+            .unwrap();
+        declare_body(&mut world, h, body([half, 100_000, 100_000]));
+        let movement = translate(&world, h, [4.0, 0.0, 0.0], [0.01; 3]);
+        apply(&mut world, &movement);
+        let position = world.entities().get(h).unwrap().position;
+        assert!((position.x - end).abs() < 0.001, "{position:?}");
+    }
+}
+
+#[test]
+fn disabled_body_crosses_solids_but_refuses_absent_and_out_of_bounds_cells() {
+    let (mut world, _) = setup(false, false);
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    world
+        .store_mut()
+        .edit(BlockPos::new(4, 4, 4), stone)
+        .unwrap();
+    let h = world
+        .entities_mut()
+        .spawn(Position::new(2.5, 4.5, 4.5))
+        .unwrap();
+    declare_body(&mut world, h, EntityCollider::Disabled);
+    let movement = translate(&world, h, [4.0, 0.0, 0.0], [0.3; 3]);
+    apply(&mut world, &movement);
+    assert_eq!(world.entities().get(h).unwrap().position.x, 6.5);
+    for delta in [[10.0, 0.0, 0.0], [0.0, -6.0, 0.0]] {
+        let movement = translate(&world, h, delta, [0.3; 3]);
+        assert_eq!(
+            world.prepare(&movement),
+            Err(PrepareError::Rejected(RejectCode::NotLoaded))
+        );
+    }
+}
+
+#[test]
+fn resize_checks_final_terrain_and_grouped_placement_checks_final_body() {
+    let (mut world, service) = setup(false, false);
+    let pos = BlockPos::new(4, 4, 4);
+    let h = world
+        .entities_mut()
+        .spawn(Position::new(3.5, 4.5, 4.5))
+        .unwrap();
+    declare_body(&mut world, h, body([100_000; 3]));
+    let place = action(&world, &service, pos, Some("base:stone"), 0).unwrap();
+    apply(&mut world, &place);
+    let expand = resize(&world, h, Some(body([800_000; 3])));
+    assert_eq!(
+        world.prepare(&expand),
+        Err(PrepareError::Rejected(RejectCode::Conflict))
+    );
+    // Expansion is valid at the final destination, swept with the original body.
+    let movement = translate(&world, h, [-1.0, 0.0, 0.0], [0.01; 3]);
+    let group =
+        TransactionGroup::new(TransactionId(100), expand.ordering, vec![expand, movement]).unwrap();
+    let prepared = world.prepare_group(&group).unwrap();
+    world.publish(prepared).unwrap();
+    assert_eq!(
+        EntityCollider::of(world.entities().get(h).unwrap()).unwrap(),
+        Some(body([800_000; 3]))
+    );
+    // The next placement may use the body's final disabled state.
+    let mut place = tx(101, "world:module");
+    let pos = BlockPos::new(2, 4, 4);
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    place
+        .write_block(pos, stone)
+        .require_block_clear(pos, stone);
+    assert!(world.prepare(&place).is_err());
+    let disable = resize(&world, h, Some(EntityCollider::Disabled));
+    let group =
+        TransactionGroup::new(TransactionId(102), disable.ordering, vec![place, disable]).unwrap();
+    world.publish(world.prepare_group(&group).unwrap()).unwrap();
+}
+
+#[test]
+fn collider_spawn_checks_initial_fit_and_module_may_create_and_remove_its_body() {
+    let (mut world, _) = setup(false, false);
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    world
+        .store_mut()
+        .edit(BlockPos::new(4, 4, 4), stone)
+        .unwrap();
+    let mut create = tx(1, "test:module");
+    create.spawn_entity(
+        Position::new(4.5, 4.5, 4.5),
+        [(collider_schema(), body([100_000; 3]).fields())].into(),
+    );
+    assert_eq!(
+        world.prepare(&create),
+        Err(PrepareError::Rejected(RejectCode::Conflict))
+    );
+    assert_eq!(world.entities().next_entity_id(), 1);
+    create.spawns[0]
+        .components
+        .insert(collider_schema(), EntityCollider::Disabled.fields());
+    apply(&mut world, &create);
+    let h = world.entities().handle_of(EntityId(1)).unwrap();
+    let mut unauthorized = resize(&world, h, Some(body([100_000; 3])));
+    unauthorized.source = key("test:module");
+    assert_eq!(
+        world.prepare(&unauthorized),
+        Err(PrepareError::Rejected(RejectCode::PermissionDenied))
+    );
+    let mut remove = tx(2, "test:module");
+    remove.despawn_entity(h, world.entities().get(h).unwrap());
+    apply(&mut world, &remove);
+    assert!(world.entities().is_empty());
+}
+
+#[test]
+fn collider_resize_and_movement_reject_stale_prepared_observations() {
+    let (mut world, _) = setup(false, false);
+    let h = world
+        .entities_mut()
+        .spawn(Position::new(4.5, 4.5, 4.5))
+        .unwrap();
+    declare_body(&mut world, h, body([100_000; 3]));
+    let movement = translate(&world, h, [1.0, 0.0, 0.0], [0.3; 3]);
+    let group =
+        TransactionGroup::new(TransactionId(5), movement.ordering, vec![movement.clone()]).unwrap();
+    let token = world.prevalidate_movement(&group).unwrap();
+    let prepared = world.prepare(&movement).unwrap();
+    declare_body(&mut world, h, EntityCollider::Disabled);
+    assert!(world.refresh_movement(&token).is_err());
+    assert!(world.publish(prepared).is_err());
+    let change = resize(&world, h, Some(body([100_000; 3])));
+    let prepared = world.prepare(&change).unwrap();
+    world
+        .entities_mut()
+        .move_to(h, Position::new(5.5, 4.5, 4.5))
+        .unwrap();
+    assert!(world.publish(prepared).is_err());
+    assert_eq!(world.seq(), CommitSeq::INITIAL);
+    let prepared = world.prepare(&change).unwrap();
+    let stone = world.registry().default_state(&key("base:stone")).unwrap();
+    world
+        .store_mut()
+        .edit(BlockPos::new(5, 4, 4), stone)
+        .unwrap();
+    assert!(world.publish(prepared).is_err());
+}
+
+#[test]
+fn tiny_body_work_is_bounded_without_partial_translation() {
+    let (mut world, _) = setup(false, false);
+    let h = world
+        .entities_mut()
+        .spawn(Position::new(4.5, 4.5, 4.5))
+        .unwrap();
+    declare_body(&mut world, h, body([1; 3]));
+    let movement = translate(&world, h, [1.0, 0.0, 0.0], [0.3; 3]);
+    assert_eq!(
+        world.prepare(&movement),
+        Err(PrepareError::Rejected(RejectCode::QuotaExceeded))
+    );
+    assert_eq!(world.entities().get(h).unwrap().position.x, 4.5);
+    assert_eq!(world.seq(), CommitSeq::INITIAL);
+}
+
+#[test]
+fn disabled_body_checks_short_diagonal_intersections_and_world_bounds() {
+    let (mut world, _) = setup(false, false);
+    for pos in [SectionPos::new(1, 0, 1), SectionPos::new(0, -1, 0)] {
+        world.store_mut().request(pos).unwrap();
+        world
+            .store_mut()
+            .install(pos, Section::empty(16).unwrap())
+            .unwrap();
+        world.store_mut().finish_load(pos).unwrap();
+    }
+    let h = world
+        .entities_mut()
+        .spawn(Position::new(15.99, 4.5, 15.98))
+        .unwrap();
+    declare_body(&mut world, h, EntityCollider::Disabled);
+    let movement = translate(&world, h, [0.2, 0.0, 0.2], [0.3; 3]);
+    assert_eq!(
+        world.prepare(&movement),
+        Err(PrepareError::Rejected(RejectCode::NotLoaded))
+    );
+    world
+        .entities_mut()
+        .move_to(h, Position::new(6.5, -15.5, 4.5))
+        .unwrap();
+    let movement = translate(&world, h, [0.0, -1.0, 0.0], [0.3; 3]);
+    assert_eq!(
+        world.prepare(&movement),
+        Err(PrepareError::Rejected(RejectCode::NotLoaded))
+    );
+}
+
+#[test]
+fn collider_checkpoint_journal_and_public_replica_preserve_the_same_fields() {
+    let (mut world, _) = setup(false, false);
+    let h = world
+        .entities_mut()
+        .spawn(Position::new(4.5, 4.5, 4.5))
+        .unwrap();
+    declare_body(&mut world, h, body([100_000, 300_000, 200_000]));
+    let snapshot = world.capture_snapshot(meta(&world)).unwrap();
+    let change = resize(&world, h, Some(EntityCollider::Disabled));
+    let changes = apply(&mut world, &change);
+    let mut recovery = Recovery::new(world.world(), world.registry(), world.schemas());
+    recovery.restore_snapshot(&snapshot).unwrap();
+    recovery.replay(&changes).unwrap();
+    let restored = recovery.finish().unwrap();
+    assert_eq!(
+        EntityCollider::of(restored.entities().iter().next().unwrap().1).unwrap(),
+        Some(EntityCollider::Disabled)
+    );
+    let checkpoint = world.capture_snapshot(meta(&world)).unwrap();
+    let mut recovery = Recovery::new(world.world(), world.registry(), world.schemas());
+    recovery.restore_snapshot(&checkpoint).unwrap();
+    assert_eq!(
+        EntityCollider::of(
+            recovery
+                .finish()
+                .unwrap()
+                .entities()
+                .iter()
+                .next()
+                .unwrap()
+                .1
+        )
+        .unwrap(),
+        Some(EntityCollider::Disabled)
+    );
+    let binding = Binding {
+        world: world.world(),
+        epoch: WorldEpoch(1),
+        compatibility: world.coordinator().compatibility(),
+    };
+    let budget = OutputBudget::new(100_000, 8_000_000);
+    let mut source = ReplicaSource::new(
+        world,
+        binding,
+        ReplicaLimits {
+            max_subscriptions: 1,
+            max_sections: 1,
+            max_queued_batches: 8,
+            snapshot: budget,
+            queue: budget,
+        },
+    )
+    .unwrap();
+    let seed = source
+        .open_replica(
+            Viewer {
+                session: SessionId(1),
+                actor: ActorContextId(1),
+            },
+            actor(),
+            ReplicaScope {
+                sections: [SectionPos::ZERO].into(),
+            },
+            budget,
+        )
+        .unwrap();
+    assert_eq!(
+        seed.state.entities[0].components.get(&collider_schema()),
+        Some(&EntityCollider::Disabled.fields())
+    );
+    let change = resize(source.world(), h, Some(body([200_000; 3])));
+    source.publish(source.prepare(&change).unwrap()).unwrap();
+    let batches = source
+        .take_replica_batches(binding, seed.subscription, budget)
+        .unwrap();
+    assert_eq!(
+        batches[0].changes.entities[0]
+            .components
+            .get(&collider_schema()),
+        Some(&body([200_000; 3]).fields())
+    );
+}
+
 fn fields(value: u32) -> ComponentFields {
     [(key("test:value"), ComponentValue::U32(value))].into()
 }

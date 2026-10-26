@@ -80,6 +80,9 @@ pub fn walker_step(
         return Err(StepError::EntityGone);
     };
     let (id, previous) = (entity.id, entity.position);
+    let half = crate::body::of(entity, &[], WALKER_HALF)
+        .map_err(StepError::Rejected)?
+        .unwrap_or(WALKER_HALF);
 
     state.velocity[0] = wish[0] * WALK_SPEED;
     state.velocity[2] = wish[2] * WALK_SPEED;
@@ -113,7 +116,7 @@ pub fn walker_step(
             requested.y - previous.y,
             requested.z - previous.z,
         ],
-        WALKER_HALF,
+        half,
     );
     let result = world.commit(&tx);
 
@@ -187,13 +190,16 @@ pub fn unstuck(
         return Err(StepError::EntityGone);
     };
     let (id, previous) = (entity.id, entity.position);
+    let half = crate::body::of(entity, &[], WALKER_HALF)
+        .map_err(StepError::Rejected)?
+        .unwrap_or(WALKER_HALF);
     let move_result = crate::movement::prepare_escape(
         world.store(),
         world.entities(),
         world.registry(),
         state.handle,
         id,
-        WALKER_HALF,
+        half,
     );
     let Some(entity_move) = move_result.map_err(StepError::Rejected)? else {
         return Ok(None);
@@ -219,7 +225,7 @@ pub fn unstuck(
         id,
         previous_bits: previous.to_bits(),
         delta_bits: delta.map(f64::to_bits),
-        half_bits: WALKER_HALF.map(f64::to_bits),
+        half_bits: half.map(f64::to_bits),
     });
     let result = world.commit_escape(&tx);
     let Some(entity) = world.entities().get(state.handle) else {
@@ -268,9 +274,12 @@ fn wedged(world: &WorldAuthority, handle: EntityHandle, id: EntityId) -> Result<
             }
         }
     }
+    let Some(half) = crate::body::of(entity, &[], WALKER_HALF)? else {
+        return Ok(false);
+    };
     let collider = Aabb::from_center(
         [entity.position.x, entity.position.y, entity.position.z],
-        WALKER_HALF,
+        half,
     );
     Ok(collides(&View { world }, &collider))
 }

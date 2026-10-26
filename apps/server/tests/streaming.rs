@@ -267,7 +267,22 @@ fn pages(dir: &Directory) -> SectionPages {
     SectionPages::new(root, base::budget(), base::codec_limits(), 64).unwrap()
 }
 fn create(dir: &Directory) -> base::Files {
-    let (world, actions) = base::world().unwrap();
+    let (mut world, actions) = base::world().unwrap();
+    let schemas = world.schemas().clone();
+    let handle = world.entities().iter().next().unwrap().0;
+    world
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(
+            &schemas,
+            &collider_schema(),
+            EntityCollider::Box {
+                half: [300_000, 900_000, 300_000],
+            }
+            .fields(),
+        )
+        .unwrap();
     let compatibility = world.coordinator().compatibility();
     base::Files::create_file(
         dir.acquire(),
@@ -339,6 +354,21 @@ fn unload_replay_checkpoint_reload_preserve_exact_entities_watermark_and_changed
         .entities()
         .handle_of(before.entities[0].id)
         .unwrap();
+    assert_eq!(
+        EntityCollider::of(
+            server
+                .authority()
+                .unwrap()
+                .world()
+                .entities()
+                .get(handle)
+                .unwrap()
+        )
+        .unwrap(),
+        Some(EntityCollider::Box {
+            half: [300_000, 900_000, 300_000]
+        })
+    );
     durable(
         server
             .unload_section(&pages, SectionPos::ZERO, &mut NoReplicas)

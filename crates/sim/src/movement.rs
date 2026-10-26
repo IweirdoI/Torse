@@ -14,7 +14,9 @@ use torse_types::{BlockPos, EntityHandle, EntityId, RejectCode};
 use torse_world::{
     BlockEdit, BlockStateRegistry, EntityMove, EntityStore, Position, SectionStore, TerrainQuery,
 };
-use torse_world_services::{Aabb, CollisionCell, CollisionSource, LocalBox, collides, sweep};
+use torse_world_services::{
+    Aabb, CollisionCell, CollisionSource, LocalBox, collides, sweep, sweep_bounded,
+};
 
 use crate::transaction::Movement;
 
@@ -69,8 +71,15 @@ pub fn prepare_escape(
     if entity.id != id {
         return Err(RejectCode::MissingTarget);
     }
+    let Some(half) = crate::body::of(entity, &[], half)? else {
+        return Ok(None);
+    };
     let position = entity.position;
-    if !bounded_position(position) || half.iter().any(|v| *v <= 0.0 || *v > MAX_COLLIDER_HALF) {
+    if !bounded_position(position)
+        || half
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0 || *v > MAX_COLLIDER_HALF)
+    {
         return Err(RejectCode::InvalidData);
     }
     let view = CollisionView {
@@ -203,10 +212,23 @@ pub(crate) fn prepare_movements(
         {
             return Err(RejectCode::InvalidData);
         }
-        // A collider thinner than a substep can tunnel through thin geometry.
-        // Require a minimum width greater than the collision substep. The
-        // existing sweep remains the shared prototype for authority/prediction.
-        if half.iter().any(|v| *v < torse_world_services::MAX_SUBSTEP) {
+        // Declared bodies use adaptive steps. Undeclared entities keep the
+        // original request bounds and minimum width for compatibility.
+        let declared =
+            torse_world::EntityCollider::of(entity).map_err(|_| RejectCode::InvalidData)?;
+        let Some(half) = crate::body::of(entity, &[], half)? else {
+            trace_loaded(&view, position, delta)?;
+            if *view.unknown.borrow() {
+                return Err(RejectCode::NotLoaded);
+            }
+            moves.push(EntityMove {
+                id: request.id,
+                previous_bits: request.previous_bits,
+                position_bits: position.translated(delta).to_bits(),
+            });
+            continue;
+        };
+        if declared.is_none() && half.iter().any(|v| *v < torse_world_services::MAX_SUBSTEP) {
             return Err(RejectCode::InvalidData);
         }
         let collider = Aabb::from_center([position.x, position.y, position.z], half);
@@ -232,7 +254,11 @@ pub(crate) fn prepare_movements(
             });
             continue;
         }
-        let result = sweep(&view, collider, delta);
+        let result = if declared.is_some() {
+            sweep_bounded(&view, collider, delta).ok_or(RejectCode::QuotaExceeded)?
+        } else {
+            sweep(&view, collider, delta)
+        };
         if *view.unknown.borrow() {
             return Err(RejectCode::InvalidData);
         }
@@ -258,6 +284,114 @@ fn bounded_position(position: Position) -> bool {
         && [position.x, position.y, position.z]
             .iter()
             .all(|value| value.abs() <= MAX_MOVEMENT_COORDINATE)
+}
+
+/// Traverse every crossed cell, including very short diagonal intersections.
+/// With at most 16 cells per axis, 96 visits cover the endpoint and boundary ties.
+fn trace_loaded(
+    view: &CollisionView<'_>,
+    start: Position,
+    delta: [f64; 3],
+) -> Result<(), RejectCode> {
+    let origin = [start.x, start.y, start.z];
+    let mut cell = origin.map(|v| v.floor() as i64);
+    let end = std::array::from_fn::<_, 3, _>(|a| (origin[a] + delta[a]).floor() as i64);
+    let step = delta.map(|d| {
+        if d > 0.0 {
+            1
+        } else if d < 0.0 {
+            -1
+        } else {
+            0
+        }
+    });
+    let interval = delta.map(|d| {
+        if d == 0.0 {
+            f64::INFINITY
+        } else {
+            1.0 / d.abs()
+        }
+    });
+    let mut next = std::array::from_fn::<_, 3, _>(|a| {
+        if step[a] == 0 {
+            f64::INFINITY
+        } else {
+            ((cell[a] + i64::from(step[a] > 0)) as f64 - origin[a]) / delta[a]
+        }
+    });
+    for _ in 0..96 {
+        if matches!(
+            view.collision(BlockPos::new(cell[0], cell[1], cell[2])),
+            CollisionCell::NotLoaded | CollisionCell::OutOfBounds
+        ) {
+            return Err(RejectCode::NotLoaded);
+        }
+        if cell == end {
+            return Ok(());
+        }
+        let axis = (0..3).min_by(|a, b| next[*a].total_cmp(&next[*b])).unwrap();
+        cell[axis] += step[axis];
+        next[axis] += interval[axis];
+    }
+    Err(RejectCode::QuotaExceeded)
+}
+
+/// Validate resized bodies at their resolved final positions, including terrain writes.
+pub(crate) fn validate_bodies(
+    store: &SectionStore,
+    entities: &EntityStore,
+    registry: &BlockStateRegistry,
+    edits: &[BlockEdit],
+    moves: &[EntityMove],
+    components: &[torse_world::ComponentEdit],
+    lifecycle: Option<&torse_world::EntityLifecycle>,
+) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
+    let view = CollisionView {
+        store,
+        registry,
+        overlay: edits.iter().map(|e| (e.pos, e.state)).collect(),
+        reads: RefCell::new(BTreeMap::new()),
+        unknown: RefCell::new(false),
+    };
+    let mut targets = Vec::new();
+    for edit in components
+        .iter()
+        .filter(|e| e.schema == torse_world::collider_schema())
+    {
+        let entity = entities
+            .handle_of(edit.id)
+            .and_then(|h| entities.get(h))
+            .ok_or(RejectCode::MissingTarget)?;
+        let Some(half) = crate::body::of(entity, components, crate::player::WALKER_HALF)? else {
+            continue;
+        };
+        let position = moves
+            .iter()
+            .find(|m| m.id == edit.id)
+            .map_or(entity.position, |m| Position::from_bits(m.position_bits));
+        targets.push((position, half));
+    }
+    for spawned in lifecycle.into_iter().flat_map(|l| &l.spawned) {
+        if let Some(fields) = spawned.components.get(&torse_world::collider_schema())
+            && let Some(half) = torse_world::EntityCollider::from_fields(fields)
+                .map_err(|_| RejectCode::InvalidData)?
+                .half()
+        {
+            targets.push((Position::from_bits(spawned.position_bits), half));
+        }
+    }
+    for (position, half) in targets {
+        let center = bounded_center([position.x, position.y, position.z], half)
+            .ok_or(RejectCode::InvalidData)?;
+        let blocked = collides(&view, &Aabb::from_center(center, half));
+        if *view.unknown.borrow() {
+            return Err(RejectCode::NotLoaded);
+        }
+        if blocked {
+            return Err(RejectCode::Conflict);
+        }
+    }
+    Ok(view.reads.into_inner().into_iter().collect())
 }
 
 struct CollisionView<'a> {

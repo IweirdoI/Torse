@@ -18,6 +18,7 @@
 
 mod archive;
 mod block_instance;
+mod collider;
 mod component;
 mod entity;
 mod exchange;
@@ -34,6 +35,9 @@ pub use archive::{
     SnapshotArchive,
 };
 pub use block_instance::{BlockInstance, block_instance_schema};
+pub use collider::{
+    COLLIDER_SCALE, EntityCollider, MAX_COLLIDER_EXTENT, collider_owner, collider_schema,
+};
 pub use component::{
     ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue,
     MAX_COMPONENT_BYTES, MAX_COMPONENT_INSTANCES, MAX_COMPONENT_NODES, MAX_VALUE_DEPTH,

@@ -208,12 +208,40 @@ pub fn collides(source: &impl CollisionSource, collider: &Aabb) -> bool {
 /// to [`MAX_SUBSTEP`] away from it. Refinement costs a fixed number of overlap
 /// tests and only runs on the blocked axis.
 pub fn sweep(source: &impl CollisionSource, collider: Aabb, delta: [f64; 3]) -> SweepResult {
+    sweep_steps(source, collider, delta, MAX_SUBSTEP)
+}
+
+/// Adapt the step to a thin body, while bounding the complete axis work.
+pub fn sweep_bounded(
+    source: &impl CollisionSource,
+    collider: Aabb,
+    delta: [f64; 3],
+) -> Option<SweepResult> {
+    let step = (0..3)
+        .map(|axis| (collider.max[axis] - collider.min[axis]) * 0.25)
+        .fold(MAX_SUBSTEP, f64::min);
+    if !step.is_finite()
+        || step <= 0.0
+        || delta.iter().any(|d| !d.is_finite())
+        || delta.iter().map(|d| (d.abs() / step).ceil()).sum::<f64>() > 512.0
+    {
+        return None;
+    }
+    Some(sweep_steps(source, collider, delta, step))
+}
+
+fn sweep_steps(
+    source: &impl CollisionSource,
+    collider: Aabb,
+    delta: [f64; 3],
+    limit: f64,
+) -> SweepResult {
     let mut current = collider;
     let mut blocked = [false; 3];
     for axis in [0usize, 2, 1] {
         let mut remaining = delta[axis];
         while remaining.abs() > f64::EPSILON {
-            let step = remaining.clamp(-MAX_SUBSTEP, MAX_SUBSTEP);
+            let step = remaining.clamp(-limit, limit);
             let mut candidate = current;
             candidate.min[axis] += step;
             candidate.max[axis] += step;
@@ -256,6 +284,36 @@ fn refine(source: &impl CollisionSource, from: Aabb, axis: usize, step: f64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adaptive_sweep_stops_a_small_body_at_a_thin_surface() {
+        struct Thin;
+        impl CollisionSource for Thin {
+            fn collision(&self, pos: BlockPos) -> CollisionCell {
+                if pos == BlockPos::new(1, 0, 0) {
+                    CollisionCell::Solid(vec![LocalBox {
+                        min: [0.11, 0.0, 0.0],
+                        max: [0.12, 1.0, 1.0],
+                    }])
+                } else {
+                    CollisionCell::Empty
+                }
+            }
+        }
+        let start = Aabb::from_center([0.95, 0.5, 0.5], [0.01; 3]);
+        let result = sweep_bounded(&Thin, start, [0.5, 0.0, 0.0]).unwrap();
+        assert!(result.blocked[0]);
+        assert!((result.aabb.max[0] - 1.11).abs() < 1e-5);
+        assert!(!collides(&Thin, &result.aabb));
+        assert!(
+            sweep_bounded(
+                &Thin,
+                Aabb::from_center([0.5; 3], [0.000_001; 3]),
+                [1.0, 0.0, 0.0]
+            )
+            .is_none()
+        );
+    }
 
     struct Grid {
         occupied: Vec<(i64, i64, i64)>,

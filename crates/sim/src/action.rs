@@ -280,16 +280,14 @@ impl ActionView<'_> {
         };
         let cell_boxes = crate::movement::boxes(&shape);
         let overlapping = self.world.entities().iter().any(|(_, entity)| {
-            if entity
-                .components
-                .component(&torse_world::block_instance_schema())
-                .is_some()
-            {
-                return false;
-            }
+            let half = match crate::body::of(entity, &[], crate::player::WALKER_HALF) {
+                Ok(Some(half)) => half,
+                Ok(None) => return false,
+                Err(_) => return true,
+            };
             let collider = Aabb::from_center(
                 [entity.position.x, entity.position.y, entity.position.z],
-                crate::player::WALKER_HALF,
+                half,
             );
             cell_boxes
                 .iter()

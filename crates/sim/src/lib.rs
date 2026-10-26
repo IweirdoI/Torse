@@ -15,6 +15,7 @@ pub mod action;
 pub mod authority;
 pub mod block_actions;
 mod block_instances;
+mod body;
 pub mod clock;
 pub mod coordinator;
 pub mod durable;

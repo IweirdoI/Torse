@@ -68,6 +68,8 @@ impl ComponentSchemas {
         }
         let binding = crate::block_instance::binding_schema();
         schemas.insert(binding.id.clone(), binding);
+        let collider = crate::collider::schema();
+        schemas.insert(collider.id.clone(), collider);
         Self {
             schemas,
             persistence: BTreeMap::new(),
@@ -209,6 +211,9 @@ impl ComponentSet {
         fields: &ComponentFields,
     ) -> Result<(), ComponentError> {
         component_size(fields)?;
+        if id == &crate::collider_schema() {
+            crate::EntityCollider::from_fields(fields)?;
+        }
         let schema = schemas
             .get(id)
             .ok_or_else(|| ComponentError::UnknownSchema { id: id.clone() })?;
@@ -529,8 +534,9 @@ mod tests {
     #[test]
     fn known_schema_is_registered_from_compiled_content() {
         let (schemas, id) = schemas();
-        assert_eq!(schemas.len(), 2);
+        assert_eq!(schemas.len(), 3);
         assert!(schemas.get(&crate::block_instance_schema()).is_some());
+        assert!(schemas.get(&crate::collider_schema()).is_some());
         assert!(schemas.get(&id).is_some());
     }
 

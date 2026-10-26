@@ -17,6 +17,6 @@ pub mod navigation;
 
 pub use collision::{
     Aabb, CONTACT_EPSILON, CollisionCell, CollisionSource, LocalBox, MAX_SUBSTEP, SweepResult,
-    collides, sweep,
+    collides, sweep, sweep_bounded,
 };
 pub use generation::{FlatTerrain, GenerationParams, HillTerrain, SectionGenerator};

@@ -45,7 +45,8 @@ pub struct PreparedChange {
     touched: Vec<SectionPos>,
     entity_moves: Vec<EntityMove>,
     movement_reads: Vec<(BlockPos, TerrainQuery)>,
-    movement_handles: Vec<(EntityHandle, EntityId)>,
+    movement_handles: Vec<(EntityHandle, EntityId, Option<torse_world::EntityCollider>)>,
+    body_positions: Vec<(EntityId, [u64; 3])>,
     component_edits: Vec<ComponentEdit>,
     component_batch: ComponentBatch,
     lifecycle_batch: Option<LifecycleBatch>,
@@ -67,11 +68,11 @@ impl MovementPrevalidation {
                     .capacity()
                     .saturating_mul(size_of::<(BlockPos, TerrainQuery)>()),
             )
-            .saturating_add(
-                p.movement_handles
-                    .capacity()
-                    .saturating_mul(size_of::<(EntityHandle, EntityId)>()),
-            )
+            .saturating_add(p.movement_handles.capacity().saturating_mul(size_of::<(
+                EntityHandle,
+                EntityId,
+                Option<torse_world::EntityCollider>,
+            )>()))
             .saturating_add(
                 p.entity_moves
                     .capacity()
@@ -127,6 +128,20 @@ impl ComponentPrevalidation {
             peak_bytes: payload.checked_mul(512)?.checked_add(65536)?,
         })
     }
+}
+
+fn body_positions(entities: &EntityStore, edits: &[ComponentEdit]) -> Vec<(EntityId, [u64; 3])> {
+    edits
+        .iter()
+        .filter(|e| e.schema == torse_world::collider_schema())
+        .map(|e| {
+            let entity = entities
+                .handle_of(e.id)
+                .and_then(|h| entities.get(h))
+                .expect("validated component owner");
+            (e.id, entity.position.to_bits())
+        })
+        .collect()
 }
 
 impl PreparedChange {
@@ -260,6 +275,10 @@ impl CommitCoordinator {
                     && m.mutations.is_empty()
                     && m.clearance.is_empty()
                     && m.movements.is_empty()
+                    && !m
+                        .components
+                        .iter()
+                        .any(|e| e.schema == torse_world::collider_schema())
                     && m.spawns.is_empty()
                     && m.despawns.is_empty()
             })
@@ -341,9 +360,11 @@ impl CommitCoordinator {
         if p.movement_reads
             .iter()
             .any(|(pos, value)| store.query(*pos) != *value)
-            || p.movement_handles
-                .iter()
-                .any(|(handle, id)| entities.get(*handle).is_none_or(|e| e.id != *id))
+            || p.movement_handles.iter().any(|(handle, id, body)| {
+                entities.get(*handle).is_none_or(|e| {
+                    e.id != *id || torse_world::EntityCollider::of(e).ok().as_ref() != Some(body)
+                })
+            })
             || entities.validate_moves(&p.entity_moves).is_err()
         {
             return Err(PrepareError::Rejected(RejectCode::Conflict));
@@ -448,6 +469,7 @@ impl CommitCoordinator {
             entity_moves: Vec::new(),
             movement_reads: Vec::new(),
             movement_handles: Vec::new(),
+            body_positions: Vec::new(),
             component_edits: Vec::new(),
             component_batch: ComponentBatch::default(),
             lifecycle_batch: None,
@@ -550,11 +572,25 @@ impl CommitCoordinator {
             lifecycle,
         )
         .map_err(PrepareError::Rejected)?;
+        prepared.movement_reads.extend(
+            crate::movement::validate_bodies(
+                store,
+                entities,
+                registry,
+                &prepared.edits,
+                &prepared.entity_moves,
+                &prepared.component_edits,
+                prepared.entity_lifecycle(),
+            )
+            .map_err(PrepareError::Rejected)?,
+        );
+        prepared.body_positions = body_positions(entities, &prepared.component_edits);
         if !crate::placement::clear(
             &prepared.clearance,
             entities,
             &prepared.entity_moves,
             prepared.entity_lifecycle(),
+            &prepared.component_edits,
         ) {
             return Err(PrepareError::Rejected(RejectCode::Conflict));
         }
@@ -687,12 +723,16 @@ impl CommitCoordinator {
             edits.extend(member_edits);
             entity_moves.extend(resolved.moves);
             movement_reads.extend(resolved.reads);
-            movement_handles.extend(
-                member
-                    .movements
-                    .iter()
-                    .map(|request| (request.handle, request.id)),
-            );
+            movement_handles.extend(member.movements.iter().map(|request| {
+                (
+                    request.handle,
+                    request.id,
+                    torse_world::EntityCollider::of(
+                        entities.get(request.handle).expect("validated handle"),
+                    )
+                    .expect("validated body"),
+                )
+            }));
             if !over_component_quota {
                 component_edits.extend(member.components.iter().cloned());
             }
@@ -752,11 +792,24 @@ impl CommitCoordinator {
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
+        movement_reads.extend(
+            crate::movement::validate_bodies(
+                store,
+                entities,
+                registry,
+                &edits,
+                &entity_moves,
+                &component_edits,
+                lifecycle_batch.as_ref().map(LifecycleBatch::change),
+            )
+            .map_err(PrepareError::Rejected)?,
+        );
         if !crate::placement::clear(
             &clearance,
             entities,
             &entity_moves,
             lifecycle_batch.as_ref().map(LifecycleBatch::change),
+            &component_edits,
         ) {
             return Err(PrepareError::Rejected(RejectCode::Conflict));
         }
@@ -781,6 +834,7 @@ impl CommitCoordinator {
             entity_moves,
             movement_reads,
             movement_handles,
+            body_positions: body_positions(entities, &component_edits),
             component_edits,
             component_batch,
             lifecycle_batch,
@@ -810,7 +864,16 @@ impl CommitCoordinator {
         prepared.movement_handles = transaction
             .movements
             .iter()
-            .map(|request| (request.handle, request.id))
+            .map(|request| {
+                (
+                    request.handle,
+                    request.id,
+                    torse_world::EntityCollider::of(
+                        entities.get(request.handle).expect("validated handle"),
+                    )
+                    .expect("validated body"),
+                )
+            })
             .collect();
         prepared.clearance =
             crate::placement::prepare(registry, &transaction.mutations, &transaction.clearance)
@@ -819,7 +882,13 @@ impl CommitCoordinator {
         // have also been derived. This entry point handles translations alone.
         if transaction.spawns.is_empty()
             && transaction.despawns.is_empty()
-            && !crate::placement::clear(&prepared.clearance, entities, &prepared.entity_moves, None)
+            && !crate::placement::clear(
+                &prepared.clearance,
+                entities,
+                &prepared.entity_moves,
+                None,
+                &transaction.components,
+            )
         {
             return Err(PrepareError::Rejected(RejectCode::Conflict));
         }
@@ -891,6 +960,7 @@ impl CommitCoordinator {
             entity_moves: Vec::new(),
             movement_reads: Vec::new(),
             movement_handles: Vec::new(),
+            body_positions: Vec::new(),
             component_edits: Vec::new(),
             component_batch: ComponentBatch::default(),
             lifecycle_batch: None,
@@ -935,6 +1005,7 @@ impl CommitCoordinator {
             entities,
             &prepared.entity_moves,
             prepared.entity_lifecycle(),
+            &prepared.component_edits,
         ) {
             return Err(CommitFault::Invariant(
                 "prepared placement occupancy changed",
@@ -957,10 +1028,18 @@ impl CommitCoordinator {
             .movement_reads
             .iter()
             .any(|(pos, expected)| store.query(*pos) != *expected)
-            || prepared
-                .movement_handles
-                .iter()
-                .any(|(handle, id)| entities.get(*handle).is_none_or(|entity| entity.id != *id))
+            || prepared.movement_handles.iter().any(|(handle, id, body)| {
+                entities.get(*handle).is_none_or(|entity| {
+                    entity.id != *id
+                        || torse_world::EntityCollider::of(entity).ok().as_ref() != Some(body)
+                })
+            })
+            || prepared.body_positions.iter().any(|(id, position)| {
+                entities
+                    .handle_of(*id)
+                    .and_then(|h| entities.get(h))
+                    .is_none_or(|e| e.position.to_bits() != *position)
+            })
         {
             return Err(CommitFault::Invariant(
                 "prepared movement observations changed",
@@ -1138,7 +1217,16 @@ impl CommitCoordinator {
         prepared.movement_handles = transaction
             .movements
             .iter()
-            .map(|request| (request.handle, request.id))
+            .map(|request| {
+                (
+                    request.handle,
+                    request.id,
+                    torse_world::EntityCollider::of(
+                        entities.get(request.handle).expect("validated handle"),
+                    )
+                    .expect("validated body"),
+                )
+            })
             .collect();
         let batch = entities
             .prepare_components(&transaction.components, schemas)

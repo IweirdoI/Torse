@@ -208,3 +208,7 @@ ExecutionHost已接入Server::unload_section、reload_section和install_section�
 装卸限于没有已接纳输入或冻结规划的Tick起点，未来事件保守阻止卸载，票据继续生效。未驻留页保留实体身份和持久字段，活动表移除对象，重新装回后水位不变。分区页与未驻留索引均有容量限制，当前不自动回收孤立页。备份须包含日志、检查点及被引用的sections页；便携归档要求先装回全部分区。
 
 可运行durable_stream示例逐次验证park、load和grow，命令、格式与场景证据见[持久分区装卸](../../benchmarks/M3-section-streaming.md)。自动选区、异步I/O及生成版本迁移另行实现。
+
+## 实体碰撞体
+
+core:schema/collider提供实体轴对齐碰撞盒或关闭碰撞的声明。EntityCollider保存以百万分之一格表示的半尺寸，移动与放置共用声明，字段按普通组件进入日志、检查点、分区页和公开复制。创建时可设置初始声明，后续修改由core:module/physics来源提交，并复核最终位置和地形。无声明对象保留兼容行为，验证及限制见[实体碰撞体](../../benchmarks/M4-entity-colliders.md)。

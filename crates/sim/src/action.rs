@@ -87,7 +87,12 @@ pub enum ActionTarget {
 }
 
 /// Upper bound on section grants one actor may carry at registration.
-pub const MAX_ACTOR_SECTIONS: usize = 64;
+///
+/// A resident 5 by 5 column scope reaches 600 grants once a world fills 24
+/// vertical sections per column, so the bound must cover full-height worlds.
+/// It stays a host mistake backstop rather than a scope policy; the replica
+/// subscription budget remains independent.
+pub const MAX_ACTOR_SECTIONS: usize = 1024;
 
 /// Identity and finite access grants established by the trusted host.
 ///

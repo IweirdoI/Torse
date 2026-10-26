@@ -55,7 +55,7 @@ requests_sent=1 requests_rejected=1 batches=0 vertices=4528
 
 ## 数量预算
 
-ActorContext分区授权上限`MAX_ACTOR_SECTIONS=64`，会话注册时由执行宿主拒绝超限actor（resource_limit）；该预算与复制订阅的`replicas.max_sections`相互独立。构造器保持不可失败，超限仅在注册时生效，1项sim测试覆盖。
+ActorContext分区授权上限`MAX_ACTOR_SECTIONS=1024`，会话注册时由执行宿主拒绝超限actor（resource_limit）；该预算与复制订阅的`replicas.max_sections`相互独立。上限按全高驻留世界取值：16格边长分区、24层垂直范围、5×5列共600个授权，原值64只够半径0的单列世界。构造器保持不可失败，超限仅在注册时生效，1项sim测试覆盖。
 
 ## 未覆盖
 

@@ -189,7 +189,8 @@ fn section_grants_have_a_registration_budget() {
     }
     assert_eq!(actor.section_count(), torse_sim::action::MAX_ACTOR_SECTIONS);
     // The builder stays infallible; registration is where the bound bites.
-    let overflowing = actor.section(SectionPos::new(999, 0, 0));
+    // Use the next unused coordinate so the count really grows.
+    let overflowing = actor.section(SectionPos::new(index, 0, 0));
     assert!(overflowing.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS);
 }
 

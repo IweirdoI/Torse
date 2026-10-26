@@ -165,6 +165,9 @@ impl ActionHandler for BlockHandler {
         }
         let mut tx = Transaction::new(request.transaction, owner(), request.ordering);
         tx.read_block(pos, current).write_block(pos, state);
+        if self.place {
+            tx.require_block_clear(pos, state);
+        }
         Ok(ActionOutput::Mutation(Box::new(tx)))
     }
 }

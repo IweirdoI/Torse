@@ -96,6 +96,9 @@ pub struct Transaction {
     pub preconditions: Vec<BlockPrecondition>,
     /// Writes applied atomically when every precondition holds.
     pub mutations: Vec<Mutation>,
+    /// Final block shapes that must remain clear of ordinary entity occupancy.
+    /// Each guard must match this transaction's final write at the same cell.
+    pub clearance: Vec<Mutation>,
     /// Translations resolved against authoritative collision before publication.
     pub movements: Vec<Movement>,
     /// Schema-validated protected fields; only the schema owner may write them.
@@ -108,6 +111,9 @@ pub struct Transaction {
 
 /// Upper bound on members in one atomic group.
 pub const MAX_GROUP_MEMBERS: usize = 4;
+
+/// Maximum placement occupancy conditions in one transaction or atomic group.
+pub const MAX_CLEARANCE_CHECKS: usize = 256;
 
 /// One atomic task contributed by several module sources.
 ///
@@ -210,6 +216,7 @@ impl Transaction {
             ordering,
             preconditions: Vec::new(),
             mutations: Vec::new(),
+            clearance: Vec::new(),
             movements: Vec::new(),
             components: Vec::new(),
             spawns: Vec::new(),
@@ -226,6 +233,16 @@ impl Transaction {
     /// Record a write.
     pub fn write_block(&mut self, pos: BlockPos, state: torse_world::BlockStateId) -> &mut Self {
         self.mutations.push(Mutation { pos, state });
+        self
+    }
+
+    /// Keep placement occupancy checks across planning, freezing and preparation.
+    pub fn require_block_clear(
+        &mut self,
+        pos: BlockPos,
+        state: torse_world::BlockStateId,
+    ) -> &mut Self {
+        self.clearance.push(Mutation { pos, state });
         self
     }
 

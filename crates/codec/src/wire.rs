@@ -504,20 +504,47 @@ fields!(EntityState {
     position_bits,
     components
 });
-fields!(StoredTransaction {
-    id,
-    source,
-    phase,
-    priority,
-    task_key,
-    local,
-    reads,
-    writes,
-    moves,
-    components,
-    spawns,
-    despawns
-});
+fn write_legacy_transaction(t: &StoredTransaction, e: &mut Encoder<'_>) -> EncodeResult<()> {
+    t.id.write(e)?;
+    t.source.write(e)?;
+    t.phase.write(e)?;
+    t.priority.write(e)?;
+    t.task_key.write(e)?;
+    t.local.write(e)?;
+    t.reads.write(e)?;
+    t.writes.write(e)?;
+    t.moves.write(e)?;
+    t.components.write(e)?;
+    t.spawns.write(e)?;
+    t.despawns.write(e)
+}
+impl Wire for StoredTransaction {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        if !self.clearance.is_empty() {
+            return Err(invalid(
+                "placement conditions require frozen transaction tag 3",
+            ));
+        }
+        write_legacy_transaction(self, e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        Ok(Self {
+            id: Wire::read(d)?,
+            source: Wire::read(d)?,
+            phase: Wire::read(d)?,
+            priority: Wire::read(d)?,
+            task_key: Wire::read(d)?,
+            local: Wire::read(d)?,
+            reads: Wire::read(d)?,
+            writes: Wire::read(d)?,
+            clearance: Vec::new(),
+            moves: Wire::read(d)?,
+            components: Wire::read(d)?,
+            spawns: Wire::read(d)?,
+            despawns: Wire::read(d)?,
+        })
+    }
+}
 fields!(Accepted { id, input });
 impl Wire for FrozenTask {
     fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
@@ -525,7 +552,15 @@ impl Wire for FrozenTask {
             None => 0u8.write(e)?,
             Some(group) => {
                 group.validate()?;
-                if group.members.len() == 1 && group.id == group.members[0].id {
+                if group.members.iter().any(|m| !m.clearance.is_empty()) {
+                    3u8.write(e)?;
+                    group.id.write(e)?;
+                    write_items(e, group.members.len(), "frozen group")?;
+                    for member in &group.members {
+                        write_legacy_transaction(member, e)?;
+                        member.clearance.write(e)?;
+                    }
+                } else if group.members.len() == 1 && group.id == group.members[0].id {
                     1u8.write(e)?;
                     group.members[0].write(e)?;
                 } else {
@@ -543,7 +578,8 @@ impl Wire for FrozenTask {
         self.output.write(e)
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
-        let transaction = match u8::read(d)? {
+        let tag = u8::read(d)?;
+        let transaction = match tag {
             0 => None,
             1 => {
                 charge_vec::<StoredTransaction>(d, 1)?;
@@ -553,7 +589,7 @@ impl Wire for FrozenTask {
                     members: vec![member],
                 })
             }
-            2 => {
+            2 | 3 => {
                 let id = TransactionId::read(d)?;
                 // Check the group bound before allocating its member vector.
                 let n = read_items(d, 1, "frozen group")?;
@@ -562,8 +598,21 @@ impl Wire for FrozenTask {
                 }
                 charge_vec::<StoredTransaction>(d, n)?;
                 let mut members = Vec::with_capacity(n);
+                let mut remaining_checks = torse_sim::transaction::MAX_CLEARANCE_CHECKS;
                 for _ in 0..n {
-                    members.push(StoredTransaction::read(d)?);
+                    let mut member = StoredTransaction::read(d)?;
+                    if tag == 3 {
+                        let checks = read_items(d, 1, "placement conditions")?;
+                        remaining_checks = remaining_checks
+                            .checked_sub(checks)
+                            .ok_or_else(|| invalid("too many placement conditions"))?;
+                        charge_vec::<StableCell>(d, checks)?;
+                        member.clearance = Vec::with_capacity(checks);
+                        for _ in 0..checks {
+                            member.clearance.push(StableCell::read(d)?);
+                        }
+                    }
+                    members.push(member);
                 }
                 Some(StoredTransactionGroup { id, members })
             }

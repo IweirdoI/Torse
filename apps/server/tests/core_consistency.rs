@@ -167,17 +167,31 @@ fn rules() -> Vec<Box<dyn DurableRule>> {
     vec![Box::new(Update)]
 }
 fn create(directory: WorldDirectory) -> base::Files {
+    create_with(directory, rules())
+}
+fn create_with(directory: WorldDirectory, registered: Vec<Box<dyn DurableRule>>) -> base::Files {
     let (world, service) = world();
     base::Files::create_file(
         directory,
         world.coordinator().compatibility(),
         base::Codec::new(base::codec_limits()).unwrap(),
         base::file_policy(),
-        |binding| ExecutionHost::new(binding, world, service, rules(), base::execution_limits()),
+        |binding| {
+            ExecutionHost::new(
+                binding,
+                world,
+                service,
+                registered,
+                base::execution_limits(),
+            )
+        },
     )
     .unwrap()
 }
 fn reopen(dir: &Directory) -> base::Files {
+    reopen_with(dir, rules())
+}
+fn reopen_with(dir: &Directory, registered: Vec<Box<dyn DurableRule>>) -> base::Files {
     let (world, service) = world();
     base::Files::open_file(
         dir.acquire(),
@@ -190,7 +204,7 @@ fn reopen(dir: &Directory) -> base::Files {
                 world.registry(),
                 world.schemas(),
                 service,
-                rules(),
+                registered,
                 base::execution_limits(),
             ))
         },
@@ -328,13 +342,25 @@ fn instance_crash_child() {
         return;
     };
     let mode = std::env::var("TORSE_INSTANCE_CRASH_MODE").unwrap();
-    let mut server = create(WorldDirectory::acquire(path, base::WORLD, 8192).unwrap());
+    let registered: Vec<Box<dyn DurableRule>> = if mode == "arrival-frozen" {
+        vec![Box::new(Arrive)]
+    } else {
+        rules()
+    };
+    let mut server = create_with(
+        WorldDirectory::acquire(path, base::WORLD, 8192).unwrap(),
+        registered,
+    );
     let id = submit(&mut server, true, 1);
     for _ in 0..64 {
         server.drive_one(&mut NoReplicas).unwrap();
         let host = server.authority().unwrap();
         let frozen = host.resume_point().next_phase == Phase::Interaction.index_u16()
             && host.runtime().work.as_ref().is_some_and(|w| w.next == 0);
+        if mode == "arrival-frozen" && frozen {
+            assert_eq!(host.runtime().work.as_ref().unwrap().tasks.len(), 2);
+            std::process::exit(76)
+        }
         if mode == "frozen" && frozen {
             std::process::exit(74)
         }
@@ -343,6 +369,97 @@ fn instance_crash_child() {
         }
     }
     panic!("instance crash point not reached");
+}
+
+struct Arrive;
+impl DurableRule for Arrive {
+    fn spec(&self) -> SystemSpec {
+        SystemSpec {
+            id: key("test:arrival"),
+            phase: Phase::Interaction,
+            rule_priority: -1,
+            before: vec![],
+            after: vec![],
+        }
+    }
+    fn plan(&self, world: &WorldAuthority, tick: Tick) -> Result<Vec<WorkPlan>, Fault> {
+        if tick != Tick(0) {
+            return Ok(vec![]);
+        }
+        let handle = world.entities().handle_of(EntityId(1)).unwrap();
+        let entity = world.entities().get(handle).unwrap();
+        let mut tx = Transaction::new(
+            TransactionId(200),
+            key("test:module"),
+            OrderingKey {
+                phase: Phase::Interaction,
+                rule_priority: -1,
+                stable_task_key: 0,
+                local_sequence: 0,
+            },
+        );
+        tx.move_entity(
+            handle,
+            entity.id,
+            entity.position,
+            [-5.0; 3],
+            [0.3, 0.9, 0.3],
+        );
+        Ok(vec![WorkPlan::transaction(tx)])
+    }
+}
+
+#[test]
+fn frozen_placement_rechecks_an_earlier_arrival_after_process_exit() {
+    let dir = Directory::new();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "instance_crash_child", "--nocapture"])
+        .env("TORSE_INSTANCE_CRASH_PATH", &dir.0)
+        .env("TORSE_INSTANCE_CRASH_MODE", "arrival-frozen")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(76));
+    let mut server = reopen_with(&dir, vec![Box::new(Arrive)]);
+    let tasks = &server
+        .authority()
+        .unwrap()
+        .runtime()
+        .work
+        .as_ref()
+        .unwrap()
+        .tasks;
+    assert!(tasks.iter().any(|t| {
+        t.transaction
+            .as_ref()
+            .is_some_and(|g| !g.members[0].clearance.is_empty())
+    }));
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    let id = RequestId {
+        world: base::WORLD,
+        epoch: WorldEpoch(1),
+        session: SessionId(1),
+        seq: RequestSeq(1),
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            server.receipt(id).unwrap().unwrap().reply.status,
+            ReplyStatus::Rejected(RejectCode::Conflict)
+        );
+        let world = server.authority().unwrap().world();
+        assert_eq!(
+            world.store().query(pos()),
+            TerrainQuery::Ready(BlockStateId::EMPTY)
+        );
+        assert_eq!(world.entities().len(), 1);
+        assert_eq!(world.entities().next_entity_id(), 2);
+        let entity = world
+            .entities()
+            .get(world.entities().handle_of(EntityId(1)).unwrap())
+            .unwrap();
+        assert_eq!(entity.position, Position::new(3.5, 3.5, 3.5));
+        drop(server);
+        server = reopen_with(&dir, vec![Box::new(Arrive)]);
+    }
 }
 
 #[test]

@@ -49,6 +49,7 @@ pub struct PreparedChange {
     component_edits: Vec<ComponentEdit>,
     component_batch: ComponentBatch,
     lifecycle_batch: Option<LifecycleBatch>,
+    clearance: Vec<crate::placement::Volume>,
 }
 
 /// Read-only collision work for exactly one pure movement. This opaque token
@@ -257,6 +258,7 @@ impl CommitCoordinator {
             && group.members.iter().all(|m| {
                 m.preconditions.is_empty()
                     && m.mutations.is_empty()
+                    && m.clearance.is_empty()
                     && m.movements.is_empty()
                     && m.spawns.is_empty()
                     && m.despawns.is_empty()
@@ -307,6 +309,7 @@ impl CommitCoordinator {
                 m.movements.len() == 1
                     && m.preconditions.is_empty()
                     && m.mutations.is_empty()
+                    && m.clearance.is_empty()
                     && m.components.is_empty()
                     && m.spawns.is_empty()
                     && m.despawns.is_empty()
@@ -448,6 +451,7 @@ impl CommitCoordinator {
             component_edits: Vec::new(),
             component_batch: ComponentBatch::default(),
             lifecycle_batch: None,
+            clearance: Vec::new(),
         })
     }
 
@@ -467,6 +471,7 @@ impl CommitCoordinator {
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
         if !transaction.movements.is_empty()
+            || !transaction.clearance.is_empty()
             || !transaction.components.is_empty()
             || !transaction.spawns.is_empty()
             || !transaction.despawns.is_empty()
@@ -545,6 +550,14 @@ impl CommitCoordinator {
             lifecycle,
         )
         .map_err(PrepareError::Rejected)?;
+        if !crate::placement::clear(
+            &prepared.clearance,
+            entities,
+            &prepared.entity_moves,
+            prepared.entity_lifecycle(),
+        ) {
+            return Err(PrepareError::Rejected(RejectCode::Conflict));
+        }
         Ok(prepared)
     }
 
@@ -572,6 +585,15 @@ impl CommitCoordinator {
         let mut movement_handles = Vec::new();
         let mut component_edits: Vec<ComponentEdit> = Vec::new();
         let mut component_batches = Vec::new();
+        let mut clearance = Vec::new();
+        if group
+            .members
+            .iter()
+            .try_fold(0usize, |n, m| n.checked_add(m.clearance.len()))
+            .is_none_or(|n| n > crate::transaction::MAX_CLEARANCE_CHECKS)
+        {
+            return Err(PrepareError::Rejected(RejectCode::QuotaExceeded));
+        }
         // Keep the established member error order, without retaining batches
         // for a group that will exceed the final aggregate component limit.
         let over_component_quota = group
@@ -610,6 +632,10 @@ impl CommitCoordinator {
                 store
                     .validate_edits(&member_edits)
                     .map_err(|error| PrepareError::Rejected(code_for(&error)))?,
+            );
+            clearance.extend(
+                crate::placement::prepare(registry, &member.mutations, &member.clearance)
+                    .map_err(PrepareError::Rejected)?,
             );
 
             let lifecycle = crate::lifecycle::prepare_lifecycle(store, entities, schemas, member)
@@ -710,6 +736,30 @@ impl CommitCoordinator {
             world: self.world,
             seq: next,
         };
+        // Unchecked native groups may repeat cell writes. A placement guard
+        // must describe the final merged state as well as its member's write.
+        if group
+            .members
+            .iter()
+            .flat_map(|m| &m.clearance)
+            .any(|check| {
+                edits
+                    .iter()
+                    .rev()
+                    .find(|e| e.pos == check.pos)
+                    .is_none_or(|e| e.state != check.state)
+            })
+        {
+            return Err(PrepareError::Rejected(RejectCode::InvalidData));
+        }
+        if !crate::placement::clear(
+            &clearance,
+            entities,
+            &entity_moves,
+            lifecycle_batch.as_ref().map(LifecycleBatch::change),
+        ) {
+            return Err(PrepareError::Rejected(RejectCode::Conflict));
+        }
         Ok(PreparedChange {
             meta: CommitMeta {
                 cursor,
@@ -734,6 +784,7 @@ impl CommitCoordinator {
             component_edits,
             component_batch,
             lifecycle_batch,
+            clearance,
         })
     }
 
@@ -761,6 +812,17 @@ impl CommitCoordinator {
             .iter()
             .map(|request| (request.handle, request.id))
             .collect();
+        prepared.clearance =
+            crate::placement::prepare(registry, &transaction.mutations, &transaction.clearance)
+                .map_err(PrepareError::Rejected)?;
+        // Lifecycle-aware preparation checks the final set once spawns/removals
+        // have also been derived. This entry point handles translations alone.
+        if transaction.spawns.is_empty()
+            && transaction.despawns.is_empty()
+            && !crate::placement::clear(&prepared.clearance, entities, &prepared.entity_moves, None)
+        {
+            return Err(PrepareError::Rejected(RejectCode::Conflict));
+        }
         Ok(prepared)
     }
 
@@ -832,6 +894,7 @@ impl CommitCoordinator {
             component_edits: Vec::new(),
             component_batch: ComponentBatch::default(),
             lifecycle_batch: None,
+            clearance: Vec::new(),
         })
     }
 
@@ -846,6 +909,7 @@ impl CommitCoordinator {
         prepared: PreparedChange,
     ) -> Result<Publication, CommitFault> {
         if !prepared.entity_moves.is_empty()
+            || !prepared.clearance.is_empty()
             || !prepared.component_edits.is_empty()
             || prepared.lifecycle_batch.is_some()
         {
@@ -866,6 +930,16 @@ impl CommitCoordinator {
         entities: &mut EntityStore,
         prepared: PreparedChange,
     ) -> Result<Publication, CommitFault> {
+        if !crate::placement::clear(
+            &prepared.clearance,
+            entities,
+            &prepared.entity_moves,
+            prepared.entity_lifecycle(),
+        ) {
+            return Err(CommitFault::Invariant(
+                "prepared placement occupancy changed",
+            ));
+        }
         if let Some(batch) = &prepared.lifecycle_batch {
             batch
                 .validate(entities)
@@ -1040,6 +1114,7 @@ impl CommitCoordinator {
         lifecycle: Result<Option<LifecycleBatch>, torse_types::RejectCode>,
     ) -> Result<PreparedChange, PrepareError> {
         if transaction.movements.len() != 1
+            || !transaction.clearance.is_empty()
             || !transaction.mutations.is_empty()
             || !transaction.components.is_empty()
             || !transaction.spawns.is_empty()

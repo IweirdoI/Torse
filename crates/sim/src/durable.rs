@@ -77,6 +77,8 @@ pub struct StoredTransaction {
     pub local: u32,
     pub reads: Vec<StableCell>,
     pub writes: Vec<StableCell>,
+    /// Occupancy requirements, resolved by stable block identity after restart.
+    pub clearance: Vec<StableCell>,
     pub moves: Vec<StableMove>,
     pub components: Vec<ComponentEdit>,
     pub spawns: Vec<StableSpawn>,
@@ -105,10 +107,12 @@ pub struct StoredTransactionGroup {
 }
 impl StoredTransactionGroup {
     pub fn single(world: &WorldAuthority, tx: &Transaction) -> Result<Self, Fault> {
-        Ok(Self {
+        let group = Self {
             id: tx.id,
             members: vec![StoredTransaction::capture(world, tx)?],
-        })
+        };
+        group.validate()?;
+        Ok(group)
     }
     pub fn capture(world: &WorldAuthority, group: &crate::TransactionGroup) -> Result<Self, Fault> {
         if group.members.iter().any(|m| m.ordering != group.ordering) {
@@ -148,7 +152,21 @@ impl StoredTransactionGroup {
         let mut touched = std::collections::BTreeSet::new();
         let mut despawned = std::collections::BTreeSet::new();
         let mut lifecycle_members = 0;
+        let mut clearance_count = 0usize;
         for member in &self.members {
+            clearance_count = clearance_count
+                .checked_add(member.clearance.len())
+                .filter(|n| *n <= crate::transaction::MAX_CLEARANCE_CHECKS)
+                .ok_or_else(|| Fault::invalid_data("too many placement conditions"))?;
+            let mut guarded = std::collections::BTreeSet::new();
+            for check in &member.clearance {
+                if check.content == CellContent::Empty
+                    || !guarded.insert(check.pos)
+                    || member.writes.iter().rev().find(|w| w.pos == check.pos) != Some(check)
+                {
+                    return Err(Fault::invalid_data("invalid frozen placement condition"));
+                }
+            }
             for write in &member.writes {
                 if !cells.insert(write.pos) {
                     return Err(Fault::invalid_data("duplicate group block"));
@@ -305,6 +323,16 @@ impl StoredTransaction {
                     })
                 })
                 .collect::<Result<_, Fault>>()?,
+            clearance: tx
+                .clearance
+                .iter()
+                .map(|r| {
+                    Ok(StableCell {
+                        pos: r.pos,
+                        content: stable(world.registry(), r.state)?,
+                    })
+                })
+                .collect::<Result<_, Fault>>()?,
             moves: tx
                 .movements
                 .iter()
@@ -343,6 +371,9 @@ impl StoredTransaction {
         }
         for r in &self.writes {
             tx.write_block(r.pos, resolve(world.registry(), &r.content)?);
+        }
+        for r in &self.clearance {
+            tx.require_block_clear(r.pos, resolve(world.registry(), &r.content)?);
         }
         for m in &self.moves {
             let handle = world

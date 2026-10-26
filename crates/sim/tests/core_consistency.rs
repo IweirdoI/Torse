@@ -224,6 +224,205 @@ fn placement_uses_the_resolved_state_collision_shape() {
 }
 
 #[test]
+fn placement_rechecks_arrivals_after_action_planning_and_frozen_restore() {
+    use torse_sim::durable::StoredTransactionGroup;
+    let (mut world, service) = setup(false, false);
+    let pos = BlockPos::new(4, 4, 4);
+    let planned = action(&world, &service, pos, Some("base:stone"), 0).unwrap();
+    let frozen = StoredTransactionGroup::single(&world, &planned).unwrap();
+    assert_eq!(frozen.members[0].clearance.len(), 1);
+    let handle = world
+        .entities_mut()
+        .spawn(Position::new(1.5, 4.5, 4.5))
+        .unwrap();
+    let entity = world.entities().get(handle).unwrap();
+    let mut arrival = tx(50, "test:module");
+    arrival.move_entity(
+        handle,
+        entity.id,
+        entity.position,
+        [3.0, 0.0, 0.0],
+        [0.3, 0.9, 0.3],
+    );
+    world.commit(&arrival).unwrap();
+    let seq = world.seq();
+    let next = world.entities().next_entity_id();
+    for attempt in [&planned, &frozen.restore(&world).unwrap().members[0]] {
+        assert_eq!(
+            world.prepare(attempt),
+            Err(PrepareError::Rejected(RejectCode::Conflict))
+        );
+    }
+    assert_eq!(world.seq(), seq);
+    assert_eq!(world.entities().next_entity_id(), next);
+    assert_eq!(
+        world.store().query(pos),
+        TerrainQuery::Ready(BlockStateId::EMPTY)
+    );
+    world
+        .entities_mut()
+        .move_to(handle, Position::new(1.5, 4.5, 4.5))
+        .unwrap();
+    let committed = world.commit(&planned).unwrap();
+    assert!(matches!(
+        committed.outcome,
+        TransactionOutcome::Committed { .. }
+    ));
+}
+
+#[test]
+fn placement_publication_rejects_new_occupants_before_any_write() {
+    let (mut world, service) = setup(true, true);
+    let pos = BlockPos::new(4, 4, 4);
+    let planned = action(&world, &service, pos, Some("base:glass"), 0).unwrap();
+    let prepared = world.prepare(&planned).unwrap();
+    world
+        .entities_mut()
+        .spawn(Position::new(4.5, 4.5, 4.5))
+        .unwrap();
+    assert!(world.publish(prepared).is_err());
+    assert_eq!(world.seq(), CommitSeq(0));
+    assert_eq!(world.entities().len(), 1);
+    assert_eq!(world.entities().next_entity_id(), 2);
+    assert_eq!(
+        world.store().query(pos),
+        TerrainQuery::Ready(BlockStateId::EMPTY)
+    );
+    assert!(world.entities().block_instance_at(pos).unwrap().is_none());
+}
+
+#[test]
+fn delayed_placement_retains_partial_shape_and_removal_semantics() {
+    let (mut world, service) = setup(false, false);
+    let pos = BlockPos::new(4, 4, 4);
+    let lower = action(&world, &service, pos, Some("base:glass_slab"), 0).unwrap();
+    let upper = action(&world, &service, pos, Some("base:glass_slab"), 1).unwrap();
+    let handle = world
+        .entities_mut()
+        .spawn(Position::new(4.5, 3.5, 4.5))
+        .unwrap();
+    assert_eq!(
+        world.prepare(&lower),
+        Err(PrepareError::Rejected(RejectCode::Conflict))
+    );
+    apply(&mut world, &upper);
+    world
+        .entities_mut()
+        .move_to(handle, Position::new(1.5, 4.5, 4.5))
+        .unwrap();
+    let complete = action(&world, &service, pos, Some("base:glass_slab"), 0).unwrap();
+    let remove = action(&world, &service, pos, None, 0).unwrap();
+    assert!(remove.clearance.is_empty());
+    world
+        .entities_mut()
+        .move_to(handle, Position::new(4.5, 3.5, 4.5))
+        .unwrap();
+    assert_eq!(
+        world.prepare(&complete),
+        Err(PrepareError::Rejected(RejectCode::Conflict))
+    );
+    apply(&mut world, &remove);
+}
+
+#[test]
+fn sibling_spawns_and_moves_cannot_enter_a_guarded_placement() {
+    let (mut world, service) = setup(true, true);
+    let pos = BlockPos::new(4, 4, 4);
+    let place = action(&world, &service, pos, Some("base:glass"), 0).unwrap();
+    let mut spawn = tx(2, "test:module");
+    spawn.spawn_entity(Position::new(4.5, 4.5, 4.5), Default::default());
+    let group = TransactionGroup::new(
+        TransactionId(3),
+        place.ordering,
+        vec![place.clone(), spawn.clone()],
+    )
+    .unwrap();
+    assert_eq!(
+        world.prepare_group(&group),
+        Err(PrepareError::Rejected(RejectCode::Conflict))
+    );
+    assert_eq!(world.seq(), CommitSeq(0));
+    assert!(world.entities().is_empty());
+    assert_eq!(world.entities().next_entity_id(), 1);
+    let handle = world
+        .entities_mut()
+        .spawn(Position::new(1.5, 4.5, 4.5))
+        .unwrap();
+    let entity = world.entities().get(handle).unwrap();
+    let mut movement = tx(4, "test:module");
+    movement.move_entity(
+        handle,
+        entity.id,
+        entity.position,
+        [3.0, 0.0, 0.0],
+        [0.3, 0.9, 0.3],
+    );
+    let group = TransactionGroup::new(
+        TransactionId(5),
+        place.ordering,
+        vec![place.clone(), movement],
+    )
+    .unwrap();
+    assert_eq!(
+        world.prepare_group(&group),
+        Err(PrepareError::Rejected(RejectCode::Conflict))
+    );
+    assert_eq!(
+        world.entities().get(handle).unwrap().position,
+        Position::new(1.5, 4.5, 4.5)
+    );
+    spawn.spawns[0].position_bits = Position::new(12.5, 4.5, 4.5).to_bits();
+    let group =
+        TransactionGroup::new(TransactionId(6), place.ordering, vec![place, spawn]).unwrap();
+    let prepared = world.prepare_group(&group).unwrap();
+    assert_eq!(prepared.entity_lifecycle().unwrap().spawned.len(), 2);
+    world.publish(prepared).unwrap();
+    assert_eq!(world.entities().len(), 3);
+    assert!(world.entities().block_instance_at(pos).unwrap().is_some());
+}
+
+#[test]
+fn placement_conditions_reject_mismatch_duplicates_and_excess_before_publication() {
+    let (world, service) = setup(false, false);
+    let pos = BlockPos::new(4, 4, 4);
+    let planned = action(&world, &service, pos, Some("base:stone"), 0).unwrap();
+    let mut invalid = planned.clone();
+    invalid.clearance[0].pos.x += 1;
+    assert_eq!(
+        world.prepare(&invalid),
+        Err(PrepareError::Rejected(RejectCode::InvalidData))
+    );
+    invalid = planned.clone();
+    invalid.clearance.push(invalid.clearance[0]);
+    assert_eq!(
+        world.prepare(&invalid),
+        Err(PrepareError::Rejected(RejectCode::InvalidData))
+    );
+    invalid.clearance.resize(257, planned.clearance[0]);
+    assert_eq!(
+        world.prepare(&invalid),
+        Err(PrepareError::Rejected(RejectCode::QuotaExceeded))
+    );
+    assert!(
+        world
+            .coordinator()
+            .prepare(world.store(), &planned)
+            .is_err()
+    );
+    let mut replacement = tx(2, "test:module");
+    replacement.write_block(pos, BlockStateId::EMPTY);
+    let unchecked = TransactionGroup {
+        id: TransactionId(3),
+        ordering: planned.ordering,
+        members: vec![planned, replacement],
+    };
+    assert_eq!(
+        world.prepare_group(&unchecked),
+        Err(PrepareError::Rejected(RejectCode::InvalidData))
+    );
+}
+
+#[test]
 fn instances_follow_cells_atomically_and_keep_identity_across_state_changes() {
     let (mut world, service) = setup(true, true);
     let pos = BlockPos::new(-1, 4, 3);

@@ -22,6 +22,7 @@ mod lifecycle;
 pub mod movement;
 pub mod payload;
 pub mod phase;
+mod placement;
 pub mod player;
 pub mod replica;
 pub mod simulation;

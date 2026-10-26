@@ -32,6 +32,7 @@ fn member(source: &str, x: i64) -> StoredTransaction {
             pos: BlockPos::new(x, 0, 0),
             content: CellContent::Empty,
         }],
+        clearance: Vec::new(),
         moves: Vec::new(),
         components: Vec::new(),
         spawns: Vec::new(),
@@ -156,6 +157,104 @@ fn malformed_groups_reject_before_recovery() {
         assert!(wire::decode::<FrozenTask>(&bytes, BUDGET, LIMITS).is_err());
         let mut out = vec![9];
         assert!(wire::encode(&task(members), &mut out, BUDGET, LIMITS).is_err());
+        assert_eq!(out, [9]);
+    }
+}
+
+fn guarded_task() -> FrozenTask {
+    let mut t = task(vec![member("world:module", 0)]);
+    let m = &mut t.transaction.as_mut().unwrap().members[0];
+    m.writes[0].content = CellContent::Block {
+        block: ContentKey::parse("base:stone").unwrap(),
+        values: vec![],
+    };
+    m.clearance = m.writes.clone();
+    t
+}
+
+fn raw_guarded_task(t: &FrozenTask) -> Vec<u8> {
+    let group = t.transaction.as_ref().unwrap();
+    let mut bytes = vec![];
+    let mut e = Encoder::new(&mut bytes, BUDGET, LIMITS);
+    1u16.write(&mut e).unwrap();
+    3u8.write(&mut e).unwrap();
+    group.id.write(&mut e).unwrap();
+    (group.members.len() as u32).write(&mut e).unwrap();
+    for member in &group.members {
+        let mut legacy = member.clone();
+        legacy.clearance.clear();
+        legacy.write(&mut e).unwrap();
+        member.clearance.write(&mut e).unwrap();
+    }
+    t.request.write(&mut e).unwrap();
+    t.consume.write(&mut e).unwrap();
+    t.schedule.write(&mut e).unwrap();
+    t.cancel.write(&mut e).unwrap();
+    t.status.write(&mut e).unwrap();
+    t.output.write(&mut e).unwrap();
+    e.finish();
+    bytes
+}
+
+#[test]
+fn guarded_task_has_explicit_layout_roundtrip_truncation_and_budgets() {
+    let t = guarded_task();
+    let mut bytes = vec![];
+    wire::encode(&t, &mut bytes, BUDGET, LIMITS).unwrap();
+    assert_eq!(bytes, raw_guarded_task(&t));
+    assert_eq!(
+        wire::decode::<FrozenTask>(&bytes, BUDGET, LIMITS).unwrap(),
+        t
+    );
+    for end in 0..bytes.len() {
+        assert!(wire::decode::<FrozenTask>(&bytes[..end], BUDGET, LIMITS).is_err());
+    }
+    assert!(
+        wire::decode::<FrozenTask>(
+            &bytes,
+            OutputBudget {
+                max_items: 1,
+                ..BUDGET
+            },
+            LIMITS
+        )
+        .is_err()
+    );
+    let mut out = vec![9];
+    assert!(
+        wire::encode(
+            &t,
+            &mut out,
+            OutputBudget {
+                max_bytes: 12,
+                ..BUDGET
+            },
+            LIMITS
+        )
+        .is_err()
+    );
+    assert_eq!(out, [9]);
+    // The legacy standalone writer must refuse instead of silently losing guards.
+    assert!(wire::encode(&t.transaction.unwrap().members[0], &mut out, BUDGET, LIMITS).is_err());
+    assert_eq!(out, [9]);
+}
+
+#[test]
+fn malformed_placement_conditions_reject_during_decode() {
+    let t = guarded_task();
+    for mode in 0..4 {
+        let mut invalid = t.clone();
+        let member = &mut invalid.transaction.as_mut().unwrap().members[0];
+        match mode {
+            0 => member.clearance[0].pos.x += 1,
+            1 => member.clearance[0].content = CellContent::Empty,
+            2 => member.clearance.push(member.clearance[0].clone()),
+            _ => member.clearance.resize(257, member.clearance[0].clone()),
+        }
+        let bytes = raw_guarded_task(&invalid);
+        assert!(wire::decode::<FrozenTask>(&bytes, BUDGET, LIMITS).is_err());
+        let mut out = vec![9];
+        assert!(wire::encode(&invalid, &mut out, BUDGET, LIMITS).is_err());
         assert_eq!(out, [9]);
     }
 }

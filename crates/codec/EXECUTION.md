@@ -37,6 +37,8 @@ ContentKey、ComponentValue与嵌套组件字段沿用WORLD.md。位置和位移
 
 B9为FrozenTask的transaction字段增加标签2。标签0表示无事务，标签1沿用原StoredTransaction布局，读取时提升为单成员组；标签2随后写组id与成员列表。单成员且组id等于成员id时继续写标签1，保持原字节不变；多成员或独立组id写标签2。其他Option仍只接受0/1。该补充保留提交版本1的原字段顺序；旧读取器遇任务标签2明确拒绝，新读取器可以读取既有单事务日志。
 
+放置占用复核新增事务标签3：随后为组id、u32成员数，每成员写上述StoredTransaction正文，再写clearance列表（计数加StableCell）。整组合计最多256个条件，分配前检查累计数量；条件不得为空占用或重复位置，须与本成员最终写入的状态一致。没有条件仍使用标签1或2，解码旧标签得到空条件。带条件的成员不能单独按旧正文编码，避免条件丢失。新读取器读取0至3，旧读取器明确拒绝3；Execution提交仍为版本2，快照仍为版本1。未完成任务恢复后执行空间条件，已提交结果不重跑碰撞。验证见[放置占用复核](../../benchmarks/M2-placement-clearance.md)。
+
 组成员数在解码分配前限制为1到4。编码、解码与领域恢复均检查来源严格有序、共同排序键、块和组件目标不重复、生命周期不交叠。冻结保存全部成员，恢复执行按原顺序还原后调用prepare_group；已经结算的日志只重放合并ChangeSet，不重跑Guest。组与事件、任务位置共同形成一条日志记录。此前B8排入的转移事件仍可结算，新机器计划不再生成这种延迟转移事件。
 
 WorldSnapshot包裹先写SnapshotMeta，再写ExecutionSnapshot；CommitRecord先写CommitMeta，再写ExecutionChanges。包裹与world子体元数据必须一致。世界子体没有再次添加世界版本前缀，两个提交版本与快照版本1均固定解释为布局3。

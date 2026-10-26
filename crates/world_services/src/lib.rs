@@ -6,13 +6,14 @@
 //! - [`generation`] produces deterministic sections from a seed and a rule set.
 //! - [`collision`] answers and moves against block collision shapes.
 //!
-//! Lighting, pathfinding, and streaming remain unimplemented. Their intended
-//! interfaces depend on sections and services that do not exist yet.
+//! Navigation provides a bounded lattice search with caller-supplied traversal policy.
+//! Lighting and streaming remain application responsibilities.
 
 #![forbid(unsafe_code)]
 
 pub mod collision;
 pub mod generation;
+pub mod navigation;
 
 pub use collision::{
     Aabb, CONTACT_EPSILON, CollisionCell, CollisionSource, LocalBox, MAX_SUBSTEP, SweepResult,

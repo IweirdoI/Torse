@@ -31,8 +31,60 @@ fn visual_quad() -> crate::RenderQuad {
         cull_face: Some(Face::PosZ),
         tint_channel: None,
         shade: true,
+        shade_direction: None,
         double_sided: false,
     }
+}
+
+#[test]
+fn weighted_parts_are_bounded_independent_and_have_complete_identity() {
+    use crate::{ModelChoice, ModelPart, RenderModel};
+    let mut left = visual_quad();
+    left.material = key("sample:left");
+    let mut right = left.clone();
+    right.material = key("sample:right");
+    let part = ModelPart {
+        choices: vec![
+            ModelChoice {
+                weight: 2,
+                quads: vec![left].into(),
+            },
+            ModelChoice {
+                weight: 3,
+                quads: vec![right].into(),
+            },
+        ],
+    };
+    let mut model = RenderModel {
+        quads: Vec::new(),
+        parts: vec![part.clone(), part],
+    };
+    model.validate().unwrap();
+    assert_eq!(model.occlusion_mask(), 1 << Face::PosZ.index());
+    assert!((0..100).any(|seed| {
+        let choices: Vec<_> = model.selected_quads(seed).map(|q| &q.material).collect();
+        choices[0] != choices[1]
+    }));
+    let mut pack = m0_fixture_pack();
+    pack.blocks[0].value.render_profile.shape = Shape::Model(model.clone().into());
+    pack.blocks[0].value.occlusion_profile.face_mask = 0;
+    let before = compile(pack.clone()).unwrap();
+    model.parts[0].choices[0].weight = 7;
+    pack.blocks[0].value.render_profile.shape = Shape::Model(model.clone().into());
+    let after = compile(pack).unwrap();
+    assert_eq!(before.authority_digest, after.authority_digest);
+    assert_ne!(before.presentation_digest, after.presentation_digest);
+    std::sync::Arc::make_mut(&mut model.parts[0].choices[0].quads)[0].alpha_mode = AlphaMode::Mask;
+    model.parts[1].choices.clear();
+    assert!(model.validate().is_err());
+    assert_eq!(model.occlusion_mask(), 0);
+    model.parts = vec![ModelPart {
+        choices: vec![ModelChoice {
+            weight: 0,
+            quads: vec![visual_quad()].into(),
+        }],
+    }];
+    assert!(model.validate().is_err());
 }
 
 #[test]
@@ -42,6 +94,7 @@ fn model_uv_changes_only_presentation_and_physics_rejects_visual_models() {
     block.render_profile.shape = Shape::Model(
         crate::RenderModel {
             quads: vec![visual_quad()],
+            parts: Vec::new(),
         }
         .into(),
     );
@@ -68,6 +121,7 @@ fn model_uv_changes_only_presentation_and_physics_rejects_visual_models() {
 fn model_limits_finite_coordinates_winding_and_independent_compounds_are_validated() {
     let mut model = crate::RenderModel {
         quads: vec![visual_quad()],
+        parts: Vec::new(),
     };
     assert!(model.validate().is_ok());
     model.quads[0].positions[0][0] = f32::NAN;

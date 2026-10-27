@@ -18,11 +18,10 @@ use std::time::{Duration, Instant};
 use wgpu::{
     AddressMode, BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
     BindingType, BlendState, Buffer, BufferBindingType, BufferDescriptor, BufferUsages, Color,
-    ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor, Device,
-    DeviceDescriptor, Extent3d, FilterMode, FragmentState, Instance, InstanceDescriptor, LoadOp,
-    MapMode, MultisampleState, Operations, Origin3d, PollType, PrimitiveState, Queue,
-    RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
-    RenderPipeline, RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
+    ColorTargetState, ColorWrites, CommandEncoder, CommandEncoderDescriptor, Device, Extent3d,
+    FilterMode, FragmentState, LoadOp, MapMode, MultisampleState, Operations, Origin3d, PollType,
+    PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, SamplerBindingType,
     SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp,
     TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
     TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
@@ -823,13 +822,10 @@ pub struct Renderer {
 impl Renderer {
     /// Create a headless renderer.
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
-        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&RequestAdapterOptions::default()))
-                .map_err(|error| format!("adapter unavailable: {error}"))?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
-                .map_err(|error| format!("device unavailable: {error}"))?;
+        let session = torse_render::open_headless()?;
+        let info = session.info();
+        eprintln!("{}", torse_render::startup_line(&info, None));
+        let (device, queue) = (session.device, session.queue);
 
         let color = device.create_texture(&TextureDescriptor {
             label: Some("client color target"),

@@ -225,11 +225,7 @@ impl Background {
                     .generate_cancellable(pos, || cancel.is_cancelled())
                     .map_err(|e| JobError::Failed(e.to_string()))?
                     .ok_or(JobError::Cancelled)?;
-                let cells = match section.storage() {
-                    torse_world::SectionStorage::Uniform(_) => 0,
-                    torse_world::SectionStorage::Dense(cells) => cells.capacity(),
-                };
-                let bytes = size_of::<Section>() + cells * size_of::<BlockStateId>();
+                let bytes = size_of::<Section>() + section.allocated_bytes();
                 Ok(JobOutput {
                     value: Output::Generated(section),
                     bytes,

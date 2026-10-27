@@ -135,12 +135,13 @@ pub(crate) fn prepare(
             pos,
             budget,
         )?;
-        if current
-            .persistent_view(world.schemas())
-            .map_err(fault)?
-            .as_ref()
-            != page
-        {
+        if !same_page(
+            current
+                .persistent_view(world.schemas())
+                .map_err(fault)?
+                .as_ref(),
+            page,
+        ) {
             return Err(Fault::invalid_data(
                 "unload page differs from resident data",
             ));
@@ -159,6 +160,33 @@ pub(crate) fn prepare(
         revision: world.store().revision(pos),
         retired: world.store().retired_revision(pos),
     })
+}
+
+// Legacy writers could leave an all-equal section in Dense form. Reclaiming its
+// runtime buffer must not invalidate an old durable unload record.
+fn same_page(a: &Snapshot, b: &Snapshot) -> bool {
+    a.meta == b.meta
+        && a.side == b.side
+        && a.bounds == b.bounds
+        && a.states == b.states
+        && a.entities == b.entities
+        && a.next_entity_id == b.next_entity_id
+        && a.sections.len() == b.sections.len()
+        && a.sections
+            .iter()
+            .zip(&b.sections)
+            .all(|(a_section, b_section)| {
+                use torse_world::SnapshotCells;
+                a_section.pos == b_section.pos
+                    && match (&a_section.cells, &b_section.cells) {
+                        (SnapshotCells::Uniform(state), SnapshotCells::Dense(cells))
+                        | (SnapshotCells::Dense(cells), SnapshotCells::Uniform(state)) => {
+                            cells.len() == (a.side as usize).pow(3)
+                                && cells.iter().all(|v| v == state)
+                        }
+                        (a, b) => a == b,
+                    }
+            })
 }
 
 pub(crate) fn fault(error: impl std::fmt::Display) -> Fault {

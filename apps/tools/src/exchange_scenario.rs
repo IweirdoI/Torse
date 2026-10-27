@@ -174,13 +174,10 @@ pub fn run() -> Result<ExchangeReport, ExchangeScenarioError> {
             .store
             .section(pos)
             .ok_or_else(|| ExchangeScenarioError::new("restored section missing"))?;
-        if source.storage() != target.storage() {
+        if !source.values().eq(target.values()) {
             equal = false;
         }
-        report.cells_checked += match source.storage() {
-            torse_world::SectionStorage::Uniform(_) => 1,
-            torse_world::SectionStorage::Dense(cells) => cells.len(),
-        };
+        report.cells_checked += source.cell_count();
     }
     report.restored_equal = equal;
     if !equal {

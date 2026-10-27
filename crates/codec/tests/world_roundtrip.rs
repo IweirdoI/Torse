@@ -178,8 +178,14 @@ fn captured_snapshot_survives_encode_decode_and_restore() {
     let restored = decoded.restore(&world.registry, &world.schemas).unwrap();
     for pos in world.store.positions() {
         assert_eq!(
-            restored.store.section(pos).map(Section::storage),
-            world.store.section(pos).map(Section::storage),
+            restored
+                .store
+                .section(pos)
+                .map(|s| s.values().collect::<Vec<_>>()),
+            world
+                .store
+                .section(pos)
+                .map(|s| s.values().collect::<Vec<_>>()),
             "section {pos:?}"
         );
     }

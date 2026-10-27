@@ -51,6 +51,16 @@ pub enum SnapshotCells {
     Dense(Vec<BlockStateId>),
 }
 
+impl SnapshotCells {
+    /// Capture the stable exchange representation, independently of heap layout.
+    pub fn capture(section: &Section) -> Self {
+        match section.storage() {
+            SectionStorage::Uniform(state) => Self::Uniform(*state),
+            _ => Self::Dense(section.values().collect()),
+        }
+    }
+}
+
 /// One section inside a snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotSection {
@@ -311,10 +321,7 @@ impl Snapshot {
                     detail: format!("section {pos:?} is not readable"),
                 });
             };
-            let cells = match section.storage() {
-                SectionStorage::Uniform(value) => SnapshotCells::Uniform(*value),
-                SectionStorage::Dense(cells) => SnapshotCells::Dense(cells.clone()),
-            };
+            let cells = SnapshotCells::capture(section);
             match &cells {
                 SnapshotCells::Uniform(value) => {
                     used.insert(*value, ());

@@ -8,6 +8,56 @@ use torse_types::*;
 use torse_world::*;
 
 #[test]
+fn legacy_dense_uniform_pages_replay_after_runtime_compaction() {
+    let (world, _) = base::world().unwrap();
+    let mut page = world
+        .capture_section(SectionPos::ZERO, base::budget())
+        .unwrap();
+    page.entities.clear();
+    page.states.clear();
+    page.sections[0].cells =
+        SnapshotCells::Dense(vec![BlockStateId::EMPTY; (page.side as usize).pow(3)]);
+    let mut encoded = Vec::new();
+    wire::encode(&page, &mut encoded, base::budget(), base::codec_limits()).unwrap();
+    let old: Snapshot = wire::decode(&encoded[..], base::budget(), base::codec_limits()).unwrap();
+    let restored = old.restore(world.registry(), world.schemas()).unwrap();
+    assert!(matches!(
+        restored.store.section(SectionPos::ZERO).unwrap().storage(),
+        SectionStorage::Uniform(_)
+    ));
+    let mut recovery = torse_sim::Recovery::new(world.world(), world.registry(), world.schemas());
+    recovery.restore_snapshot(&old).unwrap();
+    let mut changes = ChangeSet {
+        meta: CommitMeta {
+            previous: old.meta.cursor.seq,
+            cursor: CommitCursor {
+                world: world.world(),
+                seq: old.meta.cursor.seq.next().unwrap(),
+            },
+            compatibility: old.meta.compatibility,
+            resume_at: old.meta.resume_at,
+        },
+        edits: Vec::new(),
+        entity_moves: Vec::new(),
+        component_edits: Vec::new(),
+        entity_lifecycle: None,
+    };
+    recovery
+        .replay_section(&changes, &old, false, base::budget())
+        .unwrap();
+    changes.meta.previous = changes.meta.cursor.seq;
+    changes.meta.cursor.seq = changes.meta.cursor.seq.next().unwrap();
+    recovery
+        .replay_section(&changes, &old, true, base::budget())
+        .unwrap();
+    let restored = recovery.finish().unwrap();
+    assert_eq!(
+        restored.store().query(BlockPos::new(1, 1, 1)),
+        TerrainQuery::Ready(BlockStateId::EMPTY)
+    );
+}
+
+#[test]
 fn section_tokens_preserve_tickets_handles_and_revision_dependencies() {
     let (mut world, _) = base::world().unwrap();
     let other = world

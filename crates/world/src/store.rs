@@ -575,9 +575,11 @@ impl SectionStore {
             match entry.phase {
                 SectionPhase::Ready | SectionPhase::Active => {
                     stats.loaded_sections += 1;
-                    stats.dense_cells += entry.section.allocated_cells();
-                    if entry.section.allocated_cells() == 0 {
-                        stats.uniform_sections += 1;
+                    stats.cell_bytes += entry.section.allocated_bytes();
+                    match entry.section.storage() {
+                        crate::SectionStorage::Uniform(_) => stats.uniform_sections += 1,
+                        crate::SectionStorage::Dense(cells) => stats.dense_cells += cells.len(),
+                        crate::SectionStorage::Palette(_) => stats.palette_sections += 1,
                     }
                 }
                 SectionPhase::Requested | SectionPhase::Loading => stats.pending_sections += 1,
@@ -585,6 +587,19 @@ impl SectionStore {
             stats.tickets += entry.ticket_total();
         }
         stats
+    }
+
+    /// Report resident section structs and cell buffers, including loading data.
+    /// Map nodes, tickets and retired-revision metadata are owned separately.
+    pub fn memory_resident(&self) -> Option<torse_types::MemoryResident> {
+        let bytes = self.sections.values().fold(0u64, |total, entry| {
+            total.saturating_add((size_of::<Section>() + entry.section.allocated_bytes()) as u64)
+        });
+        (bytes > 0).then_some(torse_types::MemoryResident {
+            class: torse_types::MemoryClass::World,
+            bytes,
+            rank: torse_types::EvictionRank::Pinned,
+        })
     }
 }
 
@@ -599,6 +614,10 @@ pub struct StoreStats {
     pub uniform_sections: usize,
     /// Allocated cell identifiers across dense sections.
     pub dense_cells: usize,
+    /// Loaded sections using packed local palette indices.
+    pub palette_sections: usize,
+    /// Heap capacity of readable sections, including palette metadata.
+    pub cell_bytes: usize,
     /// Tickets currently held by callers.
     pub tickets: u32,
 }
@@ -930,10 +949,31 @@ mod tests {
         assert_eq!(stats.dense_cells, 0);
         store
             .edit(BlockPos::new(1, 2, 3), BlockStateId(2))
-            .expect("edit makes the section dense");
+            .expect("edit makes the section non-uniform");
         let stats = store.stats();
         assert_eq!(stats.uniform_sections, 1);
-        assert_eq!(stats.dense_cells, 16usize.pow(3));
+        assert_eq!(stats.dense_cells, 0);
+        assert_eq!(stats.palette_sections, 1);
+        assert_eq!(stats.cell_bytes, 524 + size_of::<crate::PaletteCells>());
+    }
+
+    #[test]
+    fn world_memory_report_tracks_packed_buffers_and_loading_sections() {
+        let mut store = store();
+        ready(&mut store, SectionPos::ZERO, BlockStateId::EMPTY);
+        let mut ledger = torse_types::MemoryLedger::new(torse_types::MemoryBudget::new(1_000_000));
+        let original = ledger.charge(store.memory_resident().unwrap()).unwrap();
+        store.edit(BlockPos::new(1, 1, 1), BlockStateId(1)).unwrap();
+        store.request(SectionPos::new(1, 0, 0)).unwrap();
+        let report = store.memory_resident().unwrap();
+        assert_eq!(
+            report.bytes,
+            (store.stats().cell_bytes + 2 * size_of::<Section>()) as u64
+        );
+        let replacement = ledger.exchange(&[original], &[report]).unwrap()[0];
+        assert_eq!(ledger.usage(torse_types::MemoryClass::World), report.bytes);
+        assert!(ledger.eviction_plan(report.bytes).charges.is_empty());
+        ledger.release(replacement).unwrap();
     }
 
     #[test]

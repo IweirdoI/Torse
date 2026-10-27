@@ -566,6 +566,12 @@ fn project(
                     mark(*state)?;
                 }
             }
+            SectionStorage::Palette(cells) => {
+                cost.bytes(cells.len() * size_of::<u16>())?;
+                for state in cells.states() {
+                    mark(*state)?;
+                }
+            }
         }
         if !cost.fits(budget) {
             return Err(Fault::resource_limit("replica snapshot budget"));
@@ -624,15 +630,8 @@ fn project(
         .copied()
         .filter(|pos| readable(world, *pos))
         .map(|pos| {
-            let cells = match world
-                .store()
-                .section(pos)
-                .expect("readable section")
-                .storage()
-            {
-                SectionStorage::Uniform(state) => SnapshotCells::Uniform(*state),
-                SectionStorage::Dense(cells) => SnapshotCells::Dense(cells.clone()),
-            };
+            let cells =
+                SnapshotCells::capture(world.store().section(pos).expect("readable section"));
             SnapshotSection { pos, cells }
         })
         .collect();

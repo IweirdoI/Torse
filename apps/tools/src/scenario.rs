@@ -40,6 +40,8 @@ pub struct ScenarioReport {
     pub sections_loaded: usize,
     /// Cell identifiers allocated by dense sections.
     pub dense_cells: usize,
+    /// Resident compressed cell buffers and palette metadata.
+    pub cell_bytes: usize,
     /// Blocks edited after generation.
     pub blocks_edited: usize,
     /// Simulation steps executed for the walk.
@@ -259,6 +261,7 @@ pub fn run() -> Result<ScenarioReport, ScenarioError> {
     // Every loaded section can be released, which is the memory-stability check:
     // after teardown the store holds nothing.
     report.dense_cells = store.stats().dense_cells;
+    report.cell_bytes = store.stats().cell_bytes;
     for section in &planned {
         store
             .unload(*section)

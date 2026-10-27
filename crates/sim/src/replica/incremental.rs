@@ -105,15 +105,15 @@ impl Dirty {
 fn section_cost(section: &Section) -> Result<Cost, Fault> {
     let mut cost = Cost::default();
     cost.entries::<SnapshotSection>(1)?;
-    if let SectionStorage::Dense(cells) = section.storage() {
-        cost.bytes(std::mem::size_of_val(cells.as_slice()))?;
+    if !matches!(section.storage(), SectionStorage::Uniform(_)) {
+        cost.bytes(section.cell_count() * size_of::<u16>())?;
     }
     Ok(cost)
 }
 fn same_section(previous: &SnapshotCells, current: &Section) -> bool {
     match (previous, current.storage()) {
         (SnapshotCells::Uniform(a), SectionStorage::Uniform(b)) => a == b,
-        (SnapshotCells::Dense(a), SectionStorage::Dense(b)) => a == b,
+        (SnapshotCells::Dense(a), _) => a.iter().copied().eq(current.values()),
         _ => false,
     }
 }
@@ -308,10 +308,7 @@ pub(super) fn update(
         .iter()
         .map(|(i, section)| SnapshotSection {
             pos: previous.sections[*i].pos,
-            cells: match section.storage() {
-                SectionStorage::Uniform(id) => SnapshotCells::Uniform(*id),
-                SectionStorage::Dense(cells) => SnapshotCells::Dense(cells.clone()),
-            },
+            cells: SnapshotCells::capture(section),
         })
         .collect();
     let mut changed_entities = vec![];

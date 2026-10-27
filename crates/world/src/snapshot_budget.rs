@@ -97,6 +97,13 @@ impl Snapshot {
                         used[state.0 as usize] = true;
                     }
                 }
+                SectionStorage::Palette(cells) => {
+                    // The exchange still expands every cell before encoding.
+                    remaining.bytes((cells.len() * size_of::<u16>()) as u64)?;
+                    for state in cells.states() {
+                        used[state.0 as usize] = true;
+                    }
+                }
             }
         }
         for (id, _) in used.iter().enumerate().skip(1).filter(|(_, used)| **used) {

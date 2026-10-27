@@ -176,6 +176,7 @@ fn m1_scenario() -> ExitCode {
         Ok(report) => {
             println!("sections_loaded={}", report.sections_loaded);
             println!("dense_cells={}", report.dense_cells);
+            println!("cell_bytes={}", report.cell_bytes);
             println!("blocks_edited={}", report.blocks_edited);
             println!("steps={}", report.steps);
             println!("blocked_steps={}", report.blocked_steps);

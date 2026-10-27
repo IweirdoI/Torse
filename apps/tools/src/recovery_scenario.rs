@@ -180,13 +180,10 @@ pub fn run() -> Result<RecoveryReport, RecoveryScenarioError> {
             .store()
             .section(pos)
             .ok_or_else(|| RecoveryScenarioError::new("recovered section missing"))?;
-        if live.storage() != restored.storage() {
+        if !live.values().eq(restored.values()) {
             equal = false;
         }
-        report.cells_checked += match live.storage() {
-            torse_world::SectionStorage::Uniform(_) => 1,
-            torse_world::SectionStorage::Dense(cells) => cells.len(),
-        };
+        report.cells_checked += live.cell_count();
     }
     report.restored_equal = equal;
     if !equal {

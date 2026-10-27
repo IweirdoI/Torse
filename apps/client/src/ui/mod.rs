@@ -157,24 +157,20 @@ struct Skin {
 }
 impl Skin {
     fn load() -> Result<Self, String> {
-        macro_rules! asset {
-            ($name:literal) => {
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../games/base/assets/",
-                    $name
-                )) as &[u8]
-            };
-        }
+        let catalog = crate::texture::resident_base_assets()?;
         let sources = [
-            (asset!("icons/items/stone.png"), (16, 16)),
-            (asset!("icons/items/glass_slab.png"), (16, 16)),
-            (asset!("icons/items/plant.png"), (16, 16)),
+            crate::texture::BASE_ICON_STONE,
+            crate::texture::BASE_ICON_GLASS,
+            crate::texture::BASE_ICON_PLANT,
         ];
         Ok(Self {
             icons: sources
                 .into_iter()
-                .map(|(bytes, size)| Sprite::decode(bytes, size))
+                .map(|guid| {
+                    let handle = catalog.handle(guid).ok_or("base icon is not resident")?;
+                    let bytes = catalog.get(handle).ok_or("base icon handle is stale")?;
+                    Sprite::decode(bytes, (16, 16), guid)
+                })
                 .collect::<Result<_, _>>()?,
         })
     }

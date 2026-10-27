@@ -243,7 +243,7 @@ impl Scene {
             meshes: BTreeMap::new(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
-            asset_generation: 1,
+            asset_generation: palette.asset_generation(),
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
             background: None,
@@ -293,7 +293,7 @@ impl Scene {
             meshes: BTreeMap::new(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
-            asset_generation: 1,
+            asset_generation: palette.asset_generation(),
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
             background: None,
@@ -942,7 +942,7 @@ impl Scene {
             meshes: BTreeMap::new(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
-            asset_generation: 1,
+            asset_generation: palette.asset_generation(),
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
             background: None,
@@ -1461,6 +1461,17 @@ mod tests {
             scene.center_section([-0.5, 5.0, 15.5]),
             SectionPos::new(-1, 0, 0)
         );
+    }
+
+    #[test]
+    fn actual_palette_assets_stamp_the_scene() {
+        let scene = Scene::new(1).unwrap();
+        assert_eq!(scene.asset_generation, scene.palette.asset_generation());
+        assert_eq!(
+            scene.asset_generation,
+            u64::from(crate::texture::MIP_LEVELS)
+        );
+        assert!(!scene.palette.mips().is_empty());
     }
 
     #[test]

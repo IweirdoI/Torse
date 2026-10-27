@@ -6,4 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 pub mod texture;
+
+pub use catalog::{AssetAlias, AssetCatalog, AssetError, AssetGuid, AssetHandle};

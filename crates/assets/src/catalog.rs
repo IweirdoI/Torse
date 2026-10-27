@@ -1,0 +1,386 @@
+//! Resident CPU copies of assets.
+//!
+//! A caller assigns a 128-bit [`AssetGuid`]. Aliases, either a [`ContentKey`]
+//! or a relative path, look that guid up. A handle pairs the guid with a
+//! generation so an unloaded asset cannot be read through an old handle.
+//! Loading is synchronous. Unloading drops the CPU bytes and releases the
+//! resource-class charge. This crate does not upload GPU memory, stream
+//! assets in the background, or change world identities.
+
+use std::collections::BTreeMap;
+
+use torse_types::{
+    ContentKey, ContentKeyError, EvictionRank, Fault, MemoryBudget, MemoryClass, MemoryLedger,
+    MemoryResident,
+};
+
+/// Assigned 128-bit asset identity.
+///
+/// This is not a [`ContentKey`] and not an entity id. Callers choose the
+/// value. It is not derived from the file bytes, so a later cook step can
+/// keep the same guid when the source image changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct AssetGuid(pub u128);
+
+/// Handle for one resident CPU copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct AssetHandle {
+    guid: AssetGuid,
+    generation: u64,
+}
+
+impl AssetHandle {
+    /// Guid named by this handle.
+    pub const fn guid(self) -> AssetGuid {
+        self.guid
+    }
+
+    /// Generation assigned when this copy was loaded.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+/// Name that resolves to a guid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssetAlias {
+    /// Namespaced content key. It does not become the asset guid.
+    Key(ContentKey),
+    /// Relative path using `/` separators.
+    Path(String),
+}
+
+impl AssetAlias {
+    /// Parse a content-key alias.
+    pub fn key(value: &str) -> Result<Self, AssetError> {
+        ContentKey::parse(value)
+            .map(Self::Key)
+            .map_err(AssetError::Alias)
+    }
+
+    /// Parse a relative path alias.
+    ///
+    /// Empty paths, absolute paths, backslashes, and `..` segments are
+    /// rejected so an alias cannot name a location outside the pack.
+    pub fn path(value: &str) -> Result<Self, AssetError> {
+        if value.is_empty()
+            || value.len() > 128
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains('\\')
+            || value.contains("//")
+            || value
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || !value.bytes().all(is_path_byte)
+        {
+            return Err(AssetError::BadPath);
+        }
+        Ok(Self::Path(value.to_owned()))
+    }
+}
+
+fn is_path_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.' | b'/')
+}
+
+/// Why a load or unload did not change the catalog.
+#[derive(Debug)]
+pub enum AssetError {
+    /// The CPU copy contained no bytes.
+    Empty,
+    /// The path alias was not a relative pack path.
+    BadPath,
+    /// The content-key alias was not a valid key.
+    Alias(ContentKeyError),
+    /// An alias already names a different guid.
+    AliasUsed,
+    /// A dependency guid is not resident.
+    MissingDependency(AssetGuid),
+    /// This guid is already resident with different bytes.
+    DifferentBytes,
+    /// The handle does not name the resident generation.
+    Stale,
+    /// A resident asset still depends on this one.
+    StillUsed,
+    /// The resource-class budget refused the CPU copy.
+    Budget(Fault),
+}
+
+impl std::fmt::Display for AssetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "asset copy contains no bytes"),
+            Self::BadPath => write!(f, "asset path alias is not a relative pack path"),
+            Self::Alias(error) => write!(f, "{error}"),
+            Self::AliasUsed => write!(f, "asset alias already names another guid"),
+            Self::MissingDependency(guid) => {
+                write!(f, "asset dependency {:#x} is not loaded", guid.0)
+            }
+            Self::DifferentBytes => write!(f, "asset guid is already loaded with other bytes"),
+            Self::Stale => write!(f, "asset handle does not match the resident generation"),
+            Self::StillUsed => write!(f, "asset is still used by a loaded dependent"),
+            Self::Budget(fault) => write!(f, "{fault}"),
+        }
+    }
+}
+
+impl std::error::Error for AssetError {}
+
+struct Resident {
+    generation: u64,
+    bytes: Vec<u8>,
+    dependencies: Vec<AssetGuid>,
+    dependents: u32,
+    charge: torse_types::MemoryChargeId,
+    keys: Vec<ContentKey>,
+    paths: Vec<String>,
+}
+
+/// Resident CPU copies and the resource-class ledger that accounts them.
+pub struct AssetCatalog {
+    ledger: MemoryLedger,
+    resident: BTreeMap<u128, Resident>,
+    /// Last generation issued for a guid. Survives unload.
+    issued: BTreeMap<u128, u64>,
+    keys: BTreeMap<ContentKey, u128>,
+    paths: BTreeMap<String, u128>,
+    /// Changes on every successful load and unload.
+    generation: u64,
+}
+
+impl AssetCatalog {
+    /// Empty catalog. `budget` limits the sum of resident CPU copies.
+    pub fn new(budget: MemoryBudget) -> Self {
+        Self {
+            ledger: MemoryLedger::new(budget),
+            resident: BTreeMap::new(),
+            issued: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            paths: BTreeMap::new(),
+            generation: 0,
+        }
+    }
+
+    /// Value hosts copy into their asset-generation stamp.
+    pub const fn asset_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Bytes currently charged to the resource class.
+    pub fn charged_bytes(&self) -> u64 {
+        self.ledger.usage(MemoryClass::Resource)
+    }
+
+    /// Load `bytes` for `guid`.
+    ///
+    /// Dependencies must already be resident. A second load of the same bytes
+    /// returns the existing handle and does not change aliases. Different
+    /// bytes for a resident guid are rejected, so this is not a hot reload.
+    pub fn load(
+        &mut self,
+        guid: AssetGuid,
+        bytes: &[u8],
+        aliases: &[AssetAlias],
+        dependencies: &[AssetGuid],
+    ) -> Result<AssetHandle, AssetError> {
+        if bytes.is_empty() {
+            return Err(AssetError::Empty);
+        }
+        for dependency in dependencies {
+            if !self.resident.contains_key(&dependency.0) {
+                return Err(AssetError::MissingDependency(*dependency));
+            }
+        }
+        if let Some(resident) = self.resident.get(&guid.0) {
+            if resident.bytes.as_slice() != bytes {
+                return Err(AssetError::DifferentBytes);
+            }
+            return Ok(AssetHandle {
+                guid,
+                generation: resident.generation,
+            });
+        }
+        self.claim_aliases(guid, aliases)?;
+        let charge = self
+            .ledger
+            .charge(MemoryResident {
+                class: MemoryClass::Resource,
+                bytes: bytes.len() as u64,
+                rank: EvictionRank::ReloadableResource,
+            })
+            .map_err(AssetError::Budget)?;
+        let generation = self.issued.get(&guid.0).copied().unwrap_or(0) + 1;
+        let mut keys = Vec::new();
+        let mut paths = Vec::new();
+        for alias in aliases {
+            match alias {
+                AssetAlias::Key(key) => {
+                    self.keys.insert(key.clone(), guid.0);
+                    keys.push(key.clone());
+                }
+                AssetAlias::Path(path) => {
+                    self.paths.insert(path.clone(), guid.0);
+                    paths.push(path.clone());
+                }
+            }
+        }
+        for dependency in dependencies {
+            if let Some(resident) = self.resident.get_mut(&dependency.0) {
+                resident.dependents += 1;
+            }
+        }
+        self.issued.insert(guid.0, generation);
+        self.resident.insert(
+            guid.0,
+            Resident {
+                generation,
+                bytes: bytes.to_vec(),
+                dependencies: dependencies.to_vec(),
+                dependents: 0,
+                charge,
+                keys,
+                paths,
+            },
+        );
+        self.generation += 1;
+        Ok(AssetHandle { guid, generation })
+    }
+
+    /// Drop a resident copy and release its resource-class charge.
+    pub fn unload(&mut self, handle: AssetHandle) -> Result<(), AssetError> {
+        let Some(resident) = self.resident.get(&handle.guid.0) else {
+            return Err(AssetError::Stale);
+        };
+        if resident.generation != handle.generation || resident.dependents > 0 {
+            return Err(if resident.generation != handle.generation {
+                AssetError::Stale
+            } else {
+                AssetError::StillUsed
+            });
+        }
+        let dependencies = resident.dependencies.clone();
+        let charge = resident.charge;
+        let keys = resident.keys.clone();
+        let paths = resident.paths.clone();
+        self.ledger.release(charge).map_err(AssetError::Budget)?;
+        for key in keys {
+            self.keys.remove(&key);
+        }
+        for path in paths {
+            self.paths.remove(&path);
+        }
+        self.resident.remove(&handle.guid.0);
+        for dependency in dependencies {
+            if let Some(resident) = self.resident.get_mut(&dependency.0) {
+                resident.dependents = resident.dependents.saturating_sub(1);
+            }
+        }
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Borrow the resident bytes when the handle generation is current.
+    pub fn get(&self, handle: AssetHandle) -> Option<&[u8]> {
+        let resident = self.resident.get(&handle.guid.0)?;
+        if resident.generation != handle.generation {
+            return None;
+        }
+        Some(&resident.bytes)
+    }
+
+    /// Guid currently named by a content key, if that copy is resident.
+    pub fn guid_for_key(&self, key: &ContentKey) -> Option<AssetGuid> {
+        self.keys.get(key).copied().map(AssetGuid)
+    }
+
+    /// Guid currently named by a relative path, if that copy is resident.
+    pub fn guid_for_path(&self, path: &str) -> Option<AssetGuid> {
+        self.paths.get(path).copied().map(AssetGuid)
+    }
+
+    fn claim_aliases(&self, guid: AssetGuid, aliases: &[AssetAlias]) -> Result<(), AssetError> {
+        for alias in aliases {
+            let taken = match alias {
+                AssetAlias::Key(key) => self.keys.get(key).copied(),
+                AssetAlias::Path(path) => self.paths.get(path).copied(),
+            };
+            if taken.is_some_and(|owner| owner != guid.0) {
+                return Err(AssetError::AliasUsed);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn guid(value: u128) -> AssetGuid {
+        AssetGuid(value)
+    }
+
+    fn catalog() -> AssetCatalog {
+        AssetCatalog::new(MemoryBudget::new(64))
+    }
+
+    #[test]
+    fn load_resolves_aliases_and_unload_invalidates_the_handle() {
+        let mut catalog = catalog();
+        let key = AssetAlias::key("base:texture/atlas").unwrap();
+        let path = AssetAlias::path("textures/atlas.png").unwrap();
+        let handle = catalog.load(guid(1), b"atlas", &[key, path], &[]).unwrap();
+        assert_eq!(catalog.get(handle), Some(b"atlas".as_slice()));
+        assert_eq!(
+            catalog.guid_for_key(&ContentKey::parse("base:texture/atlas").unwrap()),
+            Some(guid(1))
+        );
+        assert_eq!(catalog.guid_for_path("textures/atlas.png"), Some(guid(1)));
+        assert_eq!(catalog.charged_bytes(), 5);
+        assert_eq!(catalog.asset_generation(), 1);
+        catalog.unload(handle).unwrap();
+        assert_eq!(catalog.get(handle), None);
+        assert_eq!(catalog.charged_bytes(), 0);
+        assert_eq!(catalog.guid_for_path("textures/atlas.png"), None);
+        assert_eq!(catalog.asset_generation(), 2);
+        let again = catalog.load(guid(1), b"atlas", &[], &[]).unwrap();
+        assert_ne!(again.generation(), handle.generation());
+        assert_eq!(catalog.get(handle), None);
+        assert_eq!(catalog.get(again), Some(b"atlas".as_slice()));
+    }
+
+    #[test]
+    fn dependencies_block_unload_and_a_missing_one_loads_nothing() {
+        let mut catalog = catalog();
+        let base = catalog.load(guid(1), b"base", &[], &[]).unwrap();
+        let missing = catalog.load(guid(2), b"child", &[], &[guid(9)]);
+        assert!(matches!(missing, Err(AssetError::MissingDependency(_))));
+        assert_eq!(catalog.charged_bytes(), 4);
+        let child = catalog.load(guid(2), b"child", &[], &[guid(1)]).unwrap();
+        assert!(matches!(catalog.unload(base), Err(AssetError::StillUsed)));
+        assert_eq!(catalog.get(base), Some(b"base".as_slice()));
+        catalog.unload(child).unwrap();
+        catalog.unload(base).unwrap();
+        assert_eq!(catalog.charged_bytes(), 0);
+    }
+
+    #[test]
+    fn a_full_budget_and_a_changed_payload_leave_the_catalog() {
+        let mut catalog = catalog();
+        let handle = catalog.load(guid(1), &[7; 64], &[], &[]).unwrap();
+        let refused = catalog.load(guid(2), b"more", &[], &[]);
+        assert!(matches!(refused, Err(AssetError::Budget(_))));
+        assert_eq!(catalog.charged_bytes(), 64);
+        assert!(catalog.get(handle).is_some());
+        let same = catalog.load(guid(1), &[7; 64], &[], &[]).unwrap();
+        assert_eq!(same, handle);
+        assert!(matches!(
+            catalog.load(guid(1), b"other", &[], &[]),
+            Err(AssetError::DifferentBytes)
+        ));
+        assert_eq!(catalog.asset_generation(), 1);
+        assert!(AssetAlias::path("../secret").is_err());
+        assert!(AssetAlias::path("/absolute").is_err());
+    }
+}

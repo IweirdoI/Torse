@@ -26,7 +26,8 @@ use torse_world::{
 use torse_world_services::{GenerationParams, HillTerrain, SectionGenerator};
 
 use crate::pick::{PickHit, PickOutcome, cast_ray};
-use crate::texture::{Palette, TexturePack};
+use crate::texture::{Palette, TexturePack, resident_base_assets};
+use torse_assets::AssetCatalog;
 
 mod background;
 pub use background::BackgroundStats;
@@ -107,6 +108,7 @@ pub struct Scene {
     meshes: BTreeMap<SectionPos, (MeshStamp, MeshData)>,
     sections: Vec<SectionPos>,
     epoch: WorldEpoch,
+    assets: AssetCatalog,
     asset_generation: u64,
     next_load_generation: u64,
     load_generations: BTreeMap<SectionPos, u64>,
@@ -243,6 +245,7 @@ impl Scene {
             meshes: BTreeMap::new(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
+            assets: resident_base_assets()?,
             asset_generation: 1,
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
@@ -254,6 +257,7 @@ impl Scene {
             tint_provider: None,
             tint_provider_generation: 0,
         };
+        scene.asset_generation = scene.assets.asset_generation();
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)
     }
@@ -293,6 +297,7 @@ impl Scene {
             meshes: BTreeMap::new(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
+            assets: resident_base_assets()?,
             asset_generation: 1,
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
@@ -304,6 +309,7 @@ impl Scene {
             tint_provider: None,
             tint_provider_generation: 0,
         };
+        scene.asset_generation = scene.assets.asset_generation();
         scene.install_snapshot(snapshot)?;
         Ok(scene)
     }
@@ -942,6 +948,7 @@ impl Scene {
             meshes: BTreeMap::new(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
+            assets: resident_base_assets()?,
             asset_generation: 1,
             next_load_generation: 1,
             load_generations: BTreeMap::new(),
@@ -953,6 +960,7 @@ impl Scene {
             tint_provider: None,
             tint_provider_generation: 0,
         };
+        scene.asset_generation = scene.assets.asset_generation();
         scene.placeable = Some(game.placeable_blocks());
         scene.layers = (game.height_limit() + i64::from(side) - 1) / i64::from(side);
         scene.layers = scene.layers.clamp(1, 4);
@@ -1460,6 +1468,25 @@ mod tests {
         assert_eq!(
             scene.center_section([-0.5, 5.0, 15.5]),
             SectionPos::new(-1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn base_assets_stay_resident_and_stamp_the_scene() {
+        let scene = Scene::new(1).unwrap();
+        assert_eq!(scene.asset_generation, scene.assets.asset_generation());
+        assert!(scene.assets.charged_bytes() > 0);
+        assert!(scene.assets.guid_for_path("textures/atlas.png").is_some());
+        assert!(
+            scene
+                .assets
+                .guid_for_path("icons/items/stone.png")
+                .is_some()
+        );
+        let key = torse_types::ContentKey::parse("base:texture/atlas").unwrap();
+        assert_eq!(
+            scene.assets.guid_for_key(&key),
+            Some(crate::texture::BASE_ATLAS)
         );
     }
 

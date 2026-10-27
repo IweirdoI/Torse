@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use torse_assets::texture::TexturePack;
 use torse_assets::texture::{Atlas, MaterialAnimation, MaterialEntry, MipLevel, TintSource};
+use torse_assets::{AssetAlias, AssetCatalog, AssetGuid};
 use torse_content::{AlphaMode, Face};
-use torse_types::ContentKey;
+use torse_types::{ContentKey, MemoryBudget};
 use torse_world::{BlockStateId, BlockStateRegistry};
 
 /// Maximum materials addressable by one terrain vertex.
@@ -180,6 +181,74 @@ pub fn base_pack() -> Result<TexturePack, String> {
         [76, 4, 16, 16],
         [100, 4, 16, 16],
     )
+}
+
+/// Assigned identities for the base texture sources.
+pub const BASE_ATLAS: AssetGuid = AssetGuid(0x0001_0000_0000_0001);
+/// Assigned identity for the stone item icon.
+pub const BASE_ICON_STONE: AssetGuid = AssetGuid(0x0001_0000_0000_0002);
+/// Assigned identity for the glass slab item icon.
+pub const BASE_ICON_GLASS: AssetGuid = AssetGuid(0x0001_0000_0000_0003);
+/// Assigned identity for the plant item icon.
+pub const BASE_ICON_PLANT: AssetGuid = AssetGuid(0x0001_0000_0000_0004);
+
+/// Load the base atlas and item icons into `catalog`.
+///
+/// The bytes still come from the compiled pack. The catalog owns the resident
+/// CPU copies and accounts them. GPU upload stays with the palette and UI.
+pub fn install_base_assets(catalog: &mut AssetCatalog) -> Result<(), String> {
+    macro_rules! asset {
+        ($name:literal) => {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../games/base/assets/",
+                $name
+            )) as &[u8]
+        };
+    }
+    let sources = [
+        (
+            BASE_ATLAS,
+            asset!("textures/atlas.png"),
+            "base:texture/atlas",
+            "textures/atlas.png",
+        ),
+        (
+            BASE_ICON_STONE,
+            asset!("icons/items/stone.png"),
+            "base:icon/stone",
+            "icons/items/stone.png",
+        ),
+        (
+            BASE_ICON_GLASS,
+            asset!("icons/items/glass_slab.png"),
+            "base:icon/glass_slab",
+            "icons/items/glass_slab.png",
+        ),
+        (
+            BASE_ICON_PLANT,
+            asset!("icons/items/plant.png"),
+            "base:icon/plant",
+            "icons/items/plant.png",
+        ),
+    ];
+    for (guid, bytes, key, path) in sources {
+        let aliases = [
+            AssetAlias::key(key).map_err(|error| error.to_string())?,
+            AssetAlias::path(path).map_err(|error| error.to_string())?,
+        ];
+        catalog
+            .load(guid, bytes, &aliases, &[])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Resident catalog for one client scene.
+pub fn resident_base_assets() -> Result<AssetCatalog, String> {
+    let mut catalog = AssetCatalog::new(MemoryBudget::new(8 * 1024 * 1024));
+    install_base_assets(&mut catalog)?;
+    Ok(catalog)
 }
 
 #[cfg(test)]

@@ -23,7 +23,10 @@
 
 use std::collections::BTreeMap;
 
-use torse_types::{BlockPos, Revision, SectionPos};
+use torse_types::{
+    BlockPos, EvictionRank, Fault, MemoryChargeId, MemoryClass, MemoryLedger, MemoryResident,
+    Revision, SectionPos,
+};
 
 /// The six cell faces in occlusion-mask order: `-x, +x, -y, +y, -z, +z`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -927,12 +930,15 @@ pub enum InsertOutcome {
 
 /// Bounded store of finished section meshes.
 ///
-/// The cache keeps one mesh per section and evicts in coordinate order when it
-/// exceeds capacity. Coordinate order is deterministic, which keeps test output
-/// stable; it is not an eviction policy based on visibility.
+/// The cache keeps one mesh per section. Without a focus it evicts in
+/// coordinate order when it exceeds capacity, which keeps tests deterministic.
+/// With a focus it evicts the section farthest from that focus. Ties release
+/// the lower section coordinate. Neither policy deletes authoritative terrain;
+/// the cache only stores derived meshes.
 #[derive(Debug)]
 pub struct MeshCache {
     capacity: usize,
+    focus: Option<SectionPos>,
     entries: BTreeMap<SectionPos, CachedMesh>,
 }
 
@@ -941,8 +947,23 @@ impl MeshCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            focus: None,
             entries: BTreeMap::new(),
         }
+    }
+
+    /// Section the cache should prefer to keep.
+    ///
+    /// Distances are measured in section coordinates. Callers that move the
+    /// camera should set the focus again and [`Self::publish_memory`] so the
+    /// ledger ranks meshes with the new distances.
+    pub fn set_focus(&mut self, focus: Option<SectionPos>) {
+        self.focus = focus;
+    }
+
+    /// Focus currently used for eviction and ledger ranking.
+    pub const fn focus(&self) -> Option<SectionPos> {
+        self.focus
     }
 
     /// Number of cached meshes.
@@ -976,12 +997,74 @@ impl MeshCache {
         }
         self.entries.insert(job.section, CachedMesh { job, mesh });
         while self.entries.len() > self.capacity {
-            let Some(first) = self.entries.keys().next().copied() else {
+            let Some(victim) = self.select_victim() else {
                 break;
             };
-            self.entries.remove(&first);
+            self.entries.remove(&victim);
         }
         InsertOutcome::Accepted
+    }
+
+    /// Drop one cached mesh.
+    ///
+    /// This does not release a ledger charge. Publish again, or release the
+    /// charge that [`Self::publish_memory`] returned for `section`.
+    pub fn remove(&mut self, section: SectionPos) -> Option<CachedMesh> {
+        self.entries.remove(&section)
+    }
+
+    /// Replace `published` with one mesh-class charge per cached mesh that
+    /// owns heap capacity.
+    ///
+    /// The exchange is atomic: if the meshes do not fit, `published` stays
+    /// charged and this cache is unchanged. A mesh whose reserved capacity is
+    /// zero is omitted. Bytes count that capacity, including unused slots, via
+    /// [`MeshData::allocated_bytes`]. A missing focus ranks every mesh as far
+    /// (`u64::MAX`).
+    pub fn publish_memory(
+        &self,
+        ledger: &mut MemoryLedger,
+        published: &[MemoryChargeId],
+    ) -> Result<Vec<(SectionPos, MemoryChargeId)>, Fault> {
+        let mut incoming = Vec::new();
+        let mut sections = Vec::new();
+        for (pos, cached) in &self.entries {
+            let bytes = u64::try_from(cached.mesh.allocated_bytes()).unwrap_or(u64::MAX);
+            if bytes == 0 {
+                continue;
+            }
+            let distance_sq = self
+                .focus
+                .map(|focus| section_distance_sq(*pos, focus))
+                .unwrap_or(u64::MAX);
+            incoming.push(MemoryResident {
+                class: MemoryClass::Mesh,
+                bytes,
+                rank: EvictionRank::Mesh { distance_sq },
+            });
+            sections.push(*pos);
+        }
+        let ids = ledger.exchange(published, &incoming)?;
+        Ok(sections.into_iter().zip(ids).collect())
+    }
+
+    fn select_victim(&self) -> Option<SectionPos> {
+        let mut victim = None;
+        for pos in self.entries.keys().copied() {
+            let replace = match (victim, self.focus) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(current), Some(focus)) => {
+                    let distance = section_distance_sq(pos, focus);
+                    let current_distance = section_distance_sq(current, focus);
+                    distance > current_distance || (distance == current_distance && pos < current)
+                }
+            };
+            if replace {
+                victim = Some(pos);
+            }
+        }
+        victim
     }
 
     /// Total CPU bytes held by cached meshes.
@@ -993,9 +1076,24 @@ impl MeshCache {
     }
 }
 
+fn section_distance_sq(section: SectionPos, focus: SectionPos) -> u64 {
+    let dx = axis_sq(section.x as i128 - focus.x as i128);
+    let dy = axis_sq(section.y as i128 - focus.y as i128);
+    let dz = axis_sq(section.z as i128 - focus.z as i128);
+    let sum = dx.saturating_add(dy).saturating_add(dz);
+    u64::try_from(sum).unwrap_or(u64::MAX)
+}
+
+fn axis_sq(delta: i128) -> u128 {
+    let magnitude = delta.unsigned_abs();
+    magnitude.saturating_mul(magnitude)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+
+    use torse_types::MemoryBudget;
 
     use super::*;
 
@@ -1029,6 +1127,17 @@ mod tests {
         assert_eq!(job.neighbor_revisions[Face::PosX.index() as usize], None);
         assert_eq!(job.neighbor_revisions[Face::NegY.index() as usize], None);
         assert!(job.validate(|_| Some(Revision::INITIAL)));
+    }
+
+    fn one_cell(section: SectionPos) -> MeshData {
+        let origin = BlockPos::new(section.x, section.y, section.z);
+        build_mesh(1, section, move |pos| {
+            if pos == origin {
+                MeshSample::Ready(cube(0b11_1111))
+            } else {
+                MeshSample::NotLoaded
+            }
+        })
     }
 
     fn cube(occlusion: u8) -> RenderBlock {
@@ -1456,5 +1565,138 @@ mod tests {
         assert_eq!(build(SectionPos::new(1, 0, 0)), InsertOutcome::Accepted);
         assert_eq!(cache.len(), 1);
         assert!(cache.get(SectionPos::ZERO).is_none());
+    }
+
+    #[test]
+    fn cache_with_focus_keeps_the_near_section() {
+        let mesh = build_mesh(1, SectionPos::ZERO, |_| MeshSample::Ready(cube(0b11_1111)));
+        let mut focused = MeshCache::new(1);
+        focused.set_focus(Some(SectionPos::ZERO));
+        let insert = |cache: &mut MeshCache, section: SectionPos| {
+            let job = MeshJob::capture(1, section, |_| None);
+            cache.insert(job, mesh.clone(), |_| None)
+        };
+        assert_eq!(
+            insert(&mut focused, SectionPos::ZERO),
+            InsertOutcome::Accepted
+        );
+        assert_eq!(
+            insert(&mut focused, SectionPos::new(4, 0, 0)),
+            InsertOutcome::Accepted
+        );
+        assert!(focused.get(SectionPos::ZERO).is_some());
+        assert!(focused.get(SectionPos::new(4, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn publish_memory_ranks_the_far_mesh_and_keeps_the_previous_charge() {
+        let near = one_cell(SectionPos::ZERO);
+        let far_section = SectionPos::new(3, 0, 0);
+        let far = one_cell(far_section);
+        let bytes = near.allocated_bytes() as u64;
+        assert!(bytes > 0);
+        assert_eq!(far.allocated_bytes() as u64, bytes);
+
+        let mut cache = MeshCache::new(4);
+        cache.set_focus(Some(SectionPos::ZERO));
+        let near_job = MeshJob::capture(1, SectionPos::ZERO, |_| None);
+        cache.insert(near_job, near, |_| None);
+
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(bytes));
+        let published = cache.publish_memory(&mut ledger, &[]).unwrap();
+        assert_eq!(ledger.usage(MemoryClass::Mesh), bytes);
+
+        let far_job = MeshJob::capture(1, far_section, |_| None);
+        cache.insert(far_job, far, |_| None);
+        let held: Vec<_> = published.iter().map(|(_, id)| *id).collect();
+        let error = cache.publish_memory(&mut ledger, &held).unwrap_err();
+        assert_eq!(error.code, torse_types::FaultCode::ResourceLimit);
+        assert_eq!(ledger.usage(MemoryClass::Mesh), bytes);
+        assert!(ledger.get(held[0]).is_some());
+        assert_eq!(cache.len(), 2);
+
+        let mut room = MemoryLedger::new(MemoryBudget::new(bytes.saturating_mul(2)));
+        let ranked = cache.publish_memory(&mut room, &[]).unwrap();
+        let plan = room.eviction_plan(1);
+        let far_id = ranked
+            .iter()
+            .find(|(pos, _)| *pos == far_section)
+            .expect("far mesh is charged")
+            .1;
+        assert_eq!(plan.charges.first().copied(), Some(far_id));
+    }
+
+    #[test]
+    fn publish_memory_charges_reserved_capacity_of_a_nonempty_mesh() {
+        let mesh = quad_with_reserved_positions(1024);
+        assert_eq!(mesh.byte_size(), 268);
+        assert_eq!(mesh.allocated_bytes(), 12_508);
+
+        let mut cache = MeshCache::new(1);
+        let job = MeshJob::capture(1, SectionPos::ZERO, |_| None);
+        cache.insert(job, mesh, |_| None);
+
+        let mut tight = MemoryLedger::new(MemoryBudget::new(268));
+        let error = cache.publish_memory(&mut tight, &[]).unwrap_err();
+        assert_eq!(error.code, torse_types::FaultCode::ResourceLimit);
+        assert_eq!(tight.total_usage(), 0);
+
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(12_508));
+        cache.publish_memory(&mut ledger, &[]).unwrap();
+        assert_eq!(ledger.usage(torse_types::MemoryClass::Mesh), 12_508);
+    }
+
+    #[test]
+    fn publish_memory_charges_an_empty_mesh_that_keeps_capacity() {
+        let mesh = empty_with_reserved_positions(1024);
+        assert_eq!(mesh.byte_size(), 0);
+        assert_eq!(mesh.allocated_bytes(), 12_288);
+
+        let mut cache = MeshCache::new(1);
+        let job = MeshJob::capture(1, SectionPos::ZERO, |_| None);
+        cache.insert(job, mesh, |_| None);
+
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(0));
+        let error = cache.publish_memory(&mut ledger, &[]).unwrap_err();
+        assert_eq!(error.code, torse_types::FaultCode::ResourceLimit);
+        assert_eq!(ledger.total_usage(), 0);
+        assert!(cache.get(SectionPos::ZERO).is_some());
+    }
+
+    fn quad_with_reserved_positions(slots: usize) -> MeshData {
+        let mut positions = Vec::with_capacity(slots);
+        positions.extend([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        MeshData {
+            section: SectionPos::ZERO,
+            positions,
+            normals: vec![[0.0, 1.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            materials: vec![1],
+            overlays: vec![u16::MAX],
+            tints: vec![[1.0, 1.0, 1.0]; 4],
+            overlay_tints: vec![[1.0, 1.0, 1.0]; 4],
+            shades: vec![1.0; 4],
+        }
+    }
+
+    fn empty_with_reserved_positions(slots: usize) -> MeshData {
+        MeshData {
+            section: SectionPos::ZERO,
+            positions: Vec::with_capacity(slots),
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: Vec::new(),
+            materials: Vec::new(),
+            overlays: Vec::new(),
+            tints: Vec::new(),
+            overlay_tints: Vec::new(),
+            shades: Vec::new(),
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! Shared types for world identity, coordinates, time, and I/O contracts.
+//! Shared types for world identity, coordinates, time, memory accounting, and I/O contracts.
 //!
 //! This module defines the foundational types used across authority simulation,
 //! storage, and network layers. Types here must remain stable across module boundaries.
@@ -9,6 +9,7 @@ use core::fmt;
 
 mod identity;
 mod lifecycle;
+mod memory;
 mod replication;
 mod spatial;
 mod validation;
@@ -20,6 +21,10 @@ pub use identity::{ContentKey, ContentKeyError, EntityHandle, EntityId, EntityId
 pub use lifecycle::{
     EventId, EventIdError, Revision, ScheduledEvent, TransactionId, TransactionIdError,
     TransactionOutcome, TransactionResult,
+};
+pub use memory::{
+    AdmittedDemand, EvictionPlan, EvictionRank, MemoryBudget, MemoryChargeId, MemoryClass,
+    MemoryLedger, MemoryResident, RetainFailure, RetainedDemandId, RetainedFailure, RetryReport,
 };
 pub use replication::{
     AuthorityMode, PresentationHint, ReplicationDeclaration, ReplicationVisibility, UpdateMode,

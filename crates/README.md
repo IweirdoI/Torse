@@ -4,7 +4,7 @@
 
 | 目录 | 职责与当前范围 |
 |---|---|
-| [types](types/src/lib.rs) | 身份、坐标、时间、结果、持久位置与复制等公共类型 |
+| [types](types/src/lib.rs) | 身份、坐标、时间、结果、持久位置、复制与内存账本等公共类型 |
 | [runtime](runtime/README.md) | 有界CPU执行器、预留、优先级与取消，另含可选ECS实验 |
 | [content](content/src/lib.rs) | 内容契约、编译、摘要与基础内容夹具 |
 | [world](world/src/lib.rs) | 方块状态、分区、实体、组件与快照、变更载荷 |
@@ -19,7 +19,7 @@
 | [storage](storage/README.md) | 有界日志、检查点、文件恢复扫描与故障处理 |
 | [protocol](protocol/README.md) | 兼容握手、请求、结果、订阅和授权复制消息 |
 | [net](net/README.md) | 会话、速率、有界内存与TCP传输、原子客户端镜像 |
-| [render](render/src/lib.rs) | CPU网格、逐面材质槽与局部贴图坐标、遮挡剔除、依赖修订校验与网格缓存，另含可选GPU初始化实验 |
+| [render](render/src/lib.rs) | CPU网格、逐面材质槽与局部贴图坐标、遮挡剔除、依赖修订校验、按焦点距离驱逐的网格缓存与内存账本汇报，另含可选GPU初始化实验 |
 | [assets](assets/src/lib.rs) | 图集PNG解码、材质包校验与mipmap生成（实色填充与边缘扩张）；UI资源与基础游戏材质声明仍由客户端提供 |
 | [diagnostics](diagnostics/src/lib.rs) | 可选、有界的串行分项计时；其他指标由各实现提供 |
 

@@ -1,4 +1,4 @@
-//! Visual extraction, meshing, materials, and GPU device probes.
+//! Visual extraction, meshing, materials, mesh-cache accounting, and GPU device probes.
 //!
 //! The mesher is dependency-free CPU code so it can run on a server, in tests,
 //! and on a client that has no GPU device. The GPU probe stays behind the

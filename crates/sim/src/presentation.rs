@@ -53,24 +53,33 @@ impl PresentationClock {
             return 0;
         }
         let sum = self.accumulator + dt;
-        self.accumulator = if sum.is_finite() {
-            sum
-        } else {
-            self.step * f64::from(self.max_steps)
-        };
-        let mut steps = 0u32;
-        while self.accumulator >= self.step && steps < self.max_steps {
-            self.accumulator -= self.step;
-            steps += 1;
+        if !sum.is_finite() {
+            // Scaling before adding keeps even an overflowing finite sum
+            // defined. accumulator < step, so this ratio remains finite.
+            let owed = self.accumulator / self.step + dt / self.step;
+            self.accumulator = owed.fract() * self.step;
+            return owed.floor().min(f64::from(self.max_steps)) as u32;
         }
-        if self.accumulator >= self.step {
-            let dropped = (self.accumulator / self.step).floor();
-            self.accumulator -= dropped * self.step;
-            if !(0.0..self.step).contains(&self.accumulator) {
-                self.accumulator = 0.0;
+        // Decimal steps such as 1/20 are not exactly representable. Treat a
+        // few ulps at a step boundary as equality, without rounding actual
+        // partial frames up to a full tick.
+        let mut owed = sum / self.step;
+        if owed < f64::from(self.max_steps) + 1.0 {
+            let tolerance = 8.0 * f64::EPSILON * owed.max(1.0);
+            if (owed - owed.round()).abs() <= tolerance {
+                owed = owed.round();
             }
+            self.accumulator = owed.fract() * self.step;
+            return owed.floor().min(f64::from(self.max_steps)) as u32;
         }
-        steps
+        // Remainder avoids repeated subtraction and also works when a very
+        // small step makes the quotient overflow. Whole overdue steps drop.
+        self.accumulator = sum % self.step;
+        let tolerance = self.step * (8.0 * f64::EPSILON);
+        if self.accumulator <= tolerance || self.step - self.accumulator <= tolerance {
+            self.accumulator = 0.0;
+        }
+        self.max_steps
     }
 
     /// Fraction of the current logic step elapsed since the last completed step.
@@ -139,5 +148,34 @@ mod tests {
         assert!(PresentationClock::new(0.0, 2).is_none());
         assert!(PresentationClock::new(0.5, 0).is_none());
         assert!(PresentationClock::new(f64::INFINITY, 2).is_none());
+    }
+
+    #[test]
+    fn decimal_steps_do_not_delay_a_tick_at_the_boundary() {
+        let mut clock = PresentationClock::new(0.05, 8).expect("clock");
+        assert_eq!(clock.pump_logic(0.15), 3);
+        assert!(clock.presentation_alpha() < 1e-12);
+        assert_eq!(clock.pump_logic(1.0), 8);
+        assert!(clock.presentation_alpha() < 1e-12);
+    }
+
+    #[test]
+    fn twenty_hz_logic_is_independent_of_presentation_rate() {
+        for fps in [30, 60, 144, 1000] {
+            let mut clock = PresentationClock::new(0.05, 8).expect("clock");
+            let ticks: u32 = (0..fps)
+                .map(|_| clock.pump_logic(1.0 / f64::from(fps)))
+                .sum();
+            assert_eq!(ticks, 20, "presentation rate {fps}");
+            assert!(clock.presentation_alpha() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn finite_intervals_that_overflow_the_sum_still_count_steps() {
+        let mut clock = PresentationClock::new(1.5e308, 8).expect("clock");
+        assert_eq!(clock.pump_logic(1e308), 0);
+        assert_eq!(clock.pump_logic(1e308), 1);
+        assert!((clock.presentation_alpha() - 1.0 / 3.0).abs() < 1e-12);
     }
 }

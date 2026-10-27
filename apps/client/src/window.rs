@@ -308,15 +308,6 @@ impl WindowApp {
         // The HUD needs the pack labels before the GPU borrow starts.
         let names = self.hotbar_names();
         let frame_started = Instant::now();
-        let now = frame_started;
-        // First frame assumes 60 fps; afterwards integrate the real interval,
-        // clamped so a pause (breakpoint, window drag) cannot teleport the camera.
-        let step = self
-            .last_frame
-            .map_or(1.0 / 60.0, |last| now.duration_since(last).as_secs_f32())
-            .clamp(0.0001, 0.25);
-        self.last_frame = Some(now);
-
         if !self.poll_network(event_loop) {
             return;
         }
@@ -364,13 +355,16 @@ impl WindowApp {
             }
             return;
         }
+        let dt = self.frame_interval(frame_started);
         let speed_now = self.camera.as_ref().expect("camera").speed;
         let (mut motion, speed) = self.input.take_input(speed_now);
         self.camera.as_mut().expect("camera").speed = speed;
         if self.config.autoplay && !self.ui.modal() {
             motion.forward = 1.0;
         }
-        if !self.pump_logic(event_loop, step, motion) {
+        if let Err(reason) = self.pump_logic(dt, motion) {
+            self.failure = Some(reason);
+            event_loop.exit();
             return;
         }
 
@@ -744,26 +738,33 @@ impl WindowApp {
 
     /// Run the fixed logic steps owed to `dt` seconds.
     ///
-    /// Returns false when the frame must stop. Streaming and drawing stay
-    /// outside this call. A modal discards accumulated time so the pause does
-    /// not replay as a burst of steps.
-    fn pump_logic(&mut self, event_loop: &ActiveEventLoop, dt: f32, motion: MoveInput) -> bool {
+    /// Streaming and drawing stay outside this call. Modal frame intervals
+    /// are discarded while the existing interpolation phase stays frozen.
+    fn pump_logic(&mut self, dt: f64, motion: MoveInput) -> Result<(), String> {
         if self.ui.modal() {
-            self.presentation.reset();
-            self.apply_presented_eye();
-            return true;
+            return Ok(());
         }
-        let steps = self.presentation.pump_logic(f64::from(dt));
-        let continued = if self.walk {
-            self.pump_walk(event_loop, steps, motion)
+        let steps = self.presentation.pump_logic(dt);
+        if self.walk {
+            self.pump_walk(steps, motion)?;
         } else {
             self.pump_fly(steps, motion);
-            true
-        };
-        if continued {
-            self.apply_presented_eye();
         }
-        continued
+        self.apply_presented_eye();
+        Ok(())
+    }
+
+    /// Measure real elapsed time; the presentation clock alone caps catch-up.
+    fn frame_interval(&mut self, now: Instant) -> f64 {
+        self.last_frame
+            .replace(now)
+            .map_or(0.0, |last| now.duration_since(last).as_secs_f64())
+    }
+
+    fn set_ui_mode(&mut self, mode: crate::ui::Mode) {
+        self.ui.set_mode(mode);
+        // A transition can happen with no redraws during a long pause.
+        self.last_frame = None;
     }
 
     /// Fraction of the current logic step, for read-only pose interpolation.
@@ -777,6 +778,8 @@ impl WindowApp {
     /// this when an external pose replaces the one the logic steps produced.
     fn reset_presentation_pose(&mut self, eye: [f32; 3]) {
         self.presentation.reset();
+        self.last_frame = None;
+        self.walk_blocked = false;
         self.present_prev = eye;
         self.present_next = eye;
         if let Some(camera) = self.camera.as_mut() {
@@ -795,7 +798,7 @@ impl WindowApp {
         }
     }
 
-    fn pump_walk(&mut self, event_loop: &ActiveEventLoop, steps: u32, motion: MoveInput) -> bool {
+    fn pump_walk(&mut self, steps: u32, motion: MoveInput) -> Result<(), String> {
         if let Some(camera) = self.camera.as_mut() {
             camera.look(motion.yaw_delta, motion.pitch_delta);
         }
@@ -820,9 +823,7 @@ impl WindowApp {
                 f64::from(self.present_next[0]),
                 f64::from(self.present_next[2]),
             );
-            let Some(scene) = self.scene.as_mut() else {
-                return false;
-            };
+            let scene = self.scene.as_mut().ok_or("walk mode has no scene")?;
             match scene.step_walker(wish, jump, step) {
                 Ok((position, _)) => {
                     let wanted = wish[0].abs() + wish[2].abs() > 1e-9;
@@ -837,14 +838,10 @@ impl WindowApp {
                         position.z as f32,
                     ];
                 }
-                Err(reason) => {
-                    self.failure = Some(reason);
-                    event_loop.exit();
-                    return false;
-                }
+                Err(reason) => return Err(reason),
             }
         }
-        true
+        Ok(())
     }
 
     fn pump_fly(&mut self, steps: u32, mut motion: MoveInput) {
@@ -1302,7 +1299,7 @@ impl ApplicationHandler for WindowApp {
                             } else {
                                 crate::ui::Mode::Pause
                             };
-                            self.ui.set_mode(mode);
+                            self.set_ui_mode(mode);
                             self.input.reset();
                             self.set_grab(!self.ui.modal());
                             return;
@@ -1313,7 +1310,7 @@ impl ApplicationHandler for WindowApp {
                             } else {
                                 crate::ui::Mode::MachinePreview
                             };
-                            self.ui.set_mode(mode);
+                            self.set_ui_mode(mode);
                             self.input.reset();
                             self.set_grab(!self.ui.modal());
                             return;
@@ -1346,10 +1343,10 @@ impl ApplicationHandler for WindowApp {
                             match action {
                                 crate::ui::Action::Quit => self.finish(event_loop),
                                 crate::ui::Action::Resume => {
-                                    self.ui.set_mode(crate::ui::Mode::Game)
+                                    self.set_ui_mode(crate::ui::Mode::Game)
                                 }
                                 crate::ui::Action::Preview => {
-                                    self.ui.set_mode(crate::ui::Mode::MachinePreview)
+                                    self.set_ui_mode(crate::ui::Mode::MachinePreview)
                                 }
                                 crate::ui::Action::SensDown => {
                                     self.look_sensitivity =
@@ -1640,4 +1637,183 @@ pub fn run_window(config: WindowConfig) -> Result<WindowSummary, String> {
     }
     app.summary
         .ok_or_else(|| "window closed before the first frame".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn app() -> WindowApp {
+        let mut app = WindowApp::new(WindowConfig {
+            radius: 1,
+            width: 960,
+            height: 540,
+            frames: None,
+            screenshot: None,
+            autoplay: false,
+            walk: false,
+            connect: None,
+            sensitivity: 1.0,
+            probe_outside: false,
+            ui_mode: crate::ui::Mode::Game,
+            content: None,
+        });
+        app.camera = Some(FlyCamera::new([8.5, 12.7, 8.5]));
+        app.reset_presentation_pose([8.5, 12.7, 8.5]);
+        app
+    }
+
+    fn forward() -> MoveInput {
+        MoveInput {
+            forward: 1.0,
+            ..MoveInput::default()
+        }
+    }
+
+    #[test]
+    fn frame_intervals_use_wall_time_without_fabrication_or_clamping() {
+        let mut app = app();
+        let now = Instant::now();
+        assert_eq!(app.frame_interval(now), 0.0);
+        assert_eq!(app.frame_interval(now), 0.0);
+        assert_eq!(app.frame_interval(now + Duration::from_micros(10)), 0.00001);
+        let dt = app.frame_interval(now + Duration::from_secs(1) + Duration::from_micros(10));
+        assert_eq!(dt, 1.0);
+        app.pump_logic(dt, forward()).expect("fly");
+        // The single catch-up cap allows eight 50 ms steps after a hitch.
+        assert!((app.present_next[2] - (8.5 - 8.0 * 12.0 * 0.05)).abs() < 1e-5);
+        assert!(app.presentation_alpha() < 1e-6);
+    }
+
+    #[test]
+    fn fly_pose_and_look_are_independent_of_frame_rate() {
+        for fps in [30, 60, 144, 1000] {
+            let mut app = app();
+            for frame in 0..fps {
+                let motion = MoveInput {
+                    yaw_delta: if frame == 0 { 0.5 } else { 0.0 },
+                    ..forward()
+                };
+                app.pump_logic(1.0 / f64::from(fps), motion).expect("fly");
+            }
+            let camera = app.camera.expect("camera");
+            assert_eq!(camera.yaw, 0.5);
+            assert!((app.present_next[0] - (8.5 - 12.0 * 0.5f32.sin())).abs() < 1e-4);
+            assert!((app.present_next[2] - (8.5 - 12.0 * 0.5f32.cos())).abs() < 1e-4);
+            assert!(app.presentation_alpha() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn pause_freezes_the_pose_and_resumes_without_replaying_wall_time() {
+        let mut app = app();
+        app.pump_logic(0.075, forward()).expect("fly");
+        let eye = app.camera.expect("camera").eye;
+        let target = app.present_next;
+        let alpha = app.presentation_alpha();
+        app.set_ui_mode(crate::ui::Mode::Pause);
+        app.pump_logic(10.0, forward()).expect("pause");
+        assert_eq!(app.camera.expect("camera").eye, eye);
+        assert_eq!(app.present_next, target);
+        assert_eq!(app.presentation_alpha(), alpha);
+
+        let now = Instant::now();
+        app.frame_interval(now);
+        app.set_ui_mode(crate::ui::Mode::Game);
+        let dt = app.frame_interval(now + Duration::from_secs(30));
+        assert_eq!(dt, 0.0);
+        app.pump_logic(dt, forward()).expect("resume");
+        assert_eq!(app.camera.expect("camera").eye, eye);
+        app.pump_logic(0.025, forward()).expect("next tick");
+        assert!(app.camera.expect("camera").eye[2] < eye[2]);
+    }
+
+    #[test]
+    fn correction_replaces_both_endpoints_and_discards_old_time() {
+        let mut app = app();
+        app.pump_logic(0.075, forward()).expect("fly");
+        app.last_frame = Some(Instant::now());
+        app.walk_blocked = true;
+        let corrected = [100.0, 20.0, 100.0];
+        app.reset_presentation_pose(corrected);
+        assert_eq!(app.presentation_alpha(), 0.0);
+        assert!(app.last_frame.is_none());
+        assert!(!app.walk_blocked);
+        app.pump_logic(0.025, forward()).expect("partial frame");
+        assert_eq!(app.camera.expect("camera").eye, corrected);
+        assert_eq!(app.present_prev, corrected);
+        assert_eq!(app.present_next, corrected);
+        app.pump_logic(0.025, forward()).expect("step");
+        assert_eq!(app.present_prev, corrected);
+        assert!((app.present_next[2] - 99.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn walking_uses_fixed_steps_and_presentation_does_not_move_the_entity() {
+        let mut expected = None;
+        for fps in [30, 60, 144] {
+            let mut app = app();
+            app.scene = Some(Scene::new(1).expect("scene"));
+            app.enter_walk(app.camera.expect("camera").eye);
+            assert!(app.walk);
+            for _ in 0..fps {
+                app.pump_logic(1.0 / f64::from(fps), forward())
+                    .expect("walk");
+            }
+            assert_eq!(app.walk_ticks, 20);
+            let position = app
+                .scene
+                .as_ref()
+                .expect("scene")
+                .walker_position()
+                .expect("walker");
+            if let Some(expected) = expected {
+                assert_eq!(position, expected);
+            } else {
+                expected = Some(position);
+            }
+            app.apply_presented_eye();
+            app.apply_presented_eye();
+            app.set_ui_mode(crate::ui::Mode::Pause);
+            app.pump_logic(30.0, forward()).expect("pause");
+            assert_eq!(app.walk_ticks, 20);
+            assert_eq!(
+                app.scene.as_ref().expect("scene").walker_position(),
+                Some(position)
+            );
+            // Switching modes drops stale interpolation and autoplay state.
+            let eye = app.camera.expect("camera").eye;
+            app.toggle_walk();
+            assert!(!app.walk);
+            assert_eq!(app.present_prev, eye);
+            assert_eq!(app.present_next, eye);
+            assert_eq!(app.presentation_alpha(), 0.0);
+        }
+    }
+
+    #[test]
+    fn network_walk_does_not_create_a_local_authority() {
+        let mut app = app();
+        let snapshot = torse_sim::replica::ReplicaSnapshot {
+            side: 16,
+            bounds: torse_world::WorldBounds::new(0, 32).expect("bounds"),
+            states: Vec::new(),
+            sections: Vec::new(),
+            entities: Vec::new(),
+        };
+        app.scene = Some(Scene::from_snapshot(&snapshot).expect("replica"));
+        app.enter_walk(app.camera.expect("camera").eye);
+        assert!(!app.walk);
+        app.pump_logic(1.0, forward()).expect("network fly");
+        assert_eq!(app.walk_ticks, 0);
+        assert!(
+            app.scene
+                .as_ref()
+                .expect("scene")
+                .walker_position()
+                .is_none()
+        );
+        assert_eq!(app.last_result, "network walking is not supported yet");
+    }
 }

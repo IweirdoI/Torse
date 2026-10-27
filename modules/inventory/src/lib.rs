@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod content;
+mod operations;
 mod transfer;
 
 use std::collections::BTreeMap;
@@ -15,6 +16,7 @@ use torse_types::{ContentKey, RejectCode};
 use torse_world::{ComponentFields, ComponentValue};
 
 pub use content::{descriptors, owner, register_content, schema};
+pub use operations::{InventoryOperation, InventoryPlan, MAX_OPERATIONS, plan_inventory};
 pub use transfer::{Transfer, handlers, plan_transfer};
 
 /// Bounded slot count of the first native container implementation.

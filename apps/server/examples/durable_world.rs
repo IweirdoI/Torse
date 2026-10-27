@@ -133,6 +133,8 @@ fn policy() -> FileServerConfig {
             checkpoint_predecessors: 1,
         },
         journal: JournalConfig {
+            max_segment_bytes: 16_777_216,
+            max_segment_files: 1024,
             max_pending_records: 2,
             max_pending_bytes: 2_097_152,
             codec_budget: budget,

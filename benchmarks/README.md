@@ -103,6 +103,7 @@
 | [本地世界装配](M3-local-world.md) | 真实权威接入文件协调器与进程退出 |
 | [实体生命周期](M3-entity-lifecycle.md) | 生成、销毁、分配水位与版本2读取 |
 | [文件锁回归](M3-file-locks.md) | 描述符副本、解锁与跨平台CI |
+| [存储回收](M3-storage-reclamation.md) | 分段日志、manifest整理、引用页回收与中断恢复 |
 | [阶段进度](M3-phase-progress.md) | 阶段恢复与有界关闭 |
 | [持久执行与网络](B6-B7-execution-network.md) | 任务、事件、结果、去重与真实服务端程序 |
 

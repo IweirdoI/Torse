@@ -112,7 +112,7 @@ pub struct RequestId {
 // ================================================================================================
 
 /// Content digest, currently SHA-256 (32 bytes).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Digest(pub [u8; 32]);
 
 /// Compatibility record for authority schema, rules, and content.

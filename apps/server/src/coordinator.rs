@@ -384,8 +384,8 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
     }
 
     /// Maintenance remains serialized under the same directory lease as publication. The
-    /// storage layer always revalidates the active snapshot and reports a conservative log
-    /// floor; the host keeps the complete B2 journal regardless of that floor.
+    /// storage layer revalidates retained snapshots and persists a conservative log floor
+    /// before the journal may reclaim complete covered segments.
     pub fn prune_checkpoints(&mut self, retain: usize) -> Result<CheckpointRetention, Fault> {
         if self.state != ServerState::Running {
             return Err(stopped());
@@ -395,7 +395,14 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
 
     fn prune(&mut self, retain: usize) -> Result<CheckpointRetention, Fault> {
         match self.checkpoints.prune_checkpoints(retain) {
-            Ok(report) => Ok(report),
+            Ok(report) => {
+                if let Some(floor) = report.log_floor
+                    && let Err(error) = self.journal.reclaim(floor)
+                {
+                    return Err(self.fail(error));
+                }
+                Ok(report)
+            }
             Err(error)
                 if !self.checkpoints.is_stopped()
                     && matches!(
@@ -410,6 +417,10 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
     }
 
     fn save_checkpoint(&mut self) -> Result<Durability, Fault> {
+        self.save_checkpoint_retaining(self.config.checkpoint_predecessors as usize)
+    }
+
+    pub(crate) fn save_checkpoint_retaining(&mut self, retain: usize) -> Result<Durability, Fault> {
         if !self.authority.at_tick_boundary() {
             return Err(Fault::new(
                 FaultCode::InvalidState,
@@ -435,9 +446,9 @@ impl<A: HostAuthority, J: CommitJournal<A::Model>, S: HostCheckpointStore<A::Mod
                 "authority snapshot mismatch",
             )));
         }
-        // Reclaim only older generations and orphans. The active checkpoint and the full
-        // journal remain available throughout the following publication, including on error.
-        self.prune(self.config.checkpoint_predecessors as usize)?;
+        // Retained checkpoints and their continuous journal suffix remain available
+        // throughout the following publication, including on error.
+        self.prune(retain)?;
         if let Err(error) = self.checkpoints.publish_checkpoint(&snapshot, durable) {
             if error.code == FaultCode::ResourceLimit && !self.checkpoints.is_stopped() {
                 return Err(error);

@@ -66,6 +66,8 @@ pub fn file_policy() -> FileServerConfig {
             checkpoint_predecessors: 1,
         },
         journal: torse_storage::JournalConfig {
+            max_segment_bytes: 16_777_216,
+            max_segment_files: 1024,
             max_pending_records: 4,
             max_pending_bytes: 16_777_216,
             codec_budget: b,

@@ -12,8 +12,7 @@ use crate::checkpoint_backend::{
 };
 use crate::manifest::{self, CheckpointManifest, corrupt};
 
-/// Local resource policy. The append-only manifest has a finite lifetime until future
-/// compaction support is added. Exhaustion is reported before publication starts.
+/// Local resource policy. Explicit pruning compacts the manifest before deleting snapshots.
 #[derive(Clone, Copy, Debug)]
 pub struct CheckpointConfig {
     pub codec_limits: CodecLimits,
@@ -55,8 +54,7 @@ pub trait CheckpointStore<M: AuthorityData> {
 }
 
 /// Conservative recovery floor after explicit pruning. Journal records strictly after this
-/// position must remain available for every retained checkpoint. This store never deletes
-/// journal files: B2 journals are monolithic and cannot safely lose their prefix in place.
+/// position must remain available for every retained checkpoint.
 #[derive(Debug, Eq, PartialEq)]
 pub struct CheckpointRetention {
     pub log_floor: Option<CommitCursor>,
@@ -161,6 +159,26 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: CheckpointBackend> Checkpoints<M, 
     pub fn current(&self) -> Option<CheckpointManifest> {
         self.history.last().copied()
     }
+
+    /// Read every retained snapshot before collecting references owned by its payload.
+    /// The callback runs without mutation and must discard its result if any load fails.
+    pub fn visit_retained(
+        &mut self,
+        mut visit: impl FnMut(ModelSnapshot<M>) -> Result<(), Fault>,
+    ) -> Result<(), Fault> {
+        self.ensure_running()?;
+        let files = self
+            .backend
+            .snapshot_generations(self.config.max_snapshot_files)?;
+        for index in 0..self.history.len() {
+            let entry = self.history[index];
+            // Legacy append-only histories can refer to already-pruned snapshots.
+            if files.contains(&entry.generation) {
+                visit(self.load(entry)?)?;
+            }
+        }
+        Ok(())
+    }
     pub fn is_stopped(&self) -> bool {
         self.stopped
     }
@@ -204,8 +222,30 @@ impl<M: AuthorityData, C: StorageCodec<M>, B: CheckpointBackend> Checkpoints<M, 
             .rev()
             .filter(|entry| files.contains(&entry.generation))
             .take(retain)
+            .copied()
             .collect();
         let log_floor = retained.last().map(|entry| entry.snapshot.cursor);
+        // Validate every retained reference before publishing the new recovery root.
+        for entry in &retained {
+            self.load(*entry)?;
+        }
+        let mut retained = retained;
+        retained.reverse();
+        if retained != self.history {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(retained.len() * manifest::ENTRY_BYTES)
+                .map_err(|_| Fault::resource_limit("compact manifest allocation"))?;
+            for entry in &retained {
+                bytes.extend_from_slice(&manifest::encode_compacted(*entry)?);
+            }
+            if let Err(error) = self.backend.replace_manifest(&bytes) {
+                self.stopped = true;
+                return Err(error);
+            }
+            self.manifest_bytes = bytes.len() as u64;
+            self.history = retained.clone();
+        }
         let mut removed_generations = Vec::new();
         removed_generations
             .try_reserve_exact(files.len())

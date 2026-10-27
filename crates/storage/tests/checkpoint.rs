@@ -396,6 +396,8 @@ enum Failure {
     Append(usize),
     ManifestSync,
     Remove,
+    CompactBefore,
+    CompactAfter,
 }
 
 /// Write failures may leave any prefix. Sync failure deliberately preserves all written
@@ -408,6 +410,16 @@ fn injected() -> Fault {
     Fault::new(FaultCode::StorageUnavailable, "injected checkpoint failure")
 }
 impl CheckpointBackend for Failing {
+    fn replace_manifest(&mut self, bytes: &[u8]) -> Result<(), Fault> {
+        if self.failure == Failure::CompactBefore {
+            return Err(injected());
+        }
+        self.inner.replace_manifest(bytes)?;
+        if self.failure == Failure::CompactAfter {
+            return Err(injected());
+        }
+        Ok(())
+    }
     fn read_manifest(&mut self, limit: u64) -> Result<Vec<u8>, Fault> {
         self.inner.read_manifest(limit)
     }
@@ -545,6 +557,73 @@ fn cleanup_failure_stops_instance_without_losing_current_checkpoint() {
 }
 
 #[test]
+fn compaction_failure_on_either_side_of_publication_keeps_a_valid_recovery_root() {
+    for failure in [Failure::CompactBefore, Failure::CompactAfter] {
+        let mut store = seeded(failure);
+        assert!(store.prune(1).is_err());
+        assert!(store.is_stopped());
+        let mut backend = store.into_backend();
+        backend.failure = Failure::None;
+        assert_eq!(backend.snapshot_generations(8).unwrap(), vec![1, 2]);
+        let mut reopened =
+            Checkpoints::<TestModel, _, _>::open(binding(), TestCodec::new(), policy(), backend)
+                .unwrap();
+        assert_eq!(
+            reopened.load_current().unwrap().unwrap().meta.cursor,
+            cursor(1)
+        );
+        assert_eq!(reopened.prune(1).unwrap().log_floor, Some(cursor(1)));
+    }
+}
+
+#[test]
+fn repeated_checkpoints_reuse_a_small_manifest_and_keep_two_predecessors() {
+    let directory = TestDirectory::new();
+    let mut config = policy();
+    config.max_manifest_bytes = 168 * 3;
+    config.max_snapshot_files = 3;
+    let mut store = Checkpoints::<TestModel, _, _>::open(
+        binding(),
+        TestCodec::new(),
+        config,
+        FileCheckpointBackend::open(&directory.0).unwrap(),
+    )
+    .unwrap();
+    store.publish_checkpoint(&snapshot(0), durable(0)).unwrap();
+    for sequence in 1..=128 {
+        store.prune(2).unwrap();
+        store
+            .publish_checkpoint(&snapshot(sequence), durable(sequence))
+            .unwrap();
+        assert!(
+            fs::metadata(directory.0.join("manifest.log"))
+                .unwrap()
+                .len()
+                <= 504
+        );
+    }
+    let report = store.prune(2).unwrap();
+    assert_eq!(report.log_floor, Some(cursor(127)));
+    drop(store);
+    // An interrupted replacement is never selected as a recovery root.
+    fs::write(directory.0.join("manifest.next"), b"incomplete replacement").unwrap();
+    let mut store = directory.open();
+    let mut seen = Vec::new();
+    store
+        .visit_retained(|s| {
+            seen.push(s.meta.cursor.seq.0);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(seen, vec![127, 128]);
+    assert_eq!(
+        store.load_current().unwrap().unwrap().meta.cursor,
+        cursor(128)
+    );
+    assert!(FileCheckpointBackend::open(&directory.0).is_err());
+}
+
+#[test]
 fn manifest_sync_failure_never_reports_success_but_can_recover_new_generation() {
     let mut store = seeded(Failure::ManifestSync);
     assert!(store.publish_checkpoint(&snapshot(3), durable(3)).is_err());
@@ -584,7 +663,7 @@ fn checksum_valid_manifest_semantic_errors_are_fatal() {
     // Layout: version[0..2], generation[2..10], SnapshotMeta[10..120],
     // durable[120..128], snapshot bytes[128..136], snapshot CRC[136..140].
     let cases: Vec<(std::ops::Range<usize>, Vec<u8>)> = vec![
-        (0..2, 2u16.to_le_bytes().to_vec()),
+        (0..2, 3u16.to_le_bytes().to_vec()),
         (2..10, 1u64.to_le_bytes().to_vec()),
         (10..26, 99u128.to_le_bytes().to_vec()),
         (34..38, 99u32.to_le_bytes().to_vec()),
@@ -887,6 +966,11 @@ impl CrashBackend {
     }
 }
 impl CheckpointBackend for CrashBackend {
+    fn replace_manifest(&mut self, bytes: &[u8]) -> Result<(), Fault> {
+        self.inner.replace_manifest(bytes)?;
+        self.exit_at("compact");
+        Ok(())
+    }
     fn read_manifest(&mut self, limit: u64) -> Result<Vec<u8>, Fault> {
         self.inner.read_manifest(limit)
     }
@@ -923,7 +1007,54 @@ impl CheckpointBackend for CrashBackend {
         self.inner.snapshot_generations(limit)
     }
     fn remove_snapshot(&mut self, generation: u64) -> Result<(), Fault> {
-        self.inner.remove_snapshot(generation)
+        self.inner.remove_snapshot(generation)?;
+        self.exit_at("remove");
+        Ok(())
+    }
+}
+
+#[test]
+fn cleanup_crash_worker() {
+    let Ok(root) = std::env::var("TORSE_CLEANUP_CRASH_ROOT") else {
+        return;
+    };
+    let backend = CrashBackend {
+        inner: FileCheckpointBackend::open(root).unwrap(),
+        phase: std::env::var("TORSE_CLEANUP_CRASH_PHASE").unwrap(),
+        publishing: true,
+    };
+    let mut store =
+        Checkpoints::<TestModel, _, _>::open(binding(), TestCodec::new(), policy(), backend)
+            .unwrap();
+    store.prune(1).unwrap();
+    panic!("cleanup crash hook was not reached");
+}
+
+#[test]
+fn process_exit_after_manifest_replacement_or_snapshot_removal_keeps_current_checkpoint() {
+    for phase in ["compact", "remove"] {
+        let directory = TestDirectory::new();
+        let mut store = directory.open();
+        for sequence in 0..=2 {
+            store
+                .publish_checkpoint(&snapshot(sequence), durable(sequence))
+                .unwrap();
+        }
+        drop(store);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cleanup_crash_worker"])
+            .env("TORSE_CLEANUP_CRASH_ROOT", &directory.0)
+            .env("TORSE_CLEANUP_CRASH_PHASE", phase)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(86), "{phase}: {output:?}");
+        let mut store = directory.open();
+        assert_eq!(
+            store.load_current().unwrap().unwrap().meta.cursor,
+            cursor(2)
+        );
+        assert_eq!(store.prune(1).unwrap().log_floor, Some(cursor(2)));
+        assert!(directory.snapshot(3).exists());
     }
 }
 

@@ -1,7 +1,13 @@
 //! Append and durability adapters shared by production journals and fault-injection tests.
 
+use crate::{
+    JournalConfig,
+    segments::{self, Anchor, SegmentWriter},
+};
 use std::fs::File;
 use std::io::{self, Write};
+use std::path::PathBuf;
+use torse_types::{CommitCursor, Fault};
 
 /// The journal stops permanently after either operation fails.
 ///
@@ -11,6 +17,14 @@ use std::io::{self, Write};
 pub trait JournalBackend {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
     fn sync(&mut self) -> io::Result<()>;
+    fn reclaim(
+        &mut self,
+        _floor: CommitCursor,
+        _durable: CommitCursor,
+        _config: JournalConfig,
+    ) -> Result<(), Fault> {
+        Ok(())
+    }
 }
 
 /// A bounded in-process store for deterministic tests and local adapters.
@@ -73,6 +87,9 @@ impl JournalBackend for MemoryBackend {
 #[derive(Debug)]
 pub struct FileBackend {
     pub(crate) file: File,
+    pub(crate) path: PathBuf,
+    pub(crate) baseline: CommitCursor,
+    pub(crate) segments: Option<SegmentWriter>,
 }
 
 impl Drop for FileBackend {
@@ -84,11 +101,102 @@ impl Drop for FileBackend {
 
 impl JournalBackend for FileBackend {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)
+        match &mut self.segments {
+            Some(writer) => writer.append(bytes),
+            None => self.file.write_all(bytes),
+        }
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        match &mut self.segments {
+            Some(writer) => writer.sync(),
+            None => self.file.sync_all(),
+        }
+    }
+
+    fn reclaim(
+        &mut self,
+        floor: CommitCursor,
+        durable: CommitCursor,
+        config: JournalConfig,
+    ) -> Result<(), Fault> {
+        use crate::journal::io_fault;
+        use std::fs;
+        let root = segments::root(&self.path);
+        let mut files = segments::list(&root, config)?;
+        let mut anchor = self.segments.as_ref().map(|s| s.anchor).unwrap_or(Anchor {
+            base: self.baseline,
+            legacy_end: durable.seq,
+            floor: self.baseline.seq,
+            legacy_bytes: self
+                .file
+                .metadata()
+                .map_err(|e| io_fault("stat legacy journal", e))?
+                .len(),
+        });
+        if floor.seq < anchor.floor {
+            return Err(Fault::invalid_data(
+                "journal retention floor cannot regress",
+            ));
+        }
+        if self.segments.is_none() {
+            if !files.is_empty() {
+                return Err(Fault::invalid_data("unpublished journal segments exist"));
+            }
+            if !root.exists() {
+                fs::create_dir(&root).map_err(|e| io_fault("create segment directory", e))?;
+                segments::sync_directory(root.parent().expect("journal has a parent"))?;
+            }
+        }
+        anchor.floor = floor.seq;
+        // The durable root is published before touching any previously reachable byte.
+        segments::publish_anchor(&root, anchor)?;
+        if let Some(writer) = &mut self.segments {
+            writer.active = None;
+        }
+        let mut retained = Vec::new();
+        for index in 0..files.len() {
+            let end = files
+                .get(index + 1)
+                .map(|next| next.first - 1)
+                .unwrap_or(durable.seq.0);
+            if end <= floor.seq.0 {
+                fs::remove_file(&files[index].path)
+                    .map_err(|e| io_fault("remove covered segment", e))?;
+            } else {
+                retained.push(index);
+            }
+        }
+        segments::install_marker(&mut self.file, anchor)?;
+        segments::sync_directory(&root)?;
+        let active = if let Some(index) = retained.last() {
+            let segment = &files[*index];
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&segment.path)
+                .map_err(|e| io_fault("reopen active segment", e))?;
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::End(0))
+                .map_err(|e| io_fault("seek active segment", e))?;
+            Some((file, segment.length))
+        } else {
+            None
+        };
+        self.segments = Some(SegmentWriter {
+            root,
+            anchor,
+            active,
+            files: retained.len() as u32,
+            next: durable
+                .seq
+                .0
+                .checked_add(1)
+                .ok_or_else(|| Fault::resource_limit("journal sequence exhausted"))?,
+            config,
+        });
+        files.clear();
+        Ok(())
     }
 }
 
@@ -122,7 +230,12 @@ mod lock_tests {
             .open(&path)
             .unwrap();
         file.try_lock().unwrap();
-        let owner = FileBackend { file };
+        let owner = FileBackend {
+            file,
+            path: path.clone(),
+            baseline: CommitCursor::initial(torse_types::WorldId(1)),
+            segments: None,
+        };
         let duplicate = owner.file.try_clone().unwrap();
         drop(owner);
         let reopened = OpenOptions::new()

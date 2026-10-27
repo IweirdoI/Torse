@@ -316,6 +316,77 @@ fn pages(dir: &Directory) -> SectionPages {
     std::fs::create_dir_all(&root).unwrap();
     SectionPages::new(root, base::budget(), base::codec_limits(), 64).unwrap()
 }
+
+#[test]
+fn page_collection_traces_parked_checkpoints_and_replay_before_removing_orphans() {
+    let dir = Directory::new();
+    let pages = pages(&dir);
+    let mut server = create(&dir);
+    let orphan = generated(
+        server.authority().unwrap().world(),
+        SectionPos::new(9, 0, 0),
+    );
+    let orphan_digest = pages.put(&orphan).unwrap();
+    std::fs::write(dir.0.join("sections/page-123-0.part"), b"torn publication").unwrap();
+    durable(
+        server
+            .unload_section(&pages, SectionPos::ZERO, &mut NoReplicas)
+            .unwrap(),
+    );
+    let parked = server.authority().unwrap().parked_sections()[&SectionPos::ZERO].digest;
+    let report = server.collect_section_pages(&pages, 2).unwrap();
+    assert_eq!(report.removed_pages, 1);
+    assert_eq!(report.removed_temporaries, 1);
+    assert!(!pages.path(orphan_digest).exists());
+    assert!(pages.get(parked).is_ok());
+    durable(
+        server
+            .reload_section(&pages, SectionPos::ZERO, &mut NoReplicas)
+            .unwrap(),
+    );
+    // The older checkpoint and retained reload record still own the page.
+    assert_eq!(
+        server
+            .collect_section_pages(&pages, 2)
+            .unwrap()
+            .removed_pages,
+        0
+    );
+    drop(server);
+    let mut server = open(&dir, pages.clone()).unwrap();
+    assert!(server.authority().unwrap().parked_sections().is_empty());
+    // Once every retained checkpoint has resident data and the reload is covered, collect it.
+    assert_eq!(
+        server
+            .collect_section_pages(&pages, 1)
+            .unwrap()
+            .removed_pages,
+        1
+    );
+    assert!(!pages.path(parked).exists());
+    drop(server);
+    assert!(open(&dir, pages).is_ok());
+}
+
+#[test]
+fn page_collection_validates_every_root_and_filename_before_any_deletion() {
+    use std::collections::BTreeSet;
+    let dir = Directory::new();
+    let pages = pages(&dir);
+    let (world, _) = base::world().unwrap();
+    let page = generated(&world, SectionPos::new(9, 0, 0));
+    let orphan = pages.put(&page).unwrap();
+    let mut references = BTreeSet::new();
+    references.insert(Digest([1; 32]));
+    assert!(pages.collect(&references).is_err());
+    assert!(pages.path(orphan).exists());
+    std::fs::write(dir.0.join("sections/unrelated.txt"), b"keep").unwrap();
+    assert!(pages.collect(&BTreeSet::new()).is_err());
+    assert!(pages.path(orphan).exists());
+    std::fs::remove_file(dir.0.join("sections/unrelated.txt")).unwrap();
+    assert_eq!(pages.collect(&BTreeSet::new()).unwrap().removed_pages, 1);
+    assert_eq!(pages.collect(&BTreeSet::new()).unwrap().removed_pages, 0);
+}
 fn create(dir: &Directory) -> base::Files {
     let (mut world, actions) = base::world().unwrap();
     let schemas = world.schemas().clone();

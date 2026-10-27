@@ -130,6 +130,30 @@ fn compatibility_preflight_preserves_every_file_and_retains_the_directory_lease(
 }
 
 #[test]
+fn legacy_preflight_and_rejected_recovery_do_not_create_a_namespace_lock() {
+    let directory = Directory::new();
+    drop(create_file(&directory, Control::new()));
+    let lock = directory.0.join("checkpoints/manifest.lock");
+    fs::remove_file(&lock).unwrap();
+    let lease = WorldLease::inspect(&directory.0, WORLD, 8192).unwrap();
+    TestFileServer::preflight_file(
+        &lease,
+        compatibility(),
+        Codec(Control::new()),
+        file_config(),
+    )
+    .unwrap();
+    drop(lease);
+    assert!(!lock.exists());
+    let control = Control::new();
+    control.failure.set(Failure::Restore);
+    assert!(open_file(&directory, control).is_err());
+    assert!(!lock.exists());
+    drop(open_file(&directory, Control::new()).unwrap());
+    assert!(lock.exists());
+}
+
+#[test]
 fn semantic_recovery_failure_leaves_both_torn_tails_unchanged_and_releases_lock() {
     let directory = Directory::new();
     let mut server = create_file(&directory, Control::new());
@@ -371,7 +395,12 @@ fn repeated_checkpoints_reclaim_capacity_and_remain_recoverable_across_shutdown(
             let files = fs::read_dir(directory.0.join("checkpoints"))
                 .unwrap()
                 .map(|entry| entry.unwrap())
-                .filter(|entry| entry.file_name() != "manifest.log")
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("checkpoint-")
+                })
                 .count();
             assert!(files <= (predecessors + 1) as usize);
         }

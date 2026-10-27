@@ -45,6 +45,8 @@ pub fn baseline() -> CommitCursor {
 
 pub fn config() -> JournalConfig {
     JournalConfig {
+        max_segment_bytes: 16_777_216,
+        max_segment_files: 1024,
         max_pending_records: 3,
         max_pending_bytes: 4096,
         codec_budget: OutputBudget::new(8, 2048),

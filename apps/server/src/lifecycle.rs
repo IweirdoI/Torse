@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use torse_codec::StorageCodec;
 use torse_storage::{
     CheckpointConfig, Checkpoints, FileCheckpointBackend, FileCheckpoints, FileJournal,
-    JournalConfig, scan_journal,
+    JournalConfig, scan_file_journal,
 };
 use torse_types::{
     Binding, CommitCursor, Compatibility, Fault, FaultCode, SnapshotMeta, WorldEpoch,
@@ -84,7 +84,7 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
             binding,
             codec.clone(),
             config.checkpoint,
-            FileCheckpointBackend::open(checkpoint_path)?,
+            FileCheckpointBackend::inspect(checkpoint_path)?,
         )?;
         let manifest = checkpoints.current().ok_or_else(|| {
             Fault::new(
@@ -92,15 +92,13 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
                 "world has no complete initial checkpoint",
             )
         })?;
-        let mut journal = fs::File::open(lease.root().join("journal.log"))
-            .map_err(|e| io_fault("open preflight journal", e))?;
-        let report = scan_journal::<A::Model, _, _, _>(
-            &mut journal,
+        let report = scan_file_journal::<A::Model, _>(
+            lease.root().join("journal.log"),
             binding,
             CommitCursor::initial(binding.world),
+            manifest.snapshot.cursor,
             &codec,
-            config.journal.codec_limits,
-            config.journal.codec_budget,
+            config.journal,
             |_| Ok(()),
         )?;
         if report.through.seq < manifest.snapshot.cursor.seq
@@ -166,8 +164,8 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
         Self::initialize(directory, authority, journal, checkpoints, config.server)
     }
 
-    /// B2 currently retains the complete journal from position one. Validate that whole log,
-    /// replay only records after the checkpoint, and require both C and the manifest's known
+    /// Validate the retained contiguous suffix, replay only records after the checkpoint,
+    /// and require both C and the manifest's known
     /// durable position to exist. A removed whole-record suffix must not become silent loss.
     pub fn open_file<R>(
         directory: WorldDirectory,
@@ -205,7 +203,7 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
             binding,
             codec.clone(),
             config.checkpoint,
-            FileCheckpointBackend::open(checkpoint_path)?,
+            FileCheckpointBackend::inspect(checkpoint_path)?,
         )?;
         let manifest = checkpoints.current().ok_or_else(|| {
             Fault::new(
@@ -218,17 +216,13 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
         let mut expected_resume = snapshot.meta.resume_at;
         let mut recovery = begin_restore(binding)?;
         recovery.restore_snapshot(snapshot)?;
-        let mut reader = OpenOptions::new()
-            .read(true)
-            .open(&journal_path)
-            .map_err(|e| io_fault("open recovery journal", e))?;
-        let report = scan_journal::<A::Model, _, _, _>(
-            &mut reader,
+        let report = scan_file_journal::<A::Model, _>(
+            &journal_path,
             binding,
             CommitCursor::initial(binding.world),
+            baseline,
             &codec,
-            config.journal.codec_limits,
-            config.journal.codec_budget,
+            config.journal,
             |record| {
                 if record.meta.cursor.seq > baseline.seq {
                     expected_resume = record.meta.resume_at;
@@ -237,7 +231,6 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
                 Ok(())
             },
         )?;
-        drop(reader);
         if report.through.seq < baseline.seq || report.through.seq.0 < manifest.durable_through.0 {
             return Err(Fault::new(
                 FaultCode::SequenceGap,
@@ -257,10 +250,11 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
             ));
         }
         checkpoints.activate()?;
-        let (journal, reopened) = FileJournal::open(
+        let (journal, reopened) = FileJournal::open_from_checkpoint(
             journal_path,
             binding,
             CommitCursor::initial(binding.world),
+            baseline,
             codec,
             config.journal,
         )?;

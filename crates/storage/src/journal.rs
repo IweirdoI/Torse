@@ -16,7 +16,7 @@ use torse_types::{
     ModelCommit, OutputBudget, StageError,
 };
 
-use crate::{FileBackend, JournalBackend, MemoryBackend, RecoveryReport, scan_journal};
+use crate::{FileBackend, JournalBackend, MemoryBackend, RecoveryReport, segments};
 
 /// Storage-side interface from the authority/I/O contract.
 ///
@@ -38,6 +38,11 @@ pub trait CommitJournal<M: AuthorityData> {
     fn flush_through(&mut self, target: CommitCursor) -> Result<Durability, Fault>;
     /// Observe the last confirmed position, including after a terminal storage fault.
     fn durability(&self) -> Durability;
+    /// Persist the oldest retained checkpoint cursor before reclaiming covered segments.
+    /// The caller owns checkpoint retention; a no-op backend keeps all history.
+    fn reclaim(&mut self, _floor: CommitCursor) -> Result<(), Fault> {
+        Ok(())
+    }
 }
 
 /// Explicit bounds for queue storage, single-record encoding, and input framing.
@@ -55,6 +60,10 @@ pub struct JournalConfig {
     pub codec_budget: OutputBudget,
     /// Outer frame limit. The supplied domain codec maintains its own field/depth checks.
     pub codec_limits: CodecLimits,
+    /// Maximum encoded bytes per segment after explicit journal reclamation is enabled.
+    pub max_segment_bytes: u64,
+    /// Maximum segment files, excluding the fixed retention root and its replacement.
+    pub max_segment_files: u32,
 }
 
 impl JournalConfig {
@@ -63,6 +72,8 @@ impl JournalConfig {
         if self.max_pending_records == 0
             || self.max_pending_bytes < record::OVERHEAD_BYTES as u64
             || self.codec_budget.max_items == 0
+            || self.max_segment_bytes <= record::OVERHEAD_BYTES as u64
+            || self.max_segment_files == 0
         {
             return Err(Fault::invalid_data("journal limits cannot hold a record"));
         }
@@ -76,7 +87,8 @@ impl JournalConfig {
             self.codec_budget
                 .max_bytes
                 .min(u64::from(self.codec_limits.max_frame_bytes))
-                .min(self.max_pending_bytes - record::OVERHEAD_BYTES as u64),
+                .min(self.max_pending_bytes - record::OVERHEAD_BYTES as u64)
+                .min(self.max_segment_bytes - record::OVERHEAD_BYTES as u64),
         )
     }
 }
@@ -247,6 +259,15 @@ impl<M: AuthorityData, C: StorageCodec<M>> FileJournal<M, C> {
         config: JournalConfig,
     ) -> Result<Self, Fault> {
         validate_baseline(binding, baseline, config)?;
+        let path = path.as_ref();
+        if segments::root(path)
+            .try_exists()
+            .map_err(|e| io_fault("inspect journal segment namespace", e))?
+        {
+            return Err(Fault::invalid_data(
+                "journal segment namespace already exists",
+            ));
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -255,7 +276,19 @@ impl<M: AuthorityData, C: StorageCodec<M>> FileJournal<M, C> {
             .map_err(|error| io_fault("create journal", error))?;
         file.try_lock()
             .map_err(|error| io_fault("lock journal", error))?;
-        Self::with_backend(binding, baseline, codec, config, FileBackend { file })
+        Self::with_backend(
+            binding,
+            baseline,
+            codec,
+            config,
+            FileBackend {
+                file,
+                path: std::fs::canonicalize(path)
+                    .map_err(|e| io_fault("resolve journal path", e))?,
+                baseline,
+                segments: None,
+            },
+        )
     }
 
     /// Validate everything before modification, then remove only an incomplete EOF tail.
@@ -270,7 +303,24 @@ impl<M: AuthorityData, C: StorageCodec<M>> FileJournal<M, C> {
         codec: C,
         config: JournalConfig,
     ) -> Result<(Self, RecoveryReport), Fault> {
+        Self::open_from_checkpoint(path, binding, baseline, baseline, codec, config)
+    }
+
+    /// Reopen a legacy baseline or a segmented suffix covered by a trusted checkpoint.
+    pub fn open_from_checkpoint(
+        path: impl AsRef<Path>,
+        binding: Binding,
+        baseline: CommitCursor,
+        checkpoint: CommitCursor,
+        codec: C,
+        config: JournalConfig,
+    ) -> Result<(Self, RecoveryReport), Fault> {
         validate_baseline(binding, baseline, config)?;
+        let path = path.as_ref();
+        segments::regular(path, false)?;
+        let resolved =
+            std::fs::canonicalize(path).map_err(|e| io_fault("resolve journal path", e))?;
+        let path = resolved.as_path();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -278,17 +328,70 @@ impl<M: AuthorityData, C: StorageCodec<M>> FileJournal<M, C> {
             .map_err(|error| io_fault("open journal", error))?;
         file.try_lock()
             .map_err(|error| io_fault("lock journal", error))?;
-        let mut backend = FileBackend { file };
-        let report = scan_journal::<M, _, _, _>(
-            &mut backend.file,
+        let mut backend = FileBackend {
+            file,
+            path: path.to_owned(),
+            baseline,
+            segments: None,
+        };
+        let inspected = segments::inspect(
+            (path, &mut backend.file),
             binding,
             baseline,
+            checkpoint,
             &codec,
-            config.codec_limits,
-            config.codec_budget,
+            config,
             |_| Ok(()),
         )?;
-        if report.incomplete_tail {
+        let report = inspected.report;
+        if let Some(anchor) = inspected.anchor {
+            segments::install_marker(&mut backend.file, anchor)?;
+            let active = if let Some(last) = inspected
+                .files
+                .last()
+                .filter(|_| inspected.last_through >= anchor.floor)
+            {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&last.path)
+                    .map_err(|e| io_fault("open active journal segment", e))?;
+                if report.incomplete_tail {
+                    file.set_len(inspected.last_valid)
+                        .map_err(|e| io_fault("repair final segment", e))?;
+                }
+                file.sync_all()
+                    .map_err(|e| io_fault("sync recovered segment", e))?;
+                let mut file = file;
+                file.seek(SeekFrom::End(0))
+                    .map_err(|e| io_fault("seek active segment", e))?;
+                Some((
+                    file,
+                    if report.incomplete_tail {
+                        inspected.last_valid
+                    } else {
+                        last.length
+                    },
+                ))
+            } else {
+                None
+            };
+            backend.baseline = anchor.base;
+            backend.segments = Some(segments::SegmentWriter {
+                root: segments::root(path),
+                anchor,
+                active,
+                files: inspected.files.len() as u32,
+                next: report
+                    .through
+                    .seq
+                    .0
+                    .checked_add(1)
+                    .ok_or_else(|| Fault::resource_limit("journal sequence exhausted"))?,
+                config,
+            });
+            segments::sync_directory(&segments::root(path))?;
+        } else if report.incomplete_tail {
             backend
                 .file
                 .set_len(report.valid_bytes)
@@ -305,12 +408,61 @@ impl<M: AuthorityData, C: StorageCodec<M>> FileJournal<M, C> {
         let journal = Self::with_backend(binding, report.through, codec, config, backend)?;
         Ok((journal, report))
     }
+
+    /// Read the retained recovery suffix for host-owned reference tracing. No repair occurs.
+    pub fn visit_retained(
+        &mut self,
+        replay: impl FnMut(ModelCommit<M>) -> Result<(), Fault>,
+    ) -> Result<RecoveryReport, Fault> {
+        self.check_running()?;
+        let result = segments::inspect(
+            (&self.backend.path, &mut self.backend.file),
+            self.binding,
+            self.backend.baseline,
+            CommitCursor {
+                world: self.binding.world,
+                seq: self.accepted,
+            },
+            &self.codec,
+            self.config,
+            replay,
+        )
+        .map(|inspection| inspection.report);
+        self.backend
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| io_fault("restore journal append position", e))?;
+        result
+    }
 }
 
 impl<M: AuthorityData, C: StorageCodec<M>, B: JournalBackend> CommitJournal<M>
     for Journal<M, C, B>
 {
     type Staged = Staged;
+
+    fn reclaim(&mut self, floor: CommitCursor) -> Result<(), Fault> {
+        self.check_running()?;
+        if floor.world != self.binding.world || floor.seq.0 > self.durable.0 {
+            return Err(Fault::invalid_data(
+                "journal retention floor is not durable in this world",
+            ));
+        }
+        if self.pending_usage() != (0, 0) {
+            return Err(Fault::new(
+                FaultCode::InvalidState,
+                "flush and release all journal reservations before reclamation",
+            ));
+        }
+        let durable = CommitCursor {
+            world: self.binding.world,
+            seq: CommitSeq(self.durable.0),
+        };
+        if let Err(error) = self.backend.reclaim(floor, durable, self.config) {
+            return Err(self.stop(error));
+        }
+        Ok(())
+    }
 
     fn try_stage(&mut self, value: &ModelCommit<M>) -> Result<Staged, StageError> {
         self.check_running().map_err(StageError::Stopped)?;

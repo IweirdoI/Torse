@@ -23,13 +23,21 @@ const LIMITS: CodecLimits = CodecLimits {
 };
 
 pub(crate) fn encode(value: CheckpointManifest) -> Result<Vec<u8>, Fault> {
+    encode_version(value, 1)
+}
+
+pub(crate) fn encode_compacted(value: CheckpointManifest) -> Result<Vec<u8>, Fault> {
+    encode_version(value, 2)
+}
+
+fn encode_version(value: CheckpointManifest, version: u16) -> Result<Vec<u8>, Fault> {
     let mut payload = Vec::new();
     let mut out = Encoder::new(
         &mut payload,
         OutputBudget::new(1, PAYLOAD_BYTES as u64),
         LIMITS,
     );
-    out.write_u16(1)?;
+    out.write_u16(version)?;
     out.write_u64(value.generation)?;
     metadata::write_snapshot_meta(&mut out, value.snapshot)?;
     out.write_u64(value.durable_through.0)?;
@@ -75,7 +83,8 @@ pub(crate) fn scan(
                 return Err(corrupt("invalid manifest record kind or width"));
             }
             let mut input = Decoder::new(payload, OutputBudget::new(0, 0), LIMITS);
-            if input.read_u16()? != 1 {
+            let version = input.read_u16()?;
+            if version != 1 && version != 2 {
                 return Err(Fault::new(
                     FaultCode::Incompatible,
                     "unsupported manifest version",
@@ -110,7 +119,7 @@ pub(crate) fn scan(
                 {
                     return Err(corrupt("manifest history regressed"));
                 }
-            } else if value.snapshot.cursor.seq.0 != 0 {
+            } else if version == 1 && value.snapshot.cursor.seq.0 != 0 {
                 return Err(corrupt("first checkpoint must describe position zero"));
             }
             Ok(Some((value, encoded_bytes)))

@@ -21,6 +21,15 @@ pub trait CheckpointBackend {
     fn truncate_manifest(&mut self, length: u64) -> Result<(), Fault>;
     fn append_manifest(&mut self, bytes: &[u8]) -> Result<(), Fault>;
     fn sync_manifest(&mut self) -> Result<(), Fault>;
+    /// Atomically replace the complete history and persist its name before returning.
+    /// Errors stop the caller; either the previous or replacement history must survive.
+    /// Custom backends may reject compaction before performing any mutation.
+    fn replace_manifest(&mut self, _bytes: &[u8]) -> Result<(), Fault> {
+        Err(Fault::new(
+            FaultCode::InvalidState,
+            "manifest replacement is unsupported",
+        ))
+    }
     fn create_snapshot(&mut self, generation: u64, bytes: &[u8]) -> Result<(), Fault>;
     fn sync_snapshot(&mut self, generation: u64) -> Result<(), Fault>;
     fn read_snapshot(&mut self, generation: u64, limit: u64) -> Result<Vec<u8>, Fault>;
@@ -97,6 +106,18 @@ impl CheckpointBackend for MemoryCheckpointBackend {
         Ok(())
     }
 
+    fn replace_manifest(&mut self, bytes: &[u8]) -> Result<(), Fault> {
+        let total = self.used - self.manifest.len() as u64;
+        let total = total
+            .checked_add(bytes.len() as u64)
+            .filter(|n| *n <= self.max_bytes)
+            .ok_or_else(|| Fault::resource_limit("memory checkpoint retention limit exceeded"))?;
+        let replacement = self.copy(bytes, bytes.len() as u64)?;
+        self.manifest = replacement;
+        self.used = total;
+        Ok(())
+    }
+
     fn create_snapshot(&mut self, generation: u64, bytes: &[u8]) -> Result<(), Fault> {
         if self.snapshots.contains_key(&generation) {
             return Err(corrupt("checkpoint generation already exists"));
@@ -150,6 +171,7 @@ impl CheckpointBackend for MemoryCheckpointBackend {
 pub struct FileCheckpointBackend {
     root: PathBuf,
     manifest: File,
+    lock: Option<File>,
 }
 
 impl Drop for FileCheckpointBackend {
@@ -157,11 +179,24 @@ impl Drop for FileCheckpointBackend {
         // A forked child or duplicate descriptor can outlive this owner. Closing only
         // our descriptor would leave its lock alive until every duplicate closes.
         let _ = self.manifest.unlock();
+        if let Some(lock) = &self.lock {
+            let _ = lock.unlock();
+        }
     }
 }
 
 impl FileCheckpointBackend {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, Fault> {
+        Self::open_mode(root.as_ref(), true)
+    }
+
+    /// Acquire existing locks and inspect an existing namespace without creating paths.
+    /// Synchronization during activation creates the stable namespace lock for legacy data.
+    pub fn inspect(root: impl AsRef<Path>) -> Result<Self, Fault> {
+        Self::open_mode(root.as_ref(), false)
+    }
+
+    fn open_mode(root: &Path, create: bool) -> Result<Self, Fault> {
         let root =
             fs::canonicalize(root).map_err(|e| io_fault("resolve checkpoint directory", &e))?;
         if !root.is_dir() {
@@ -169,19 +204,41 @@ impl FileCheckpointBackend {
                 "checkpoint root must be an existing directory",
             ));
         }
+        reject_symlink(&root.join("manifest.lock"), true)?;
+        let lock = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .open(root.join("manifest.lock"))
+        {
+            Ok(lock) => {
+                lock.try_lock()
+                    .map_err(|e| io_fault("lock checkpoint namespace", e))?;
+                Some(lock)
+            }
+            Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io_fault("open checkpoint namespace lock", e)),
+        };
         reject_symlink(&root.join("manifest.log"), true)?;
         let manifest = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .truncate(false)
             .open(root.join("manifest.log"))
             .map_err(|e| io_fault("open checkpoint manifest", &e))?;
         manifest
             .try_lock()
             .map_err(|e| io_fault("lock checkpoint manifest", &e))?;
-        let backend = Self { root, manifest };
-        backend.sync_directory()?;
+        let backend = Self {
+            root,
+            manifest,
+            lock,
+        };
+        if create {
+            backend.sync_directory()?;
+        }
         Ok(backend)
     }
 
@@ -217,10 +274,48 @@ impl CheckpointBackend for FileCheckpointBackend {
     }
 
     fn sync_manifest(&mut self) -> Result<(), Fault> {
+        if self.lock.is_none() {
+            reject_symlink(&self.root.join("manifest.lock"), true)?;
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(self.root.join("manifest.lock"))
+                .map_err(|e| io_fault("create checkpoint namespace lock", e))?;
+            lock.try_lock()
+                .map_err(|e| io_fault("lock checkpoint namespace", e))?;
+            self.lock = Some(lock);
+        }
         self.manifest
             .sync_all()
             .map_err(|e| io_fault("sync checkpoint manifest", &e))?;
         self.sync_directory()
+    }
+
+    fn replace_manifest(&mut self, bytes: &[u8]) -> Result<(), Fault> {
+        let path = self.root.join("manifest.next");
+        reject_symlink(&path, true)?;
+        let mut replacement = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| io_fault("create replacement manifest", e))?;
+        replacement
+            .try_lock()
+            .map_err(|e| io_fault("lock replacement manifest", e))?;
+        replacement
+            .write_all(bytes)
+            .and_then(|_| replacement.sync_all())
+            .map_err(|e| io_fault("persist replacement manifest", e))?;
+        fs::rename(&path, self.root.join("manifest.log"))
+            .map_err(|e| io_fault("publish replacement manifest", e))?;
+        self.sync_directory()?;
+        let _ = self.manifest.unlock();
+        self.manifest = replacement;
+        Ok(())
     }
 
     fn create_snapshot(&mut self, generation: u64, bytes: &[u8]) -> Result<(), Fault> {
@@ -267,7 +362,7 @@ impl CheckpointBackend for FileCheckpointBackend {
             let name = name
                 .to_str()
                 .ok_or_else(|| corrupt("invalid checkpoint filename"))?;
-            if name == "manifest.log" {
+            if matches!(name, "manifest.log" | "manifest.lock" | "manifest.next") {
                 continue;
             }
             let number = name
@@ -368,6 +463,7 @@ mod lock_tests {
         assert!(FileCheckpointBackend::open(&root).is_err());
         drop(reopened);
         fs::remove_file(root.join("manifest.log")).unwrap();
+        fs::remove_file(root.join("manifest.lock")).unwrap();
         fs::remove_dir(root).unwrap();
     }
 }

@@ -1,6 +1,7 @@
 //! Immutable, content-addressed section pages. Publish pages before referencing them in a journal.
 use sha2::{Digest as _, Sha256};
 use std::{
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -11,6 +12,12 @@ use torse_types::{Digest, Fault, FaultCode, OutputBudget};
 use torse_world::Snapshot;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PageCollection {
+    pub removed_pages: u32,
+    pub removed_temporaries: u32,
+}
 
 #[derive(Clone)]
 pub struct SectionPages {
@@ -28,7 +35,10 @@ impl SectionPages {
         codec: CodecLimits,
         max_files: usize,
     ) -> Result<Self, Fault> {
-        if !root.as_ref().is_dir()
+        if !fs::symlink_metadata(root.as_ref())
+            .map_err(io)?
+            .file_type()
+            .is_dir()
             || max_files == 0
             || budget.max_bytes == 0
             || budget.max_items == 0
@@ -46,6 +56,9 @@ impl SectionPages {
     }
     pub fn digest(&self, page: &Snapshot) -> Result<Digest, Fault> {
         Ok(hash(&self.encode(page)?))
+    }
+    pub fn max_files(&self) -> usize {
+        self.max_files
     }
     fn encode(&self, page: &Snapshot) -> Result<Vec<u8>, Fault> {
         if page.sections.len() != 1 {
@@ -102,7 +115,15 @@ impl SectionPages {
         result
     }
     pub fn get(&self, digest: Digest) -> Result<Snapshot, Fault> {
-        let file = fs::File::open(self.path(digest)).map_err(io)?;
+        let path = self.path(digest);
+        if !fs::symlink_metadata(&path)
+            .map_err(io)?
+            .file_type()
+            .is_file()
+        {
+            return Err(Fault::invalid_data("section page must be a regular file"));
+        }
+        let file = fs::File::open(path).map_err(io)?;
         let limit = self
             .budget
             .max_bytes
@@ -126,6 +147,87 @@ impl SectionPages {
     pub fn path(&self, digest: Digest) -> PathBuf {
         let name: String = digest.0.iter().map(|b| format!("{b:02x}")).collect();
         self.root.join(format!("{name}.page"))
+    }
+
+    /// Trace all retained checkpoint, replay, and live authority references first.
+    /// The caller holds the world's exclusive lease and excludes page publication for this
+    /// entire operation. A deletion failure leaves only unreachable files to retry later.
+    pub fn collect(&self, retained: &BTreeSet<Digest>) -> Result<PageCollection, Fault> {
+        if retained.len() > self.max_files {
+            return Err(Fault::resource_limit("section reference capacity exceeded"));
+        }
+        for digest in retained {
+            self.get(*digest)?;
+        }
+        let mut garbage = Vec::new();
+        for (index, entry) in fs::read_dir(&self.root).map_err(io)?.enumerate() {
+            if index >= self.max_files {
+                return Err(Fault::resource_limit(
+                    "section page directory capacity exceeded",
+                ));
+            }
+            let entry = entry.map_err(io)?;
+            if !entry.file_type().map_err(io)?.is_file() {
+                return Err(Fault::invalid_data(
+                    "section page directory contains a non-regular file",
+                ));
+            }
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| Fault::invalid_data("invalid page filename"))?;
+            let temporary = if let Some(stem) = name
+                .strip_prefix("page-")
+                .and_then(|s| s.strip_suffix(".part"))
+            {
+                stem.split_once('-').is_some_and(|(pid, serial)| {
+                    [pid, serial]
+                        .iter()
+                        .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                })
+            } else {
+                false
+            };
+            let digest = name.strip_suffix(".page").and_then(|s| {
+                if s.len() != 64
+                    || !s
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return None;
+                }
+                let mut digest = [0; 32];
+                for (index, byte) in digest.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&s[index * 2..index * 2 + 2], 16).ok()?;
+                }
+                Some(Digest(digest))
+            });
+            if !temporary && digest.is_none() {
+                return Err(Fault::invalid_data(
+                    "unexpected file in section page directory",
+                ));
+            }
+            if temporary || digest.is_some_and(|d| !retained.contains(&d)) {
+                garbage
+                    .try_reserve(1)
+                    .map_err(|_| Fault::resource_limit("page collection allocation"))?;
+                garbage.push((entry.path(), temporary));
+            }
+        }
+        let mut report = PageCollection::default();
+        for (path, temporary) in garbage {
+            fs::remove_file(path).map_err(io)?;
+            if temporary {
+                report.removed_temporaries += 1;
+            } else {
+                report.removed_pages += 1;
+            }
+        }
+        #[cfg(unix)]
+        fs::File::open(&self.root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(io)?;
+        Ok(report)
     }
 }
 

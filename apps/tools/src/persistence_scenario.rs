@@ -462,6 +462,8 @@ fn wrap(snapshot: &Snapshot) -> WorldSnapshot<Snapshot> {
 
 fn journal_config() -> JournalConfig {
     JournalConfig {
+        max_segment_bytes: 16_777_216,
+        max_segment_files: 1024,
         max_pending_records: 4,
         max_pending_bytes: 1 << 20,
         codec_budget: BUDGET,

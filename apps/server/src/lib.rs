@@ -14,6 +14,7 @@ mod lifecycle;
 pub mod mods;
 pub mod network;
 mod profiling;
+mod reclamation;
 pub mod section_pages;
 pub mod systems;
 pub use execution::PlanningConfig;

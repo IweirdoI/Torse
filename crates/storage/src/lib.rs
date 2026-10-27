@@ -12,6 +12,7 @@ mod checkpoint_backend;
 mod journal;
 mod manifest;
 mod recovery;
+mod segments;
 
 pub use backend::{FileBackend, JournalBackend, MemoryBackend};
 pub use checkpoint::{
@@ -22,3 +23,4 @@ pub use checkpoint_backend::{CheckpointBackend, FileCheckpointBackend, MemoryChe
 pub use journal::{CommitJournal, FileJournal, Journal, JournalConfig, MemoryJournal, Staged};
 pub use manifest::CheckpointManifest;
 pub use recovery::{RecoveryReport, scan_journal};
+pub use segments::scan_file_journal;

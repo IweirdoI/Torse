@@ -29,6 +29,8 @@ pub fn compatibility() -> Compatibility {
 }
 pub fn journal_config() -> JournalConfig {
     JournalConfig {
+        max_segment_bytes: 16_777_216,
+        max_segment_files: 1024,
         max_pending_records: 2,
         max_pending_bytes: 2048,
         codec_budget: OutputBudget::new(8, 512),
@@ -605,7 +607,7 @@ impl Drop for Directory {
             if entry.file_type().unwrap().is_dir() {
                 assert!(matches!(
                     entry.file_name().to_str(),
-                    Some("checkpoints" | "sections")
+                    Some("checkpoints" | "sections" | "journal.log.segments")
                 ));
                 for file in fs::read_dir(entry.path()).unwrap() {
                     fs::remove_file(file.unwrap().path()).unwrap();

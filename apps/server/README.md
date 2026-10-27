@@ -6,6 +6,7 @@
 |---|---|
 | [authority.rs](src/authority.rs) | 服务端本地权威、准备项、独立恢复和订阅失效适配接口 |
 | [checkpoint.rs](src/checkpoint.rs) | 检查点保留、维护与存储健康状态适配 |
+| [reclamation.rs](src/reclamation.rs) | 检查点、日志与分区页引用追踪及回收 |
 | [coordinator.rs](src/coordinator.rs) | 预留、发布、接纳、刷盘、持久确认、检查点与有界关闭 |
 | [directory.rs](src/directory.rs) | 世界目录排他锁与运行代数分配 |
 | [lifecycle.rs](src/lifecycle.rs) | 文件世界创建、只读恢复检查、激活与日志重开 |
@@ -129,7 +130,7 @@ drive_one依次准备、预留日志、发布、立即接纳日志、处理订�
 
 create_file拒绝既有日志或检查点目录，创建并同步空日志，再保存位置0的完整初始快照。初始化成功后才返回可接纳输入的Server，失败不会开放半初始化世界。
 
-open_file先检查文件与兼容信息，用Checkpoints::inspect读取完整manifest及快照。独立恢复构建器应用快照，再扫描完整日志，仅向构建器重放快照之后的连续记录。日志必须覆盖快照位置及manifest中已知的DurableSeq。构建器finish校验预期位置，返回的权威实例也要匹配新Binding和扫描位置。
+open_file先检查文件与兼容信息，用Checkpoints::inspect读取完整manifest及快照。独立恢复构建器应用快照，再扫描旧日志或分段日志中仍需保留的连续记录，仅向构建器重放快照之后的部分。日志必须覆盖快照位置及manifest中已知的DurableSeq，持久保留点不得晚于可信快照。构建器finish校验预期位置，返回的权威实例也要匹配新Binding和扫描位置。
 
 宿主同时保留最终ResumePoint：存在快照后的完整记录时取最后一条，否则取快照值。finish返回的Tick、阶段和步骤必须全部匹配，再激活存储，避免只恢复正确序号却重置执行进度。
 
@@ -137,11 +138,13 @@ open_file先检查文件与兼容信息，用Checkpoints::inspect读取完整man
 
 ## 检查点维护
 
-checkpoint_predecessors规定每次发布新快照前保留最近多少代已发布快照，至少为1。FileServerConfig要求快照文件容量严格大于该值，为新快照预留一个文件位置。每次捕获并核对快照后，先清理更旧快照和孤立文件，再发布新一代；当前检查点和全部B2日志始终保留，发布成功后至多保留前代数加1份快照。
+checkpoint_predecessors规定每次发布新快照前保留最近多少代已发布快照，至少为1。FileServerConfig要求快照文件容量严格大于该值，为新快照预留一个文件位置。每次捕获并核对快照后，先验证保留快照、原子整理manifest、清理旧快照与孤立文件，再将最早保留位置交给日志回收，最后发布新一代。当前检查点与其恢复所需后缀始终保留，发布成功后至多保留前代数加1份快照。
 
-HostCheckpointStore是应用本地维护适配接口，沿用共同CheckpointStore的发布签名。prune_checkpoints提供目录锁保护下的显式清理入口。清理不删除日志，不改变当前权威状态。
+HostCheckpointStore是应用本地维护适配接口，沿用共同CheckpointStore的发布签名。prune_checkpoints提供目录锁保护下的显式清理入口，同时回收被全部保留检查点覆盖的日志段。首次回收启用分段布局，此后按`max_segment_bytes`与`max_segment_files`限制磁盘段，应用示例显式设置16MiB与1024个段。世界载荷和网络协议不变，布局及迁移见[存储格式](../../crates/storage/FORMAT.md)。
 
-健康存储在写入前报告ResourceLimit时，checkpoint返回错误，Server仍可运行或维护后重试。若容量错误发生在部分写入之后，存储已停止，宿主仍按终止性故障处理。manifest总容量继续保持显式上限，当前没有自动压缩；关闭时无法发布检查点仍返回失败，不宣称保存成功。
+健康存储在写入前报告ResourceLimit时，checkpoint返回错误，Server仍可运行或维护后重试。若容量错误发生在部分写入之后，存储已停止，宿主仍按终止性故障处理。manifest整理释放历史引用占用，但保留记录加新记录仍须满足显式上限；关闭时无法发布检查点仍返回失败，不宣称保存成功。
+
+文件版ExecutionHost提供`collect_section_pages(&pages, retain)`，要求空闲Tick边界及至少一代保留。它按指定保留代数保存当前快照并整理日志，逐份读取保留快照与连续日志后缀，追踪parked页与装卸记录引用，最后删除不可达页和中断发布留下的`.part`。当前驻留数据已完整进入快照，待处理装卸计划会阻止回收。删除前验证全部引用页及目录名，缺页、坏页和意外文件会拒绝清理；删除中断只留下不可达文件，重试安全。页目录必须专属于同一世界，并由调用方沿用该世界的排他租约。
 
 ## 目录与运行代数
 
@@ -149,7 +152,11 @@ HostCheckpointStore是应用本地维护适配接口，沿用共同CheckpointSto
 world/
     world.lock
     journal.log
+    journal.log.segments/
+        head
+        0000000000000001.seg
     checkpoints/
+        manifest.lock
         manifest.log
         checkpoint-0000000000000001.bin
 ```
@@ -180,7 +187,7 @@ shutdown消耗Server，先停止接纳，通知权威适配器按包含截止Tic
 
 [协调器测试](tests/coordinator.rs)检查调用次序、预留拒绝后的重试、失败后的持久门槛、输入身份、订阅失效、快照与有界关闭。[目录测试](tests/directory.rs)检查跨进程互斥、退出后解锁、逐字节截断与位翻转、代数递增和容量。[文件生命周期测试](tests/lifecycle.rs)覆盖恢复后续号、尾部保留、整条后缀缺失、初始化拒绝，以及发布后、接纳前突然退出。
 
-当前日志从位置1完整保留，恢复会校验整个文件。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。分段回收、异步刷盘、脏区流送和硬件断电保证仍需单独验收，当前功能测试不代替性能或平台承诺。
+首次回收前校验完整旧日志，之后按持久保留点校验仍需保留的段。回收、只读预检、旧布局和清理中断验证见[存储回收记录](../../benchmarks/M3-storage-reclamation.md)。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。异步刷盘、自动脏区流送和硬件断电保证仍需单独验收，当前功能测试不代替性能或平台承诺。
 
 ## Mod机器与UI模型
 

@@ -7,10 +7,11 @@
 //! wrong surface.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub use torse_assets::texture::TexturePack;
 use torse_assets::texture::{Atlas, MaterialAnimation, MaterialEntry, MipLevel, TintSource};
-use torse_assets::{AssetAlias, AssetCatalog, AssetGuid};
+use torse_assets::{AssetAlias, AssetCatalog, AssetGuid, AssetHandle};
 use torse_content::{AlphaMode, Face};
 use torse_types::{ContentKey, MemoryBudget};
 use torse_world::{BlockStateId, BlockStateRegistry};
@@ -41,7 +42,40 @@ pub struct Surface {
 pub struct Palette {
     slots: BTreeMap<(ContentKey, AlphaMode), u16>,
     surfaces: Vec<Surface>,
-    mips: Vec<MipLevel>,
+    assets: Arc<AssetCatalog>,
+    mips: Vec<ResidentMip>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResidentMip {
+    width: u32,
+    height: u32,
+    handle: AssetHandle,
+}
+
+pub struct MipView<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: &'a [u8],
+}
+
+fn resident_mips(mips: Vec<MipLevel>) -> Result<(Arc<AssetCatalog>, Vec<ResidentMip>), String> {
+    let mut assets = AssetCatalog::new(MemoryBudget::new(8 * 1024 * 1024));
+    let mut resident = Vec::new();
+    for (index, mip) in mips.into_iter().enumerate() {
+        let guid = AssetGuid(0x0002_0000_0000_0000 + index as u128);
+        let path = AssetAlias::path(&format!("derived/atlas/mip-{index}.rgba"))
+            .map_err(|error| error.to_string())?;
+        let handle = assets
+            .load(guid, &mip.pixels, &[path], &[])
+            .map_err(|error| error.to_string())?;
+        resident.push(ResidentMip {
+            width: mip.width,
+            height: mip.height,
+            handle,
+        });
+    }
+    Ok((Arc::new(assets), resident))
 }
 
 impl Palette {
@@ -107,10 +141,12 @@ impl Palette {
             alpha: AlphaMode::Opaque,
         });
 
+        let (assets, mips) = resident_mips(pack.mips(MIP_LEVELS)?)?;
         Ok(Self {
             slots,
             surfaces,
-            mips: pack.mips(MIP_LEVELS)?,
+            assets,
+            mips,
         })
     }
 
@@ -130,8 +166,22 @@ impl Palette {
     }
 
     /// Uploaded mip chain; the first level is the base atlas.
-    pub fn mips(&self) -> &[MipLevel] {
-        &self.mips
+    pub fn mips(&self) -> Vec<MipView<'_>> {
+        self.mips
+            .iter()
+            .map(|mip| MipView {
+                width: mip.width,
+                height: mip.height,
+                pixels: self
+                    .assets
+                    .get(mip.handle)
+                    .expect("palette owns its resident mip"),
+            })
+            .collect()
+    }
+
+    pub fn asset_generation(&self) -> u64 {
+        self.assets.asset_generation()
     }
 
     /// Slot reserved for entity debug bodies.
@@ -146,16 +196,11 @@ impl Palette {
 /// 24-pixel pitch so mip extrusion has a gutter; the last two tiles are the
 /// missing sprite and a white sprite for tinted debug surfaces.
 pub fn base_pack() -> Result<TexturePack, String> {
-    macro_rules! asset {
-        ($name:literal) => {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../games/base/assets/textures/",
-                $name
-            )) as &[u8]
-        };
-    }
-    let atlas = Atlas::decode(asset!("atlas.png"))?;
+    let sources = resident_base_assets()?;
+    let handle = sources
+        .handle(BASE_ATLAS)
+        .ok_or("base atlas is not resident")?;
+    let atlas = Atlas::decode(sources.get(handle).ok_or("base atlas handle is stale")?)?;
     TexturePack::new(
         atlas,
         vec![
@@ -244,7 +289,9 @@ pub fn install_base_assets(catalog: &mut AssetCatalog) -> Result<(), String> {
     Ok(())
 }
 
-/// Resident catalog for one client scene.
+/// Source catalog used during synchronous atlas and icon decoding.
+/// Processed CPU pixels have their own resident catalog; dropping this source
+/// catalog frees its encoded copies after decoding.
 pub fn resident_base_assets() -> Result<AssetCatalog, String> {
     let mut catalog = AssetCatalog::new(MemoryBudget::new(8 * 1024 * 1024));
     install_base_assets(&mut catalog)?;
@@ -263,15 +310,18 @@ impl Palette {
 
     /// Palette without materials, for table-shape tests.
     pub fn empty_for_tests() -> Self {
+        let (assets, mips) = resident_mips(Self::test_mips()).unwrap();
         Self {
             slots: BTreeMap::new(),
             surfaces: Vec::new(),
-            mips: Self::test_mips(),
+            assets,
+            mips,
         }
     }
 
     /// Palette with a single surface, for byte-layout tests.
     pub fn single_for_tests(rect: [f32; 4], tint: [f32; 3], alpha: AlphaMode) -> Self {
+        let (assets, mips) = resident_mips(Self::test_mips()).unwrap();
         Self {
             slots: BTreeMap::new(),
             surfaces: vec![Surface {
@@ -281,7 +331,8 @@ impl Palette {
                 animation: None,
                 alpha,
             }],
-            mips: Self::test_mips(),
+            assets,
+            mips,
         }
     }
 }
@@ -310,6 +361,40 @@ mod tests {
             "/../../games/base/assets/textures/atlas.png"
         )))
         .expect("atlas decodes")
+    }
+
+    #[test]
+    fn palette_charges_actual_pixels_and_clones_share_the_same_copy() {
+        let (_, registry) = registry();
+        let pack = base_pack().unwrap();
+        let expected = pack.mips(MIP_LEVELS).unwrap();
+        let palette = Palette::build(&registry, &pack).unwrap();
+        let bytes: u64 = expected.iter().map(|mip| mip.pixels.len() as u64).sum();
+        assert_eq!(palette.assets.charged_bytes(), bytes);
+        for (actual, expected) in palette.mips().iter().zip(&expected) {
+            assert_eq!(actual.pixels, expected.pixels);
+        }
+        let clone = palette.clone();
+        assert!(Arc::ptr_eq(&palette.assets, &clone.assets));
+        let weak = Arc::downgrade(&palette.assets);
+        drop(palette);
+        assert_eq!(clone.assets.charged_bytes(), bytes);
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn source_alias_handles_are_consumed_and_unload_releases_the_copy() {
+        let mut sources = resident_base_assets().unwrap();
+        let guid = sources.guid_for_path("textures/atlas.png").unwrap();
+        let handle = sources.handle(guid).unwrap();
+        let before = sources.charged_bytes();
+        let len = sources.get(handle).unwrap().len() as u64;
+        assert!(Atlas::decode(sources.get(handle).unwrap()).is_ok());
+        sources.unload(handle).unwrap();
+        assert_eq!(sources.charged_bytes(), before - len);
+        assert!(sources.get(handle).is_none());
+        assert!(sources.handle(guid).is_none());
     }
 
     #[test]

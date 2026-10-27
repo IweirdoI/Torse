@@ -1,7 +1,8 @@
 //! Asset location, decoding, and adaptation.
 //!
-//! The crate currently provides the texture-atlas primitives: PNG decoding and
-//! material-pack validation. Callers own the mapping from their content
+//! The crate provides resident CPU asset handles with explicit load/unload and
+//! resource-class budgets, plus PNG decoding and material-pack validation.
+//! Callers own the mapping from their content
 //! materials to pack entries; the base game's pack is declared by the client.
 
 #![forbid(unsafe_code)]

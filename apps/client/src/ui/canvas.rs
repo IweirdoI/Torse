@@ -5,14 +5,17 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use ab_glyph::{Font, FontVec, ScaleFont, point};
+use torse_assets::{AssetCatalog, AssetGuid, AssetHandle};
+use torse_types::MemoryBudget;
 
 pub struct Sprite {
     pub width: u32,
     pub height: u32,
-    pixels: Vec<u8>,
+    assets: AssetCatalog,
+    handle: AssetHandle,
 }
 impl Sprite {
-    pub fn decode(bytes: &[u8], expected: (u32, u32)) -> Result<Self, String> {
+    pub fn decode(bytes: &[u8], expected: (u32, u32), guid: AssetGuid) -> Result<Self, String> {
         let mut decoder = png::Decoder::new(Cursor::new(bytes));
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
@@ -35,10 +38,24 @@ impl Sprite {
                 png::ColorType::Indexed => return Err("unexpanded UI palette".into()),
             });
         }
+        Self::from_pixels(info.width, info.height, pixels, guid)
+    }
+
+    fn from_pixels(
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        guid: AssetGuid,
+    ) -> Result<Self, String> {
+        let mut assets = AssetCatalog::new(MemoryBudget::new(8 * 1024 * 1024));
+        let handle = assets
+            .load(guid, &pixels, &[], &[])
+            .map_err(|error| error.to_string())?;
         Ok(Self {
-            width: info.width,
-            height: info.height,
-            pixels,
+            width,
+            height,
+            assets,
+            handle,
         })
     }
 }
@@ -135,6 +152,10 @@ impl Canvas {
         }
     }
     pub fn sprite(&mut self, sprite: &Sprite, rect: Rect, border: u32) {
+        let pixels = sprite
+            .assets
+            .get(sprite.handle)
+            .expect("sprite owns its resident pixels");
         // Nine-slice mappings preserve corners and stretch only the middle.
         let map = |p: u32, dst: u32, src: u32| {
             let b = border.min(src / 2).min(dst / 2);
@@ -154,7 +175,7 @@ impl Canvas {
                 self.blend(
                     rect.x + x as i32,
                     rect.y + y as i32,
-                    sprite.pixels[i..i + 4].try_into().unwrap(),
+                    pixels[i..i + 4].try_into().unwrap(),
                 );
             }
         }
@@ -311,10 +332,10 @@ mod tests {
     use super::*;
     #[test]
     fn nine_slice_preserves_corners_and_transparency() {
-        let sprite = Sprite {
-            width: 3,
-            height: 3,
-            pixels: [
+        let sprite = Sprite::from_pixels(
+            3,
+            3,
+            [
                 [255, 0, 0, 255],
                 [0, 255, 0, 255],
                 [0, 0, 255, 255],
@@ -326,7 +347,9 @@ mod tests {
                 [255, 0, 255, 255],
             ]
             .concat(),
-        };
+            AssetGuid(1),
+        )
+        .unwrap();
         let mut canvas = Canvas::new(9, 9, 1);
         canvas.sprite(&sprite, Rect::new(0, 0, 9, 9), 1);
         assert_eq!(&canvas.pixels[..4], &[255, 0, 0, 255]);

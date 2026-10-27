@@ -7,7 +7,7 @@
 //! resource-class charge. This crate does not upload GPU memory, stream
 //! assets in the background, or change world identities.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use torse_types::{
     ContentKey, ContentKeyError, EvictionRank, Fault, MemoryBudget, MemoryClass, MemoryLedger,
@@ -23,6 +23,9 @@ use torse_types::{
 pub struct AssetGuid(pub u128);
 
 /// Handle for one resident CPU copy.
+///
+/// Handles belong to the issuing catalog. Hosts keep the catalog/world epoch
+/// when moving work across scenes; handles are not persistent asset identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct AssetHandle {
     guid: AssetGuid,
@@ -99,6 +102,8 @@ pub enum AssetError {
     MissingDependency(AssetGuid),
     /// This guid is already resident with different bytes.
     DifferentBytes,
+    /// Resident dependencies are immutable until the asset is unloaded.
+    DifferentDependencies,
     /// The handle does not name the resident generation.
     Stale,
     /// A resident asset still depends on this one.
@@ -118,6 +123,9 @@ impl std::fmt::Display for AssetError {
                 write!(f, "asset dependency {:#x} is not loaded", guid.0)
             }
             Self::DifferentBytes => write!(f, "asset guid is already loaded with other bytes"),
+            Self::DifferentDependencies => {
+                write!(f, "asset guid is already loaded with other dependencies")
+            }
             Self::Stale => write!(f, "asset handle does not match the resident generation"),
             Self::StillUsed => write!(f, "asset is still used by a loaded dependent"),
             Self::Budget(fault) => write!(f, "{fault}"),
@@ -127,25 +135,26 @@ impl std::fmt::Display for AssetError {
 
 impl std::error::Error for AssetError {}
 
+#[derive(Debug)]
 struct Resident {
     generation: u64,
     bytes: Vec<u8>,
     dependencies: Vec<AssetGuid>,
-    dependents: u32,
+    dependents: usize,
     charge: torse_types::MemoryChargeId,
     keys: Vec<ContentKey>,
     paths: Vec<String>,
 }
 
 /// Resident CPU copies and the resource-class ledger that accounts them.
+#[derive(Debug)]
 pub struct AssetCatalog {
     ledger: MemoryLedger,
     resident: BTreeMap<u128, Resident>,
-    /// Last generation issued for a guid. Survives unload.
-    issued: BTreeMap<u128, u64>,
     keys: BTreeMap<ContentKey, u128>,
     paths: BTreeMap<String, u128>,
-    /// Changes on every successful load and unload.
+    /// Monotonic revision also used for new handles, avoiding an ever-growing
+    /// tombstone map for unloaded guids. Idempotent loads keep this revision.
     generation: u64,
 }
 
@@ -155,7 +164,6 @@ impl AssetCatalog {
         Self {
             ledger: MemoryLedger::new(budget),
             resident: BTreeMap::new(),
-            issued: BTreeMap::new(),
             keys: BTreeMap::new(),
             paths: BTreeMap::new(),
             generation: 0,
@@ -176,7 +184,8 @@ impl AssetCatalog {
     ///
     /// Dependencies must already be resident. A second load of the same bytes
     /// returns the existing handle and does not change aliases. Different
-    /// bytes for a resident guid are rejected, so this is not a hot reload.
+    /// bytes or dependencies for a resident guid are rejected, so this is not
+    /// a hot reload. Dependency order and duplicates do not change identity.
     pub fn load(
         &mut self,
         guid: AssetGuid,
@@ -187,7 +196,13 @@ impl AssetCatalog {
         if bytes.is_empty() {
             return Err(AssetError::Empty);
         }
-        for dependency in dependencies {
+        let dependencies: Vec<_> = dependencies
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for dependency in &dependencies {
             if !self.resident.contains_key(&dependency.0) {
                 return Err(AssetError::MissingDependency(*dependency));
             }
@@ -196,12 +211,23 @@ impl AssetCatalog {
             if resident.bytes.as_slice() != bytes {
                 return Err(AssetError::DifferentBytes);
             }
+            if resident.dependencies != dependencies {
+                return Err(AssetError::DifferentDependencies);
+            }
             return Ok(AssetHandle {
                 guid,
                 generation: resident.generation,
             });
         }
         self.claim_aliases(guid, aliases)?;
+        let generation = self.next_generation()?;
+        for dependency in &dependencies {
+            if self.resident[&dependency.0].dependents == usize::MAX {
+                return Err(AssetError::Budget(Fault::resource_limit(
+                    "asset dependent count exhausted",
+                )));
+            }
+        }
         let charge = self
             .ledger
             .charge(MemoryResident {
@@ -210,7 +236,6 @@ impl AssetCatalog {
                 rank: EvictionRank::ReloadableResource,
             })
             .map_err(AssetError::Budget)?;
-        let generation = self.issued.get(&guid.0).copied().unwrap_or(0) + 1;
         let mut keys = Vec::new();
         let mut paths = Vec::new();
         for alias in aliases {
@@ -225,25 +250,24 @@ impl AssetCatalog {
                 }
             }
         }
-        for dependency in dependencies {
+        for dependency in &dependencies {
             if let Some(resident) = self.resident.get_mut(&dependency.0) {
                 resident.dependents += 1;
             }
         }
-        self.issued.insert(guid.0, generation);
         self.resident.insert(
             guid.0,
             Resident {
                 generation,
                 bytes: bytes.to_vec(),
-                dependencies: dependencies.to_vec(),
+                dependencies,
                 dependents: 0,
                 charge,
                 keys,
                 paths,
             },
         );
-        self.generation += 1;
+        self.generation = generation;
         Ok(AssetHandle { guid, generation })
     }
 
@@ -259,6 +283,7 @@ impl AssetCatalog {
                 AssetError::StillUsed
             });
         }
+        let generation = self.next_generation()?;
         let dependencies = resident.dependencies.clone();
         let charge = resident.charge;
         let keys = resident.keys.clone();
@@ -276,7 +301,7 @@ impl AssetCatalog {
                 resident.dependents = resident.dependents.saturating_sub(1);
             }
         }
-        self.generation += 1;
+        self.generation = generation;
         Ok(())
     }
 
@@ -287,6 +312,15 @@ impl AssetCatalog {
             return None;
         }
         Some(&resident.bytes)
+    }
+
+    /// Current resident handle for a guid resolved through an alias.
+    pub fn handle(&self, guid: AssetGuid) -> Option<AssetHandle> {
+        let resident = self.resident.get(&guid.0)?;
+        Some(AssetHandle {
+            guid,
+            generation: resident.generation,
+        })
     }
 
     /// Guid currently named by a content key, if that copy is resident.
@@ -303,13 +337,22 @@ impl AssetCatalog {
         for alias in aliases {
             let taken = match alias {
                 AssetAlias::Key(key) => self.keys.get(key).copied(),
-                AssetAlias::Path(path) => self.paths.get(path).copied(),
+                AssetAlias::Path(path) => {
+                    AssetAlias::path(path)?;
+                    self.paths.get(path).copied()
+                }
             };
             if taken.is_some_and(|owner| owner != guid.0) {
                 return Err(AssetError::AliasUsed);
             }
         }
         Ok(())
+    }
+
+    fn next_generation(&self) -> Result<u64, AssetError> {
+        self.generation
+            .checked_add(1)
+            .ok_or_else(|| AssetError::Budget(Fault::resource_limit("asset generation exhausted")))
     }
 }
 
@@ -382,5 +425,91 @@ mod tests {
         assert_eq!(catalog.asset_generation(), 1);
         assert!(AssetAlias::path("../secret").is_err());
         assert!(AssetAlias::path("/absolute").is_err());
+    }
+
+    #[test]
+    fn raw_path_aliases_cannot_bypass_validation() {
+        let mut catalog = catalog();
+        for path in ["../secret", "/absolute", "C:/outside", "a\\b"] {
+            assert!(matches!(
+                catalog.load(guid(1), b"copy", &[AssetAlias::Path(path.into())], &[]),
+                Err(AssetError::BadPath)
+            ));
+            assert_eq!(catalog.charged_bytes(), 0);
+            assert_eq!(catalog.asset_generation(), 0);
+            assert!(catalog.guid_for_path(path).is_none());
+        }
+    }
+
+    #[test]
+    fn resident_load_cannot_silently_change_dependencies() {
+        let mut catalog = catalog();
+        let base = catalog.load(guid(1), b"base", &[], &[]).unwrap();
+        catalog.load(guid(2), b"child", &[], &[]).unwrap();
+        let before = catalog.asset_generation();
+        assert!(catalog.load(guid(2), b"child", &[], &[guid(1)]).is_err());
+        assert_eq!(catalog.asset_generation(), before);
+        catalog.unload(base).unwrap();
+    }
+
+    #[test]
+    fn exhausted_generation_rejects_load_and_unload_atomically() {
+        let mut catalog = catalog();
+        catalog.generation = u64::MAX;
+        assert!(catalog.load(guid(1), b"copy", &[], &[]).is_err());
+        assert_eq!(catalog.charged_bytes(), 0);
+        assert!(catalog.resident.is_empty());
+
+        catalog.generation = 0;
+        let handle = catalog.load(guid(1), b"copy", &[], &[]).unwrap();
+        catalog.generation = u64::MAX;
+        assert!(catalog.unload(handle).is_err());
+        assert_eq!(catalog.get(handle), Some(b"copy".as_slice()));
+        assert_eq!(catalog.charged_bytes(), 4);
+    }
+
+    #[test]
+    fn class_limit_and_alias_conflicts_leave_no_partial_registration() {
+        let mut catalog =
+            AssetCatalog::new(MemoryBudget::new(64).with_class_limit(MemoryClass::Resource, 4));
+        let alias = AssetAlias::path("a.png").unwrap();
+        let first = catalog
+            .load(guid(1), b"abcd", std::slice::from_ref(&alias), &[])
+            .unwrap();
+        assert!(matches!(
+            catalog.load(guid(2), b"x", std::slice::from_ref(&alias), &[]),
+            Err(AssetError::AliasUsed)
+        ));
+        let other = AssetAlias::path("b.png").unwrap();
+        assert!(matches!(
+            catalog.load(guid(2), b"x", &[other], &[]),
+            Err(AssetError::Budget(_))
+        ));
+        assert_eq!(catalog.asset_generation(), 1);
+        assert_eq!(catalog.guid_for_path("a.png"), Some(guid(1)));
+        assert!(catalog.guid_for_path("b.png").is_none());
+        assert!(catalog.handle(guid(2)).is_none());
+        assert_eq!(catalog.get(first), Some(b"abcd".as_slice()));
+    }
+
+    #[test]
+    fn dependency_duplicates_are_idempotent_and_generations_survive_unload() {
+        let mut catalog = catalog();
+        let base = catalog.load(guid(1), b"base", &[], &[]).unwrap();
+        let child = catalog
+            .load(guid(2), b"child", &[], &[guid(1), guid(1)])
+            .unwrap();
+        assert_eq!(
+            catalog.load(guid(2), b"child", &[], &[guid(1)]).unwrap(),
+            child
+        );
+        assert_eq!(catalog.handle(guid(2)), Some(child));
+        assert!(matches!(catalog.unload(base), Err(AssetError::StillUsed)));
+        catalog.unload(child).unwrap();
+        catalog.unload(base).unwrap();
+        assert!(catalog.resident.is_empty());
+        let again = catalog.load(guid(2), b"new", &[], &[]).unwrap();
+        assert!(again.generation() > child.generation());
+        assert!(catalog.get(child).is_none());
     }
 }

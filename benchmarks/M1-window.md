@@ -11,7 +11,7 @@
 cargo run -p torse-client -- --window --radius 4
 # 自动取证：前向匀速飞行，呈现指定帧数后退出并存最后一帧
 cargo run --release -p torse-client -- --window --autoplay --frames 4000 --radius 4
-cargo run -p torse-client -- --window --autoplay --frames 120 --screenshot M1-window.png --radius 3
+cargo run -p torse-client -- --window --autoplay --frames 120 --screenshot figures/M1-window.png --radius 3
 ```
 
 ## 输出
@@ -29,7 +29,7 @@ vertices=239292 faces=59823 elapsed_ms=3261
 
 ## 画面
 
-![窗口模式下的飞行视角](M1-window.png)
+![窗口模式下的飞行视角](figures/M1-window.png)
 
 初始相机站在`scene.eye()`给出的地表位置，默认带轻微俯角，自动飞行方向为负z。半径3共49个分区，画面与离屏路径共用同一网格与管线。
 

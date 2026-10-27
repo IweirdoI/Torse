@@ -26,7 +26,7 @@ requests_sent=25 requests_rejected=22 batches=0
 
 ## 画面
 
-![联机编辑后的镜像世界](M5-net-edit.png)
+![联机编辑后的镜像世界](figures/M5-net-edit.png)
 
 俯视石板地面：凸起的方块为服务端接受的放置，凹陷缺口为服务端接受的破坏，两个橙棕色实体盒保持可见；所有变化经授权批次回投镜像，客户端本地零提交。
 

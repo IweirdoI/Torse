@@ -25,7 +25,7 @@
 | 批次前缀 | `M0` 到 `M6`、`A`、`B` 系列 | `A8-acceptance.md` |
 | 数据目录 | `<场景>/<NN>-<变体>/` | `data/incremental-projection/01-before/` |
 | 环境文件 | `environment.txt` | 设备、系统、工具链 |
-| 图 | `NN-<主题>.png` | `figures/09-slab-merge.png` |
+| 图 | 新图 `NN-<主题>.png`，旧记录沿用原文件名 | `figures/09-slab-merge.png`、`figures/M1-actions.png` |
 
 主题用小写英文和连字符，不复述批次；同一场景的对照运行用两位序号区分。
 
@@ -52,13 +52,9 @@
 4. 更新本文件索引，放到对应分组。
 5. 不改旧记录的数字与结论；新的对照另起记录，并在旧记录里补一行指向新记录。
 
-## 历史例外
+## 图文件
 
-根目录下 9 张早期截图是旧布局，仍被对应报告直接引用：
-
-`A10-entity-persist.png`、`M1-actions.png`、`M1-client.png`、`M1-walk.png`、`M1-window.png`、`M2-presentation-fly.png`、`M2-presentation-walk.png`、`M5-net-client.png`、`M5-net-edit.png`。
-
-新截图一律放 `figures/`；上述文件在对应记录下次修订时迁移，不单独改动路径。
+截图统一放在 `figures/`。新图用两位序号命名，旧记录沿用原文件名（如 `figures/M1-actions.png`），不再散落到报告目录。报告里引用图时写相对路径 `figures/<name>`。
 
 ## 世界、客户端与图形
 

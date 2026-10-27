@@ -10,7 +10,7 @@
 # 服务端：新世界铺一层石头地面，持续Tick
 torse-server <world-dir> --listen 127.0.0.1:7799 --fill
 # 客户端：连接、镜像、渲染；autoplay每24帧对准星目标发一次破坏请求
-torse-client --window --connect 127.0.0.1:7799 --autoplay --frames 300 --screenshot M5-net-client.png
+torse-client --window --connect 127.0.0.1:7799 --autoplay --frames 300 --screenshot figures/M5-net-client.png
 ```
 
 ## 输出
@@ -26,7 +26,7 @@ frames=301 session=11 batches=0 requests_sent=13 requests_rejected=9
 
 ## 画面
 
-![联网客户端镜像的服务端世界](M5-net-client.png)
+![联网客户端镜像的服务端世界](figures/M5-net-client.png)
 
 画面为服务端演示世界的授权投影：灰色石板地面（服务端`--fill`初始世界内容）与两个橙棕色实体盒（服务端装配的两个库存实体）。基线相机近乎垂直俯视，避免视线漂出32x16格的订阅范围。
 

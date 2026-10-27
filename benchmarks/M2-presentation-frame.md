@@ -62,9 +62,9 @@ cargo run -p torse-client --locked -- --window --connect 127.0.0.1:7777 --walk -
 
 以下两张 PNG 由本次验证运行的 `torse-client` 截取，使用仓库现有内置内容与材质；未引入第三方图片、字体文件或其他外部二进制素材。这里只把选定的最终画面保存为场景证据，原始运行产物仍留在 `.work/`。
 
-![固定逻辑步驱动的飞行视角](M2-presentation-fly.png)
+![固定逻辑步驱动的飞行视角](figures/M2-presentation-fly.png)
 
-![固定逻辑步驱动的行走视角](M2-presentation-walk.png)
+![固定逻辑步驱动的行走视角](figures/M2-presentation-walk.png)
 
 ## 未覆盖范围
 

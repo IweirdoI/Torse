@@ -10,7 +10,7 @@
 # 交互：右键放置选中材质，左键破坏，数字键1到3切换石头/玻璃半砖/植物
 cargo run -p torse-client -- --window --radius 4
 # 自动取证：前向飞行并每24帧交替破坏/放置准星目标，呈现指定帧数后退出
-cargo run -p torse-client -- --window --autoplay --frames 360 --screenshot M1-actions.png --radius 3
+cargo run -p torse-client -- --window --autoplay --frames 360 --screenshot figures/M1-actions.png --radius 3
 ```
 
 ## 输出
@@ -27,7 +27,7 @@ sections=81 meshes=81 vertices=239324 faces=59831 elapsed_ms=3175
 
 ## 画面
 
-![窗口模式下的选中框与破坏痕迹](M1-actions.png)
+![窗口模式下的选中框与破坏痕迹](figures/M1-actions.png)
 
 相机贴近地表前向飞行，准星套在目标方块上的深色线框为选中框；画面中的凹陷是自动破坏留下的缺口。截取于debug运行最后一帧。
 

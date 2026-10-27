@@ -18,7 +18,7 @@ sections=25 meshes=25 entities=0 seq=0 vertices=76832 indices=115248 faces=19208
 
 ## 画面
 
-![丘陵地形的离屏渲染](M1-client.png)
+![丘陵地形的离屏渲染](figures/M1-client.png)
 
 俯视全景相机位于`(40, 18, 40)`，看向`(0, 6, 0)`。地形为种子7的丘陵生成器，基准高度7、振幅9，分区边长16，半径2。
 

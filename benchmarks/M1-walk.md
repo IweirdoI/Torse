@@ -10,7 +10,7 @@
 # 交互：F5在飞行与行走间切换，WASD行走，空格跳跃，鼠标拖动转向
 cargo run -p torse-client -- --window --radius 4
 # 自动取证：以行走模式启动并自动前进，遇到台阶自动跳跃
-cargo run --release -p torse-client -- --window --walk --autoplay --frames 2400 --screenshot M1-walk.png --radius 3
+cargo run --release -p torse-client -- --window --walk --autoplay --frames 2400 --screenshot figures/M1-walk.png --radius 3
 ```
 
 ## 输出
@@ -26,7 +26,7 @@ walker=(8.5,7.9,4.3)
 
 ## 画面
 
-![行走模式下的第一人称视角](M1-walk.png)
+![行走模式下的第一人称视角](figures/M1-walk.png)
 
 相机在实体眼睛高度略带俯角，贴地第一人称视角，准星套在正前方方块上；近处方块大、远处透视缩小，与飞行俯瞰明显不同。
 

@@ -70,6 +70,281 @@ fn session(server: &mut base::Files) {
         .register_session(viewer(), actor(), base::scope())
         .unwrap();
 }
+
+#[test]
+fn scope_replacement_invalidates_queued_old_views_and_preserves_request_sequence() {
+    use torse_sim::replica::ReplicaScope;
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    session(&mut server);
+    let near = ReplicaScope {
+        sections: [SectionPos::ZERO].into(),
+    };
+    let far = ReplicaScope {
+        sections: [SectionPos::new(1, 0, 0)].into(),
+    };
+    let old: Vec<_> = (0..2)
+        .map(|_| {
+            server
+                .open_replica(SessionId(1), near.clone(), base::budget())
+                .unwrap()
+                .subscription
+        })
+        .collect();
+    server
+        .register_session(
+            Viewer {
+                session: SessionId(2),
+                actor: ActorContextId(2),
+            },
+            actor(),
+            near.clone(),
+        )
+        .unwrap();
+    let control = server
+        .open_replica(SessionId(2), near.clone(), base::budget())
+        .unwrap();
+    server.submit(request(&server, 1, transfer()));
+    tick(&mut server);
+    assert!(
+        !server
+            .take_replica(control.subscription, base::budget())
+            .unwrap()
+            .is_empty()
+    );
+    let replacement = ActorContext::new(key("test:player"))
+        .permission(key("world:permission/edit"))
+        .section(SectionPos::new(1, 0, 0));
+    let invalidated = server
+        .replace_session_scope(SessionId(1), replacement, far.clone())
+        .unwrap();
+    assert_eq!(invalidated, old);
+    for id in &old {
+        assert_eq!(
+            server.take_replica(*id, base::budget()).unwrap_err().code,
+            FaultCode::ResetRequired
+        );
+        server.close_replica(*id).unwrap();
+    }
+    assert!(
+        server
+            .open_replica(SessionId(1), near, base::budget())
+            .is_err()
+    );
+    let seed = server
+        .open_replica(SessionId(1), far, base::budget())
+        .unwrap();
+    assert_eq!(seed.state.sections.len(), 1);
+    assert!(seed.state.entities.is_empty());
+    assert_eq!(
+        server.submit(request(&server, 1, transfer())),
+        Admission::Duplicate
+    );
+    let place = |target| Call {
+        action: key("world:action/place"),
+        version: 1,
+        target: ActionTarget::Block(target),
+        parameters: [(
+            key("world:field/block"),
+            ComponentValue::Content(key("base:stone")),
+        )]
+        .into(),
+    };
+    let denied = request(&server, 2, place(BlockPos::new(8, 1, 1)));
+    let denied_id = denied.id;
+    let accepted = request(&server, 3, place(BlockPos::new(17, 1, 1)));
+    let accepted_id = accepted.id;
+    server.submit(denied);
+    server.submit(accepted);
+    tick(&mut server);
+    assert_eq!(
+        server.receipt(denied_id).unwrap().unwrap().reply.status,
+        ReplyStatus::Rejected(RejectCode::PermissionDenied)
+    );
+    assert_eq!(
+        server.receipt(accepted_id).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    assert!(
+        !server
+            .take_replica(seed.subscription, base::budget())
+            .unwrap()
+            .is_empty()
+    );
+    for id in old {
+        assert_eq!(
+            server.take_replica(id, base::budget()).unwrap_err().code,
+            FaultCode::ResetRequired
+        );
+    }
+}
+
+#[test]
+fn rejected_scope_replacement_retains_authority_and_live_replica_queues() {
+    use torse_sim::replica::ReplicaScope;
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    session(&mut server);
+    let old = server
+        .open_replica(SessionId(1), base::scope(), base::budget())
+        .unwrap();
+    let oversized = ReplicaScope {
+        sections: (0..5).map(|x| SectionPos::new(x, 0, 0)).collect(),
+    };
+    assert!(
+        server
+            .replace_session_scope(SessionId(1), ActorContext::new(key("test:none")), oversized)
+            .is_err()
+    );
+    let mut oversized_actor = ActorContext::new(key("test:none"));
+    for x in 0..=torse_sim::action::MAX_ACTOR_SECTIONS {
+        oversized_actor = oversized_actor.section(SectionPos::new(x as i64, 0, 0));
+    }
+    assert!(
+        server
+            .replace_session_scope(SessionId(1), oversized_actor, base::scope())
+            .is_err()
+    );
+    assert!(
+        server
+            .replace_session_scope(SessionId(99), actor(), base::scope())
+            .is_err()
+    );
+    let queued = request(&server, 1, transfer());
+    let id = queued.id;
+    server.submit(queued);
+    tick(&mut server);
+    assert_eq!(
+        server.receipt(id).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    assert!(
+        !server
+            .take_replica(old.subscription, base::budget())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        server.submit(request(&server, 1, transfer())),
+        Admission::Duplicate
+    );
+}
+
+#[test]
+fn network_scope_replacement_reseeds_and_keeps_the_session_alive() {
+    use torse_sim::replica::ReplicaScope;
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    let (peer, mut client) = add(&mut hub, &server, actor());
+    hello(&mut client, server.binding());
+    hub.poll(&mut server).unwrap();
+    receive(&mut client);
+    send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.into_iter().collect(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    let old = seed(receive(&mut client));
+    let far = ReplicaScope {
+        sections: [SectionPos::new(1, 0, 0)].into(),
+    };
+    hub.replace_policy(
+        &mut server,
+        peer,
+        PeerPolicy {
+            actor: ActorContext::new(key("test:observer")),
+            scope: far,
+        },
+    )
+    .unwrap();
+    let fresh = seed(receive(&mut client));
+    assert_ne!(fresh.subscription, old.subscription);
+    assert_eq!(fresh.state.sections.len(), 1);
+    assert!(fresh.state.entities.is_empty());
+    assert_eq!(
+        server
+            .take_replica(old.subscription, base::budget())
+            .unwrap_err()
+            .code,
+        FaultCode::ResetRequired
+    );
+    let oversized = ReplicaScope {
+        sections: (0..5).map(|x| SectionPos::new(x, 0, 0)).collect(),
+    };
+    assert!(
+        hub.replace_policy(
+            &mut server,
+            peer,
+            PeerPolicy {
+                actor: actor(),
+                scope: oversized
+            }
+        )
+        .is_err()
+    );
+    server.drive_tick(&mut hub, 1024).unwrap();
+    hub.poll(&mut server).unwrap();
+    assert!(hub.contains(peer));
+    send(&mut client, ClientMessage::Ping);
+    hub.poll(&mut server).unwrap();
+    assert!(hub.contains(peer));
+}
+
+#[test]
+fn failed_network_reseed_closes_connection_and_revokes_replaced_session() {
+    let dir = Directory::new();
+    let mut server = create(&dir, Vec::new());
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    let (host, mut client) = MemoryTransport::pair(TransportLimits {
+        frame: 8_388_608,
+        queued_frames: 1,
+        queued_bytes: 16_777_216,
+        poll_bytes: 262_144,
+    })
+    .unwrap();
+    let peer = hub
+        .add(
+            host,
+            PeerPolicy {
+                actor: actor(),
+                scope: base::scope(),
+            },
+            Tick(0),
+        )
+        .unwrap();
+    hello(&mut client, server.binding());
+    hub.poll(&mut server).unwrap();
+    receive(&mut client);
+    send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: base::scope().sections.into_iter().collect(),
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    // Keep the old seed queued so replacement output has no available slot.
+    assert!(
+        hub.replace_policy(
+            &mut server,
+            peer,
+            PeerPolicy {
+                actor: ActorContext::new(key("test:observer")),
+                scope: base::scope()
+            }
+        )
+        .is_err()
+    );
+    assert!(!hub.contains(peer));
+    assert!(client.receive().is_err());
+    assert!(
+        server
+            .open_replica(SessionId(1), base::scope(), base::budget())
+            .is_err()
+    );
+}
 fn transfer() -> Call {
     Call {
         action: key("inventory:action/transfer"),

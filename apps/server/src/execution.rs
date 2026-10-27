@@ -460,12 +460,14 @@ impl ExecutionHost {
         Ok(())
     }
     /// Replace trusted grants without resetting the session request sequence.
+    /// Invalidates every old projection immediately. The caller must consume
+    /// the returned control signal before sending any further replica data.
     pub fn replace_session_scope(
         &mut self,
         session: SessionId,
         actor: ActorContext,
         scope: ReplicaScope,
-    ) -> Result<(), Fault> {
+    ) -> Result<Vec<SubscriptionId>, Fault> {
         if scope.sections.len() > self.limits.replicas.max_sections
             || actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
         {
@@ -475,9 +477,10 @@ impl ExecutionHost {
             .sessions
             .get_mut(&session.0)
             .ok_or_else(|| Fault::invalid_data("unknown session"))?;
+        let invalidated = self.source.invalidate_viewer(live.viewer);
         live.actor = actor;
         live.scope = scope;
-        Ok(())
+        Ok(invalidated)
     }
 
     pub fn revoke_session(&mut self, session: SessionId) -> Vec<SubscriptionId> {

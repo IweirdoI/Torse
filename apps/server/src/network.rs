@@ -31,12 +31,14 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.authority()?;
         self.authority.register_session(viewer, actor, scope)
     }
+    /// Retire old authorized projections and return their independent control
+    /// signal. Hosts must clear downstream copies before further sends.
     pub fn replace_session_scope(
         &mut self,
         session: SessionId,
         actor: ActorContext,
         scope: ReplicaScope,
-    ) -> Result<(), Fault> {
+    ) -> Result<Vec<SubscriptionId>, Fault> {
         self.authority()?;
         self.authority.replace_session_scope(session, actor, scope)
     }
@@ -248,6 +250,7 @@ impl<T: Transport> NetworkHub<T> {
     }
     /// Trusted application-driven scope replacement. Re-seed live subscriptions
     /// before retiring sections so residency invalidation cannot close this peer.
+    /// Failure after replacing grants closes and revokes the connection.
     pub fn replace_policy<
         J: CommitJournal<ExecutionModel>,
         S: HostCheckpointStore<ExecutionModel>,
@@ -265,18 +268,33 @@ impl<T: Transport> NetworkHub<T> {
             return Err(Fault::invalid_data("closed peer"));
         }
         if let Some(viewer) = peer.viewer {
-            server.replace_session_scope(
+            let invalidated = server.replace_session_scope(
                 viewer.session,
                 policy.actor.clone(),
                 policy.scope.clone(),
             )?;
-            for old in std::mem::take(&mut peer.subscriptions) {
-                server.close_replica(SubscriptionId(old))?;
+            // After authorization changes, a failed replacement cannot leave a
+            // connection running with its old policy or projection. Retire all
+            // old IDs, including subscriptions opened directly by the host.
+            let replacement = (|| -> Result<(), Fault> {
+                peer.subscriptions.extend(invalidated.iter().map(|id| id.0));
+                for old in std::mem::take(&mut peer.subscriptions) {
+                    server.close_replica(SubscriptionId(old))?;
+                }
+                let seed = server.open_replica(
+                    viewer.session,
+                    policy.scope.clone(),
+                    self.limits.budget,
+                )?;
+                peer.subscriptions.insert(seed.subscription.0);
+                Self::send(peer, ServerMessage::Seed(seed), self.limits)
+            })();
+            if let Err(error) = replacement {
+                peer.closed = true;
+                peer.transport.close();
+                self.cleanup(server)?;
+                return Err(error);
             }
-            let seed =
-                server.open_replica(viewer.session, policy.scope.clone(), self.limits.budget)?;
-            peer.subscriptions.insert(seed.subscription.0);
-            Self::send(peer, ServerMessage::Seed(seed), self.limits)?;
         }
         peer.policy = policy;
         Ok(())

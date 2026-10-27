@@ -1,6 +1,7 @@
 //! Composed owner-authored actions through admission, frozen work and recovery.
 mod support;
 use support::Directory;
+use torse_content::{ComponentField, ComponentFieldType, ComponentSchema, PersistencePolicy};
 use torse_content::{SourceRef, Sourced, compile, m0_fixture_pack};
 use torse_inventory::{Inventory, InventoryOperation, ItemCatalog, ItemStack, plan_inventory};
 use torse_server::{bootstrap as base, execution::*, *};
@@ -14,6 +15,123 @@ fn key(value: &str) -> ContentKey {
     base::key(value)
 }
 const POS: BlockPos = BlockPos::new(8, 1, 1);
+const DROP_POS: Position = Position::new(17.25, 1.25, 1.25);
+
+fn drop_schema() -> ContentKey {
+    key("drops:schema/stack")
+}
+fn drop_fields() -> ComponentFields {
+    [
+        (
+            key("drops:field/item"),
+            ComponentValue::Content(key("base:stone")),
+        ),
+        (key("drops:field/count"), ComponentValue::U32(1)),
+    ]
+    .into()
+}
+
+enum Lifecycle {
+    Break,
+    Pickup,
+    Create,
+    Remove,
+    Collect,
+}
+impl ActionHandler for Lifecycle {
+    fn plan(
+        &self,
+        view: &ActionView<'_>,
+        request: &ActionRequest,
+    ) -> Result<ActionOutput, RejectCode> {
+        let invoke = |action: &str| ActionInvocation {
+            action: key(action),
+            api_version: 1,
+            target: request.target,
+            parameters: ComponentFields::new(),
+        };
+        match self {
+            Self::Break => Ok(ActionOutput::Invoke(vec![
+                invoke("world:action/break"),
+                invoke("drops:action/create"),
+            ])),
+            Self::Pickup => Ok(ActionOutput::Invoke(vec![
+                invoke("inventory:action/collect"),
+                invoke("drops:action/remove"),
+            ])),
+            Self::Create => {
+                if view.caller_action() != Some(&key("craft:action/break")) {
+                    return Err(RejectCode::PermissionDenied);
+                }
+                let ActionTarget::Block(pos) = request.target else {
+                    return Err(RejectCode::InvalidData);
+                };
+                if view.terrain(pos)?.ready() != view.default_state(&key("base:stone")) {
+                    return Err(RejectCode::InvalidData);
+                }
+                let mut tx =
+                    Transaction::new(request.transaction, key("drops:module"), request.ordering);
+                tx.read_block(
+                    pos,
+                    view.terrain(pos)?.ready().ok_or(RejectCode::NotLoaded)?,
+                );
+                tx.spawn_entity(DROP_POS, [(drop_schema(), drop_fields())].into());
+                Ok(ActionOutput::Mutation(Box::new(tx)))
+            }
+            Self::Remove => {
+                if view.caller_action() != Some(&key("craft:action/pickup")) {
+                    return Err(RejectCode::PermissionDenied);
+                }
+                let ActionTarget::Entity(id) = request.target else {
+                    return Err(RejectCode::InvalidData);
+                };
+                let (handle, entity) = view.entity(id)?;
+                let mut tx =
+                    Transaction::new(request.transaction, key("drops:module"), request.ordering);
+                tx.despawn_entity(handle, entity);
+                Ok(ActionOutput::Mutation(Box::new(tx)))
+            }
+            Self::Collect => {
+                if view.caller_action() != Some(&key("craft:action/pickup")) {
+                    return Err(RejectCode::PermissionDenied);
+                }
+                let ActionTarget::Entity(id) = request.target else {
+                    return Err(RejectCode::InvalidData);
+                };
+                let fields = view.component(id, &drop_schema())?;
+                let (Some(ComponentValue::Content(item)), Some(ComponentValue::U32(count))) = (
+                    fields.get(&key("drops:field/item")),
+                    fields.get(&key("drops:field/count")),
+                ) else {
+                    return Err(RejectCode::InvalidData);
+                };
+                let catalog = ItemCatalog::new([(key("base:stone"), 64)]).unwrap();
+                let target = EntityId(1);
+                let expected = [(
+                    target,
+                    view.component(target, &torse_inventory::schema())?.clone(),
+                )]
+                .into();
+                let plan = plan_inventory(
+                    view,
+                    &catalog,
+                    &[InventoryOperation::Insert {
+                        target,
+                        slot: 0,
+                        stack: ItemStack {
+                            item: item.clone(),
+                            count: *count,
+                        },
+                    }],
+                    &expected,
+                    request.transaction,
+                    request.ordering,
+                )?;
+                Ok(ActionOutput::Mutation(Box::new(plan.into_parts().0)))
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -152,6 +270,85 @@ fn world(mode: Mode) -> (WorldAuthority, ActionService) {
         SourceRef::new("native/test", 0),
         consume.clone(),
     ));
+    let mut lifecycle_actions = Vec::new();
+    for (action, owner, lifecycle, target_schema) in [
+        ("craft:action/break", "craft:module", Lifecycle::Break, None),
+        (
+            "craft:action/pickup",
+            "craft:module",
+            Lifecycle::Pickup,
+            Some(drop_schema()),
+        ),
+        (
+            "drops:action/create",
+            "drops:module",
+            Lifecycle::Create,
+            None,
+        ),
+        (
+            "drops:action/remove",
+            "drops:module",
+            Lifecycle::Remove,
+            Some(drop_schema()),
+        ),
+        (
+            "inventory:action/collect",
+            "inventory:module",
+            Lifecycle::Collect,
+            Some(drop_schema()),
+        ),
+    ] {
+        let mut descriptor = compose.clone();
+        descriptor.id = key(action);
+        descriptor.handler.handler = key(action);
+        descriptor.handler.owner_module = key(owner);
+        descriptor.parameter_schema = key("world:schema/result");
+        descriptor.permission.permission = None;
+        descriptor.target_constraints = target_schema.into_iter().collect();
+        descriptor.max_items = 64;
+        descriptor.max_bytes = 65536;
+        lifecycle_actions.push((descriptor, lifecycle));
+    }
+    register_action_module(
+        &mut pack,
+        key("drops:module"),
+        key("drops:state"),
+        vec![ComponentSchema {
+            id: drop_schema(),
+            schema_version: 1,
+            owner_module: key("drops:module"),
+            fields: vec![
+                ComponentField {
+                    id: key("drops:field/item"),
+                    field_type: ComponentFieldType::ContentReference,
+                    required: true,
+                },
+                ComponentField {
+                    id: key("drops:field/count"),
+                    field_type: ComponentFieldType::Unsigned32,
+                    required: true,
+                },
+            ],
+            persistence: PersistencePolicy::Always,
+            replication: ReplicationDeclaration::SERVER_PRIVATE,
+            migration_binding: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    for (descriptor, _) in &lifecycle_actions {
+        pack.modules
+            .iter_mut()
+            .find(|m| m.value.id == descriptor.handler.owner_module)
+            .unwrap()
+            .value
+            .registered_actions
+            .push(descriptor.id.clone());
+        pack.actions.push(Sourced::new(
+            SourceRef::new("native/test", 0),
+            descriptor.clone(),
+        ));
+    }
     let content = compile(pack).unwrap();
     let (schemas, compatibility) = ComponentSchemas::assemble(
         &content,
@@ -181,6 +378,14 @@ fn world(mode: Mode) -> (WorldAuthority, ActionService) {
             implementation: Box::new(Compose(mode)),
         },
     ]);
+    for (descriptor, lifecycle) in lifecycle_actions {
+        handlers.push(NativeHandler {
+            handler: descriptor.handler.handler.clone(),
+            owner: descriptor.handler.owner_module.clone(),
+            implementation: Box::new(lifecycle),
+        });
+        descriptors.push(descriptor);
+    }
     let service = ActionService::bind(descriptors, handlers, &schemas).unwrap();
     let mut world = WorldAuthority::new(
         base::WORLD,
@@ -224,6 +429,9 @@ fn world(mode: Mode) -> (WorldAuthority, ActionService) {
 }
 fn create(dir: &Directory, mode: Mode) -> base::Files {
     let (world, actions) = world(mode);
+    create_world(dir, world, actions)
+}
+fn create_world(dir: &Directory, world: WorldAuthority, actions: ActionService) -> base::Files {
     base::Files::create_file(
         dir.acquire(),
         world.coordinator().compatibility(),
@@ -241,6 +449,291 @@ fn create(dir: &Directory, mode: Mode) -> base::Files {
     )
     .unwrap()
 }
+
+fn create_lifecycle(dir: &Directory, full: bool) -> base::Files {
+    let (mut world, service) = world(Mode::Normal);
+    let mut section = Section::empty(16).unwrap();
+    section
+        .set(
+            LocalPos { x: 8, y: 1, z: 1 },
+            world.registry().default_state(&key("base:stone")).unwrap(),
+        )
+        .unwrap();
+    world.store_mut().unload(SectionPos::ZERO).unwrap();
+    world.store_mut().request(SectionPos::ZERO).unwrap();
+    world
+        .store_mut()
+        .install(SectionPos::ZERO, section)
+        .unwrap();
+    world.store_mut().finish_load(SectionPos::ZERO).unwrap();
+    if full {
+        let schemas = world.schemas().clone();
+        let catalog = ItemCatalog::new([(key("base:stone"), 64)]).unwrap();
+        let mut inventory = Inventory::new(1).unwrap();
+        inventory
+            .set(
+                0,
+                Some(ItemStack {
+                    item: key("base:stone"),
+                    count: 64,
+                }),
+                &catalog,
+            )
+            .unwrap();
+        let handle = world.entities().handle_of(EntityId(1)).unwrap();
+        world
+            .entities_mut()
+            .components_mut(handle)
+            .unwrap()
+            .insert(&schemas, &torse_inventory::schema(), inventory.fields())
+            .unwrap();
+    }
+    create_world(dir, world, service)
+}
+fn life_actor(spawn: bool, despawn: bool, location: bool) -> ActorContext {
+    let mut actor = actor(true, true)
+        .permission(key("inventory:permission/insert"))
+        .target(ActionTarget::Entity(EntityId(2)));
+    if spawn {
+        actor = actor.permission(spawn_permission());
+    }
+    if despawn {
+        actor = actor.permission(despawn_permission());
+    }
+    if location {
+        actor = actor.target(ActionTarget::Block(DROP_POS.checked_block().unwrap()));
+    }
+    actor
+}
+fn life_request(server: &base::Files, seq: u64, pickup: bool) -> WorldRequest<Call> {
+    let mut request = request(server, seq);
+    request.input = Call {
+        action: key(if pickup {
+            "craft:action/pickup"
+        } else {
+            "craft:action/break"
+        }),
+        version: 1,
+        target: if pickup {
+            ActionTarget::Entity(EntityId(2))
+        } else {
+            ActionTarget::Block(POS)
+        },
+        parameters: ComponentFields::new(),
+    };
+    request
+}
+fn drop_state(server: &base::Files) -> Option<EntityState> {
+    let world = server.authority().unwrap().world();
+    world
+        .entities()
+        .handle_of(EntityId(2))
+        .and_then(|handle| world.entities().get(handle))
+        .map(EntityState::capture)
+}
+
+#[test]
+fn break_spawn_recovers_and_drop_identity_survives_section_unload_reload() {
+    let dir = Directory::new();
+    let mut server = create_lifecycle(&dir, false);
+    session(&mut server, life_actor(true, true, true));
+    let queued = life_request(&server, 1, false);
+    let id = queued.id;
+    server.submit(queued);
+    freeze(&mut server);
+    assert!(placed(&server));
+    assert!(drop_state(&server).is_none());
+    drop(server);
+    let mut server = reopen(&dir);
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    assert!(!placed(&server));
+    assert_eq!(
+        server.receipt(id).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    let state = drop_state(&server).unwrap();
+    assert_eq!(state.position_bits, DROP_POS.to_bits());
+    assert_eq!(state.components[&drop_schema()], drop_fields());
+    let next = server
+        .authority()
+        .unwrap()
+        .world()
+        .entities()
+        .next_entity_id();
+    let root = dir.0.join("sections");
+    std::fs::create_dir_all(&root).unwrap();
+    let pages = torse_server::section_pages::SectionPages::new(
+        root,
+        base::budget(),
+        base::codec_limits(),
+        64,
+    )
+    .unwrap();
+    let section = SectionPos::new(1, 0, 0);
+    assert!(matches!(
+        server
+            .unload_section(&pages, section, &mut NoReplicas)
+            .unwrap(),
+        CommitStep::Durable(_)
+    ));
+    assert!(drop_state(&server).is_none());
+    drop(server);
+    let mut server = reopen(&dir);
+    assert!(drop_state(&server).is_none());
+    assert!(matches!(
+        server
+            .reload_section(&pages, section, &mut NoReplicas)
+            .unwrap(),
+        CommitStep::Durable(_)
+    ));
+    assert_eq!(drop_state(&server), Some(state));
+    assert_eq!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .entities()
+            .next_entity_id(),
+        next
+    );
+    session(&mut server, life_actor(true, true, true));
+    let queued = life_request(&server, 2, true);
+    let id = queued.id;
+    server.submit(queued);
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    assert_eq!(
+        server.receipt(id).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    assert!(drop_state(&server).is_none());
+    let final_stock = stock(&server);
+    drop(server);
+    let server = reopen(&dir);
+    assert_eq!(stock(&server), final_stock);
+    assert!(drop_state(&server).is_none());
+}
+
+#[test]
+fn simultaneous_pickups_and_duplicate_requests_collect_exactly_once() {
+    let dir = Directory::new();
+    let mut server = create_lifecycle(&dir, false);
+    session(&mut server, life_actor(true, true, true));
+    server.submit(life_request(&server, 1, false));
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    let a = life_request(&server, 2, true);
+    let b = life_request(&server, 3, true);
+    let ids = [a.id, b.id];
+    server.submit(a);
+    server.submit(b);
+    assert_eq!(
+        server.submit(life_request(&server, 2, true)),
+        Admission::Duplicate
+    );
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    assert_eq!(
+        server.receipt(ids[0]).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    assert!(matches!(
+        server.receipt(ids[1]).unwrap().unwrap().reply.status,
+        ReplyStatus::Rejected(_)
+    ));
+    assert_eq!(
+        server.submit(life_request(&server, 2, true)),
+        Admission::Duplicate
+    );
+    assert!(drop_state(&server).is_none());
+    let catalog = ItemCatalog::new([(key("base:stone"), 64)]).unwrap();
+    assert_eq!(
+        Inventory::from_fields(&stock(&server), &catalog)
+            .unwrap()
+            .slots()[0]
+            .as_ref()
+            .unwrap()
+            .count,
+        2
+    );
+}
+
+#[test]
+fn lifecycle_permissions_full_inventory_and_direct_resource_children_fail_atomically() {
+    for actor in [life_actor(false, true, true), life_actor(true, true, false)] {
+        let dir = Directory::new();
+        let mut server = create_lifecycle(&dir, false);
+        session(&mut server, actor);
+        let queued = life_request(&server, 1, false);
+        let id = queued.id;
+        server.submit(queued);
+        server.drive_tick(&mut NoReplicas, 1024).unwrap();
+        assert_eq!(
+            server.receipt(id).unwrap().unwrap().reply.status,
+            ReplyStatus::Rejected(RejectCode::PermissionDenied)
+        );
+        assert!(placed(&server));
+        assert!(drop_state(&server).is_none());
+        assert_eq!(
+            server
+                .authority()
+                .unwrap()
+                .world()
+                .entities()
+                .next_entity_id(),
+            2
+        );
+    }
+    for full in [false, true] {
+        let dir = Directory::new();
+        let mut server = create_lifecycle(&dir, full);
+        session(&mut server, life_actor(true, full, true));
+        server.submit(life_request(&server, 1, false));
+        server.drive_tick(&mut NoReplicas, 1024).unwrap();
+        let before = drop_state(&server).unwrap();
+        let inventory = stock(&server);
+        let queued = life_request(&server, 2, true);
+        let id = queued.id;
+        server.submit(queued);
+        server.drive_tick(&mut NoReplicas, 1024).unwrap();
+        assert_eq!(
+            server.receipt(id).unwrap().unwrap().reply.status,
+            ReplyStatus::Rejected(if full {
+                RejectCode::Conflict
+            } else {
+                RejectCode::PermissionDenied
+            })
+        );
+        assert_eq!(drop_state(&server), Some(before));
+        assert_eq!(stock(&server), inventory);
+    }
+    let dir = Directory::new();
+    let mut server = create_lifecycle(&dir, false);
+    session(&mut server, life_actor(true, true, true));
+    server.submit(life_request(&server, 1, false));
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    for (seq, action, target) in [
+        (
+            2,
+            "inventory:action/collect",
+            ActionTarget::Entity(EntityId(2)),
+        ),
+        (3, "drops:action/remove", ActionTarget::Entity(EntityId(2))),
+        (4, "drops:action/create", ActionTarget::Block(POS)),
+    ] {
+        let inventory = stock(&server);
+        let drop = drop_state(&server);
+        let mut queued = life_request(&server, seq, true);
+        queued.input.action = key(action);
+        queued.input.target = target;
+        let id = queued.id;
+        server.submit(queued);
+        server.drive_tick(&mut NoReplicas, 1024).unwrap();
+        assert_eq!(
+            server.receipt(id).unwrap().unwrap().reply.status,
+            ReplyStatus::Rejected(RejectCode::PermissionDenied)
+        );
+        assert_eq!(stock(&server), inventory);
+        assert_eq!(drop_state(&server), drop);
+    }
+}
 fn reopen(dir: &Directory) -> base::Files {
     let (world, actions) = world(Mode::Normal);
     base::Files::open_file(
@@ -249,14 +742,25 @@ fn reopen(dir: &Directory) -> base::Files {
         base::Codec::new(base::codec_limits()).unwrap(),
         base::file_policy(),
         |binding| {
-            Ok(ExecutionRecovery::new(
+            let mut recovery = ExecutionRecovery::new(
                 binding,
                 world.registry(),
                 world.schemas(),
                 actions,
                 Vec::new(),
                 base::execution_limits(),
-            ))
+            );
+            let root = dir.0.join("sections");
+            if root.is_dir() {
+                recovery =
+                    recovery.with_section_pages(torse_server::section_pages::SectionPages::new(
+                        root,
+                        base::budget(),
+                        base::codec_limits(),
+                        64,
+                    )?);
+            }
+            Ok(recovery)
         },
     )
     .unwrap()

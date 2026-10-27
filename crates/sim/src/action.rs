@@ -9,10 +9,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use torse_actions::{ActionDescriptor, ActionKind, ActionRegistry, validate_actions};
-use torse_types::{BlockPos, ContentKey, EntityId, RejectCode, SectionPos, TransactionId};
+use torse_types::{
+    BlockPos, ContentKey, EntityHandle, EntityId, RejectCode, SectionPos, TransactionId,
+};
 use torse_world::{
-    BlockStateId, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue, TerrainQuery,
-    component_size,
+    BlockStateId, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue, Entity,
+    Position, TerrainQuery, component_size,
 };
 use torse_world_services::Aabb;
 
@@ -158,7 +160,11 @@ impl ActorContext {
     }
     /// Open the same restricted view for a scheduled native operation.
     pub fn view<'a>(&'a self, world: &'a WorldAuthority) -> ActionView<'a> {
-        ActionView { world, actor: self }
+        ActionView {
+            world,
+            actor: self,
+            caller: None,
+        }
     }
     /// Whether the host granted access to this exact target. Section grants
     /// are not consulted; use [`ActorContext::allows_block`] for cells.
@@ -207,6 +213,16 @@ pub struct ActionInvocation {
 pub const MAX_ACTION_DEPTH: usize = 4;
 pub const MAX_ACTION_INVOCATIONS: usize = 16;
 
+/// Explicit host permission for creating ordinary entities at granted cells.
+pub fn spawn_permission() -> ContentKey {
+    ContentKey::parse("world:permission/spawn").expect("static permission")
+}
+
+/// Explicit host permission for removing individually granted ordinary entities.
+pub fn despawn_permission() -> ContentKey {
+    ContentKey::parse("world:permission/despawn").expect("static permission")
+}
+
 /// A bounded query result or an unpublished mutation plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionOutput {
@@ -227,9 +243,17 @@ pub enum ActionOutput {
 pub struct ActionView<'a> {
     world: &'a WorldAuthority,
     actor: &'a ActorContext,
+    caller: Option<&'a ContentKey>,
 }
 
 impl ActionView<'_> {
+    /// Immediate parent established by dispatch, absent for an external request
+    /// or a scheduled native view. A child that produces external resources
+    /// must restrict its caller to the trusted composition that removes them.
+    /// This provenance never grants permissions or target access by itself.
+    pub fn caller_action(&self) -> Option<&ContentKey> {
+        self.caller
+    }
     pub fn actor(&self) -> &ActorContext {
         self.actor
     }
@@ -258,6 +282,24 @@ impl ActionView<'_> {
             .get(handle)
             .and_then(|entity| entity.components.component(schema))
             .ok_or(RejectCode::MissingTarget)
+    }
+    /// Observe a granted entity and its current runtime generation. Lifecycle
+    /// planners capture both its identity and full state as a removal condition.
+    pub fn entity(&self, id: EntityId) -> Result<(EntityHandle, &Entity), RejectCode> {
+        if !self.actor.allows(ActionTarget::Entity(id)) {
+            return Err(RejectCode::PermissionDenied);
+        }
+        let handle = self
+            .world
+            .entities()
+            .handle_of(id)
+            .ok_or(RejectCode::MissingTarget)?;
+        let entity = self
+            .world
+            .entities()
+            .get(handle)
+            .ok_or(RejectCode::MissingTarget)?;
+        Ok((handle, entity))
     }
     pub fn default_state(&self, block: &ContentKey) -> Option<BlockStateId> {
         self.world.registry().default_state(block)
@@ -450,7 +492,7 @@ impl ActionService {
         phase: Phase,
         request: &ActionRequest,
     ) -> Result<ActionOutput, RejectCode> {
-        self.dispatch(world, actor, phase, request, 0, &mut 0)
+        self.dispatch(world, actor, phase, request, &mut Vec::new(), &mut 0)
     }
 
     fn dispatch(
@@ -459,11 +501,11 @@ impl ActionService {
         actor: &ActorContext,
         phase: Phase,
         request: &ActionRequest,
-        depth: usize,
+        path: &mut Vec<ContentKey>,
         calls: &mut usize,
     ) -> Result<ActionOutput, RejectCode> {
         *calls += 1;
-        if depth >= MAX_ACTION_DEPTH || *calls > MAX_ACTION_INVOCATIONS {
+        if path.len() >= MAX_ACTION_DEPTH || *calls > MAX_ACTION_INVOCATIONS {
             return Err(RejectCode::QuotaExceeded);
         }
         let action = self
@@ -526,9 +568,14 @@ impl ActionService {
             .handlers
             .get(&action.handler.handler)
             .expect("frozen handler exists");
-        let output = handler
-            .implementation
-            .plan(&ActionView { world, actor }, request)?;
+        let output = handler.implementation.plan(
+            &ActionView {
+                world,
+                actor,
+                caller: path.last(),
+            },
+            request,
+        )?;
         if let ActionOutput::Invoke(invocations) = output {
             if action.kind != ActionKind::Mutation {
                 return Err(RejectCode::InvalidData);
@@ -537,6 +584,7 @@ impl ActionService {
                 return Err(RejectCode::QuotaExceeded);
             }
             let mut members = Vec::new();
+            path.push(request.action.clone());
             for invocation in invocations {
                 let child = ActionRequest {
                     action: invocation.action,
@@ -547,7 +595,7 @@ impl ActionService {
                     transaction: request.transaction,
                     ordering: request.ordering,
                 };
-                match self.dispatch(world, actor, phase, &child, depth + 1, calls)? {
+                match self.dispatch(world, actor, phase, &child, path, calls)? {
                     ActionOutput::Mutation(tx) => members.push(*tx),
                     ActionOutput::Atomic(group) => members.extend(group.members),
                     _ => return Err(RejectCode::InvalidData),
@@ -556,6 +604,7 @@ impl ActionService {
                     return Err(RejectCode::QuotaExceeded);
                 }
             }
+            path.pop();
             check_group_budget(&members, action.max_items, action.max_bytes)?;
             let group = TransactionGroup::new(request.transaction, request.ordering, members)?;
             world.prepare_group(&group).map_err(prepare_rejection)?;
@@ -581,9 +630,9 @@ impl ActionService {
                 }
             }
             ActionOutput::Mutation(tx) if action.kind == ActionKind::Mutation => {
-                // Lifecycle actions need their own target and creation grants. Until those
-                // are declared, native handlers cannot emit trusted-host lifecycle work.
-                if !tx.spawns.is_empty() || !tx.despawns.is_empty() {
+                if (!tx.spawns.is_empty() && !actor.permits(&spawn_permission()))
+                    || (!tx.despawns.is_empty() && !actor.permits(&despawn_permission()))
+                {
                     return Err(RejectCode::PermissionDenied);
                 }
                 if tx.source != handler.owner
@@ -591,6 +640,28 @@ impl ActionService {
                     || tx.ordering != request.ordering
                 {
                     return Err(RejectCode::InvalidData);
+                }
+                for spawn in &tx.spawns {
+                    let pos = Position::from_bits(spawn.position_bits)
+                        .checked_block()
+                        .ok_or(RejectCode::InvalidData)?;
+                    if !actor.allows_block(pos, side) {
+                        return Err(RejectCode::PermissionDenied);
+                    }
+                }
+                if tx
+                    .despawns
+                    .iter()
+                    .any(|despawn| !actor.allows(ActionTarget::Entity(despawn.previous.id)))
+                {
+                    return Err(RejectCode::PermissionDenied);
+                }
+                if !tx.spawns.is_empty() || !tx.despawns.is_empty() {
+                    check_group_budget(
+                        std::slice::from_ref(tx.as_ref()),
+                        action.max_items,
+                        action.max_bytes,
+                    )?;
                 }
                 let blocks = tx
                     .preconditions

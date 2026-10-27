@@ -63,7 +63,8 @@ impl Position {
         Self::new(self.x + delta[0], self.y + delta[1], self.z + delta[2])
     }
 
-    /// Floor position to the containing block cell.
+    /// Floor position to the containing block cell, using saturating casts.
+    /// Use `checked_block` at admission boundaries instead.
     pub fn block(self) -> BlockPos {
         BlockPos::new(
             self.x.floor() as i64,
@@ -72,9 +73,20 @@ impl Position {
         )
     }
 
+    /// Convert only finite positions whose floored cells fit signed 64-bit axes.
+    /// The upper limit is exclusive: `i64::MAX as f64` rounds up to 2^63.
+    pub fn checked_block(self) -> Option<BlockPos> {
+        fn axis(value: f64) -> Option<i64> {
+            let floor = value.floor();
+            (floor.is_finite() && floor >= i64::MIN as f64 && floor < -(i64::MIN as f64))
+                .then_some(floor as i64)
+        }
+        Some(BlockPos::new(axis(self.x)?, axis(self.y)?, axis(self.z)?))
+    }
+
     /// Section that contains this position, given a section side.
     pub fn section(self, side: u32) -> Option<SectionPos> {
-        let block = self.block();
+        let block = self.checked_block()?;
         block.to_section(side).ok().map(|(section, _)| section)
     }
 }
@@ -320,19 +332,19 @@ impl EntityStore {
 
     /// Spawn an entity at a position.
     pub fn spawn(&mut self, position: Position) -> Result<EntityHandle, EntityError> {
-        if !position.is_finite() {
-            return Err(EntityError::InvalidPosition);
+        let section = position
+            .section(self.side)
+            .ok_or(EntityError::InvalidPosition)?;
+        if self.free.is_empty() {
+            u32::try_from(self.slots.len()).map_err(|_| EntityError::IdExhausted)?;
         }
         let id = EntityId(self.next_id);
         id.validate().map_err(|_| EntityError::IdExhausted)?;
-        self.next_id = self
+        let next_id = self
             .next_id
             .checked_add(1)
             .ok_or(EntityError::IdExhausted)?;
 
-        let section = position
-            .section(self.side)
-            .ok_or(EntityError::InvalidPosition)?;
         let entity = Entity {
             id,
             position,
@@ -361,6 +373,7 @@ impl EntityStore {
         }
         self.live += 1;
         self.by_id.insert(id, slot_index);
+        self.next_id = next_id;
         Ok(EntityHandle {
             slot: slot_index,
             generation,

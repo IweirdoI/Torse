@@ -14,6 +14,8 @@ pub struct PresentationClock {
     step: f64,
     max_steps: u32,
     accumulator: f64,
+    /// Rounding allowance in step units carried with the fractional phase.
+    phase_roundoff: f64,
 }
 
 impl PresentationClock {
@@ -30,6 +32,7 @@ impl PresentationClock {
             step,
             max_steps,
             accumulator: 0.0,
+            phase_roundoff: 0.0,
         })
     }
 
@@ -53,32 +56,36 @@ impl PresentationClock {
             return 0;
         }
         let sum = self.accumulator + dt;
-        if !sum.is_finite() {
-            // Scaling before adding keeps even an overflowing finite sum
-            // defined. accumulator < step, so this ratio remains finite.
-            let owed = self.accumulator / self.step + dt / self.step;
-            self.accumulator = owed.fract() * self.step;
-            return owed.floor().min(f64::from(self.max_steps)) as u32;
-        }
-        // Decimal steps such as 1/20 are not exactly representable. Treat a
-        // few ulps at a step boundary as equality, without rounding actual
-        // partial frames up to a full tick.
-        let mut owed = sum / self.step;
-        if owed < f64::from(self.max_steps) + 1.0 {
-            let tolerance = 8.0 * f64::EPSILON * owed.max(1.0);
+        // Scale before adding only when the finite operands overflow their
+        // sum. accumulator < step, so this scaled sum remains finite.
+        let mut owed = if sum.is_finite() {
+            sum / self.step
+        } else {
+            self.accumulator / self.step + dt / self.step
+        };
+        // Normalize in step units before applying the catch-up cap. Decimal
+        // steps such as 1/20 are not exactly representable: taking 2.0 % 0.05
+        // instead leaves almost a full step and invents a tick next frame.
+        // Capped and uncapped frames must use the same boundary tolerance.
+        if owed.is_finite() {
+            let tolerance = self.phase_roundoff + 8.0 * f64::EPSILON * owed.max(1.0);
             if (owed - owed.round()).abs() <= tolerance {
                 owed = owed.round();
+                self.phase_roundoff = 0.0;
+            } else {
+                // A fractional hitch can lose precision at its original
+                // scale. Preserve that allowance until the phase reaches a
+                // boundary; the next short frame must not shrink it away.
+                self.phase_roundoff = tolerance;
             }
             self.accumulator = owed.fract() * self.step;
             return owed.floor().min(f64::from(self.max_steps)) as u32;
         }
-        // Remainder avoids repeated subtraction and also works when a very
-        // small step makes the quotient overflow. Whole overdue steps drop.
+        // A very small step can overflow the quotient even with a finite
+        // interval. All whole overdue steps exceed the cap in that case;
+        // remainder still provides a finite presentation phase.
         self.accumulator = sum % self.step;
-        let tolerance = self.step * (8.0 * f64::EPSILON);
-        if self.accumulator <= tolerance || self.step - self.accumulator <= tolerance {
-            self.accumulator = 0.0;
-        }
+        self.phase_roundoff = 0.0;
         self.max_steps
     }
 
@@ -101,6 +108,7 @@ impl PresentationClock {
     /// interpolation phase so the next frames do not glide from the stale span.
     pub fn reset(&mut self) {
         self.accumulator = 0.0;
+        self.phase_roundoff = 0.0;
     }
 }
 
@@ -157,6 +165,70 @@ mod tests {
         assert!(clock.presentation_alpha() < 1e-12);
         assert_eq!(clock.pump_logic(1.0), 8);
         assert!(clock.presentation_alpha() < 1e-12);
+    }
+
+    #[test]
+    fn two_second_hitch_does_not_leave_a_phantom_tick() {
+        let mut clock = PresentationClock::new(0.05, 8).expect("clock");
+        assert_eq!(clock.pump_logic(2.0), 8);
+        let alpha = clock.presentation_alpha();
+        assert_eq!(clock.pump_logic(0.001), 0, "phase after hitch was {alpha}");
+        assert!((clock.presentation_alpha() - 0.02).abs() < 1e-12);
+        for _ in 0..48 {
+            assert_eq!(clock.pump_logic(0.001), 0);
+        }
+        assert_eq!(clock.pump_logic(0.001), 1);
+        assert_eq!(clock.presentation_alpha(), 0.0);
+    }
+
+    #[test]
+    fn capped_frames_normalize_boundaries_and_preserve_real_remainders() {
+        for step in [0.05, 0.02, 0.125, 1.0 / 60.0] {
+            for whole_steps in [8, 9, 20, 40, 50, 200, 1200, 72_000] {
+                let mut clock = PresentationClock::new(step, 8).expect("clock");
+                assert_eq!(clock.pump_logic(step * f64::from(whole_steps)), 8);
+                assert!(
+                    clock.presentation_alpha() < 1e-12,
+                    "step {step}, count {whole_steps}"
+                );
+                assert_eq!(clock.pump_logic(step * 0.02), 0);
+                assert!((clock.presentation_alpha() - 0.02).abs() < 1e-12);
+
+                clock.reset();
+                assert_eq!(clock.pump_logic(step * (f64::from(whole_steps) + 0.5)), 8);
+                assert!((clock.presentation_alpha() - 0.5).abs() < 1e-9);
+                assert_eq!(clock.pump_logic(step * 0.25), 0);
+                assert_eq!(clock.pump_logic(step * 0.25), 1);
+                assert_eq!(clock.presentation_alpha(), 0.0);
+            }
+        }
+
+        let mut clock = PresentationClock::new(0.05, 8).expect("clock");
+        assert_eq!(clock.pump_logic(2.025), 8);
+        assert!((clock.presentation_alpha() - 0.5).abs() < 1e-12);
+        assert_eq!(clock.pump_logic(0.001), 0);
+        assert!((clock.presentation_alpha() - 0.52).abs() < 1e-12);
+        assert_eq!(clock.pump_logic(0.024), 1);
+        assert!(clock.presentation_alpha() < 1e-12);
+
+        clock.reset();
+        assert_eq!(clock.pump_logic(2.0 - 1e-9), 8);
+        assert!(clock.presentation_alpha() > 0.999_999);
+        assert_eq!(clock.pump_logic(0.001), 1);
+    }
+
+    #[test]
+    fn large_hitches_keep_a_defined_fraction_without_overflowing_the_quotient() {
+        let mut clock = clock();
+        assert_eq!(clock.pump_logic(2.0f64.powi(40) + 0.125), 2);
+        assert_eq!(clock.presentation_alpha(), 0.25);
+        assert_eq!(clock.pump_logic(0.125), 0);
+        assert_eq!(clock.presentation_alpha(), 0.5);
+
+        let mut tiny = PresentationClock::new(f64::MIN_POSITIVE, 8).expect("clock");
+        assert_eq!(tiny.pump_logic(f64::MAX), 8);
+        assert!((0.0..1.0).contains(&tiny.presentation_alpha()));
+        assert_eq!(tiny.pump_logic(f64::MIN_POSITIVE), 1);
     }
 
     #[test]

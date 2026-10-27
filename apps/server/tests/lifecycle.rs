@@ -57,6 +57,79 @@ fn real_file_world_recovers_checkpoint_and_log_tail_then_continues_in_a_new_epoc
 }
 
 #[test]
+fn compatibility_preflight_preserves_every_file_and_retains_the_directory_lease() {
+    fn all_bytes(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut result = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                result.extend(all_bytes(&entry.path()));
+            } else {
+                result.insert(entry.path(), fs::read(entry.path()).unwrap());
+            }
+        }
+        result
+    }
+    let directory = Directory::new();
+    drop(create_file(&directory, Control::new()));
+    add_tail(&directory.0.join("checkpoints/manifest.log"));
+    add_tail(&directory.0.join("journal.log"));
+    let before = all_bytes(&directory.0);
+    for incompatible in [
+        Compatibility {
+            authority_schema: 2,
+            ..compatibility()
+        },
+        Compatibility {
+            rules_digest: Digest([8; 32]),
+            ..compatibility()
+        },
+        Compatibility {
+            content_digest: Digest([9; 32]),
+            ..compatibility()
+        },
+    ] {
+        let lease = WorldLease::inspect(&directory.0, WORLD, 8192).unwrap();
+        assert_eq!(
+            TestFileServer::preflight_file(
+                &lease,
+                incompatible,
+                Codec(Control::new()),
+                file_config()
+            )
+            .err()
+            .unwrap()
+            .code,
+            FaultCode::Incompatible
+        );
+        assert!(WorldDirectory::acquire(&directory.0, WORLD, 8192).is_err());
+        drop(lease);
+        assert_eq!(all_bytes(&directory.0), before);
+    }
+    let lease = WorldLease::inspect(&directory.0, WORLD, 8192).unwrap();
+    let metadata = TestFileServer::preflight_file(
+        &lease,
+        compatibility(),
+        Codec(Control::new()),
+        file_config(),
+    )
+    .unwrap();
+    assert_eq!(metadata.compatibility, compatibility());
+    assert_eq!(metadata.cursor, CommitCursor::initial(WORLD));
+    drop(lease);
+    assert_eq!(all_bytes(&directory.0), before);
+    let directory_guard = WorldLease::inspect(&directory.0, WORLD, 8192)
+        .unwrap()
+        .start()
+        .unwrap();
+    assert_eq!(directory_guard.epoch(), WorldEpoch(2));
+    assert!(WorldLease::inspect(&directory.0, WORLD, 8192).is_err());
+    drop(directory_guard);
+}
+
+#[test]
 fn semantic_recovery_failure_leaves_both_torn_tails_unchanged_and_releases_lock() {
     let directory = Directory::new();
     let mut server = create_file(&directory, Control::new());

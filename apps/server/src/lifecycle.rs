@@ -7,7 +7,9 @@ use torse_storage::{
     CheckpointConfig, Checkpoints, FileCheckpointBackend, FileCheckpoints, FileJournal,
     JournalConfig, scan_journal,
 };
-use torse_types::{Binding, CommitCursor, Compatibility, Fault, FaultCode};
+use torse_types::{
+    Binding, CommitCursor, Compatibility, Fault, FaultCode, SnapshotMeta, WorldEpoch,
+};
 
 use crate::directory::{io_fault, sync_directory};
 use crate::{HostAuthority, RecoveryTarget, Server, ServerConfig, WorldDirectory};
@@ -41,6 +43,76 @@ impl FileServerConfig {
 }
 
 impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
+    /// Check existing checkpoint identity and payload under an exclusive lease,
+    /// without allocating an epoch, creating paths or repairing incomplete tails.
+    /// Hosts may also inspect their own rule/generation descriptors through the lease root.
+    pub fn preflight_file(
+        lease: &crate::WorldLease,
+        compatibility: Compatibility,
+        codec: C,
+        config: FileServerConfig,
+    ) -> Result<SnapshotMeta, Fault> {
+        config.validate()?;
+        let checkpoint_path = lease.root().join("checkpoints");
+        if !fs::symlink_metadata(&checkpoint_path)
+            .map_err(|e| io_fault("inspect checkpoint directory", e))?
+            .file_type()
+            .is_dir()
+        {
+            return Err(Fault::invalid_data(
+                "checkpoint root must be a real directory",
+            ));
+        }
+        for path in [
+            checkpoint_path.join("manifest.log"),
+            lease.root().join("journal.log"),
+        ] {
+            if !fs::symlink_metadata(&path)
+                .map_err(|e| io_fault("inspect preflight file", e))?
+                .file_type()
+                .is_file()
+            {
+                return Err(Fault::invalid_data("preflight data must be regular files"));
+            }
+        }
+        let binding = Binding {
+            world: lease.world(),
+            epoch: WorldEpoch(0),
+            compatibility,
+        };
+        let checkpoints = Checkpoints::inspect(
+            binding,
+            codec.clone(),
+            config.checkpoint,
+            FileCheckpointBackend::open(checkpoint_path)?,
+        )?;
+        let manifest = checkpoints.current().ok_or_else(|| {
+            Fault::new(
+                FaultCode::CorruptData,
+                "world has no complete initial checkpoint",
+            )
+        })?;
+        let mut journal = fs::File::open(lease.root().join("journal.log"))
+            .map_err(|e| io_fault("open preflight journal", e))?;
+        let report = scan_journal::<A::Model, _, _, _>(
+            &mut journal,
+            binding,
+            CommitCursor::initial(binding.world),
+            &codec,
+            config.journal.codec_limits,
+            config.journal.codec_budget,
+            |_| Ok(()),
+        )?;
+        if report.through.seq < manifest.snapshot.cursor.seq
+            || report.through.seq.0 < manifest.durable_through.0
+        {
+            return Err(Fault::new(
+                FaultCode::SequenceGap,
+                "journal is shorter than checkpoint recovery expectation",
+            ));
+        }
+        Ok(manifest.snapshot)
+    }
     /// Create in a leased root. Existing data paths are rejected without overwriting them.
     /// Incomplete initialization is never silently treated as a new empty running world.
     pub fn create_file(

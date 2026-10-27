@@ -19,6 +19,17 @@ pub struct WorldDirectory {
     _lock: DirectoryLock,
 }
 
+/// Exclusive inspection of an existing world, without allocating a run epoch.
+/// Hold this guard through every compatibility check, then consume it with `start`.
+pub struct WorldLease {
+    root: PathBuf,
+    world: WorldId,
+    previous: u128,
+    valid_bytes: u64,
+    max_epoch_bytes: u64,
+    _lock: DirectoryLock,
+}
+
 /// Construct immediately after acquisition so every validation failure unlocks explicitly.
 struct DirectoryLock(File);
 
@@ -28,15 +39,14 @@ impl Drop for DirectoryLock {
     }
 }
 
-impl WorldDirectory {
-    /// Allocate an epoch while holding the directory's cooperative single-writer lease.
-    /// The finite ledger limit fails explicitly rather than recycling old run identities.
-    /// A partial final entry was never exposed by a successful acquisition and may be
-    /// repaired. Complete corruption is fatal; system clocks are never used as identity.
-    pub fn acquire(
+impl WorldLease {
+    /// Inspect the ledger while holding its cooperative single-writer lease.
+    /// Complete corruption is fatal; partial tails remain untouched until start.
+    fn lock(
         root: impl AsRef<Path>,
         world: WorldId,
         max_epoch_bytes: u64,
+        create: bool,
     ) -> Result<Self, Fault> {
         if max_epoch_bytes < ENTRY_BYTES as u64 {
             return Err(Fault::invalid_data(
@@ -57,7 +67,7 @@ impl WorldDirectory {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .truncate(false)
             .open(path)
             .map_err(|e| io_fault("open world lock", e))?;
@@ -118,38 +128,85 @@ impl WorldDirectory {
             valid_bytes += ENTRY_BYTES as u64;
             remaining -= ENTRY_BYTES as u64;
         }
-        let epoch = previous
+        Ok(Self {
+            root,
+            world,
+            previous,
+            valid_bytes,
+            max_epoch_bytes,
+            _lock: lock,
+        })
+    }
+
+    /// Lock and inspect only an existing ledger. Partial tails are left intact.
+    /// Missing paths, corruption and wrong-world failures never create files.
+    pub fn inspect(
+        root: impl AsRef<Path>,
+        world: WorldId,
+        max_epoch_bytes: u64,
+    ) -> Result<Self, Fault> {
+        Self::lock(root, world, max_epoch_bytes, false)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn world(&self) -> WorldId {
+        self.world
+    }
+    pub fn previous_epoch(&self) -> WorldEpoch {
+        WorldEpoch(self.previous)
+    }
+
+    /// Begin a live session after successful inspection, retaining the same lock.
+    /// This is the only inspection operation that repairs and appends the ledger.
+    pub fn start(mut self) -> Result<WorldDirectory, Fault> {
+        let epoch = self
+            .previous
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("world epochs exhausted"))?;
-        if valid_bytes
+        if self
+            .valid_bytes
             .checked_add(ENTRY_BYTES as u64)
-            .is_none_or(|n| n > max_epoch_bytes)
+            .is_none_or(|n| n > self.max_epoch_bytes)
         {
             return Err(Fault::resource_limit("epoch ledger capacity exhausted"));
         }
         let mut bytes = [0; ENTRY_BYTES];
         bytes[..8].copy_from_slice(MAGIC);
-        bytes[8..24].copy_from_slice(&world.0.to_le_bytes());
+        bytes[8..24].copy_from_slice(&self.world.0.to_le_bytes());
         bytes[24..40].copy_from_slice(&epoch.to_le_bytes());
         let crc = crc32c::crc32c(&bytes[..40]);
         bytes[40..44].copy_from_slice(&crc.to_le_bytes());
         bytes[44..].copy_from_slice(b"EEND");
         // Validate and reserve the next identity before repairing anything. A failed write
         // may leave a suffix, but that epoch is never returned to the application.
-        file.set_len(valid_bytes)
+        let file = &mut self._lock.0;
+        file.set_len(self.valid_bytes)
             .and_then(|_| file.seek(SeekFrom::End(0)))
             .and_then(|_| file.write_all(&bytes))
             .and_then(|_| file.sync_all())
             .map_err(|e| io_fault("persist new world epoch", e))?;
-        sync_directory(&root)?;
-        Ok(Self {
-            root,
-            world,
+        sync_directory(&self.root)?;
+        Ok(WorldDirectory {
+            root: self.root,
+            world: self.world,
             epoch: WorldEpoch(epoch),
-            _lock: lock,
+            _lock: self._lock,
         })
     }
+}
 
+impl WorldDirectory {
+    /// Acquire and start immediately. Existing hosts retain the original behavior;
+    /// use `WorldLease::inspect` for checks that must precede epoch allocation.
+    pub fn acquire(
+        root: impl AsRef<Path>,
+        world: WorldId,
+        max_epoch_bytes: u64,
+    ) -> Result<Self, Fault> {
+        WorldLease::lock(root, world, max_epoch_bytes, true)?.start()
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }

@@ -25,6 +25,6 @@ pub use coordinator::{
     CommitBatch, CommitStep, DurablePublication, FlushMetrics, Server, ServerConfig, ServerState,
     ShutdownReport,
 };
-pub use directory::WorldDirectory;
+pub use directory::{WorldDirectory, WorldLease};
 pub use lifecycle::{FileServer, FileServerConfig};
 pub use world::{LocalCommit, LocalWorldModel, WorldHost, WorldHostRecovery, WorldPrepared};

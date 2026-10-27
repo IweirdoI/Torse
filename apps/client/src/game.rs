@@ -394,16 +394,7 @@ fn texture_pack(descriptor: &Descriptor, atlas: Atlas) -> Result<TexturePack, St
         // The index records a reference colour next to the source that produces
         // the real one. Keeping both would multiply the tint twice.
         let tint = if tint_source.is_some() { None } else { tint };
-        let mipmap_strategy = match entry.mipmap_strategy.as_deref() {
-            Some("dark_cutout") => MipmapStrategy::DarkCutout,
-            Some("mean") | Some("average") | None => MipmapStrategy::Average,
-            Some(other) => {
-                return Err(format!(
-                    "{}: unsupported mipmap strategy `{other}`",
-                    entry.key
-                ));
-            }
-        };
+        let mipmap_strategy = parse_mipmap_strategy(&entry.key, entry.mipmap_strategy.as_deref())?;
         let frames = entry.frames.max(1);
         let animation = (frames > 1).then(|| MaterialAnimation {
             frame_count: frames,
@@ -532,6 +523,20 @@ fn parse_shape(value: &str) -> Result<Shape, String> {
         "cross" => Ok(Shape::Cross),
         "panel" => Ok(Shape::Panel),
         other => Err(format!("unsupported shape `{other}`")),
+    }
+}
+
+/// Map one index name onto the kernel mipmap strategy.
+///
+/// `cutout` and `strict_cutout` both request coverage-preserving mips. This
+/// loader has one coverage strategy, so either name selects it. An omitted
+/// name averages texels, the same as `mean` and `average`.
+fn parse_mipmap_strategy(key: &str, value: Option<&str>) -> Result<MipmapStrategy, String> {
+    match value {
+        Some("dark_cutout") => Ok(MipmapStrategy::DarkCutout),
+        Some("cutout") | Some("strict_cutout") => Ok(MipmapStrategy::CutoutCoverage),
+        Some("mean") | Some("average") | None => Ok(MipmapStrategy::Average),
+        Some(other) => Err(format!("{key}: unsupported mipmap strategy `{other}`")),
     }
 }
 
@@ -914,4 +919,121 @@ fn column_noise(seed: u64, x: i64, z: i64, cell: i64) -> u64 {
     let bottom = corner(x0, z0 + 1) * (1.0 - sx) + corner(x0 + 1, z0 + 1) * sx;
     let value = top * (1.0 - sz) + bottom * sz;
     value.round().clamp(0.0, 255.0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_names_map_and_unknown_names_do_not() {
+        assert_eq!(
+            parse_mipmap_strategy("base:material/flower", Some("strict_cutout")).unwrap(),
+            MipmapStrategy::CutoutCoverage
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/flower", Some("cutout")).unwrap(),
+            MipmapStrategy::CutoutCoverage
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/stone", Some("mean")).unwrap(),
+            MipmapStrategy::Average
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/stone", Some("average")).unwrap(),
+            MipmapStrategy::Average
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/stone", None).unwrap(),
+            MipmapStrategy::Average
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/leaves", Some("dark_cutout")).unwrap(),
+            MipmapStrategy::DarkCutout
+        );
+        let error = parse_mipmap_strategy("base:material/flower", Some("blurry")).unwrap_err();
+        assert_eq!(
+            error,
+            "base:material/flower: unsupported mipmap strategy `blurry`"
+        );
+    }
+
+    #[test]
+    fn strict_cutout_material_is_kept_and_a_later_unknown_name_rejects_the_pack() {
+        let atlas = Atlas::decode(&solid_png(16, 16)).expect("png decodes");
+        let mut descriptor = empty_descriptor();
+        descriptor.material.push(material(
+            "base:material/flower",
+            Some("strict_cutout"),
+            2,
+            2,
+        ));
+        descriptor
+            .material
+            .push(material("base:material/stone", Some("mean"), 8, 2));
+        let pack = texture_pack(&descriptor, atlas.clone()).expect("known names build a pack");
+        assert!(
+            pack.surface(&key("base:material/flower").unwrap())
+                .is_some()
+        );
+        assert!(pack.surface(&key("base:material/stone").unwrap()).is_some());
+
+        descriptor
+            .material
+            .push(material("base:material/bad", Some("blurry"), 2, 8));
+        let error = texture_pack(&descriptor, atlas).unwrap_err();
+        assert_eq!(
+            error,
+            "base:material/bad: unsupported mipmap strategy `blurry`"
+        );
+    }
+
+    fn empty_descriptor() -> Descriptor {
+        Descriptor {
+            pack: PackInfo {
+                namespace: "base".to_owned(),
+                biome: "plains".to_owned(),
+            },
+            atlas: AtlasInfo {
+                width: 16,
+                height: 16,
+                mip_levels: 1,
+                padding: 1,
+                missing: [2, 14, 1, 1],
+                white: [8, 14, 1, 1],
+            },
+            material: Vec::new(),
+            blocks: BTreeMap::new(),
+            biomes: BTreeMap::new(),
+        }
+    }
+
+    fn material(key: &str, strategy: Option<&str>, x: u32, y: u32) -> MaterialSpec {
+        MaterialSpec {
+            key: key.to_owned(),
+            texture: String::new(),
+            x,
+            y,
+            width: 4,
+            height: 4,
+            frames: 1,
+            frametime: 1,
+            interpolate: false,
+            tint: None,
+            tint_source: None,
+            mipmap_strategy: strategy.map(str::to_owned),
+        }
+    }
+
+    fn solid_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        let pixels = vec![255u8; (width * height * 4) as usize];
+        writer.write_image_data(&pixels).expect("png pixels");
+        drop(writer);
+        bytes
+    }
 }

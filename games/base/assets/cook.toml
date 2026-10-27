@@ -1,0 +1,28 @@
+# Assigned identities match the base client's source image aliases.
+[[image]]
+guid = "00000000000000000001000000000001"
+key = "base:texture/atlas"
+path = "textures/atlas.png"
+
+[[image]]
+guid = "00000000000000000001000000000002"
+key = "base:icon/stone"
+path = "icons/items/stone.png"
+
+[[image]]
+guid = "00000000000000000001000000000003"
+key = "base:icon/glass_slab"
+path = "icons/items/glass_slab.png"
+
+[[image]]
+guid = "00000000000000000001000000000004"
+key = "base:icon/plant"
+path = "icons/items/plant.png"
+
+[[locale]]
+language = "en"
+path = "locales/en.txt"
+
+[[locale]]
+language = "zh-Hans"
+path = "locales/zh-Hans.txt"

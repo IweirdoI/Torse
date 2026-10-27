@@ -14,3 +14,11 @@
 cargo run -p torse-tools -- m1-scenario
 cargo run -p torse-tools --features experiments -- wasm-probe
 ```
+
+基础游戏的 PNG 身份、材质槽、状态投影和 locale 表可离线生成：
+
+```sh
+cargo run -p torse-tools --locked -- cook-base games/base/assets .work/base.tcook
+```
+
+输入清单、格式和当前客户端接入范围见 [cooked 表说明](../crates/content/COOKED.md)。

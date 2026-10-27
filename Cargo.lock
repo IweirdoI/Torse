@@ -2952,6 +2952,10 @@ dependencies = [
 name = "torse-tools"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "sha2",
+ "toml 0.9.12+spec-1.1.0",
+ "torse-assets",
  "torse-codec",
  "torse-content",
  "torse-inventory",

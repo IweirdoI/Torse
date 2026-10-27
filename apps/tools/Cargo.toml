@@ -13,6 +13,10 @@ wasm-probe = ["torse-mod-host/wasm-probe"]
 experiments = ["ecs-probe", "gpu-probe", "wasm-probe"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "0.9"
+torse-assets = { path = "../../crates/assets" }
 torse-codec = { path = "../../crates/codec" }
 torse-content = { path = "../../crates/content" }
 torse-inventory = { path = "../../modules/inventory" }

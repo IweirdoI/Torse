@@ -16,7 +16,8 @@ pub use compiler::{
     SourceRef, Sourced, compile,
 };
 pub use cooked::{
-    CookError, CookImage, CookedLocale, CookedTables, cook, parse_locale, read_cooked, write_cooked,
+    CookError, CookImage, CookLimits, CookedLocale, CookedMaterial, CookedState, CookedTables,
+    cook, parse_locale, read_cooked, read_cooked_with_limits, write_cooked,
 };
 pub use descriptor::{
     AlphaMode, BlockDefinition, BoxBounds, CapabilityBinding, CapabilityDescriptor,

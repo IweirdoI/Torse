@@ -1,10 +1,9 @@
 //! Server-authoritative player movement domain, per the movement contract.
 //!
-//! The same integration drives both sides: the server settles inputs through
-//! [`walker_step`] on its own authority, and a client predicts locally with
-//! the identical function so divergence stays explainable. Input sequencing,
-//! reconciliation, and session-to-player bindings round out the pieces the
-//! transport and execution layers wire up.
+//! [`plan_step`] freezes persistent server movement; [`predict_step`] uses the
+//! same fixed integration against read-only terrain. [`walker_step`] remains
+//! the immediate local-world adapter. Input sequencing and reconciliation never
+//! grant authority to a network mirror.
 
 use std::collections::BTreeMap;
 
@@ -15,6 +14,115 @@ use torse_world::Position;
 
 use crate::coordinator::CommitFault;
 use crate::{OrderingKey, Phase, Transaction, WorldAuthority};
+
+/// Network walking always integrates exactly one 50 ms simulation tick.
+pub const NETWORK_STEP_SECONDS: f64 = 0.05;
+
+fn integrate(motion: torse_world::PlayerMotion, input: MoveInput) -> ([f64; 3], i64) {
+    let speed = if motion.grounded && input.jump {
+        8_400_000
+    } else {
+        (motion.vertical_micros - 1_400_000).max(-torse_world::PlayerMotion::MAX_SPEED)
+    };
+    let wish = input.direction();
+    (
+        [
+            wish[0] * WALK_SPEED * NETWORK_STEP_SECONDS,
+            speed as f64 / 1_000_000.0 * NETWORK_STEP_SECONDS,
+            wish[2] * WALK_SPEED * NETWORK_STEP_SECONDS,
+        ],
+        speed,
+    )
+}
+fn settled_motion(
+    previous: Position,
+    settled: Position,
+    delta: [f64; 3],
+    speed: i64,
+) -> torse_world::PlayerMotion {
+    let difference = settled.y - (previous.y + delta[1]);
+    torse_world::PlayerMotion {
+        vertical_micros: if difference.abs() > 1e-9 { 0 } else { speed },
+        grounded: difference > 1e-9,
+    }
+}
+
+/// Predict against a read-only terrain mirror, keeping position and velocity detached.
+pub fn predict_step(
+    world: &WorldAuthority,
+    position: Position,
+    half: [f64; 3],
+    motion: torse_world::PlayerMotion,
+    input: MoveInput,
+) -> Result<(Position, torse_world::PlayerMotion), RejectCode> {
+    torse_world::PlayerMotion::from_fields(&motion.fields())
+        .map_err(|_| RejectCode::InvalidData)?;
+    let (delta, speed) = integrate(motion, input);
+    let settled =
+        crate::movement::predict_at(world.store(), world.registry(), position, half, delta)?;
+    Ok((settled, settled_motion(position, settled, delta, speed)))
+}
+
+/// Freeze one authoritative step as an ordinary movement plus protected motion edit.
+/// Collision observations and the body declaration become preconditions, so a changed
+/// phase-start world cannot publish velocity calculated for a different displacement.
+pub fn plan_step(
+    world: &WorldAuthority,
+    handle: EntityHandle,
+    input: MoveInput,
+    transaction: TransactionId,
+    ordering: OrderingKey,
+) -> Result<Transaction, RejectCode> {
+    use torse_world::{ComponentEdit, EntityCollider, PlayerMotion, TerrainQuery};
+    let entity = world
+        .entities()
+        .get(handle)
+        .ok_or(RejectCode::MissingTarget)?;
+    let motion = PlayerMotion::of(entity)
+        .map_err(|_| RejectCode::InvalidData)?
+        .ok_or(RejectCode::MissingTarget)?;
+    let half = EntityCollider::of(entity)
+        .map_err(|_| RejectCode::InvalidData)?
+        .and_then(EntityCollider::half)
+        .ok_or(RejectCode::InvalidData)?;
+    let (delta, speed) = integrate(motion, input);
+    let mut tx = Transaction::new(transaction, torse_world::collider_owner(), ordering);
+    tx.move_entity(handle, entity.id, entity.position, delta, half);
+    let resolved = crate::movement::prepare_movements(
+        world.store(),
+        world.entities(),
+        world.registry(),
+        &[],
+        &tx.movements,
+        crate::movement::MovementMode::Normal,
+    )?;
+    let settled = Position::from_bits(resolved.moves[0].position_bits);
+    for (pos, query) in resolved.reads {
+        match query {
+            TerrainQuery::Ready(state) => {
+                tx.read_block(pos, state);
+            }
+            _ => return Err(RejectCode::NotLoaded),
+        }
+    }
+    tx.components.push(ComponentEdit {
+        id: entity.id,
+        schema: torse_world::player_motion_schema(),
+        previous: Some(motion.fields()),
+        fields: Some(settled_motion(entity.position, settled, delta, speed).fields()),
+    });
+    let body = entity
+        .components
+        .component(&torse_world::collider_schema())
+        .cloned();
+    tx.components.push(ComponentEdit {
+        id: entity.id,
+        schema: torse_world::collider_schema(),
+        previous: body.clone(),
+        fields: body,
+    });
+    Ok(tx)
+}
 
 /// Walk speed in blocks per second.
 pub const WALK_SPEED: f64 = 4.3;
@@ -347,6 +455,10 @@ impl MoveInputBuffer {
     /// Queue one input; stale and duplicate sequences are dropped, and a full
     /// buffer evicts the oldest pending input and raises the resync flag.
     pub fn push(&mut self, input: MoveInput) {
+        if self.capacity == 0 {
+            self.resync_required = true;
+            return;
+        }
         if input.seq <= self.watermark || self.pending.contains_key(&input.seq) {
             return;
         }
@@ -362,6 +474,11 @@ impl MoveInputBuffer {
     /// The host sends a resync demand (ResetRequired) when this is set.
     pub fn take_resync(&mut self) -> bool {
         std::mem::take(&mut self.resync_required)
+    }
+
+    /// Inspect the oldest input without advancing the admitted watermark.
+    pub fn peek(&self) -> Option<MoveInput> {
+        self.pending.first_key_value().map(|(_, input)| *input)
     }
 
     /// Take up to `limit` inputs in sequence order for this tick's
@@ -412,6 +529,9 @@ pub struct PlayerBindings {
 impl PlayerBindings {
     /// Bind a session to a player entity; both sides must be free.
     pub fn bind(&mut self, session: SessionId, entity: EntityId) -> Result<(), RejectCode> {
+        if session.0 == 0 || entity.0 == 0 {
+            return Err(RejectCode::InvalidData);
+        }
         if self.by_session.contains_key(&session.0) || self.by_entity.contains_key(&entity) {
             return Err(RejectCode::Conflict);
         }

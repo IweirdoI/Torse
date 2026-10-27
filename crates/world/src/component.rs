@@ -72,6 +72,8 @@ impl ComponentSchemas {
         schemas.insert(binding.id.clone(), binding);
         let collider = crate::collider::schema();
         schemas.insert(collider.id.clone(), collider);
+        let motion = crate::player_motion::schema();
+        schemas.insert(motion.id.clone(), motion);
         Self {
             schemas,
             persistence: BTreeMap::new(),
@@ -239,6 +241,9 @@ impl ComponentSet {
         component_size(fields)?;
         if id == &crate::collider_schema() {
             crate::EntityCollider::from_fields(fields)?;
+        }
+        if id == &crate::player_motion_schema() {
+            crate::PlayerMotion::from_fields(fields)?;
         }
         let schema = schemas
             .get(id)
@@ -568,9 +573,10 @@ mod tests {
     #[test]
     fn known_schema_is_registered_from_compiled_content() {
         let (schemas, id) = schemas();
-        assert_eq!(schemas.len(), 3);
+        assert_eq!(schemas.len(), 4);
         assert!(schemas.get(&crate::block_instance_schema()).is_some());
         assert!(schemas.get(&crate::collider_schema()).is_some());
+        assert!(schemas.get(&crate::player_motion_schema()).is_some());
         assert!(schemas.get(&id).is_some());
     }
 

@@ -27,6 +27,7 @@ mod handles;
 mod lifecycle;
 mod palette;
 mod persistence;
+mod player_motion;
 mod registry;
 mod section;
 mod snapshot_budget;
@@ -61,6 +62,7 @@ pub use lifecycle::{
     MAX_SPAWN_COORDINATE,
 };
 pub use palette::{MAX_PALETTE_STATES, PaletteCells};
+pub use player_motion::{PlayerMotion, player_motion_schema};
 pub use registry::{BlockStateId, BlockStateRegistry, EMPTY_BLOCK_KEY, RegistryError};
 pub use section::{
     DEFAULT_SECTION_SIDE, MAX_SECTION_SIDE, Section, SectionError, SectionStorage, linear_index,

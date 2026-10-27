@@ -192,6 +192,14 @@ fn material_tables(
 }
 
 impl Scene {
+    /// Hide the camera's bound body without granting writes to the mirror.
+    pub fn view_player(&mut self, id: torse_types::EntityId) {
+        self.walker = self
+            .authority
+            .entities()
+            .handle_of(id)
+            .map(torse_sim::player::WalkerState::new);
+    }
     /// Build a scene with a seeded hill terrain and the base game texture pack.
     pub fn new(radius: i64) -> Result<Self, String> {
         Self::with_pack(radius, crate::texture::base_pack()?)
@@ -606,7 +614,7 @@ impl Scene {
     /// Server projections reject local walking until server movement exists.
     pub fn spawn_walker(&mut self, at: Position) -> Result<(), String> {
         if self.is_network() {
-            return Err("network walking is not supported yet".to_owned());
+            return Err("network mirrors cannot settle local movement".to_owned());
         }
         let handle = self
             .authority
@@ -636,7 +644,7 @@ impl Scene {
         dt: f32,
     ) -> Result<(Position, bool), String> {
         if self.is_network() {
-            return Err("network walking is not supported yet".to_owned());
+            return Err("network mirrors cannot settle local movement".to_owned());
         }
         let Some(mut walker) = self.walker else {
             return Err("walk mode has no entity".to_owned());
@@ -1826,7 +1834,7 @@ mod tests {
         let before = scene.authority().capture_snapshot(meta).expect("snapshot");
         assert_eq!(
             scene.spawn_walker(Position::new(8.5, 12.0, 8.5)),
-            Err("network walking is not supported yet".to_owned())
+            Err("network mirrors cannot settle local movement".to_owned())
         );
         assert!(scene.walker.is_none());
         // Even a stale walker handle must not let local movement settle
@@ -1839,7 +1847,7 @@ mod tests {
         scene.walker = Some(torse_sim::player::WalkerState::new(handle));
         assert_eq!(
             scene.step_walker([0.0, 0.0, -1.0], true, 0.05),
-            Err("network walking is not supported yet".to_owned())
+            Err("network mirrors cannot settle local movement".to_owned())
         );
         assert_eq!(scene.edit_counter, 0);
         assert_eq!(

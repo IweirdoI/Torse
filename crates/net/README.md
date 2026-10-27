@@ -15,4 +15,4 @@ MemoryTransport和TcpTransport都提供独立close，清空尚未发送的数据
 
 ReplicaMirror先校验完整新状态再替换，拒绝错误Binding、重复/缺失ReplicaSeq、无效字典、Section尺寸或实体位置。连接关闭后应用应丢弃镜像并重新获取基线，不能继续使用旧权限状态。
 
-端到端验证见[执行与网络记录](../../benchmarks/B6-B7-execution-network.md)。当前验证使用固定内容与有限范围。该传输库不包含UDP、多通道、移动预测或互联网认证；客户端的本地行走不代表已接入服务端移动结算。
+端到端验证见[执行与网络记录](../../benchmarks/B6-B7-execution-network.md)及[权威移动](../../benchmarks/M5-authoritative-movement.md)。移动输入、持久结算和客户端预测由应用层装配，传输库继续只处理有界帧、会话和复制。当前验证使用固定内容与有限范围，UDP、多通道和互联网认证尚待装配。

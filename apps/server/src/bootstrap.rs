@@ -37,7 +37,7 @@ pub fn execution_limits() -> ExecutionLimits {
             max_items: 1024,
             max_bytes: 16_384,
         },
-        sessions: 16,
+        sessions: 32,
         receipt_window: 32,
         phase_tasks: 128,
         events: 128,
@@ -84,6 +84,8 @@ pub fn file_policy() -> FileServerConfig {
 pub fn network_limits() -> NetworkLimits {
     NetworkLimits {
         peers: 16,
+        movement_inputs: 32,
+        movement_bytes: 16_384,
         requests_per_tick: 32,
         frames_per_poll: 16,
         outstanding: 32,
@@ -130,6 +132,51 @@ pub fn scope() -> ReplicaScope {
     ReplicaScope {
         sections: [SectionPos::ZERO, SectionPos::new(1, 0, 0)].into(),
     }
+}
+/// Initial-state assembly only. Live spawning must go through a durable transaction.
+pub fn spawn_players(
+    world: &mut WorldAuthority,
+    count: usize,
+) -> Result<Vec<torse_types::EntityId>, Fault> {
+    if count > 16 || world.seq().0 != 0 {
+        return Err(Fault::invalid_data("initial player count must be 0..16"));
+    }
+    let schemas = world.schemas().clone();
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let handle = world
+            .entities_mut()
+            .spawn(Position::new(
+                4.5 + (index % 8) as f64 * 2.0,
+                3.0,
+                4.5 + (index / 8) as f64 * 2.0,
+            ))
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        let id = world.entities().get(handle).expect("spawned player").id;
+        let components = world
+            .entities_mut()
+            .components_mut(handle)
+            .expect("spawned player");
+        components
+            .insert(
+                &schemas,
+                &torse_world::collider_schema(),
+                torse_world::EntityCollider::Box {
+                    half: [300_000, 900_000, 300_000],
+                }
+                .fields(),
+            )
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        components
+            .insert(
+                &schemas,
+                &torse_world::player_motion_schema(),
+                torse_world::PlayerMotion::default().fields(),
+            )
+            .map_err(|e| Fault::invalid_data(e.to_string()))?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 pub fn world() -> Result<(WorldAuthority, ActionService), Fault> {
     let mut pack = m0_fixture_pack();

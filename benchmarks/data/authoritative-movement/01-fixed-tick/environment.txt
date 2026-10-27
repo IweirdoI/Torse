@@ -1,0 +1,15 @@
+Date: 2026-10-28
+Platform: Windows x86_64-pc-windows-msvc
+Rust: 1.93.1
+Build jobs: 1
+Baseline: 7e3ddb87f664ebf79ed4aff26ecbd674303b1e83
+Profile: debug, locked dependencies
+Workspace: cargo test --workspace --all-targets --locked
+Mods: cargo test -p torse-server --features mods --all-targets --locked
+Static: cargo clippy --workspace --all-targets --locked -- -D warnings
+Format: cargo fmt --all -- --check
+Docs: RUSTDOCFLAGS=-D warnings cargo doc -p torse-server -p torse-sim -p torse-world -p torse-protocol --no-deps --locked
+Totals include the targeted movement tests; do not sum targeted runs twice.
+TCP host: torse-server <saved-world> --listen 127.0.0.1:17861 --players 2 --ticks 180
+TCP client: torse-client --window --connect 127.0.0.1:17861 --walk --autoplay --frames 180
+TCP result: 181 frames, 18 walk ticks, 17 replica batches; Vulkan, NVIDIA GeForce RTX 4060 Laptop GPU

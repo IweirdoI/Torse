@@ -286,6 +286,49 @@ fn bounded_position(position: Position) -> bool {
             .all(|value| value.abs() <= MAX_MOVEMENT_COORDINATE)
 }
 
+/// Read-only collision used by detached prediction; it never edits an entity store.
+pub(crate) fn predict_at(
+    store: &SectionStore,
+    registry: &BlockStateRegistry,
+    position: Position,
+    half: [f64; 3],
+    delta: [f64; 3],
+) -> Result<Position, RejectCode> {
+    if !bounded_position(position)
+        || !bounded_position(position.translated(delta))
+        || half
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0 || *v > MAX_COLLIDER_HALF)
+        || delta
+            .iter()
+            .any(|v| !v.is_finite() || v.abs() > MAX_MOVEMENT_DELTA)
+    {
+        return Err(RejectCode::InvalidData);
+    }
+    let view = CollisionView {
+        store,
+        registry,
+        overlay: BTreeMap::new(),
+        reads: RefCell::new(BTreeMap::new()),
+        unknown: RefCell::new(false),
+    };
+    let body = Aabb::from_center([position.x, position.y, position.z], half);
+    let _ = collides(&view, &body);
+    if *view.unknown.borrow() {
+        return Err(RejectCode::NotLoaded);
+    }
+    let result = sweep_bounded(&view, body, delta).ok_or(RejectCode::QuotaExceeded)?;
+    let blocked = collides(&view, &result.aabb);
+    if *view.unknown.borrow() {
+        return Err(RejectCode::NotLoaded);
+    }
+    if blocked {
+        return Err(RejectCode::Conflict);
+    }
+    let center = result.aabb.center();
+    Ok(Position::new(center[0], center[1], center[2]))
+}
+
 /// Traverse every crossed cell, including very short diagonal intersections.
 /// With at most 16 cells per axis, 96 visits cover the endpoint and boundary ties.
 fn trace_loaded(

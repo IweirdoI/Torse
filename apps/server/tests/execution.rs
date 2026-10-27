@@ -704,6 +704,10 @@ fn heartbeat_before_hello_and_old_or_future_protocols_cannot_hold_a_peer_slot() 
             compatibility: server.binding().compatibility,
         },
         ClientMessage::Hello {
+            version: 2,
+            compatibility: server.binding().compatibility,
+        },
+        ClientMessage::Hello {
             version: PROTOCOL_VERSION + 1,
             compatibility: server.binding().compatibility,
         },
@@ -727,7 +731,7 @@ fn heartbeat_before_hello_and_old_or_future_protocols_cannot_hold_a_peer_slot() 
 
 #[test]
 fn heartbeat_tag_appends_to_wire_v1_and_idle_timing_has_three_interval_margin() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 3);
     let mut bytes = Vec::new();
     wire::encode(
         &ClientMessage::Ping,

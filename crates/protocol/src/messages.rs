@@ -1,6 +1,72 @@
 use torse_codec::{Decoder, EncodeResult, Encoder, wire::Wire};
 use torse_types::*;
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
+/// Movement sequencing is independent of ordinary action requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoveCommand {
+    pub session: SessionId,
+    pub seq: u64,
+    pub tick_hint: Tick,
+    pub wish: [i8; 2],
+    pub jump: bool,
+}
+/// Durable authoritative pose for the player bound to this connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlayerUpdate {
+    pub session: SessionId,
+    pub entity: EntityId,
+    pub input_seq: u64,
+    pub tick: Tick,
+    pub position_bits: [u64; 3],
+    pub vertical_micros: i64,
+    pub grounded: bool,
+    pub reset: bool,
+}
+impl Wire for MoveCommand {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        self.session.write(e)?;
+        self.seq.write(e)?;
+        self.tick_hint.write(e)?;
+        (self.wish[0] as u8).write(e)?;
+        (self.wish[1] as u8).write(e)?;
+        self.jump.write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        Ok(Self {
+            session: Wire::read(d)?,
+            seq: Wire::read(d)?,
+            tick_hint: Wire::read(d)?,
+            wish: [u8::read(d)? as i8, u8::read(d)? as i8],
+            jump: Wire::read(d)?,
+        })
+    }
+}
+impl Wire for PlayerUpdate {
+    fn write(&self, e: &mut Encoder<'_>) -> EncodeResult<()> {
+        self.session.write(e)?;
+        self.entity.write(e)?;
+        self.input_seq.write(e)?;
+        self.tick.write(e)?;
+        for bits in self.position_bits {
+            bits.write(e)?;
+        }
+        self.vertical_micros.write(e)?;
+        self.grounded.write(e)?;
+        self.reset.write(e)
+    }
+    fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
+        Ok(Self {
+            session: Wire::read(d)?,
+            entity: Wire::read(d)?,
+            input_seq: Wire::read(d)?,
+            tick: Wire::read(d)?,
+            position_bits: [Wire::read(d)?, Wire::read(d)?, Wire::read(d)?],
+            vertical_micros: Wire::read(d)?,
+            grounded: Wire::read(d)?,
+            reset: Wire::read(d)?,
+        })
+    }
+}
 /// Wall-clock interval for authenticated client liveness, independent of rendering.
 pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 #[derive(Debug)]
@@ -21,6 +87,7 @@ pub enum ClientMessage<I> {
     },
     Close,
     Ping,
+    Move(MoveCommand),
 }
 #[derive(Debug)]
 pub enum ServerMessage<O, S, C> {
@@ -39,6 +106,7 @@ pub enum ServerMessage<O, S, C> {
     Seed(ReplicaSeed<S>),
     Batch(ReplicaBatch<C>),
     Rejected(RejectCode),
+    Player(PlayerUpdate),
 }
 fn invalid() -> Fault {
     Fault::invalid_data("unknown protocol message/tag")
@@ -69,6 +137,10 @@ impl<I: Wire> Wire for ClientMessage<I> {
             }
             Self::Close => 4u8.write(e),
             Self::Ping => 5u8.write(e),
+            Self::Move(input) => {
+                6u8.write(e)?;
+                input.write(e)
+            }
         }
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
@@ -89,6 +161,7 @@ impl<I: Wire> Wire for ClientMessage<I> {
             }),
             4 => Ok(Self::Close),
             5 => Ok(Self::Ping),
+            6 => Ok(Self::Move(Wire::read(d)?)),
             _ => Err(invalid()),
         }
     }
@@ -148,6 +221,10 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
                 5u8.write(e)?;
                 reason.write(e)
             }
+            Self::Player(update) => {
+                6u8.write(e)?;
+                update.write(e)
+            }
         }
     }
     fn read(d: &mut Decoder<'_>) -> EncodeResult<Self> {
@@ -167,6 +244,7 @@ impl<O: Wire, S: Wire, C: Wire> Wire for ServerMessage<O, S, C> {
             3 => Ok(Self::Seed(Wire::read(d)?)),
             4 => Ok(Self::Batch(Wire::read(d)?)),
             5 => Ok(Self::Rejected(Wire::read(d)?)),
+            6 => Ok(Self::Player(Wire::read(d)?)),
             _ => Err(invalid()),
         }
     }

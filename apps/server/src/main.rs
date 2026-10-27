@@ -20,7 +20,7 @@ fn run() -> Result<(), Fault> {
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
+            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--players N; 0..16] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     }
@@ -28,6 +28,7 @@ fn run() -> Result<(), Fault> {
     let mut address = "127.0.0.1:7777".to_owned();
     let mut ticks = 0u64;
     let mut fill = false;
+    let mut players = 0usize;
     let mut editors = false;
     let mut revoke_after = 0u64;
     let mut mod_dirs = Vec::new();
@@ -38,6 +39,13 @@ fn run() -> Result<(), Fault> {
     let mut commit_batch = 16;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--players" => {
+                players = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n <= 16)
+                    .ok_or_else(|| Fault::invalid_data("players must be 0..16"))?;
+            }
             "--prevalidate-components" => component_prevalidation = true,
             "--prevalidate-workers" => {
                 let workers = args
@@ -135,6 +143,9 @@ fn run() -> Result<(), Fault> {
     if fill {
         base::fill_floor(&mut world)?;
     }
+    if !path.join("checkpoints/manifest.log").exists() {
+        base::spawn_players(&mut world, players)?;
+    }
     let compatibility = world.coordinator().compatibility();
     let limits = base::execution_limits();
     let mut policy = base::file_policy();
@@ -160,6 +171,26 @@ fn run() -> Result<(), Fault> {
     server.set_parallel_planning(planning)?;
     server.set_prevalidation(prevalidation)?;
     server.set_commit_batch_limit(commit_batch)?;
+    let player_ids: Vec<_> = server
+        .authority()?
+        .world()
+        .entities()
+        .iter()
+        .filter(|(_, entity)| {
+            torse_world::PlayerMotion::of(entity)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+        .map(|(_, entity)| entity.id)
+        .take(players)
+        .collect();
+    if player_ids.len() != players {
+        return Err(Fault::invalid_data(
+            "requested players must exist in the saved world",
+        ));
+    }
+    let mut player_peers = std::collections::BTreeMap::new();
     let listener = TcpListener::bind(&address).map_err(|e| Fault::invalid_data(e.to_string()))?;
     listener
         .set_nonblocking(true)
@@ -220,6 +251,14 @@ fn run() -> Result<(), Fault> {
                     let policy = PeerPolicy { actor, scope };
                     if let Ok(id) = hub.add(stream, policy, server.authority()?.resume_point().tick)
                     {
+                        player_peers.retain(|peer, _| hub.contains(*peer));
+                        if let Some(player) = player_ids
+                            .iter()
+                            .find(|id| !player_peers.values().any(|used| used == *id))
+                        {
+                            hub.assign_player(id, *player)?;
+                            player_peers.insert(id, *player);
+                        }
                         peers.push(id);
                         if revoke_at.is_none() && revoke_after != 0 {
                             revoke_at = Some(done + revoke_after);

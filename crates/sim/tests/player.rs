@@ -69,6 +69,105 @@ fn world() -> WorldAuthority {
 }
 
 #[test]
+fn persistent_step_matches_detached_prediction_and_guards_frozen_collision_reads() {
+    use torse_sim::player::{plan_step, predict_step};
+    use torse_world::{EntityCollider, PlayerMotion, collider_schema, player_motion_schema};
+    let mut world = world();
+    let handle = world
+        .entities_mut()
+        .spawn(Position::new(8.5, 1.900001, 8.5))
+        .unwrap();
+    let schemas = world.schemas().clone();
+    let components = world.entities_mut().components_mut(handle).unwrap();
+    components
+        .insert(
+            &schemas,
+            &collider_schema(),
+            EntityCollider::Box {
+                half: [300_000, 900_000, 300_000],
+            }
+            .fields(),
+        )
+        .unwrap();
+    let motion = PlayerMotion {
+        vertical_micros: 0,
+        grounded: true,
+    };
+    components
+        .insert(&schemas, &player_motion_schema(), motion.fields())
+        .unwrap();
+    let input = MoveInput {
+        seq: 1,
+        wish: [127, 0, 127],
+        jump: true,
+    };
+    let previous = world.entities().get(handle).unwrap().position;
+    let predicted = predict_step(&world, previous, [0.3, 0.9, 0.3], motion, input).unwrap();
+    let order = torse_sim::OrderingKey {
+        phase: torse_sim::Phase::Simulation,
+        rule_priority: 0,
+        stable_task_key: 1,
+        local_sequence: 0,
+    };
+    let tx = plan_step(&world, handle, input, TransactionId(2), order).unwrap();
+    assert_eq!(world.entities().get(handle).unwrap().position, previous);
+    let prepared = world.prepare(&tx).unwrap();
+    world.publish(prepared).unwrap();
+    let entity = world.entities().get(handle).unwrap();
+    assert_eq!(entity.position, predicted.0);
+    assert_eq!(PlayerMotion::of(entity).unwrap().unwrap(), predicted.1);
+
+    let frozen = plan_step(
+        &world,
+        handle,
+        MoveInput {
+            seq: 2,
+            wish: [127, 0, 0],
+            jump: false,
+        },
+        TransactionId(3),
+        order,
+    )
+    .unwrap();
+    let read = frozen
+        .preconditions
+        .iter()
+        .find(|read| read.expected == torse_world::BlockStateId::EMPTY)
+        .unwrap();
+    let mut edit = torse_sim::Transaction::new(TransactionId(4), key("test:terrain"), order);
+    edit.write_block(
+        read.pos,
+        world.registry().default_state(&key("base:stone")).unwrap(),
+    );
+    world.commit(&edit).unwrap();
+    assert!(matches!(
+        world.prepare(&frozen),
+        Err(torse_sim::PrepareError::Rejected(RejectCode::Conflict))
+    ));
+}
+
+#[test]
+fn zero_capacity_movement_and_invalid_binding_ids_fail_without_panicking() {
+    let mut buffer = MoveInputBuffer::new(0);
+    buffer.push(MoveInput {
+        seq: 1,
+        wish: [1, 0, 0],
+        jump: false,
+    });
+    assert!(buffer.take_resync());
+    assert!(buffer.settle(1).is_empty());
+    let mut bindings = PlayerBindings::default();
+    assert_eq!(
+        bindings.bind(SessionId(0), EntityId(1)),
+        Err(RejectCode::InvalidData)
+    );
+    assert_eq!(
+        bindings.bind(SessionId(1), EntityId(0)),
+        Err(RejectCode::InvalidData)
+    );
+}
+
+#[test]
 fn walker_falls_lands_and_jumps() {
     let mut world = world();
     let handle = world

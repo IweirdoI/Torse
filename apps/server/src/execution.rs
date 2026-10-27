@@ -28,8 +28,11 @@ use runtime_budget::RuntimeBudget;
 #[path = "prevalidation.rs"]
 mod prevalidation;
 pub use prevalidation::{PrevalidationConfig, PrevalidationStats};
+#[path = "player_control.rs"]
+mod player_control;
 #[path = "streaming.rs"]
 mod streaming;
+pub use player_control::{PlayerState, movement_action, movement_call};
 
 pub struct ExecutionModel;
 /// Derived event tickets. They are rebuilt from committed events and current entity locations.
@@ -147,6 +150,7 @@ struct Queued {
     tick: Tick,
 }
 pub struct ExecutionHost {
+    players: BTreeMap<u128, player_control::PlayerSession>,
     parked: BTreeMap<SectionPos, ParkedSection>,
     section_pending: Option<ExecutionPrepared>,
     source: ReplicaSource,
@@ -392,6 +396,7 @@ impl ExecutionHost {
             },
         )?;
         Ok(Self {
+            players: BTreeMap::new(),
             source: ReplicaSource::new(world, binding, limits.replicas)?,
             parked: BTreeMap::new(),
             section_pending: None,
@@ -494,6 +499,18 @@ impl ExecutionHost {
     }
 
     pub fn revoke_session(&mut self, session: SessionId) -> Vec<SubscriptionId> {
+        let children: Vec<_> = self
+            .players
+            .iter()
+            .filter(|(id, player)| **id == session.0 || player.parent == session)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in children {
+            self.players.remove(&id);
+            if id != session.0 {
+                self.sessions.remove(&id);
+            }
+        }
         self.sessions
             .remove(&session.0)
             .map_or_else(Vec::new, |s| self.source.invalidate_viewer(s.viewer))
@@ -570,11 +587,14 @@ impl ExecutionHost {
         if !self.pending.is_empty() {
             for q in self.pending.iter().filter(|q| {
                 q.tick <= point.tick
-                    && self
-                        .actions
-                        .phase(&q.request.input.action)
-                        .unwrap_or(Phase::Interaction)
-                        == phase
+                    && if q.request.input.action == movement_action() {
+                        phase == Phase::Simulation
+                    } else {
+                        self.actions
+                            .phase(&q.request.input.action)
+                            .unwrap_or(Phase::Interaction)
+                            == phase
+                    }
             }) {
                 let id = q.request.id;
                 let mut task = FrozenTask {
@@ -597,6 +617,11 @@ impl ExecutionHost {
                     Err(RejectCode::Stopping)
                 } else {
                     live.ok_or(RejectCode::StaleSession).and_then(|s| {
+                        if q.request.input.action == movement_action() {
+                            return self
+                                .plan_movement(&q.request)
+                                .map(|tx| ActionOutput::Mutation(Box::new(tx)));
+                        }
                         self.actions.plan(
                             self.world(),
                             &s.actor,
@@ -759,22 +784,28 @@ impl ExecutionHost {
     }
     fn prepare_task(&self, task: &FrozenTask) -> Result<ExecutionPrepared, Fault> {
         let mut status = task.status.clone();
-        let mut prepared = match &task.transaction {
-            Some(stored) => match self.cached_prevalidation().map(Ok).unwrap_or_else(|| {
-                stored.restore(self.world()).and_then(|tx| {
-                    self.source.world().prepare_group(&tx).map_err(|e| match e {
-                        PrepareError::Rejected(c) => c,
-                        PrepareError::SequenceExhausted => RejectCode::QuotaExceeded,
+        let movement_rejection = self.check_frozen_movement(task).err();
+        let mut prepared = if let Some(reason) = movement_rejection {
+            status = ReplyStatus::Rejected(reason);
+            self.source.prepare_barrier().map_err(commit_fault)?
+        } else {
+            match &task.transaction {
+                Some(stored) => match self.cached_prevalidation().map(Ok).unwrap_or_else(|| {
+                    stored.restore(self.world()).and_then(|tx| {
+                        self.source.world().prepare_group(&tx).map_err(|e| match e {
+                            PrepareError::Rejected(c) => c,
+                            PrepareError::SequenceExhausted => RejectCode::QuotaExceeded,
+                        })
                     })
-                })
-            }) {
-                Ok(prepared) => prepared,
-                Err(reason) => {
-                    status = ReplyStatus::Rejected(reason);
-                    self.source.prepare_barrier().map_err(commit_fault)?
-                }
-            },
-            None => self.source.prepare_barrier().map_err(commit_fault)?,
+                }) {
+                    Ok(prepared) => prepared,
+                    Err(reason) => {
+                        status = ReplyStatus::Rejected(reason);
+                        self.source.prepare_barrier().map_err(commit_fault)?
+                    }
+                },
+                None => self.source.prepare_barrier().map_err(commit_fault)?,
+            }
         };
         let state = match settle(
             &self.runtime,
@@ -1134,6 +1165,17 @@ impl HostAuthority for ExecutionHost {
                     None => return Admission::Rejected(RejectCode::QuotaExceeded),
                 }
             };
+        if request.input.action == movement_action() {
+            let Some(player) = self.players.get_mut(&id.session.0) else {
+                return Admission::Rejected(RejectCode::PermissionDenied);
+            };
+            if player.last_tick == Some(Tick(target)) {
+                return Admission::Rejected(RejectCode::QuotaExceeded);
+            }
+            player.last_tick = Some(Tick(target));
+        } else if self.players.contains_key(&id.session.0) {
+            return Admission::Rejected(RejectCode::PermissionDenied);
+        }
         self.sessions
             .get_mut(&id.session.0)
             .expect("authenticated session")

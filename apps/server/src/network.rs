@@ -11,6 +11,8 @@ use torse_sim::durable::Receipt;
 use torse_sim::replica::{ReplicaScope, WorldReplicaBatch, WorldReplicaSeed};
 use torse_storage::CommitJournal;
 use torse_types::*;
+#[path = "network_player.rs"]
+mod player;
 
 pub type ClientMessage = torse_protocol::ClientMessage<torse_sim::durable::Call>;
 pub type ServerMessage = torse_protocol::ServerMessage<
@@ -159,6 +161,9 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
 #[derive(Clone, Copy)]
 pub struct NetworkLimits {
     pub peers: usize,
+    pub movement_inputs: usize,
+    /// Conservative queue-node reservation, charged at 512 bytes per input.
+    pub movement_bytes: u64,
     pub requests_per_tick: u32,
     pub frames_per_poll: usize,
     pub outstanding: usize,
@@ -190,6 +195,7 @@ pub struct PeerPolicy {
     pub scope: ReplicaScope,
 }
 struct Peer<T> {
+    player: Option<player::Control>,
     transport: T,
     policy: PeerPolicy,
     viewer: Option<Viewer>,
@@ -208,6 +214,9 @@ pub struct NetworkHub<T> {
 impl<T: Transport> NetworkHub<T> {
     pub fn new(binding: Binding, limits: NetworkLimits) -> Result<Self, Fault> {
         if limits.frames_per_poll == 0
+            || limits.movement_inputs == 0
+            || limits.movement_inputs > 4096
+            || limits.movement_bytes < limits.movement_inputs as u64 * 512
             || limits.outstanding == 0
             || limits.subscriptions == 0
             || limits.idle_ticks == 0
@@ -219,7 +228,13 @@ impl<T: Transport> NetworkHub<T> {
         Ok(Self {
             peers: BTreeMap::new(),
             next: 1,
-            sessions: SessionRegistry::new(limits.peers, limits.requests_per_tick)?,
+            sessions: SessionRegistry::new(
+                limits
+                    .peers
+                    .checked_mul(2)
+                    .ok_or_else(|| Fault::resource_limit("session capacity overflow"))?,
+                limits.requests_per_tick,
+            )?,
             limits,
             binding,
         })
@@ -233,6 +248,7 @@ impl<T: Transport> NetworkHub<T> {
         self.peers.insert(
             id,
             Peer {
+                player: None,
                 transport,
                 policy,
                 viewer: None,
@@ -349,6 +365,19 @@ impl<T: Transport> NetworkHub<T> {
                     return Err(e);
                 }
                 peer.viewer = Some(viewer);
+                if let Some(control) = &mut peer.player {
+                    let child = sessions.open()?;
+                    server.authority()?;
+                    if let Err(error) =
+                        server
+                            .authority
+                            .bind_player(viewer.session, child, control.entity)
+                    {
+                        sessions.close(child.session);
+                        return Err(error);
+                    }
+                    control.viewer = Some(child);
+                }
                 Self::send(
                     peer,
                     ServerMessage::Welcome {
@@ -356,7 +385,11 @@ impl<T: Transport> NetworkHub<T> {
                         session: viewer.session,
                     },
                     limits,
-                )
+                )?;
+                if peer.player.is_some() {
+                    Self::send_player(peer, server, false, limits)?;
+                }
+                Ok(())
             }
             ClientMessage::Request { seq, call } => {
                 let viewer = peer
@@ -370,6 +403,9 @@ impl<T: Transport> NetworkHub<T> {
                             && !peer.waiting.contains(&seq.0) =>
                     {
                         Admission::Rejected(RejectCode::QuotaExceeded)
+                    }
+                    Ok(()) if call.action == crate::execution::movement_action() => {
+                        Admission::Rejected(RejectCode::PermissionDenied)
                     }
                     Ok(()) => server.submit(WorldRequest {
                         id: RequestId {
@@ -433,6 +469,7 @@ impl<T: Transport> NetworkHub<T> {
                     .ok_or_else(|| Fault::invalid_data("handshake required"))?;
                 Ok(())
             }
+            ClientMessage::Move(input) => Self::receive_movement(peer, server, input, limits),
             ClientMessage::Close => {
                 peer.closed = true;
                 peer.transport.close();
@@ -500,6 +537,7 @@ impl<T: Transport> NetworkHub<T> {
                             peer.waiting.remove(&seq);
                         }
                     }
+                    Self::poll_player(peer, server, self.limits)?;
                     for id in peer.subscriptions.iter().copied().collect::<Vec<_>>() {
                         for batch in server.take_replica(SubscriptionId(id), self.limits.budget)? {
                             Self::send(peer, ServerMessage::Batch(batch), self.limits)?;
@@ -529,6 +567,9 @@ impl<T: Transport> NetworkHub<T> {
             let mut peer = self.peers.remove(&id).expect("peer exists");
             peer.transport.close();
             if let Some(viewer) = peer.viewer {
+                if let Some(child) = peer.player.as_ref().and_then(|p| p.viewer) {
+                    self.sessions.close(child.session);
+                }
                 server.disconnect(viewer.session)?;
                 self.sessions.close(viewer.session);
                 for subscription in peer.subscriptions {

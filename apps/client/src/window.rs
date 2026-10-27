@@ -800,6 +800,16 @@ impl WindowApp {
         }
     }
 
+    /// Frequent authority confirmations replace the pose without consuming
+    /// elapsed logic time; resetting the clock here can starve every walk tick.
+    fn correct_network_pose(&mut self, eye: [f32; 3]) {
+        self.present_prev = eye;
+        self.present_next = eye;
+        if let Some(camera) = self.camera.as_mut() {
+            camera.eye = eye;
+        }
+    }
+
     fn pump_walk(&mut self, steps: u32, motion: MoveInput) -> Result<(), String> {
         if let Some(camera) = self.camera.as_mut() {
             camera.look(motion.yaw_delta, motion.pitch_delta);
@@ -826,7 +836,26 @@ impl WindowApp {
                 f64::from(self.present_next[2]),
             );
             let scene = self.scene.as_mut().ok_or("walk mode has no scene")?;
-            match scene.step_walker(wish, jump, step) {
+            let result = if let Some(connection) = self.net.as_mut() {
+                let quantized = [
+                    (wish[0] * 127.0).round() as i8,
+                    (wish[2] * 127.0).round() as i8,
+                ];
+                match connection
+                    .move_player(scene.authority(), quantized, jump)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(position) => Ok((position, false)),
+                    None => {
+                        self.last_result =
+                            "Player position is unavailable in this subscription".to_owned();
+                        continue;
+                    }
+                }
+            } else {
+                scene.step_walker(wish, jump, step)
+            };
+            match result {
                 Ok((position, _)) => {
                     let wanted = wish[0].abs() + wish[2].abs() > 1e-9;
                     let drifted =
@@ -893,9 +922,31 @@ impl WindowApp {
                 }
                 self.reset_presentation_pose(eye);
                 self.scene = Some(scene);
+                if let Some(connection) = self.net.as_mut() {
+                    let scene = self.scene.as_mut().expect("installed scene");
+                    connection
+                        .refresh_player(scene.authority())
+                        .map_err(|e| e.to_string())?;
+                    if self.walk
+                        && let Some(id) = connection.player_entity()
+                    {
+                        scene.view_player(id);
+                    }
+                }
                 self.pending_palette = self.scene.as_ref().map(|scene| scene.palette().clone());
                 self.center = None;
                 self.uploaded = false;
+                if self.walk
+                    && let Some(position) = self.net.as_ref().zip(self.scene.as_ref()).and_then(
+                        |(connection, scene)| connection.player_position(scene.authority()),
+                    )
+                {
+                    self.reset_presentation_pose([
+                        position.x as f32,
+                        (position.y + WALKER_EYE_OFFSET) as f32,
+                        position.z as f32,
+                    ]);
+                }
             }
             NetEvent::Increment(changes) => {
                 self.batches += 1;
@@ -903,6 +954,36 @@ impl WindowApp {
                     return Err("increment before baseline".to_owned());
                 };
                 scene.apply_changes(&changes)?;
+                if let Some(connection) = self.net.as_mut() {
+                    connection
+                        .refresh_player(scene.authority())
+                        .map_err(|e| e.to_string())?;
+                    if self.walk
+                        && let Some(id) = connection.player_entity()
+                    {
+                        scene.view_player(id);
+                    }
+                }
+            }
+            NetEvent::Player(_update) => {
+                if let Some((connection, scene)) = self.net.as_mut().zip(self.scene.as_mut()) {
+                    connection
+                        .refresh_player(scene.authority())
+                        .map_err(|e| e.to_string())?;
+                    if self.walk {
+                        if let Some(id) = connection.player_entity() {
+                            scene.view_player(id);
+                        }
+                        if let Some(position) = connection.player_position(scene.authority()) {
+                            let eye = [
+                                position.x as f32,
+                                (position.y + WALKER_EYE_OFFSET) as f32,
+                                position.z as f32,
+                            ];
+                            self.correct_network_pose(eye);
+                        }
+                    }
+                }
             }
             NetEvent::Admitted { seq, rejected } => {
                 if rejected.is_some() {
@@ -924,6 +1005,14 @@ impl WindowApp {
                 );
             }
             NetEvent::Closed(reason) => return Err(reason),
+        }
+        if self.config.walk
+            && !self.walk
+            && self.net.is_some()
+            && self.scene.is_some()
+            && let Some(camera) = self.camera.as_ref()
+        {
+            self.enter_walk(camera.eye);
         }
         Ok(())
     }
@@ -982,6 +1071,23 @@ impl WindowApp {
     /// entity that already overlaps terrain, so a low spawn point freezes the
     /// walker until it is toggled again from higher up.
     fn enter_walk(&mut self, eye: [f32; 3]) {
+        if let Some((connection, scene)) = self.net.as_ref().zip(self.scene.as_mut()) {
+            if let Some(position) = connection.player_position(scene.authority()) {
+                if let Some(id) = connection.player_entity() {
+                    scene.view_player(id);
+                }
+                self.walk = true;
+                self.config.walk = false;
+                self.reset_presentation_pose([
+                    position.x as f32,
+                    (position.y + WALKER_EYE_OFFSET) as f32,
+                    position.z as f32,
+                ]);
+            } else {
+                self.last_result = "Player position is unavailable in this subscription".to_owned();
+            }
+            return;
+        }
         let under = Position::new(
             f64::from(eye[0]),
             f64::from(eye[1]) - 0.5,
@@ -997,6 +1103,7 @@ impl WindowApp {
             None => return,
         }
         self.walk = true;
+        self.config.walk = false;
         // Seed the interpolation endpoints with the spawn position so the
         // first frames do not glide in from the origin.
         let start = [
@@ -1813,6 +1920,26 @@ mod tests {
                 .walker_position()
                 .is_none()
         );
-        assert_eq!(app.last_result, "network walking is not supported yet");
+        assert_eq!(
+            app.last_result,
+            "network mirrors cannot settle local movement"
+        );
+    }
+
+    #[test]
+    fn frequent_network_confirmations_do_not_reset_elapsed_walk_time() {
+        let mut app = app();
+        app.scene = Some(Scene::new_background(1).unwrap());
+        app.enter_walk(app.camera.unwrap().eye);
+        assert!(app.walk);
+        let start = Instant::now();
+        assert_eq!(app.frame_interval(start), 0.0);
+        for frame in 1..=100 {
+            app.correct_network_pose(app.present_next);
+            let dt = app.frame_interval(start + Duration::from_millis(frame * 10));
+            assert_eq!(dt, 0.01);
+            app.pump_logic(dt, forward()).unwrap();
+        }
+        assert_eq!(app.walk_ticks, 20);
     }
 }

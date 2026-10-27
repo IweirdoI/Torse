@@ -1,4 +1,4 @@
-//! Client side of the version 2 protocol: connect, mirror, and request.
+//! Client side of the versioned protocol: connect, mirror, and request.
 //!
 //! The connection owns one transport and one [`ReplicaMirror`]. The window
 //! polls it every frame; inbound frames decode into [`NetEvent`]s and the
@@ -15,6 +15,8 @@ use torse_types::{
     Admission, BlockPos, Compatibility, ContentKey, Fault, OutputBudget, RejectCode, RequestSeq,
     SessionId,
 };
+#[path = "prediction.rs"]
+mod prediction;
 
 /// The concrete message shapes this demo exchanges; the type parameters all
 /// live in shared crates, so the client binds them itself.
@@ -25,8 +27,11 @@ pub type ServerMessage =
 /// One decoded server message the window acts on.
 #[derive(Debug)]
 pub enum NetEvent {
+    Player(torse_protocol::PlayerUpdate),
     /// Handshake finished; the session is live.
-    Welcomed { session: SessionId },
+    Welcomed {
+        session: SessionId,
+    },
     /// The authorized baseline arrived; the mirror now holds a full snapshot.
     Baseline(ReplicaSnapshot),
     /// One increment was validated and applied to the mirror.
@@ -37,15 +42,20 @@ pub enum NetEvent {
         rejected: Option<RejectCode>,
     },
     /// A request result arrived.
-    Finished { seq: RequestSeq, committed: bool },
+    Finished {
+        seq: RequestSeq,
+        committed: bool,
+    },
     /// The server closed the connection with a reason.
     Closed(String),
 }
 
 /// Live client connection to a standalone server.
 pub struct Connection<T: Transport> {
+    prediction: prediction::Prediction,
     transport: T,
     mirror: Option<ReplicaMirror>,
+    subscription_pending: bool,
     request_seq: u64,
     budget: OutputBudget,
     limits: CodecLimits,
@@ -56,8 +66,10 @@ impl<T: Transport> Connection<T> {
     /// Wrap a connected transport with the demo frame budget.
     pub fn new(transport: T) -> Self {
         Self {
+            prediction: Default::default(),
             transport,
             mirror: None,
+            subscription_pending: false,
             request_seq: 0,
             budget: OutputBudget {
                 max_items: 200_000,
@@ -84,15 +96,56 @@ impl<T: Transport> Connection<T> {
 
     /// Subscribe to a fixed section set the host already approved.
     pub fn subscribe(&mut self, sections: Vec<torse_types::SectionPos>) -> Result<(), Fault> {
-        self.send(ClientMessage::Subscribe { sections })
+        if self.subscription_pending {
+            return Err(Fault::resource_limit("subscription replacement pending"));
+        }
+        if let Some(subscription) = self.mirror.as_ref().map(|mirror| mirror.subscription) {
+            self.send(ClientMessage::Unsubscribe { subscription })?;
+        }
+        self.send(ClientMessage::Subscribe { sections })?;
+        self.subscription_pending = true;
+        Ok(())
     }
 
     /// Submit one action call; sequence numbers start at one and never repeat.
     pub fn request(&mut self, call: torse_sim::durable::Call) -> Result<RequestSeq, Fault> {
-        self.request_seq += 1;
+        self.request_seq = self
+            .request_seq
+            .checked_add(1)
+            .ok_or_else(|| Fault::resource_limit("request sequence exhausted"))?;
         let seq = RequestSeq(self.request_seq);
         self.send(ClientMessage::Request { seq, call })?;
         Ok(seq)
+    }
+
+    pub fn player_position(
+        &self,
+        world: &torse_sim::WorldAuthority,
+    ) -> Option<torse_world::Position> {
+        self.prediction.position(world)
+    }
+    pub fn player_entity(&self) -> Option<torse_types::EntityId> {
+        self.prediction.entity()
+    }
+    pub fn refresh_player(&mut self, world: &torse_sim::WorldAuthority) -> Result<(), Fault> {
+        self.prediction.refresh(world)
+    }
+    pub fn move_player(
+        &mut self,
+        world: &torse_sim::WorldAuthority,
+        wish: [i8; 2],
+        jump: bool,
+    ) -> Result<Option<torse_world::Position>, Fault> {
+        if let Some((session, input)) = self.prediction.step(world, wish, jump)? {
+            self.send(ClientMessage::Move(torse_protocol::MoveCommand {
+                session,
+                seq: input.seq,
+                tick_hint: world.coordinator().resume_point().tick,
+                wish: [input.wish[0], input.wish[2]],
+                jump: input.jump,
+            }))?;
+        }
+        Ok(self.prediction.position(world))
     }
 
     /// Poll the transport and translate every completed frame.
@@ -123,6 +176,7 @@ impl<T: Transport> Connection<T> {
     fn handle(&mut self, message: ServerMessage, now: Instant) -> Result<Option<NetEvent>, Fault> {
         match message {
             ServerMessage::Welcome { session, .. } => {
+                self.prediction.welcome(session);
                 self.last_ping = Some(now);
                 Ok(Some(NetEvent::Welcomed { session }))
             }
@@ -131,6 +185,7 @@ impl<T: Transport> Connection<T> {
                 let snapshot = seed.state.clone();
                 let mirror = ReplicaMirror::from_seed(seed)?;
                 self.mirror = Some(mirror);
+                self.subscription_pending = false;
                 Ok(Some(NetEvent::Baseline(snapshot)))
             }
             ServerMessage::Batch(batch) => {
@@ -162,6 +217,10 @@ impl<T: Transport> Connection<T> {
             ServerMessage::Rejected(reason) => {
                 self.last_ping = None;
                 Ok(Some(NetEvent::Closed(format!("rejected: {reason:?}"))))
+            }
+            ServerMessage::Player(update) => {
+                self.prediction.receive(update);
+                Ok(Some(NetEvent::Player(update)))
             }
         }
     }
@@ -294,6 +353,59 @@ mod tests {
         let second = connection.request(call).expect("send");
         assert_eq!(first.0, 1);
         assert_eq!(second.0, 2);
+    }
+
+    #[test]
+    fn subscription_replacement_unsubscribes_the_old_generation_before_subscribing() {
+        use torse_types::*;
+        let (client, mut server) = MemoryTransport::pair(default_limits()).unwrap();
+        let mut connection = Connection::new(client);
+        let binding = Binding {
+            world: WorldId(1),
+            epoch: WorldEpoch(1),
+            compatibility: Compatibility {
+                authority_schema: 1,
+                rules_digest: Digest([0; 32]),
+                content_digest: Digest([0; 32]),
+            },
+        };
+        connection.mirror = Some(ReplicaMirror {
+            binding,
+            subscription: SubscriptionId(7),
+            through: CommitCursor::initial(binding.world),
+            seq: ReplicaSeq(0),
+            state: ReplicaSnapshot {
+                side: 16,
+                bounds: torse_world::WorldBounds::new(0, 32).unwrap(),
+                states: Vec::new(),
+                sections: Vec::new(),
+                entities: Vec::new(),
+            },
+        });
+        connection.subscribe(vec![SectionPos::ZERO]).unwrap();
+        assert!(matches!(
+            wire::decode::<ClientMessage>(
+                &server.receive().unwrap().unwrap(),
+                connection.budget,
+                connection.limits
+            )
+            .unwrap(),
+            ClientMessage::Unsubscribe {
+                subscription: SubscriptionId(7)
+            }
+        ));
+        assert!(matches!(
+            wire::decode::<ClientMessage>(
+                &server.receive().unwrap().unwrap(),
+                connection.budget,
+                connection.limits
+            )
+            .unwrap(),
+            ClientMessage::Subscribe { .. }
+        ));
+        assert!(connection.subscribe(Vec::new()).is_err());
+        assert!(server.receive().unwrap().is_none());
+        assert_eq!(connection.request_seq, 0);
     }
 
     #[test]

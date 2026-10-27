@@ -9,7 +9,7 @@
 //! type would make the schema advisory, and the schema is what migration and
 //! encoding need to reason about.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use torse_content::{CompiledContent, ComponentFieldType, ComponentSchema, PersistencePolicy};
 use torse_types::{ContentKey, EntityId};
@@ -52,9 +52,11 @@ pub enum ComponentValue {
 /// which is what lets storage trust a schema identity without re-validating it.
 #[derive(Clone, Debug, Default)]
 pub struct ComponentSchemas {
-    schemas: BTreeMap<ContentKey, ComponentSchema>,
-    persistence: BTreeMap<ContentKey, bool>,
-    block_defaults: BTreeMap<ContentKey, BTreeMap<ContentKey, ComponentFields>>,
+    pub(crate) schemas: BTreeMap<ContentKey, ComponentSchema>,
+    pub(crate) persistence: BTreeMap<ContentKey, bool>,
+    pub(crate) block_defaults: BTreeMap<ContentKey, BTreeMap<ContentKey, ComponentFields>>,
+    pub(crate) blocks: BTreeMap<ContentKey, BTreeSet<ContentKey>>,
+    pub(crate) compatibility: Option<torse_types::Compatibility>,
 }
 
 impl ComponentSchemas {
@@ -74,17 +76,32 @@ impl ComponentSchemas {
             schemas,
             persistence: BTreeMap::new(),
             block_defaults: BTreeMap::new(),
+            blocks: content
+                .blocks
+                .iter()
+                .map(|(id, block)| {
+                    (
+                        id.clone(),
+                        block.component_defaults.iter().cloned().collect(),
+                    )
+                })
+                .collect(),
+            compatibility: None,
         }
     }
 
     /// Resolve an owner-defined save policy during trusted startup. Unresolved
-    /// policies preserve data. Hosts must include this choice in their rules version.
+    /// policies preserve data. World assembly automatically binds these choices
+    /// into compatibility. Frozen schemas reject further startup mutation.
     pub fn resolve_persistence(
         &mut self,
         owner: &ContentKey,
         id: &ContentKey,
         persist: bool,
     ) -> Result<(), ComponentError> {
+        if self.compatibility.is_some() {
+            return Err(ComponentError::ConfigurationFrozen);
+        }
         let schema = self
             .get(id)
             .ok_or_else(|| ComponentError::UnknownSchema { id: id.clone() })?;
@@ -118,10 +135,19 @@ impl ComponentSchemas {
         schema: ContentKey,
         fields: ComponentFields,
     ) -> Result<(), ComponentError> {
+        if self.compatibility.is_some() {
+            return Err(ComponentError::ConfigurationFrozen);
+        }
         let definition = self
             .get(&schema)
             .ok_or_else(|| ComponentError::UnknownSchema { id: schema.clone() })?;
-        if &definition.owner_module != owner || schema == crate::block_instance_schema() {
+        if &definition.owner_module != owner
+            || schema == crate::block_instance_schema()
+            || !self
+                .blocks
+                .get(&block)
+                .is_some_and(|declared| declared.contains(&schema))
+        {
             return Err(ComponentError::InvalidConfiguration { id: schema });
         }
         ComponentSet::validate(self, &schema, &fields)?;
@@ -429,6 +455,10 @@ fn validate_element(
 /// Failure produced by component validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComponentError {
+    /// Startup data cannot change after compatibility has been bound.
+    ConfigurationFrozen,
+    /// Supplied compatibility does not identify this assembled configuration.
+    ConfigurationMismatch,
     /// Startup configuration did not come from the declared owner or policy.
     InvalidConfiguration {
         /// Component schema being configured.
@@ -483,6 +513,10 @@ pub enum ComponentError {
 impl std::fmt::Display for ComponentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ConfigurationFrozen => write!(f, "component configuration is frozen"),
+            Self::ConfigurationMismatch => {
+                write!(f, "component configuration compatibility mismatch")
+            }
             Self::InvalidConfiguration { id } => write!(f, "invalid owner configuration for {id}"),
             Self::BudgetExceeded => write!(f, "component aggregate budget exceeded"),
             Self::UnknownSchema { id } => write!(f, "component schema {id} is not registered"),

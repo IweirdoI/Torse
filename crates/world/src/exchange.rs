@@ -298,6 +298,13 @@ impl Snapshot {
         schemas: Option<&ComponentSchemas>,
         selected: Option<SectionPos>,
     ) -> Result<Self, ExchangeError> {
+        if let Some(schemas) = schemas {
+            schemas
+                .validate_compatibility(meta.compatibility)
+                .map_err(|error| ExchangeError::Store {
+                    detail: error.to_string(),
+                })?;
+        }
         let side = store.side();
         let bounds = store.bounds();
         let mut sections: Vec<SnapshotSection> =
@@ -424,6 +431,11 @@ impl Snapshot {
         registry: &BlockStateRegistry,
         schemas: &ComponentSchemas,
     ) -> Result<RestoredWorld, ExchangeError> {
+        schemas
+            .validate_compatibility(self.meta.compatibility)
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
         self.validate_entity_allocator()?;
         if self.side == 0 {
             return Err(ExchangeError::InvalidWorld { side: self.side });
@@ -611,6 +623,11 @@ impl ChangeSet {
         registry: &BlockStateRegistry,
         schemas: &ComponentSchemas,
     ) -> Result<Vec<(SectionPos, torse_types::Revision)>, ExchangeError> {
+        schemas
+            .validate_compatibility(self.meta.compatibility)
+            .map_err(|error| ExchangeError::Store {
+                detail: error.to_string(),
+            })?;
         let lifecycle = self
             .entity_lifecycle
             .as_ref()

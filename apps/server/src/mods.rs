@@ -718,12 +718,17 @@ pub fn mod_world_with_layout(
 
     let catalog = ItemCatalog::new([(bootstrap::key("base:stone"), 64)])
         .map_err(|e| Fault::invalid_data(format!("{e:?}")))?;
-    let schemas = torse_world::ComponentSchemas::build(&set.content);
     let compatibility = Compatibility {
         authority_schema: 4,
         rules_digest: set.content.authority_digest,
         content_digest: set.content.presentation_digest,
     };
+    let (schemas, compatibility) = torse_world::ComponentSchemas::assemble(
+        &set.content,
+        torse_world::ComponentConfiguration::default(),
+        compatibility,
+    )
+    .map_err(|error| Fault::invalid_data(error.to_string()))?;
     let mut handlers = torse_sim::block_actions::handlers();
     handlers.extend(torse_inventory::handlers(catalog.clone()));
     let mut descriptors = torse_sim::block_actions::descriptors();

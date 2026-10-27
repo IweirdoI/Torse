@@ -252,6 +252,9 @@ impl WorldAuthority {
         bounds: WorldBounds,
         compatibility: Compatibility,
     ) -> Result<Self, AuthorityError> {
+        let (schemas, compatibility) = schemas
+            .bind_compatibility(compatibility)
+            .map_err(|error| AuthorityError::Store(error.to_string()))?;
         let store = SectionStore::new(side, bounds).map_err(|error| {
             AuthorityError::World(ExchangeError::Store {
                 detail: error.to_string(),
@@ -596,6 +599,13 @@ impl<'a> Recovery<'a> {
                 actual: snapshot.meta.cursor.world,
             });
         }
+        self.schemas
+            .validate_compatibility(snapshot.meta.compatibility)
+            .map_err(|error| {
+                RecoveryError::Payload(ExchangeError::Store {
+                    detail: error.to_string(),
+                })
+            })?;
         let snapshot = snapshot
             .persistent_view(self.schemas)
             .map_err(RecoveryError::Payload)?;
@@ -653,6 +663,11 @@ impl<'a> Recovery<'a> {
                 cursor: changes.meta.cursor.seq,
                 expected,
             });
+        }
+        if changes.meta.compatibility != self.compatibility {
+            return Err(RecoveryError::Payload(ExchangeError::Store {
+                detail: "journal compatibility changed".to_owned(),
+            }));
         }
         let changes = changes
             .persistent_view(self.schemas)

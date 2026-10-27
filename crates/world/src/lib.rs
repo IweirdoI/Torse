@@ -20,6 +20,7 @@ mod archive;
 mod block_instance;
 mod collider;
 mod component;
+mod configuration;
 mod entity;
 mod exchange;
 mod handles;
@@ -44,6 +45,7 @@ pub use component::{
     MAX_COMPONENT_BYTES, MAX_COMPONENT_INSTANCES, MAX_COMPONENT_NODES, MAX_VALUE_DEPTH,
     component_size,
 };
+pub use configuration::{BlockDefault, ComponentConfiguration, PersistenceSelection};
 pub use entity::{
     ComponentBatch, ComponentEdit, Entity, EntityError, EntityMove, EntityStore,
     MAX_COMPONENT_EDITS, Position,

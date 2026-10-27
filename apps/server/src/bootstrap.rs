@@ -139,7 +139,9 @@ pub fn world() -> Result<(WorldAuthority, ActionService), Fault> {
         rules_digest: content.authority_digest,
         content_digest: content.presentation_digest,
     };
-    let schemas = ComponentSchemas::build(&content);
+    let (schemas, compatibility) =
+        ComponentSchemas::assemble(&content, ComponentConfiguration::default(), compatibility)
+            .map_err(|error| Fault::invalid_data(error.to_string()))?;
     let catalog = torse_inventory::ItemCatalog::new([(key("base:stone"), 64)])
         .map_err(|e| Fault::invalid_data(format!("catalog: {e:?}")))?;
     let mut handlers = block_actions::handlers();

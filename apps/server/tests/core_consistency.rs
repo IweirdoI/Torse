@@ -20,6 +20,9 @@ fn fields(value: u32) -> ComponentFields {
     [(key("test:value"), ComponentValue::U32(value))].into()
 }
 fn world() -> (WorldAuthority, ActionService) {
+    world_config(7, false)
+}
+fn world_config(value: u32, persist: bool) -> (WorldAuthority, ActionService) {
     let mut pack = m0_fixture_pack();
     block_actions::register_content(&mut pack);
     let components = [
@@ -57,20 +60,30 @@ fn world() -> (WorldAuthority, ActionService) {
         .map(key)
         .into();
     let content = compile(pack).unwrap();
-    let mut schemas = ComponentSchemas::build(&content);
-    schemas
-        .resolve_persistence(&key("test:module"), &key("test:optional"), false)
-        .unwrap();
-    for schema in ["test:saved", "test:cache", "test:optional"] {
-        schemas
-            .set_block_default(
-                &key("test:module"),
-                key("base:glass"),
-                key(schema),
-                fields(7),
-            )
-            .unwrap();
-    }
+    let (schemas, compatibility) = ComponentSchemas::assemble(
+        &content,
+        ComponentConfiguration {
+            persistence: vec![PersistenceSelection {
+                owner: key("test:module"),
+                schema: key("test:optional"),
+                persist,
+            }],
+            block_defaults: ["test:saved", "test:cache", "test:optional"]
+                .map(|schema| BlockDefault {
+                    owner: key("test:module"),
+                    block: key("base:glass"),
+                    schema: key(schema),
+                    fields: fields(value),
+                })
+                .into(),
+        },
+        Compatibility {
+            authority_schema: 1,
+            rules_digest: content.authority_digest,
+            content_digest: content.presentation_digest,
+        },
+    )
+    .unwrap();
     let service = ActionService::bind(
         block_actions::descriptors(),
         block_actions::handlers(),
@@ -83,11 +96,7 @@ fn world() -> (WorldAuthority, ActionService) {
         schemas.clone(),
         16,
         WorldBounds::new(0, 32).unwrap(),
-        Compatibility {
-            authority_schema: 1,
-            rules_digest: content.authority_digest,
-            content_digest: content.presentation_digest,
-        },
+        compatibility,
     )
     .unwrap();
     world.store_mut().request(SectionPos::ZERO).unwrap();
@@ -334,6 +343,56 @@ fn execution_journal_checkpoint_and_tail_use_the_same_persistent_projection() {
     drop(server);
     let server = reopen(&dir);
     assert_restored(&server, false);
+}
+
+#[test]
+fn changed_startup_defaults_or_save_policy_reject_reopen_without_rewriting_data() {
+    fn bytes(dir: &Directory) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut result = std::collections::BTreeMap::new();
+        let journal = dir.0.join("journal.log");
+        result.insert(journal.clone(), std::fs::read(journal).unwrap());
+        for file in std::fs::read_dir(dir.0.join("checkpoints")).unwrap() {
+            let path = file.unwrap().path();
+            result.insert(path.clone(), std::fs::read(path).unwrap());
+        }
+        result
+    }
+    let dir = Directory::new();
+    let mut server = create(dir.acquire());
+    let id = submit(&mut server, true, 1);
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    assert_eq!(
+        server.receipt(id).unwrap().unwrap().reply.status,
+        ReplyStatus::Committed
+    );
+    drop(server);
+    let before = bytes(&dir);
+    for (value, persist) in [(8, false), (7, true)] {
+        let (world, service) = world_config(value, persist);
+        let result = base::Files::open_file(
+            dir.acquire(),
+            world.coordinator().compatibility(),
+            base::Codec::new(base::codec_limits()).unwrap(),
+            base::file_policy(),
+            |binding| {
+                Ok(ExecutionRecovery::new(
+                    binding,
+                    world.registry(),
+                    world.schemas(),
+                    service,
+                    rules(),
+                    base::execution_limits(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(bytes(&dir), before);
+    }
+    let mut server = reopen(&dir);
+    assert_restored(&server, true);
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    drop(server);
+    assert_restored(&reopen(&dir), true);
 }
 
 #[test]

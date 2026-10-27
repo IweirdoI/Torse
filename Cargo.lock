@@ -2973,6 +2973,7 @@ version = "0.1.0"
 name = "torse-world"
 version = "0.1.0"
 dependencies = [
+ "sha2",
  "torse-content",
  "torse-types",
 ]

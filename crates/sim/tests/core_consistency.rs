@@ -1006,7 +1006,31 @@ fn checkpoint_and_journal_projection_agree_for_updates_and_despawns() {
 #[test]
 fn owner_defined_policy_requires_the_owner_and_never_changes_fixed_policies() {
     let (world, _) = setup(false, false);
-    let mut schemas = world.schemas().clone();
+    let mut pack = m0_fixture_pack();
+    register_action_module(
+        &mut pack,
+        key("test:module"),
+        key("test:state"),
+        ["test:optional", "test:saved"]
+            .into_iter()
+            .map(|id| ComponentSchema {
+                id: key(id),
+                schema_version: 1,
+                owner_module: key("test:module"),
+                fields: vec![],
+                persistence: if id == "test:optional" {
+                    PersistencePolicy::OwnerDefined
+                } else {
+                    PersistencePolicy::Always
+                },
+                replication: ReplicationDeclaration::SERVER_PRIVATE,
+                migration_binding: None,
+            })
+            .collect(),
+        vec![],
+        vec![],
+    );
+    let mut schemas = ComponentSchemas::build(&compile(pack).unwrap());
     assert!(schemas.persists(&key("test:optional")).unwrap());
     assert!(
         schemas
@@ -1023,6 +1047,14 @@ fn owner_defined_policy_requires_the_owner_and_never_changes_fixed_policies() {
         .unwrap();
     assert!(!schemas.persists(&key("test:optional")).unwrap());
     assert!(schemas.persists(&key("test:unknown")).is_err());
+    assert_eq!(
+        world.schemas().clone().resolve_persistence(
+            &key("test:module"),
+            &key("test:optional"),
+            false
+        ),
+        Err(torse_world::ComponentError::ConfigurationFrozen)
+    );
 }
 
 #[test]
@@ -1102,6 +1134,37 @@ fn instance_recovery_and_replication_keep_bindings_but_hide_private_fields() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].changes.sections.len(), 1);
     assert_eq!(batches[0].changes.removed_entities.len(), 1);
+}
+
+#[test]
+fn recovery_refuses_changed_configuration_or_journal_metadata_before_apply() {
+    let (mut world, _) = setup(true, true);
+    let snapshot = world.capture_snapshot(meta(&world)).unwrap();
+    let mut placement = tx(1, "world:module");
+    let pos = BlockPos::new(3, 3, 3);
+    placement.write_block(
+        pos,
+        world.registry().default_state(&key("base:glass")).unwrap(),
+    );
+    let mut changes = apply(&mut world, &placement);
+    let original = changes.meta.compatibility;
+    changes.meta.compatibility.rules_digest = Digest([99; 32]);
+    let mut recovery = Recovery::new(world.world(), world.registry(), world.schemas());
+    recovery.restore_snapshot(&snapshot).unwrap();
+    assert!(recovery.replay(&changes).is_err());
+    assert_eq!(recovery.seq(), CommitSeq::INITIAL);
+    let restored = recovery.finish().unwrap();
+    assert_eq!(
+        restored.store().query(pos),
+        TerrainQuery::Ready(BlockStateId::EMPTY)
+    );
+    let mut bad = snapshot.clone();
+    bad.meta.compatibility = changes.meta.compatibility;
+    assert!(bad.restore(world.registry(), world.schemas()).is_err());
+    let mut recovery = Recovery::new(world.world(), world.registry(), world.schemas());
+    assert!(recovery.restore_snapshot(&bad).is_err());
+    assert_eq!(recovery.seq(), CommitSeq::INITIAL);
+    assert_eq!(snapshot.meta.compatibility, original);
 }
 
 #[test]

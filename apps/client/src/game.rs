@@ -21,9 +21,9 @@ use torse_assets::texture::{
     TintSource,
 };
 use torse_content::{
-    AlphaMode, BlockDefinition, CollisionProfile, ContentPack, Face, FaceMaterials, FaceOverlay,
-    FaceOverlays, InteractionProfile, LightTransport, OcclusionProfile, RenderProfile,
-    SelectionProfile, Shape, SourceRef, Sourced, StateSchema,
+    AlphaMode, BlockDefinition, BoxBounds, CollisionProfile, ContentPack, Face, FaceMaterials,
+    FaceOverlay, FaceOverlays, InteractionProfile, LightTransport, OcclusionProfile, RenderModel,
+    RenderProfile, SelectionProfile, Shape, SourceRef, Sourced, StateSchema,
 };
 use torse_types::{BlockPos, ContentKey, LocalPos, SectionPos};
 use torse_world::{BlockStateId, BlockStateRegistry, Section, SectionError, WorldBounds};
@@ -348,9 +348,17 @@ const fn one() -> u32 {
     1
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct Bounds {
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
 #[derive(Debug, Deserialize)]
 struct BlockSpec {
     shape: String,
+    #[serde(default)]
+    bounds: Option<Bounds>,
     #[serde(default = "opaque")]
     alpha: String,
     #[serde(default)]
@@ -427,7 +435,8 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
     let mut blocks = Vec::with_capacity(descriptor.blocks.len());
     for (name, spec) in &descriptor.blocks {
         let id = format!("{namespace}:{name}");
-        let shape = parse_shape(&spec.shape).map_err(|error| format!("{id}: {error}"))?;
+        let shape =
+            parse_shape(&spec.shape, spec.bounds).map_err(|error| format!("{id}: {error}"))?;
         let alpha = parse_alpha(&spec.alpha).map_err(|error| format!("{id}: {error}"))?;
         let overlay_alpha = match &spec.overlay_alpha {
             Some(value) => parse_alpha(value).map_err(|error| format!("{id}: {error}"))?,
@@ -463,6 +472,13 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
             }
         }
         let solid = shape == Shape::FullCube && alpha == AlphaMode::Opaque;
+        // Models are visual only. An index that names one without quads still
+        // has to load; collision and selection stay unset rather than copying
+        // the visual shape into those profiles.
+        let selection = match &shape {
+            Shape::Model(_) => None,
+            other => Some(other.clone()),
+        };
         blocks.push(Sourced::new(
             SourceRef::new(source, 1),
             BlockDefinition {
@@ -479,7 +495,7 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
                 collision_profile: CollisionProfile {
                     shape: collision_shape(&shape),
                 },
-                selection_profile: SelectionProfile { shape: Some(shape) },
+                selection_profile: SelectionProfile { shape: selection },
                 occlusion_profile: OcclusionProfile {
                     face_mask: if solid { 0b11_1111 } else { 0 },
                 },
@@ -516,12 +532,35 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
     })
 }
 
-fn parse_shape(value: &str) -> Result<Shape, String> {
+fn parse_shape(value: &str, bounds: Option<Bounds>) -> Result<Shape, String> {
+    if value != "box" && bounds.is_some() {
+        return Err("only box geometry accepts bounds".to_owned());
+    }
     match value {
         "full_cube" => Ok(Shape::FullCube),
         "lower_slab" => Ok(Shape::LowerSlab),
         "cross" => Ok(Shape::Cross),
         "panel" => Ok(Shape::Panel),
+        // Preset geometry is not in the index. Record an empty visual model
+        // so the block still loads; callers must not reuse it for physics.
+        "model" => Ok(Shape::Model(Arc::new(RenderModel::default()))),
+        "box" => {
+            let bounds = bounds.ok_or_else(|| "box geometry needs bounds".to_owned())?;
+            if !(0..3).all(|axis| {
+                let (minimum, maximum) = (bounds.min[axis], bounds.max[axis]);
+                minimum.is_finite()
+                    && maximum.is_finite()
+                    && minimum >= 0.0
+                    && minimum < maximum
+                    && maximum <= 1.0
+            }) {
+                return Err("invalid cell-local box bounds".to_owned());
+            }
+            Ok(Shape::Box(BoxBounds {
+                min: bounds.min,
+                max: bounds.max,
+            }))
+        }
         other => Err(format!("unsupported shape `{other}`")),
     }
 }
@@ -1022,6 +1061,132 @@ mod tests {
             tint: None,
             tint_source: None,
             mipmap_strategy: strategy.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn model_shape_stays_visual_and_a_later_unknown_shape_rejects_the_pack() {
+        let shape = parse_shape("model", None).expect("model is a shape");
+        assert!(matches!(shape, Shape::Model(ref model) if model.quads.is_empty()));
+        assert!(collision_shape(&shape).is_none());
+
+        let mut descriptor = empty_descriptor();
+        descriptor.blocks.insert(
+            "stone".to_owned(),
+            block_spec("full_cube", "opaque", "base:material/stone"),
+        );
+        descriptor.blocks.insert(
+            "log".to_owned(),
+            block_spec("model", "opaque", "base:material/log"),
+        );
+        let pack = content_pack(&descriptor, "base/atlas.toml").expect("known shapes build");
+        let stone = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:stone")
+            .expect("stone");
+        assert_eq!(stone.value.render_profile.shape, Shape::FullCube);
+        assert_eq!(stone.value.selection_profile.shape, Some(Shape::FullCube));
+        let log = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:log")
+            .expect("log");
+        assert!(matches!(log.value.render_profile.shape, Shape::Model(_)));
+        assert!(log.value.collision_profile.shape.is_none());
+        assert!(log.value.selection_profile.shape.is_none());
+        torse_content::compile(pack).expect("empty visual model compiles");
+
+        descriptor.blocks.insert(
+            "bad".to_owned(),
+            block_spec("mesh", "opaque", "base:material/stone"),
+        );
+        let error = content_pack(&descriptor, "base/atlas.toml").unwrap_err();
+        assert_eq!(error, "base:bad: unsupported shape `mesh`");
+    }
+
+    #[test]
+    fn box_shape_keeps_its_bounds_and_rejects_a_partial_declaration() {
+        let bounds = Bounds {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 0.0625, 1.0],
+        };
+        let shape = parse_shape("box", Some(bounds)).expect("box");
+        assert_eq!(
+            shape,
+            Shape::Box(BoxBounds {
+                min: bounds.min,
+                max: bounds.max,
+            })
+        );
+        assert_eq!(
+            parse_shape("box", None).unwrap_err(),
+            "box geometry needs bounds"
+        );
+        assert_eq!(
+            parse_shape("full_cube", Some(bounds)).unwrap_err(),
+            "only box geometry accepts bounds"
+        );
+        assert_eq!(
+            parse_shape(
+                "box",
+                Some(Bounds {
+                    min: [0.0, 0.5, 0.0],
+                    max: [1.0, 0.25, 1.0],
+                })
+            )
+            .unwrap_err(),
+            "invalid cell-local box bounds"
+        );
+
+        let mut descriptor = empty_descriptor();
+        let mut carpet = block_spec("box", "opaque", "base:material/wool");
+        carpet.bounds = Some(bounds);
+        descriptor.blocks.insert("carpet".to_owned(), carpet);
+        descriptor.blocks.insert(
+            "stone".to_owned(),
+            block_spec("full_cube", "opaque", "base:material/stone"),
+        );
+        let pack = content_pack(&descriptor, "base/atlas.toml").expect("box builds");
+        let carpet = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:carpet")
+            .expect("carpet");
+        assert_eq!(carpet.value.render_profile.shape, shape);
+        assert_eq!(carpet.value.selection_profile.shape, Some(shape));
+        assert!(carpet.value.collision_profile.shape.is_none());
+        let stone = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:stone")
+            .expect("stone");
+        assert_eq!(stone.value.render_profile.shape, Shape::FullCube);
+        assert_eq!(
+            stone.value.collision_profile.shape.as_ref(),
+            Some(&Shape::FullCube)
+        );
+
+        descriptor.blocks.insert(
+            "open".to_owned(),
+            block_spec("box", "opaque", "base:material/wool"),
+        );
+        assert_eq!(
+            content_pack(&descriptor, "base/atlas.toml").unwrap_err(),
+            "base:open: box geometry needs bounds"
+        );
+    }
+
+    fn block_spec(shape: &str, alpha: &str, material: &str) -> BlockSpec {
+        BlockSpec {
+            shape: shape.to_owned(),
+            bounds: None,
+            alpha: alpha.to_owned(),
+            overlay_alpha: None,
+            faces: FaceSpec {
+                all: Some(material.to_owned()),
+                ..FaceSpec::default()
+            },
         }
     }
 

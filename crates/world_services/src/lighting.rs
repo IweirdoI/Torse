@@ -11,6 +11,19 @@ use torse_world::{BlockStateRegistry, SectionPhase, SectionStore, TerrainQuery, 
 pub const MAX_LIGHT: u8 = 15;
 static NEXT_CACHE: AtomicU64 = AtomicU64::new(1);
 
+fn next_cache_identity(counter: &AtomicU64) -> Result<u64, Fault> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| Fault::resource_limit("light cache identities exhausted"))?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LightLimits {
     pub cells: usize,
@@ -371,9 +384,7 @@ impl LightCache {
         if max_sections == 0 || max_sections > 32768 || max_bytes == 0 {
             return Err(Fault::invalid_data("invalid light cache limits"));
         }
-        let identity = NEXT_CACHE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Fault::resource_limit("light cache identities exhausted"))?;
+        let identity = next_cache_identity(&NEXT_CACHE)?;
         Ok(Self {
             binding,
             entries: BTreeMap::new(),
@@ -504,4 +515,38 @@ fn readable(store: &SectionStore, pos: SectionPos) -> bool {
 }
 fn invalid(error: impl std::fmt::Display) -> Fault {
     Fault::invalid_data(error.to_string())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn identity_exhaustion_does_not_wrap_or_change_the_counter() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_cache_identity(&counter).unwrap(), u64::MAX - 1);
+        assert!(next_cache_identity(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+    #[test]
+    fn concurrent_identity_allocation_is_unique_and_consecutive() {
+        let counter = AtomicU64::new(1);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..100)
+                            .map(|_| next_cache_identity(&counter).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let mut identities: Vec<_> = workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect();
+            identities.sort_unstable();
+            assert_eq!(identities, (1..=800).collect::<Vec<_>>());
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 801);
+    }
 }

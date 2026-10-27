@@ -143,12 +143,13 @@ fn main() -> ExitCode {
         match run_window(config) {
             Ok(summary) => {
                 println!(
-                    "adapter={} backend={} format={} frames={} streams={} rebuilds={} \
+                    "adapter={} backend={} present={} format={} frames={} streams={} rebuilds={} \
                      uploads={} screenshots={} actions_ok={} actions_rejected={} walk_ticks={} \
                      walker=({:.1},{:.1},{:.1}) session={} batches={} requests_sent={} requests_rejected={} baseline_sections={} \
                      sections={} meshes={} vertices={} faces={} elapsed_ms={} \n                     mean_frame_us={} max_frame_us={} stream_frame_us={} rebuild_frame_us={}",
                     summary.adapter,
                     summary.backend,
+                    summary.present,
                     summary.format,
                     summary.frames,
                     summary.streams,

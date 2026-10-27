@@ -8,7 +8,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use wgpu::{DeviceDescriptor, Instance, InstanceDescriptor, PollType, RequestAdapterOptions};
+use crate::gpu::{apply_present_mode, open_for_window, startup_line};
+use wgpu::PollType;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -26,6 +27,8 @@ pub struct GpuProbeReport {
     pub device_type: String,
     /// Texture format selected for the configured surface.
     pub surface_format: String,
+    /// Present mode selected for the surface.
+    pub present_mode: String,
     /// Time spent creating the surface, device, and configuration.
     pub elapsed: Duration,
 }
@@ -52,7 +55,7 @@ impl ApplicationHandler for ProbeApp {
                 return;
             }
         };
-        self.result = Some(initialize_device(&window));
+        self.result = Some(initialize_device(window));
         // One initialization is enough; exiting immediately avoids a steady-state
         // event loop and makes the command suitable for automation.
         event_loop.exit();
@@ -85,49 +88,39 @@ pub fn run_gpu_probe() -> Result<GpuProbeReport, String> {
 ///
 /// The surface configuration is validated before returning, which catches common
 /// backend/driver failures without requiring a rendering pass.
-fn initialize_device(window: &Window) -> Result<GpuProbeReport, String> {
+fn initialize_device(window: Arc<Window>) -> Result<GpuProbeReport, String> {
     let start = Instant::now();
-    let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
-    let surface = instance
-        .create_surface(window)
-        .map_err(|error| format!("surface creation failed: {error}"))?;
-    // Supplying the compatible surface lets the adapter be selected with the
-    // backend and capabilities needed by the actual window.
-    let options = RequestAdapterOptions {
-        compatible_surface: Some(&surface),
-        ..RequestAdapterOptions::default()
-    };
-    let adapter = pollster::block_on(instance.request_adapter(&options))
-        .map_err(|error| format!("adapter unavailable: {error}"))?;
-    let info = adapter.get_info();
-    let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
-        .map_err(|error| format!("device unavailable: {error}"))?;
-
+    // The surface has to be created from the same instance as the adapter.
+    let (session, surface) = open_for_window(|instance| {
+        instance
+            .create_surface(window.clone())
+            .map_err(|error| format!("{error}"))
+    })?;
+    let info = session.info();
     let size = window.inner_size();
     let width = size.width.max(1);
     let height = size.height.max(1);
-    // `get_default_config` chooses a supported present mode and color format for
-    // this adapter. Clearing view formats keeps the probe independent of optional
-    // color-space reinterpretation.
+    let capabilities = surface.get_capabilities(&session.adapter);
     let mut config = surface
-        .get_default_config(&adapter, width, height)
+        .get_default_config(&session.adapter, width, height)
         .ok_or_else(|| "surface has no supported configuration".to_owned())?;
     config.view_formats.clear();
+    let present = apply_present_mode(&mut config, &capabilities.present_modes)?;
     let format = format!("{:?}", config.format);
-    // A successful configure call is the serviceable proof for this M0 probe.
-    // Frame acquisition is intentionally omitted because hidden windows may be
-    // treated as occluded by the compositor.
-    surface.configure(&device, &config);
-    queue.submit([]);
-    device
+    surface.configure(&session.device, &config);
+    session.queue.submit([]);
+    session
+        .device
         .poll(PollType::wait_indefinitely())
         .map_err(|error| format!("device poll failed: {error}"))?;
+    eprintln!("{}", startup_line(&info, Some(present)));
 
     Ok(GpuProbeReport {
         adapter_name: info.name,
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
         surface_format: format,
+        present_mode: format!("{present:?}"),
         elapsed: start.elapsed(),
     })
 }

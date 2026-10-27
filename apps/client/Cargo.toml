@@ -17,7 +17,7 @@ torse-inventory = { path = "../../modules/inventory" }
 torse-codec = { path = "../../crates/codec" }
 torse-net = { path = "../../crates/net" }
 torse-protocol = { path = "../../crates/protocol" }
-torse-render = { path = "../../crates/render" }
+torse-render = { path = "../../crates/render", features = ["gpu"] }
 torse-runtime = { path = "../../crates/runtime" }
 torse-sim = { path = "../../crates/sim" }
 torse-types = { path = "../../crates/types" }

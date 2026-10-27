@@ -6,10 +6,11 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-gpu-probe = ["dep:pollster", "dep:wgpu", "dep:winit"]
+gpu = ["dep:pollster", "dep:wgpu"]
+gpu-probe = ["gpu", "dep:winit"]
 
 [dependencies]
 torse-types = { path = "../types" }
 pollster = { version = "0.4.0", optional = true }
-wgpu = { version = "=30.0.1", default-features = false, features = ["metal", "vulkan", "wgsl", "std"], optional = true }
+wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl", "std"], optional = true }
 winit = { version = "=0.30.12", optional = true }

@@ -11,8 +11,7 @@ use std::time::Instant;
 
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, CurrentSurfaceTexture, Device,
-    DeviceDescriptor, Extent3d, Instance, InstanceDescriptor, PollType, Queue,
-    RequestAdapterOptions, Surface, SurfaceConfiguration, SurfaceTexture, TexelCopyBufferInfo,
+    Extent3d, PollType, Queue, Surface, SurfaceConfiguration, SurfaceTexture, TexelCopyBufferInfo,
     TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
     TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
 };
@@ -88,6 +87,8 @@ pub struct WindowSummary {
     pub backend: String,
     /// Surface colour format the pipeline was built for.
     pub format: String,
+    /// Present mode selected for the surface.
+    pub present: String,
     /// Presented frames.
     pub frames: u32,
     /// Times the section window moved with the camera.
@@ -145,6 +146,7 @@ struct Gpu {
     depth_view: TextureView,
     window: Arc<Window>,
     backend_name: String,
+    present_mode: String,
 }
 
 struct WindowApp {
@@ -1027,6 +1029,7 @@ impl WindowApp {
                 adapter: self.adapter.clone(),
                 backend: gpu.backend_name.clone(),
                 format: format!("{:?}", gpu.config.format),
+                present: gpu.present_mode.clone(),
                 frames: self.frames,
                 streams: self.streams,
                 rebuilds: self.rebuilds,
@@ -1094,54 +1097,49 @@ impl ApplicationHandler for WindowApp {
             }
         };
 
-        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
-        let surface = match instance.create_surface(window.clone()) {
-            Ok(surface) => surface,
+        let (session, surface) = match torse_render::open_for_window(|instance| {
+            instance
+                .create_surface(window.clone())
+                .map_err(|error| format!("{error}"))
+        }) {
+            Ok(opened) => opened,
             Err(error) => {
-                self.failure = Some(format!("surface creation failed: {error}"));
+                self.failure = Some(error);
                 event_loop.exit();
                 return;
             }
         };
-        let options = RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            ..RequestAdapterOptions::default()
-        };
-        let adapter = match pollster::block_on(instance.request_adapter(&options)) {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                self.failure = Some(format!("adapter unavailable: {error}"));
-                event_loop.exit();
-                return;
-            }
-        };
-        let info = adapter.get_info();
-        let (device, queue) =
-            match pollster::block_on(adapter.request_device(&DeviceDescriptor::default())) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    self.failure = Some(format!("device unavailable: {error}"));
-                    event_loop.exit();
-                    return;
-                }
-            };
-
+        let info = session.info();
         let size = window.inner_size();
-        let mut config =
-            match surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)) {
-                Some(config) => config,
-                None => {
-                    self.failure = Some("surface has no supported configuration".to_owned());
-                    event_loop.exit();
-                    return;
-                }
-            };
+        let mut config = match surface.get_default_config(
+            &session.adapter,
+            size.width.max(1),
+            size.height.max(1),
+        ) {
+            Some(config) => config,
+            None => {
+                self.failure = Some("surface has no supported configuration".to_owned());
+                event_loop.exit();
+                return;
+            }
+        };
         // Screenshots read back from the presented texture.
         config.usage |= TextureUsages::COPY_SRC;
-        surface.configure(&device, &config);
-        let depth = create_depth(&device, config.width, config.height);
+        let capabilities = surface.get_capabilities(&session.adapter);
+        let present =
+            match torse_render::apply_present_mode(&mut config, &capabilities.present_modes) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    self.failure = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            };
+        surface.configure(&session.device, &config);
+        let depth = create_depth(&session.device, config.width, config.height);
         let depth_view = depth.create_view(&TextureViewDescriptor::default());
-        let context = GpuContext::new(device, queue, config.format);
+        let context = GpuContext::new(session.device, session.queue, config.format);
+        eprintln!("{}", torse_render::startup_line(&info, Some(present)));
 
         let scene = if self.config.connect.is_some() {
             // Network scenes arrive with the first baseline; the window stays
@@ -1229,6 +1227,7 @@ impl ApplicationHandler for WindowApp {
         self.gpu = Some(Gpu {
             ui,
             backend_name: format!("{:?}", info.backend),
+            present_mode: format!("{present:?}"),
             context,
             surface,
             config,

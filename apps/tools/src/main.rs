@@ -249,6 +249,7 @@ fn gpu_probe() -> ExitCode {
             println!("backend={}", report.backend);
             println!("device_type={}", report.device_type);
             println!("surface_format={}", report.surface_format);
+            println!("present_mode={}", report.present_mode);
             println!("elapsed={:?}", report.elapsed);
             ExitCode::SUCCESS
         }

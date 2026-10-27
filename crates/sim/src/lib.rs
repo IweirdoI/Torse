@@ -25,6 +25,7 @@ pub mod payload;
 pub mod phase;
 mod placement;
 pub mod player;
+mod presentation;
 pub mod replica;
 pub mod simulation;
 pub mod streaming;
@@ -41,6 +42,7 @@ pub use payload::{
     changes_from_committed, changes_from_prepared, persistent_changes_from_prepared,
 };
 pub use phase::{OrderError, Phase, SystemSpec, next_resume_point, order_phase};
+pub use presentation::PresentationClock;
 pub use simulation::{
     DEFAULT_PHASE_TRANSACTION_LIMIT, Simulation, SimulationError, SimulationLimits, TickOutcome,
 };

@@ -603,7 +603,11 @@ impl Scene {
     /// The windowed client is a trusted local host, so it installs the player
     /// directly through the entity store the same way the server bootstrap
     /// installs its fixtures; movement still goes through transactions.
+    /// Server projections reject local walking until server movement exists.
     pub fn spawn_walker(&mut self, at: Position) -> Result<(), String> {
+        if self.is_network() {
+            return Err("network walking is not supported yet".to_owned());
+        }
         let handle = self
             .authority
             .entities_mut()
@@ -631,6 +635,9 @@ impl Scene {
         jump: bool,
         dt: f32,
     ) -> Result<(Position, bool), String> {
+        if self.is_network() {
+            return Err("network walking is not supported yet".to_owned());
+        }
         let Some(mut walker) = self.walker else {
             return Err("walk mode has no entity".to_owned());
         };
@@ -1799,6 +1806,35 @@ mod tests {
         // Streaming must not fabricate terrain around the mirror.
         scene.load_around(SectionPos::new(5, 0, 5)).expect("noop");
         assert_eq!(scene.sections().len(), 2);
+    }
+
+    #[test]
+    fn network_scene_rejects_local_walking_without_changing_the_replica() {
+        let mut scene = Scene::from_snapshot(&replica_snapshot()).expect("scene");
+        let meta = torse_sim::streaming::page_meta(scene.authority());
+        let before = scene.authority().capture_snapshot(meta).expect("snapshot");
+        assert_eq!(
+            scene.spawn_walker(Position::new(8.5, 12.0, 8.5)),
+            Err("network walking is not supported yet".to_owned())
+        );
+        assert!(scene.walker.is_none());
+        // Even a stale walker handle must not let local movement settle
+        // against a server-owned entity.
+        let handle = scene
+            .authority()
+            .entities()
+            .handle_of(EntityId(9))
+            .expect("entity");
+        scene.walker = Some(torse_sim::player::WalkerState::new(handle));
+        assert_eq!(
+            scene.step_walker([0.0, 0.0, -1.0], true, 0.05),
+            Err("network walking is not supported yet".to_owned())
+        );
+        assert_eq!(scene.edit_counter, 0);
+        assert_eq!(
+            scene.authority().capture_snapshot(meta).expect("snapshot"),
+            before
+        );
     }
 
     #[test]

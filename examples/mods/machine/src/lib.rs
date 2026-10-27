@@ -79,6 +79,9 @@ impl Guest for Component {
             let output = field_entity(&previous, OUTPUT_FIELD)?;
             let schema = bindings::torse::behavior::query::resolve_symbol(SCHEMA_KEY)?;
 
+            #[cfg(feature = "budget-probe")]
+            probe_budget(tick);
+
             let mut rng = Rng::new(invocation.rng_seed);
             let _work = rng.next_u64() ^ u64::from(progress);
 
@@ -128,10 +131,50 @@ impl Guest for Component {
                 wakeups: vec![WakeupRequest {
                     entity: machine,
                     tick: tick + 1,
-                    key: WORK_KEY.to_string(),
+                    key: if cfg!(feature = "budget-probe") && tick == 5 {
+                        "x".repeat(4096)
+                    } else {
+                        WORK_KEY.to_string()
+                    },
                 }],
             })
         }
+    }
+}
+
+#[cfg(feature = "budget-probe")]
+fn probe_budget(tick: u64) {
+    use bindings::torse::behavior::types::{Bbox, Vec3i};
+    let min = Vec3i { x: 0, y: 0, z: 0 };
+    match tick {
+        1 => {
+            // Deliberately ignore the query error and still return a plan.
+            let _ = bindings::torse::behavior::query::query_blocks(Bbox {
+                min,
+                max: Vec3i {
+                    x: 1_i64 << 32,
+                    y: 1_i64 << 32,
+                    z: 1,
+                },
+            });
+        }
+        2 => {
+            for _ in 0..16 {
+                let _ = bindings::torse::behavior::query::query_blocks(Bbox {
+                    min,
+                    max: Vec3i { x: 1, y: 1, z: 1 },
+                });
+            }
+        }
+        3 => bindings::torse::behavior::diagnostics::log(
+            bindings::torse::behavior::diagnostics::LogLevel::Info,
+            &"x".repeat(4096),
+        ),
+        4 => {
+            #[cfg(target_arch = "wasm32")]
+            let _ = core::arch::wasm32::memory_grow::<0>(1024);
+        }
+        _ => {}
     }
 }
 

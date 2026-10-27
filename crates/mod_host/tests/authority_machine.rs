@@ -67,6 +67,10 @@ struct Fixture {
 }
 
 fn fixture(features: &[&str], stock_input: bool) -> Fixture {
+    fixture_with_budget(features, stock_input, CallBudget::prototype())
+}
+
+fn fixture_with_budget(features: &[&str], stock_input: bool, budget: CallBudget) -> Fixture {
     let core = build_guest(features);
     let engine = engine_with(false).expect("engine");
     let bytes = encode_component(&core).expect("component encodes");
@@ -87,7 +91,7 @@ fn fixture(features: &[&str], stock_input: bool) -> Fixture {
         &engine,
         component,
         world.host,
-        CallBudget::prototype(),
+        budget,
     )
     .expect("instance builds");
     let mut fixture = Fixture {
@@ -331,4 +335,166 @@ fn trap_rebuilds_the_instance_from_committed_state() {
             .consecutive_failures(&key("machine:module")),
         2
     );
+}
+
+#[test]
+fn budget_errors_cannot_commit_even_when_the_guest_ignores_them() {
+    let mut fixture = fixture_with_budget(
+        &["budget-probe"],
+        true,
+        CallBudget {
+            max_host_work: 4,
+            max_input_bytes: 2048,
+            max_guest_instances: 4,
+            ..CallBudget::prototype()
+        },
+    );
+    for tick in 1..=5 {
+        let event = torse_mod_host::authority::InvokeEvent::Wakeup(
+            torse_mod_host::authority::WakeupTarget {
+                entity: torse_mod_host::authority::WitEntityId::from_entity_id(fixture.machine),
+                key: "machine:tick".to_string(),
+            },
+        );
+        let outcome = fixture
+            .instance
+            .dispatch(tick, event)
+            .expect("budget recovery succeeds");
+        assert!(
+            matches!(
+                outcome,
+                DispatchOutcome::Rejected { .. } | DispatchOutcome::Trapped { .. }
+            ),
+            "tick {tick}: {outcome:?}"
+        );
+        assert_eq!(fixture.instance.host().seq().0, 0);
+        assert_eq!(machine_progress(&fixture.instance, fixture.machine), 0);
+    }
+    let event =
+        torse_mod_host::authority::InvokeEvent::Wakeup(torse_mod_host::authority::WakeupTarget {
+            entity: torse_mod_host::authority::WitEntityId::from_entity_id(fixture.machine),
+            key: "machine:tick".to_string(),
+        });
+    assert!(matches!(
+        fixture.instance.dispatch(6, event).unwrap(),
+        DispatchOutcome::Committed { .. }
+    ));
+    assert_eq!(machine_progress(&fixture.instance, fixture.machine), 1);
+}
+
+#[cfg(feature = "package")]
+fn resolved_machine() -> torse_mod_host::package::ResolvedModSet {
+    torse_mod_host::package::resolve(
+        &[workspace_root().join("examples/mods/machine")],
+        &torse_mod_host::scenario::engine_base(),
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "package")]
+#[test]
+fn durable_dispatch_discards_ignored_budget_errors_and_recovers() {
+    use std::sync::Arc;
+    use torse_mod_host::durable_dispatch::{DurableGuest, GuestOutcome, SymbolTable};
+    let bytes = encode_component(&build_guest(&["budget-probe"])).unwrap();
+    let set = resolved_machine();
+    let symbols = Arc::new(SymbolTable::build(
+        &set.content,
+        &["machine:schema/state".to_string()],
+    ));
+    let world = machine_scenario(&ScenarioConfig {
+        package: "machine:module",
+        schema: "machine:schema/state",
+        stock_input: true,
+        granted_permissions: &["inventory:permission/transfer", "inventory:permission/read"],
+    })
+    .unwrap();
+    let mut guest = DurableGuest::new(
+        &bytes,
+        symbols,
+        CallBudget {
+            max_host_work: 140,
+            max_input_bytes: 2048,
+            max_guest_instances: 4,
+            ..CallBudget::prototype()
+        },
+    )
+    .unwrap();
+    let owned = [key("machine:schema/state")];
+    for tick in 1..=5 {
+        let result = guest
+            .dispatch(
+                world.host.authority(),
+                tick,
+                world.machine,
+                "machine:tick",
+                &owned,
+            )
+            .unwrap();
+        assert!(
+            matches!(result, GuestOutcome::Trapped(_)),
+            "tick {tick} must discard the plan"
+        );
+        assert_eq!(world.host.seq().0, 0);
+    }
+    assert!(matches!(
+        guest
+            .dispatch(
+                world.host.authority(),
+                6,
+                world.machine,
+                "machine:tick",
+                &owned
+            )
+            .unwrap(),
+        GuestOutcome::Plan(_)
+    ));
+}
+
+#[cfg(feature = "package")]
+#[test]
+fn shared_runtime_reclaims_trapped_instances_before_rebuilding() {
+    use torse_mod_host::scenario::BehaviorRuntime;
+    let bytes = encode_component(&build_guest(&["budget-probe"])).unwrap();
+    let set = resolved_machine();
+    let world = machine_scenario(&ScenarioConfig {
+        package: "machine:module",
+        schema: "machine:schema/state",
+        stock_input: true,
+        granted_permissions: &["inventory:permission/transfer", "inventory:permission/read"],
+    })
+    .unwrap();
+    let machine = world.machine;
+    let mut runtime = BehaviorRuntime::new(
+        &set,
+        world.host,
+        [(key("machine:module"), bytes)].into(),
+        CallBudget {
+            max_host_work: 4,
+            max_input_bytes: 2048,
+            max_guest_instances: 4,
+            ..CallBudget::prototype()
+        },
+    )
+    .unwrap();
+    for tick in 1..=6 {
+        let event = torse_mod_host::authority::InvokeEvent::Wakeup(
+            torse_mod_host::authority::WakeupTarget {
+                entity: torse_mod_host::authority::WitEntityId::from_entity_id(machine),
+                key: "machine:tick".to_string(),
+            },
+        );
+        let result = runtime
+            .dispatch(&key("machine:module"), tick, event)
+            .unwrap();
+        if tick <= 5 {
+            assert!(matches!(
+                result,
+                DispatchOutcome::Rejected { .. } | DispatchOutcome::Trapped { .. }
+            ));
+            assert_eq!(runtime.host().seq().0, 0);
+        } else {
+            assert!(matches!(result, DispatchOutcome::Committed { .. }));
+        }
+    }
 }

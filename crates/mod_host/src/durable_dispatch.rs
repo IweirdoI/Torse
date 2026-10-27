@@ -26,6 +26,7 @@ use wasmtime::Engine;
 use wasmtime::Store;
 use wasmtime::component::{Component, bindgen};
 
+use crate::budget::{GuestLimits, HostBudget};
 use crate::component::{CallBudget, Meters, encode_component};
 
 bindgen!({
@@ -36,6 +37,8 @@ bindgen!({
 use exports::torse::behavior::invoke::{
     Event, Invocation, ObjectRef, OwnedState, Plan, WakeupTarget,
 };
+
+crate::budget::boundary_sizes!();
 
 /// Session-wide stable symbol table shared by all dispatches.
 #[derive(Clone, Debug, Default)]
@@ -93,6 +96,8 @@ pub struct DispatchState {
     view: BoundedView,
     symbols: Arc<SymbolTable>,
     pub meters: Meters,
+    budget: HostBudget,
+    guest_limits: GuestLimits,
 }
 
 /// Outcome of one guest dispatch.
@@ -168,9 +173,14 @@ fn snapshot_fields(
     symbols: &SymbolTable,
     entity: EngineEntityId,
     schema: &ContentKey,
+    budget: &mut HostBudget,
 ) -> Option<Vec<Field>> {
     let handle = world.entities().handle_of(entity)?;
     let fields = world.entities().get(handle)?.components.component(schema)?;
+    budget.work(fields.len() as u64).ok()?;
+    budget
+        .output(crate::budget::flat_source_size(fields)?)
+        .ok()?;
     let mut flat = Vec::with_capacity(fields.len());
     for (field_key, value) in fields {
         let atom = match value {
@@ -240,13 +250,20 @@ impl DurableGuest {
                 view,
                 symbols,
                 meters: Meters::default(),
+                budget: HostBudget::new(budget),
+                guest_limits: GuestLimits::new(budget),
             },
         );
+        store.limiter(|host| &mut host.guest_limits);
+        store.set_hostcall_fuel(budget.copy_fuel());
         store
             .set_fuel(budget.fuel)
             .map_err(|error| format!("fuel setup failed: {error}"))?;
         let bindings = ModBehavior::instantiate(&mut store, component, &linker)
             .map_err(|error| format!("instantiation failed: {error}"))?;
+        if store.data().budget.exceeded() {
+            return Err("component initialization exceeded host budget".to_string());
+        }
         Ok((bindings, store))
     }
 
@@ -307,6 +324,7 @@ impl DurableGuest {
         owned_schemas: &[ContentKey],
     ) -> Result<GuestOutcome, String> {
         self.rebuild()?;
+        self.store.data_mut().budget.reset();
         self.dispatches += 1;
         let symbols = Arc::clone(&self.store.data().symbols);
 
@@ -359,7 +377,17 @@ impl DurableGuest {
         for y in center.1 - VIEW_RADIUS..=center.1 + VIEW_RADIUS {
             for z in center.2 - VIEW_RADIUS..=center.2 + VIEW_RADIUS {
                 for x in center.0 - VIEW_RADIUS..=center.0 + VIEW_RADIUS {
+                    self.store
+                        .data_mut()
+                        .budget
+                        .work(1)
+                        .map_err(|_| "snapshot work budget exceeded".to_string())?;
                     let cell = snapshot_cell(world, &symbols, BlockPos::new(x, y, z));
+                    self.store
+                        .data_mut()
+                        .budget
+                        .output(64 + cell_size(&cell))
+                        .map_err(|_| "snapshot output budget exceeded".to_string())?;
                     cells.insert((x, y, z), cell);
                 }
             }
@@ -371,6 +399,11 @@ impl DurableGuest {
         };
         let mut entities = Vec::new();
         let mut components = BTreeMap::new();
+        self.store
+            .data_mut()
+            .budget
+            .work(world.entities().allocated_slots() as u64)
+            .map_err(|_| "snapshot work budget exceeded".to_string())?;
         for (_, candidate) in world.entities().iter() {
             let position = candidate.position;
             let x = position.x.floor() as i64;
@@ -379,12 +412,28 @@ impl DurableGuest {
             if !in_box(x, y, z) {
                 continue;
             }
+            self.store
+                .data_mut()
+                .budget
+                .output(64)
+                .map_err(|_| "snapshot output budget exceeded".to_string())?;
             entities.push(EntitySample {
                 id: wit_entity(candidate.id),
                 position: Vec3i { x, y, z },
             });
             for schema in owned_schemas {
-                let fields = snapshot_fields(world, &symbols, candidate.id, schema);
+                self.store
+                    .data_mut()
+                    .budget
+                    .work(1)
+                    .map_err(|_| "snapshot work budget exceeded".to_string())?;
+                let fields = snapshot_fields(
+                    world,
+                    &symbols,
+                    candidate.id,
+                    schema,
+                    &mut self.store.data_mut().budget,
+                );
                 components.insert((candidate.id.0, schema.to_string()), fields);
             }
         }
@@ -417,6 +466,12 @@ impl DurableGuest {
             rng_seed: tick.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5eed_cafe,
         };
 
+        self.store
+            .data_mut()
+            .budget
+            .output(invocation_size(&invocation))
+            .map_err(|_| "snapshot output budget exceeded".to_string())?;
+
         {
             let state = self.store.data_mut();
             state.view = BoundedView {
@@ -435,6 +490,17 @@ impl DurableGuest {
                 .torse_behavior_invoke()
                 .call_handle_event(&mut self.store, &invocation)
         };
+        if let Ok(plan) = &result
+            && self
+                .store
+                .data_mut()
+                .budget
+                .input(plan.as_ref().map_or(0, plan_size))
+                .is_err()
+        {
+            self.rebuild()?;
+            return Ok(GuestOutcome::Trapped("host budget exceeded".to_string()));
+        }
         match result {
             Err(trap) => {
                 let reason = trap
@@ -455,43 +521,51 @@ impl torse::behavior::types::Host for DispatchState {}
 
 impl torse::behavior::query::Host for DispatchState {
     fn resolve_symbol(&mut self, key: String) -> Option<u32> {
-        self.meters.resolve_calls += 1;
+        self.budget.enter(key.len() as u64).ok()?;
+        self.meters.resolve_calls = self.meters.resolve_calls.saturating_add(1);
+        self.budget.output(4).ok()?;
         self.symbols.symbol_of(&key)
     }
 
     fn symbol_key(&mut self, symbol: u32) -> Option<String> {
-        self.symbols
-            .keys
-            .get(symbol.checked_sub(1)? as usize)
-            .cloned()
+        self.budget.enter(4).ok()?;
+        let key = self.symbols.keys.get(symbol.checked_sub(1)? as usize)?;
+        self.budget.output(key.len() as u64).ok()?;
+        Some(key.clone())
     }
 
     fn query_blocks(&mut self, region: Bbox) -> Result<Vec<CellSample>, QueryError> {
-        self.meters.query_block_calls += 1;
-        let width = (region.max.x - region.min.x).max(0) as u64;
-        let height = (region.max.y - region.min.y).max(0) as u64;
-        let depth = (region.max.z - region.min.z).max(0) as u64;
-        if width * height * depth > u64::from(self.view.cells_available()) {
-            return Err(QueryError::BudgetExceeded);
+        self.meters.query_block_calls = self.meters.query_block_calls.saturating_add(1);
+        let count = self
+            .budget
+            .region(
+                [region.min.x, region.min.y, region.min.z],
+                [region.max.x, region.max.y, region.max.z],
+                self.view.cells_available(),
+            )
+            .map_err(|_| QueryError::BudgetExceeded)?;
+        if count == 0 {
+            return Ok(Vec::new());
         }
         let mut samples = Vec::new();
         for y in region.min.y..region.max.y {
             for z in region.min.z..region.max.z {
                 for x in region.min.x..region.max.x {
-                    let cell = self
-                        .view
-                        .cells
-                        .get(&(x, y, z))
-                        .cloned()
-                        .unwrap_or(Cell::NotLoaded);
+                    let cell = self.view.cells.get(&(x, y, z)).unwrap_or(&Cell::NotLoaded);
+                    self.budget
+                        .output(24 + cell_size(cell))
+                        .map_err(|_| QueryError::BudgetExceeded)?;
                     samples.push(CellSample {
                         pos: Vec3i { x, y, z },
-                        cell,
+                        cell: cell.clone(),
                     });
                 }
             }
         }
-        self.meters.cells_returned += samples.len() as u32;
+        self.meters.cells_returned = self
+            .meters
+            .cells_returned
+            .saturating_add(samples.len() as u32);
         Ok(samples)
     }
 
@@ -501,6 +575,15 @@ impl torse::behavior::query::Host for DispatchState {
         cursor: Option<String>,
         limit: u32,
     ) -> Result<EntityPage, QueryError> {
+        self.budget
+            .enter(52 + cursor.as_ref().map_or(0, |value| value.len() as u64))
+            .map_err(|_| QueryError::BudgetExceeded)?;
+        if limit > self.budget.limits.max_cells_per_query {
+            return self.budget.reject().map_err(|_| QueryError::BudgetExceeded);
+        }
+        self.budget
+            .work(self.view.entities.len() as u64)
+            .map_err(|_| QueryError::BudgetExceeded)?;
         let skip = match &cursor {
             None => 0_usize,
             Some(raw) => raw
@@ -515,19 +598,23 @@ impl torse::behavior::query::Host for DispatchState {
                 && sample.position.z >= region.min.z
                 && sample.position.z < region.max.z
         };
-        let matched: Vec<&EntitySample> =
-            self.view.entities.iter().filter(|e| in_region(e)).collect();
-        let items = matched
-            .iter()
-            .skip(skip)
-            .take(limit as usize)
-            .map(|sample| EntitySample {
-                id: sample.id,
-                position: sample.position,
-            })
-            .collect();
-        let next = if skip + (limit as usize) < matched.len() {
-            Some((skip + limit as usize).to_string())
+        let matched = self.view.entities.iter().filter(|e| in_region(e));
+        let mut items = Vec::new();
+        let mut total = 0_usize;
+        for sample in matched {
+            if total >= skip && items.len() < limit as usize {
+                self.budget
+                    .output(40)
+                    .map_err(|_| QueryError::BudgetExceeded)?;
+                items.push(EntitySample {
+                    id: sample.id,
+                    position: sample.position,
+                });
+            }
+            total += 1;
+        }
+        let next = if skip.saturating_add(items.len()) < total {
+            Some(skip.saturating_add(items.len()).to_string())
         } else {
             None
         };
@@ -538,6 +625,10 @@ impl torse::behavior::query::Host for DispatchState {
         &mut self,
         targets: Vec<ComponentTarget>,
     ) -> Result<Vec<ComponentSnapshot>, QueryError> {
+        self.budget
+            .enter((targets.len() as u64).saturating_mul(24))
+            .and_then(|_| self.budget.work(targets.len() as u64))
+            .map_err(|_| QueryError::BudgetExceeded)?;
         let mut snapshots = Vec::with_capacity(targets.len());
         for target in targets {
             let schema = self
@@ -548,17 +639,21 @@ impl torse::behavior::query::Host for DispatchState {
                 .view
                 .components
                 .get(&(engine_entity(&target.entity).0, schema.to_string()))
-                .cloned()
-                .flatten();
+                .and_then(|fields| fields.as_deref());
+            self.budget
+                .work(fields.map_or(0, |fields| fields.len() as u64))
+                .and_then(|_| self.budget.output(40 + fields.map_or(0, fields_size)))
+                .map_err(|_| QueryError::BudgetExceeded)?;
             snapshots.push(ComponentSnapshot {
                 entity: target.entity,
-                fields,
+                fields: fields.map(Vec::from),
             });
         }
         Ok(snapshots)
     }
 
-    fn probe_item_port(&mut self, _entity: EntityId, _port: String) -> Option<PortEstimate> {
+    fn probe_item_port(&mut self, _entity: EntityId, port: String) -> Option<PortEstimate> {
+        self.budget.enter(16 + port.len() as u64).ok()?;
         // Port estimates need live inventory access; not part of the durable
         // snapshot.
         None
@@ -567,18 +662,15 @@ impl torse::behavior::query::Host for DispatchState {
 
 impl torse::behavior::diagnostics::Host for DispatchState {
     fn log(&mut self, level: LogLevel, message: String) {
-        if self.meters.log_entries >= self.budget_log() {
-            self.meters.log_dropped += 1;
+        if self.budget.enter(4 + message.len() as u64).is_err()
+            || self.budget.logs >= self.budget.limits.max_log_entries
+        {
+            self.meters.log_dropped = self.meters.log_dropped.saturating_add(1);
             return;
         }
-        self.meters.log_entries += 1;
+        self.budget.logs += 1;
+        self.meters.log_entries = self.meters.log_entries.saturating_add(1);
         let _ = (level, message);
-    }
-}
-
-impl DispatchState {
-    fn budget_log(&self) -> u32 {
-        CallBudget::prototype().max_log_entries
     }
 }
 
@@ -594,7 +686,10 @@ impl BoundedView {
 }
 
 impl torse::behavior::schedule::Host for DispatchState {
-    fn pending_wakeups(&mut self, _key_prefix: Option<String>) -> Vec<WakeupSlot> {
+    fn pending_wakeups(&mut self, key_prefix: Option<String>) -> Vec<WakeupSlot> {
+        let _ = self
+            .budget
+            .enter(key_prefix.as_ref().map_or(0, |key| key.len() as u64));
         // The durable queue is not guest-visible; the host owns scheduling.
         Vec::new()
     }
@@ -795,4 +890,114 @@ pub fn convert_plan(
 /// package loader for a single build path.
 pub fn encode_guest(core: &[u8]) -> Result<Vec<u8>, String> {
     encode_component(core)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use torse::behavior::query::Host;
+
+    fn state(budget: CallBudget) -> DispatchState {
+        DispatchState {
+            view: BoundedView {
+                center: (0, 0, 0),
+                radius: 2,
+                cells: [((0, 0, 0), Cell::Empty)].into(),
+                entities: Vec::new(),
+                components: BTreeMap::new(),
+            },
+            symbols: Arc::new(SymbolTable::default()),
+            meters: Meters::default(),
+            budget: HostBudget::new(budget),
+            guest_limits: GuestLimits::new(budget),
+        }
+    }
+
+    fn region(min: [i64; 3], max: [i64; 3]) -> Bbox {
+        Bbox {
+            min: Vec3i {
+                x: min[0],
+                y: min[1],
+                z: min[2],
+            },
+            max: Vec3i {
+                x: max[0],
+                y: max[1],
+                z: max[2],
+            },
+        }
+    }
+
+    #[test]
+    fn durable_queries_reject_extremes_before_cloning() {
+        let mut host = state(CallBudget::prototype());
+        for (min, max) in [
+            ([0; 3], [1_i64 << 32, 1_i64 << 32, 1]),
+            ([i64::MIN, 0, 0], [i64::MAX, 1, 1]),
+        ] {
+            host.budget.reset();
+            assert!(matches!(
+                host.query_blocks(region(min, max)),
+                Err(QueryError::BudgetExceeded)
+            ));
+        }
+        host.budget.reset();
+        assert!(
+            host.query_blocks(region([0; 3], [0, i64::MAX, i64::MAX]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(host.meters.cells_returned, 0);
+        assert_eq!(host.view.cells.len(), 1);
+    }
+
+    #[test]
+    fn durable_totals_outputs_and_huge_cursor_are_bounded() {
+        let mut host = state(CallBudget {
+            max_host_work: 1,
+            ..CallBudget::prototype()
+        });
+        assert_eq!(host.query_blocks(region([0; 3], [1; 3])).unwrap().len(), 1);
+        assert!(matches!(
+            host.query_blocks(region([0; 3], [1; 3])),
+            Err(QueryError::BudgetExceeded)
+        ));
+        let mut host = state(CallBudget {
+            max_output_bytes: 1,
+            ..CallBudget::prototype()
+        });
+        assert!(matches!(
+            host.query_blocks(region([0; 3], [1; 3])),
+            Err(QueryError::BudgetExceeded)
+        ));
+        let mut host = state(CallBudget::prototype());
+        let page = host
+            .query_entities(
+                region([i64::MIN; 3], [i64::MAX; 3]),
+                Some(usize::MAX.to_string()),
+                1,
+            )
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
+        assert!(matches!(
+            host.query_entities(region([0; 3], [1; 3]), None, u32::MAX),
+            Err(QueryError::BudgetExceeded)
+        ));
+        let mut host = state(CallBudget {
+            max_output_bytes: 1,
+            ..CallBudget::prototype()
+        });
+        host.symbols = Arc::new(SymbolTable {
+            map: [("probe:schema/state".to_string(), 1)].into(),
+            keys: vec!["probe:schema/state".to_string()],
+        });
+        assert!(matches!(
+            host.read_components(vec![ComponentTarget {
+                entity: EntityId { low: 1, high: 0 },
+                schema: 1,
+            }]),
+            Err(QueryError::BudgetExceeded)
+        ));
+    }
 }

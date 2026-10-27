@@ -598,6 +598,8 @@ impl EntityStore {
     }
 
     /// Iterate live entities with their handles, ordered by slot.
+    ///
+    /// A full scan visits `allocated_slots()` entries, including vacant slots.
     pub fn iter(&self) -> impl Iterator<Item = (EntityHandle, &Entity)> {
         self.slots.iter().enumerate().filter_map(|(index, slot)| {
             slot.entity.as_ref().map(|entity| {
@@ -610,6 +612,12 @@ impl EntityStore {
                 )
             })
         })
+    }
+
+    /// Number of allocated slots, including vacancies visited by `iter()`.
+    /// Callers can reserve scan work before entering a sparse store.
+    pub fn allocated_slots(&self) -> usize {
+        self.slots.len()
     }
 
     /// Number of entries in the spatial index, used by consistency checks.

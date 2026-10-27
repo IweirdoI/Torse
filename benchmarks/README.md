@@ -126,6 +126,7 @@
 | [包工具](M4-mod-package.md) | 清单、内容、多包依赖、锁文件与场景工具 |
 | [持久Mod执行](M4-mod-durable.md) | 唤醒、请求去重与恢复 |
 | [Mod原子执行](M4-mod-atomic.md) | 机器状态、库存计划与唤醒共同结算 |
+| [宿主预算边界](M4-mod-budgets.md) | 受检查询、累计Host工作、ABI复制、Store资源及失败恢复 |
 
 现有机器状态与动作模型已供服务端和无GPU客户端验证，图形客户端的真实机器面板仍待接入。开发入口见[Mod示例与工具](../examples/mods/README.md)。
 

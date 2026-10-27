@@ -48,7 +48,10 @@ bindgen!({
     world: "mod-behavior",
 });
 
+use crate::budget::{GuestLimits, HostBudget};
 use crate::component::{CallBudget, Meters};
+
+crate::budget::boundary_sizes!();
 
 /// Consecutive plan rejections or traps before the handler is deactivated.
 const FAILURE_THRESHOLD: u32 = 8;
@@ -117,6 +120,8 @@ pub struct AuthorityHost {
     deactivated: BTreeSet<ContentKey>,
     transaction_counter: u128,
     dispatch_local: u32,
+    budget: HostBudget,
+    guest_limits: GuestLimits,
 }
 
 impl AuthorityHost {
@@ -159,6 +164,8 @@ impl AuthorityHost {
             deactivated: BTreeSet::new(),
             transaction_counter: 0,
             dispatch_local: 0,
+            budget: HostBudget::new(CallBudget::prototype()),
+            guest_limits: GuestLimits::new(CallBudget::prototype()),
         }
     }
 
@@ -204,6 +211,66 @@ impl AuthorityHost {
 
     pub fn begin_invocation(&mut self) {
         self.read_positions.clear();
+        self.budget.reset();
+    }
+
+    pub(crate) fn configure_budget(&mut self, budget: CallBudget) {
+        self.budget = HostBudget::new(budget);
+        self.guest_limits = GuestLimits::new(budget);
+    }
+
+    pub(crate) fn bounded_store(
+        engine: &Engine,
+        mut host: Self,
+        budget: CallBudget,
+    ) -> Result<Store<Self>, String> {
+        host.configure_budget(budget);
+        let mut store = Store::new(engine, host);
+        store.limiter(|host| &mut host.guest_limits);
+        store.set_hostcall_fuel(budget.copy_fuel());
+        store
+            .set_fuel(budget.fuel)
+            .map_err(|error| format!("fuel setup failed: {error}"))?;
+        Ok(store)
+    }
+
+    pub(crate) fn prepare_invocation(
+        &mut self,
+        tick: u64,
+        event: &Event,
+        package: &ContentKey,
+    ) -> Option<Invocation> {
+        // Reserve owned state before cloning it into the boundary value.
+        if let Event::Wakeup(target) = event {
+            self.budget.output(target.key.len() as u64).ok()?;
+            if let Some(handle) = self
+                .authority
+                .entities()
+                .handle_of(target.entity.to_entity_id())
+                && let Some(entity) = self.authority.entities().get(handle)
+                && let Some(grant) = self.packages.get(package)
+            {
+                for schema in &grant.owned_schemas {
+                    self.budget.work(1).ok()?;
+                    if let Some(fields) = entity.components.component(schema)
+                        && let Some(bytes) = crate::budget::flat_source_size(fields)
+                    {
+                        self.budget.output(bytes).ok()?;
+                    }
+                }
+            }
+        }
+        let invocation = self.build_invocation(tick, event, package);
+        self.budget.output(invocation_size(&invocation)).ok()?;
+        Some(invocation)
+    }
+
+    pub(crate) fn budget_exceeded(&self) -> bool {
+        self.budget.exceeded()
+    }
+
+    pub(crate) fn plan_fits(&mut self, plan: Option<&Plan>) -> bool {
+        self.budget.input(plan.map_or(0, plan_size)).is_ok()
     }
 
     pub fn drain_due_wakeups(&mut self, tick: u64) -> Vec<(EntityId, String, ContentKey)> {
@@ -285,6 +352,9 @@ impl AuthorityHost {
     }
 
     fn fields_to_flat(&self, fields: &ComponentFields) -> Option<Vec<Field>> {
+        if crate::budget::flat_source_size(fields)? > self.budget.limits.max_output_bytes {
+            return None;
+        }
         let mut flat = Vec::with_capacity(fields.len());
         for (field_key, value) in fields {
             let atom = self.value_to_atom(value)?;
@@ -372,6 +442,11 @@ impl AuthorityHost {
         plan: &Plan,
         package: &ContentKey,
     ) -> Result<DispatchOutcome, String> {
+        if !self.plan_fits(Some(plan)) {
+            return Ok(DispatchOutcome::Rejected {
+                reason: "host input budget exceeded".to_string(),
+            });
+        }
         let mut transactions: Vec<Transaction> = Vec::new();
         let mut machine_tx = Transaction::new(
             self.next_transaction_id(),
@@ -583,23 +658,31 @@ impl torse::behavior::types::Host for AuthorityHost {}
 
 impl torse::behavior::query::Host for AuthorityHost {
     fn resolve_symbol(&mut self, key: String) -> Option<u32> {
-        self.meters.resolve_calls += 1;
+        self.budget.enter(key.len() as u64).ok()?;
+        self.meters.resolve_calls = self.meters.resolve_calls.saturating_add(1);
+        self.budget.output(4).ok()?;
         self.symbols.get(&key).copied()
     }
 
     fn symbol_key(&mut self, symbol: u32) -> Option<String> {
-        self.symbol_keys
-            .get(symbol.checked_sub(1)? as usize)
-            .cloned()
+        self.budget.enter(4).ok()?;
+        let key = self.symbol_keys.get(symbol.checked_sub(1)? as usize)?;
+        self.budget.output(key.len() as u64).ok()?;
+        Some(key.clone())
     }
 
     fn query_blocks(&mut self, region: Bbox) -> Result<Vec<CellSample>, QueryError> {
-        self.meters.query_block_calls += 1;
-        let width = (region.max.x - region.min.x).max(0) as u64;
-        let height = (region.max.y - region.min.y).max(0) as u64;
-        let depth = (region.max.z - region.min.z).max(0) as u64;
-        if width * height * depth > u64::from(CallBudget::prototype().max_cells_per_query) {
-            return Err(QueryError::BudgetExceeded);
+        self.meters.query_block_calls = self.meters.query_block_calls.saturating_add(1);
+        let count = self
+            .budget
+            .region(
+                [region.min.x, region.min.y, region.min.z],
+                [region.max.x, region.max.y, region.max.z],
+                self.budget.limits.max_cells_per_query,
+            )
+            .map_err(|_| QueryError::BudgetExceeded)?;
+        if count == 0 {
+            return Ok(Vec::new());
         }
         let mut samples = Vec::new();
         for y in region.min.y..region.max.y {
@@ -620,15 +703,20 @@ impl torse::behavior::query::Host for AuthorityHost {
                                 .authority
                                 .registry()
                                 .state_values(state)
-                                .map(Vec::from)
                                 .unwrap_or_default();
+                            self.budget
+                                .output((values.len() as u64).saturating_mul(2))
+                                .map_err(|_| QueryError::BudgetExceeded)?;
                             Cell::Occupied(BlockRef {
                                 definition,
-                                state_values: values,
+                                state_values: values.to_vec(),
                             })
                         }
                         TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => Cell::NotLoaded,
                     };
+                    self.budget
+                        .output(std::mem::size_of::<CellSample>() as u64)
+                        .map_err(|_| QueryError::BudgetExceeded)?;
                     samples.push(CellSample {
                         pos: Vec3i { x, y, z },
                         cell,
@@ -636,7 +724,10 @@ impl torse::behavior::query::Host for AuthorityHost {
                 }
             }
         }
-        self.meters.cells_returned += samples.len() as u32;
+        self.meters.cells_returned = self
+            .meters
+            .cells_returned
+            .saturating_add(samples.len() as u32);
         Ok(samples)
     }
 
@@ -646,6 +737,12 @@ impl torse::behavior::query::Host for AuthorityHost {
         cursor: Option<String>,
         limit: u32,
     ) -> Result<EntityPage, QueryError> {
+        self.budget
+            .enter(52 + cursor.as_ref().map_or(0, |value| value.len() as u64))
+            .map_err(|_| QueryError::BudgetExceeded)?;
+        if limit > self.budget.limits.max_cells_per_query {
+            return self.budget.reject().map_err(|_| QueryError::BudgetExceeded);
+        }
         let skip = match &cursor {
             None => 0_usize,
             Some(raw) => raw
@@ -654,6 +751,9 @@ impl torse::behavior::query::Host for AuthorityHost {
         };
         let mut items = Vec::new();
         let mut index = 0_usize;
+        self.budget
+            .work(self.authority.entities().allocated_slots() as u64)
+            .map_err(|_| QueryError::BudgetExceeded)?;
         for (_, entity) in self.authority.entities().iter() {
             let position = entity.position;
             let x = position.x.floor() as i64;
@@ -669,6 +769,9 @@ impl torse::behavior::query::Host for AuthorityHost {
                 continue;
             }
             if index >= skip && items.len() < limit as usize {
+                self.budget
+                    .output(40)
+                    .map_err(|_| QueryError::BudgetExceeded)?;
                 items.push(EntitySample {
                     id: WitEntityId::from_entity_id(entity.id),
                     position: Vec3i { x, y, z },
@@ -676,8 +779,8 @@ impl torse::behavior::query::Host for AuthorityHost {
             }
             index += 1;
         }
-        let next = if index > skip + items.len() {
-            Some((skip + items.len()).to_string())
+        let next = if index > skip.saturating_add(items.len()) {
+            Some(skip.saturating_add(items.len()).to_string())
         } else {
             None
         };
@@ -688,8 +791,15 @@ impl torse::behavior::query::Host for AuthorityHost {
         &mut self,
         targets: Vec<ComponentTarget>,
     ) -> Result<Vec<ComponentSnapshot>, QueryError> {
+        self.budget
+            .enter((targets.len() as u64).saturating_mul(24))
+            .and_then(|_| self.budget.work(targets.len() as u64))
+            .map_err(|_| QueryError::BudgetExceeded)?;
         let mut snapshots = Vec::with_capacity(targets.len());
         for target in targets {
+            self.budget
+                .output(40)
+                .map_err(|_| QueryError::BudgetExceeded)?;
             let schema = self
                 .key_of(target.schema)
                 .ok_or(QueryError::InvalidCursor)?; // unknown symbol
@@ -700,6 +810,14 @@ impl torse::behavior::query::Host for AuthorityHost {
                 .handle_of(entity)
                 .and_then(|handle| self.authority.entities().get(handle))
                 .and_then(|entity| entity.components.component(&schema));
+            if let Some(fields) = fields {
+                self.budget
+                    .work(fields.len() as u64)
+                    .map_err(|_| QueryError::BudgetExceeded)?;
+                self.budget
+                    .output(crate::budget::flat_source_size(fields).ok_or(QueryError::Unsupported)?)
+                    .map_err(|_| QueryError::BudgetExceeded)?;
+            }
             let flat = match fields {
                 Some(fields) => Some(self.fields_to_flat(fields).ok_or(QueryError::Unsupported)?),
                 None => None,
@@ -712,7 +830,9 @@ impl torse::behavior::query::Host for AuthorityHost {
         Ok(snapshots)
     }
 
-    fn probe_item_port(&mut self, entity: WitEntityId, _port: String) -> Option<PortEstimate> {
+    fn probe_item_port(&mut self, entity: WitEntityId, port: String) -> Option<PortEstimate> {
+        self.budget.enter(16 + port.len() as u64).ok()?;
+        self.budget.work(torse_inventory::MAX_SLOTS as u64).ok()?;
         let entity = entity.to_entity_id();
         let fields = self
             .authority
@@ -735,6 +855,7 @@ impl torse::behavior::query::Host for AuthorityHost {
             .into_iter()
             .filter_map(|key| self.symbols.get(&key).copied())
             .collect::<Vec<_>>();
+        self.budget.output(16 + accepts.len() as u64 * 4).ok()?;
         Some(PortEstimate {
             accepts,
             free_estimate: free,
@@ -744,30 +865,46 @@ impl torse::behavior::query::Host for AuthorityHost {
 
 impl torse::behavior::diagnostics::Host for AuthorityHost {
     fn log(&mut self, level: LogLevel, message: String) {
-        if self.meters.log_entries >= CallBudget::prototype().max_log_entries {
-            self.meters.log_dropped += 1;
+        if self.budget.enter(4 + message.len() as u64).is_err()
+            || self.budget.logs >= self.budget.limits.max_log_entries
+        {
+            self.meters.log_dropped = self.meters.log_dropped.saturating_add(1);
             return;
         }
-        self.meters.log_entries += 1;
+        self.budget.logs += 1;
+        self.meters.log_entries = self.meters.log_entries.saturating_add(1);
         let _ = (level, message);
     }
 }
 
 impl torse::behavior::schedule::Host for AuthorityHost {
     fn pending_wakeups(&mut self, key_prefix: Option<String>) -> Vec<WakeupSlot> {
-        self.wakeups
-            .iter()
-            .filter(|(_, _, key, _)| {
-                key_prefix
-                    .as_ref()
-                    .is_none_or(|prefix| key.starts_with(prefix.as_str()))
-            })
-            .map(|(tick, entity, key, _)| WakeupSlot {
+        if self
+            .budget
+            .enter(key_prefix.as_ref().map_or(0, |key| key.len() as u64))
+            .is_err()
+            || self.budget.work(self.wakeups.len() as u64).is_err()
+        {
+            return Vec::new();
+        }
+        let mut slots = Vec::new();
+        for (tick, entity, key, _) in &self.wakeups {
+            if key_prefix
+                .as_ref()
+                .is_some_and(|prefix| !key.starts_with(prefix))
+            {
+                continue;
+            }
+            if self.budget.output(48 + key.len() as u64).is_err() {
+                return Vec::new();
+            }
+            slots.push(WakeupSlot {
                 entity: WitEntityId::from_entity_id(*entity),
                 tick: *tick,
                 key: key.clone(),
-            })
-            .collect()
+            });
+        }
+        slots
     }
 }
 
@@ -815,12 +952,12 @@ impl ModInstance {
             |state| state,
         )
         .map_err(|error| format!("linker setup failed: {error}"))?;
-        let mut store = Store::new(engine, host);
-        store
-            .set_fuel(budget.fuel)
-            .map_err(|error| format!("fuel setup failed: {error}"))?;
+        let mut store = AuthorityHost::bounded_store(engine, host, budget)?;
         let bindings = ModBehavior::instantiate(&mut store, component, &linker)
             .map_err(|error| format!("instantiation failed: {error}"))?;
+        if store.data().budget_exceeded() {
+            return Err("component initialization exceeded host budget".to_string());
+        }
         Ok((bindings, store))
     }
 
@@ -865,7 +1002,12 @@ impl ModInstance {
                 .map_err(|error| format!("fuel reset failed: {error}"))?;
             store.data_mut().begin_invocation();
         }
-        let invocation = self.host().build_invocation(tick, &event, &package);
+        let Some(invocation) = self.host_mut().prepare_invocation(tick, &event, &package) else {
+            self.host_mut().on_failure(tick, &event, &package);
+            return Ok(DispatchOutcome::Rejected {
+                reason: "host output budget exceeded".to_string(),
+            });
+        };
         let result = {
             let store = self.store.as_mut().expect("store present");
             self.bindings
@@ -883,11 +1025,21 @@ impl ModInstance {
                 self.rebuild()?;
                 Ok(DispatchOutcome::Trapped { reason })
             }
-            Ok(None) => Ok(DispatchOutcome::NoPlan),
+            Ok(None) if self.host_mut().plan_fits(None) => Ok(DispatchOutcome::NoPlan),
+            Ok(None) => {
+                self.host_mut().on_failure(tick, &event, &package);
+                self.rebuild()?;
+                Ok(DispatchOutcome::Rejected {
+                    reason: "host budget exceeded".to_string(),
+                })
+            }
             Ok(Some(plan)) => {
                 let outcome = self.host_mut().apply_plan(&plan, &package)?;
                 if matches!(outcome, DispatchOutcome::Rejected { .. }) {
                     self.host_mut().on_failure(tick, &event, &package);
+                    if self.host().budget_exceeded() {
+                        self.rebuild()?;
+                    }
                 }
                 Ok(outcome)
             }
@@ -1081,4 +1233,164 @@ pub fn machine_scenario(config: &ScenarioConfig) -> Result<MachineWorld, String>
         input,
         output,
     })
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use torse::behavior::query::Host;
+
+    fn host() -> AuthorityHost {
+        machine_scenario(&ScenarioConfig {
+            package: "machine:module",
+            schema: "machine:schema/state",
+            stock_input: true,
+            granted_permissions: &["inventory:permission/transfer", "inventory:permission/read"],
+        })
+        .unwrap()
+        .host
+    }
+
+    fn region(min: [i64; 3], max: [i64; 3]) -> Bbox {
+        Bbox {
+            min: Vec3i {
+                x: min[0],
+                y: min[1],
+                z: min[2],
+            },
+            max: Vec3i {
+                x: max[0],
+                y: max[1],
+                z: max[2],
+            },
+        }
+    }
+
+    #[test]
+    fn authority_rejects_overflow_without_reads_or_commits() {
+        let mut host = host();
+        let seq = host.seq();
+        for (min, max) in [
+            ([0; 3], [1_i64 << 32, 1_i64 << 32, 1]),
+            ([i64::MIN, 0, 0], [i64::MAX, 1, 1]),
+        ] {
+            host.begin_invocation();
+            assert!(matches!(
+                host.query_blocks(region(min, max)),
+                Err(QueryError::BudgetExceeded)
+            ));
+            assert!(host.read_positions.is_empty());
+        }
+        host.begin_invocation();
+        assert!(
+            host.query_blocks(region([0; 3], [0, i64::MAX, i64::MAX]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(host.seq(), seq);
+    }
+
+    #[test]
+    fn actual_authority_budget_is_cumulative_and_fail_closed() {
+        let mut host = host();
+        host.configure_budget(CallBudget {
+            max_cells_per_query: 1,
+            max_host_work: 1,
+            ..CallBudget::prototype()
+        });
+        assert_eq!(host.query_blocks(region([0; 3], [1; 3])).unwrap().len(), 1);
+        assert!(matches!(
+            host.query_blocks(region([0; 3], [1; 3])),
+            Err(QueryError::BudgetExceeded)
+        ));
+        let plan = Plan {
+            edits: Vec::new(),
+            component_edits: Vec::new(),
+            transfers: Vec::new(),
+            wakeups: Vec::new(),
+        };
+        let seq = host.seq();
+        assert!(matches!(
+            host.apply_plan(&plan, &key("machine:module")).unwrap(),
+            DispatchOutcome::Rejected { .. }
+        ));
+        assert_eq!(host.seq(), seq);
+        host.begin_invocation();
+        assert_eq!(host.query_blocks(region([0; 3], [1; 3])).unwrap().len(), 1);
+        host.begin_invocation();
+        assert!(matches!(
+            host.query_blocks(region([0; 3], [2, 1, 1])),
+            Err(QueryError::BudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn oversized_inputs_results_and_cursor_are_safe() {
+        let mut host = host();
+        host.configure_budget(CallBudget {
+            max_input_bytes: 2,
+            ..CallBudget::prototype()
+        });
+        assert!(host.resolve_symbol("machine:module".to_string()).is_none());
+        assert!(host.budget_exceeded());
+        host.configure_budget(CallBudget {
+            max_output_bytes: 1,
+            ..CallBudget::prototype()
+        });
+        assert!(matches!(
+            host.query_blocks(region([0; 3], [1; 3])),
+            Err(QueryError::BudgetExceeded)
+        ));
+        host.configure_budget(CallBudget::prototype());
+        let page = host
+            .query_entities(
+                region([i64::MIN; 3], [i64::MAX; 3]),
+                Some(usize::MAX.to_string()),
+                1,
+            )
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
+        host.configure_budget(CallBudget {
+            max_output_bytes: 1,
+            ..CallBudget::prototype()
+        });
+        let target = ComponentTarget {
+            entity: WitEntityId {
+                low: u64::MAX,
+                high: u64::MAX,
+            },
+            schema: host.symbol_of(&key("machine:schema/state")).unwrap(),
+        };
+        assert!(matches!(
+            host.read_components(vec![target]),
+            Err(QueryError::BudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn vacant_entity_slots_are_charged_before_scanning() {
+        let mut host = host();
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            handles.push(
+                host.authority_mut()
+                    .entities_mut()
+                    .spawn(Position::new(0.0, 64.0, 0.0))
+                    .unwrap(),
+            );
+        }
+        for handle in handles {
+            host.authority_mut().entities_mut().despawn(handle).unwrap();
+        }
+        assert_eq!(host.authority().entities().len(), 3);
+        host.configure_budget(CallBudget {
+            max_host_work: 10,
+            ..CallBudget::prototype()
+        });
+        assert!(matches!(
+            host.query_entities(region([i64::MIN; 3], [i64::MAX; 3]), None, 1),
+            Err(QueryError::BudgetExceeded)
+        ));
+    }
 }

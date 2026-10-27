@@ -1,6 +1,6 @@
 # Mod宿主预算边界
 
-日期：2026-10-27。范围：行为组件的调用预算、编组复制、Store资源限制及失败恢复。
+日期：2026-10-27。环境：Windows、x86_64、Rust1.93.1、Wasmtime45.0.0。状态：验证通过。范围：行为组件的调用预算、编组复制、Store资源限制及失败恢复。
 
 ## 一、行为
 
@@ -56,4 +56,10 @@ cargo clippy -p torse-mod-host --features package -p torse-server --features mod
 cargo doc -p torse-mod-host --features package -p torse-world --no-deps --locked
 ```
 
-全工作区默认测试760项通过，零忽略。Mod宿主启用package后的测试35项通过，原有性能测量保留1项显式忽略。
+全工作区默认测试760项通过，零忽略。Mod宿主启用package后的测试35项通过，原有性能测量保留1项显式忽略。服务端启用mods后的测试172项通过，零忽略。
+
+测试结果逐目标汇总见[原始结果表](data/mod-host-budgets/01-bounded/tests.csv)，运行环境见[环境记录](data/mod-host-budgets/01-bounded/environment.txt)。
+
+## 五、未覆盖范围
+
+本次未重新运行跨设备GPU测量及长时间进程内存压力场景。编译器内存、整进程分配器与包文件装载上限不由本次调用预算保证；1项性能测试保持显式忽略。本次不以测试耗时作为性能结论。

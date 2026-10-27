@@ -1,0 +1,11 @@
+Date: 2026-10-27
+OS: Windows
+Architecture: x86_64
+Rust: rustc 1.93.1 (01f6ddf75 2026-02-11)
+Wasmtime: 45.0.0
+Guest target: wasm32-unknown-unknown
+Host profile: debug
+Guest profile: release
+Build concurrency: 1 for final feature and durability checks
+Ignored: one pre-existing release measurement harness
+No GPU or process peak-memory performance claims

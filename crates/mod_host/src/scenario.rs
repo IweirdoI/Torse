@@ -344,7 +344,7 @@ pub enum GrantPolicy<'a> {
 /// scenario steps against one shared authority.
 pub struct BehaviorRuntime {
     engine: Engine,
-    store: Store<AuthorityHost>,
+    store: Option<Store<AuthorityHost>>,
     instances: BTreeMap<ContentKey, (ModBehavior, Component)>,
     budget: CallBudget,
     stats: BTreeMap<ContentKey, PackageStats>,
@@ -358,7 +358,7 @@ impl BehaviorRuntime {
         budget: CallBudget,
     ) -> Result<Self, String> {
         let engine = engine_with(false)?;
-        let mut store = Store::new(&engine, host);
+        let mut store = AuthorityHost::bounded_store(&engine, host, budget)?;
         let mut linker: wasmtime::component::Linker<AuthorityHost> =
             wasmtime::component::Linker::new(&engine);
         ModBehavior::add_to_linker::<AuthorityHost, wasmtime::component::HasSelf<AuthorityHost>>(
@@ -377,16 +377,23 @@ impl BehaviorRuntime {
             let component = Component::new(&engine, bytes).map_err(|error| {
                 format!("component for {} failed: {error}", package.manifest.id)
             })?;
+            store
+                .set_fuel(budget.fuel)
+                .map_err(|error| format!("fuel setup failed: {error}"))?;
+            store.data_mut().begin_invocation();
             let bindings =
                 ModBehavior::instantiate(&mut store, &component, &linker).map_err(|error| {
                     format!("instantiation for {} failed: {error}", package.manifest.id)
                 })?;
+            if store.data().budget_exceeded() {
+                return Err("component initialization exceeded host budget".to_string());
+            }
             let _ = entry;
             instances.insert(package.manifest.principal(), (bindings, component));
         }
         Ok(Self {
             engine,
-            store,
+            store: Some(store),
             instances,
             budget,
             stats: BTreeMap::new(),
@@ -394,11 +401,11 @@ impl BehaviorRuntime {
     }
 
     pub fn host(&self) -> &AuthorityHost {
-        self.store.data()
+        self.store.as_ref().expect("store present").data()
     }
 
     pub fn host_mut(&mut self) -> &mut AuthorityHost {
-        self.store.data_mut()
+        self.store.as_mut().expect("store present").data_mut()
     }
 
     /// Dispatches one event to one package's instance, rebuilding it on trap.
@@ -416,10 +423,17 @@ impl BehaviorRuntime {
         let start = Instant::now();
         let fuel = self.budget.fuel;
         self.store
+            .as_mut()
+            .expect("store present")
             .set_fuel(fuel)
             .map_err(|error| format!("fuel reset failed: {error}"))?;
-        self.store.data_mut().begin_invocation();
-        let invocation = self.store.data().build_invocation(tick, &event, package);
+        self.host_mut().begin_invocation();
+        let Some(invocation) = self.host_mut().prepare_invocation(tick, &event, package) else {
+            self.host_mut().on_failure(tick, &event, package);
+            return Ok(DispatchOutcome::Rejected {
+                reason: "host output budget exceeded".to_string(),
+            });
+        };
         let result = {
             let bindings = &self
                 .instances
@@ -428,7 +442,7 @@ impl BehaviorRuntime {
                 .0;
             bindings
                 .torse_behavior_invoke()
-                .call_handle_event(&mut self.store, &invocation)
+                .call_handle_event(self.store.as_mut().expect("store present"), &invocation)
         };
         let outcome = match result {
             Err(trap) => {
@@ -438,20 +452,31 @@ impl BehaviorRuntime {
                     .collect::<Vec<_>>()
                     .join("; ");
                 self.host_mut().on_failure(tick, &event, package);
-                // Discard and rebuild just this package's instance; the store
-                // and the shared authority survive the trap.
+                // Rebuild the store so trapped instances cannot accumulate
+                // unreclaimable memories or consume its object count budget.
                 self.rebuild(package)?;
                 Ok::<DispatchOutcome, String>(DispatchOutcome::Trapped { reason })
             }
-            Ok(None) => Ok(DispatchOutcome::NoPlan),
+            Ok(None) if self.host_mut().plan_fits(None) => Ok(DispatchOutcome::NoPlan),
+            Ok(None) => {
+                self.host_mut().on_failure(tick, &event, package);
+                self.rebuild(package)?;
+                Ok(DispatchOutcome::Rejected {
+                    reason: "host budget exceeded".to_string(),
+                })
+            }
             Ok(Some(plan)) => {
                 let outcome = self.host_mut().apply_plan(&plan, package)?;
                 if matches!(outcome, DispatchOutcome::Rejected { .. }) {
                     self.host_mut().on_failure(tick, &event, package);
+                    if self.host().budget_exceeded() {
+                        self.rebuild(package)?;
+                    }
                 }
                 Ok(outcome)
             }
         }?;
+        let meters = self.host().meters.clone();
         let stats = self.stats.entry(package.clone()).or_default();
         stats.dispatches += 1;
         stats.wall += start.elapsed();
@@ -464,15 +489,16 @@ impl BehaviorRuntime {
                 stats.deactivated = true;
             }
         }
-        stats.meters = self.store.data().meters.clone();
+        stats.meters = meters;
         Ok(outcome)
     }
 
     fn rebuild(&mut self, package: &ContentKey) -> Result<(), String> {
-        let (_, component) = self
-            .instances
-            .remove(package)
-            .ok_or_else(|| format!("no instance for {package}"))?;
+        if !self.instances.contains_key(package) {
+            return Err(format!("no instance for {package}"));
+        }
+        let old = self.store.take().expect("store present");
+        let mut store = AuthorityHost::bounded_store(&self.engine, old.into_data(), self.budget)?;
         let mut linker: wasmtime::component::Linker<AuthorityHost> =
             wasmtime::component::Linker::new(&self.engine);
         ModBehavior::add_to_linker::<AuthorityHost, wasmtime::component::HasSelf<AuthorityHost>>(
@@ -480,10 +506,21 @@ impl BehaviorRuntime {
             |state| state,
         )
         .map_err(|error| format!("linker setup failed: {error}"))?;
-        let bindings = ModBehavior::instantiate(&mut self.store, &component, &linker)
-            .map_err(|error| format!("rebuild for {package} failed: {error}"))?;
-        self.instances
-            .insert(package.clone(), (bindings, component));
+        let mut instances = BTreeMap::new();
+        for (principal, (_, component)) in &self.instances {
+            store
+                .set_fuel(self.budget.fuel)
+                .map_err(|error| format!("fuel reset failed: {error}"))?;
+            store.data_mut().begin_invocation();
+            let bindings = ModBehavior::instantiate(&mut store, component, &linker)
+                .map_err(|error| format!("rebuild for {principal} failed: {error}"))?;
+            if store.data().budget_exceeded() {
+                return Err("component initialization exceeded host budget".to_string());
+            }
+            instances.insert(principal.clone(), (bindings, component.clone()));
+        }
+        self.instances = instances;
+        self.store = Some(store);
         Ok(())
     }
 
@@ -491,7 +528,7 @@ impl BehaviorRuntime {
     pub fn run_ticks(&mut self, from: u64, count: u64) -> Result<Vec<DispatchOutcome>, String> {
         let mut outcomes = Vec::new();
         for tick in from..from + count {
-            let due = self.store.data_mut().drain_due_wakeups(tick);
+            let due = self.host_mut().drain_due_wakeups(tick);
             for (entity, key, package) in due {
                 let event = crate::authority::WakeupTarget {
                     entity: crate::authority::WitEntityId::from_entity_id(entity),

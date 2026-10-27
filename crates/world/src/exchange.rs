@@ -431,15 +431,12 @@ impl Snapshot {
         registry: &BlockStateRegistry,
         schemas: &ComponentSchemas,
     ) -> Result<RestoredWorld, ExchangeError> {
+        self.validate_structure()?;
         schemas
             .validate_compatibility(self.meta.compatibility)
             .map_err(|error| ExchangeError::Store {
                 detail: error.to_string(),
             })?;
-        self.validate_entity_allocator()?;
-        if self.side == 0 {
-            return Err(ExchangeError::InvalidWorld { side: self.side });
-        }
         let mut mapping: BTreeMap<BlockStateId, BlockStateId> = BTreeMap::new();
         for entry in &self.states {
             let state = registry

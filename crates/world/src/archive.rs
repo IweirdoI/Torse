@@ -437,18 +437,8 @@ fn check_budget(
     budget: OutputBudget,
 ) -> Result<(), Fault> {
     snapshot
-        .validate_entity_allocator()
+        .validate_structure()
         .map_err(|e| Fault::invalid_data(e.to_string()))?;
-    if snapshot.side == 0
-        || snapshot.side > crate::MAX_SECTION_SIDE
-        || snapshot.states.iter().any(|s| s.id.is_empty())
-        || snapshot.states.windows(2).any(|w| w[0].id >= w[1].id)
-        || snapshot.sections.windows(2).any(|w| w[0].pos >= w[1].pos)
-        || snapshot.entities.iter().any(|e| e.id.0 == 0)
-        || snapshot.entities.windows(2).any(|w| w[0].id >= w[1].id)
-    {
-        return Err(Fault::invalid_data("noncanonical archive structure"));
-    }
     let mut remaining = Budget {
         items: budget.max_items,
         bytes: budget.max_bytes,

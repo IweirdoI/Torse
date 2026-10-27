@@ -38,6 +38,7 @@ impl Snapshot {
         &'a self,
         schemas: &ComponentSchemas,
     ) -> Result<Cow<'a, Self>, ExchangeError> {
+        self.validate_structure()?;
         if !needs_projection(
             schemas,
             self.entities

@@ -329,6 +329,54 @@ fn snapshot_matches_specification_and_fixture() {
 }
 
 #[test]
+fn undefined_cell_states_are_rejected_by_both_encoding_and_decoding() {
+    let uniform = snapshot_spec().replace(
+        "section.west",
+        join(&[i64s(-1), i64s(0), i64s(0), u8s(0), u16s(2)]),
+    );
+    assert_fault(
+        decode_snapshot(&uniform.bytes()),
+        "cell references an undefined state",
+    );
+    let mut value = sample_snapshot();
+    value.sections[0].cells = SnapshotCells::Uniform(BlockStateId(2));
+    assert_fault(
+        encode_snapshot(&value),
+        "cell references an undefined state",
+    );
+    value.sections[0].cells = SnapshotCells::Dense(vec![BlockStateId(2); 8]);
+    assert_fault(
+        encode_snapshot(&value),
+        "cell references an undefined state",
+    );
+    let dense = snapshot_spec().replace(
+        "section.origin",
+        join(&[i64s(0), i64s(0), i64s(0), u8s(1), u16s(2).repeat(8)]),
+    );
+    assert_fault(
+        decode_snapshot(&dense.bytes()),
+        "cell references an undefined state",
+    );
+}
+
+#[test]
+fn finite_but_unindexable_entity_positions_fail_at_the_codec_boundary() {
+    for coordinate in [f64::MAX, -(i64::MIN as f64)] {
+        let encoded = snapshot_spec().replace("entity.position", position(coordinate, 0.0, 0.0));
+        assert_fault(
+            decode_snapshot(&encoded.bytes()),
+            "invalid entity identity or position",
+        );
+        let mut value = sample_snapshot();
+        value.entities[0].position_bits = bits(coordinate, 0.0, 0.0);
+        assert_fault(
+            encode_snapshot(&value),
+            "invalid entity identity or position",
+        );
+    }
+}
+
+#[test]
 fn changes_match_specification_and_fixture() {
     let spec = changes_spec();
     check_fixture(

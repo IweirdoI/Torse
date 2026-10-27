@@ -69,7 +69,12 @@ pub(crate) fn write_snapshot(out: &mut Encoder<'_>, value: &Snapshot) -> EncodeR
     write_states(out, &value.states)?;
     write_sections(out, &value.sections, cells)?;
     write_entities(out, &value.entities)?;
-    out.write_u128(value.next_entity_id)
+    out.write_u128(value.next_entity_id)?;
+    // Preserve the codec's earlier, more specific ordering and resource errors.
+    // The encoder remains private until this domain validation also succeeds.
+    value
+        .validate_structure()
+        .map_err(|error| invalid(error.to_string()))
 }
 
 pub(crate) fn read_snapshot(input: &mut Decoder<'_>) -> EncodeResult<Snapshot> {
@@ -93,7 +98,7 @@ pub(crate) fn read_snapshot(input: &mut Decoder<'_>) -> EncodeResult<Snapshot> {
         next_entity_id,
     };
     snapshot
-        .validate_entity_allocator()
+        .validate_structure()
         .map_err(|error| invalid(error.to_string()))?;
     Ok(snapshot)
 }

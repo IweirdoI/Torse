@@ -30,6 +30,7 @@ mod persistence;
 mod registry;
 mod section;
 mod snapshot_budget;
+mod snapshot_validation;
 mod store;
 
 pub use archive::{

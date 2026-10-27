@@ -1168,6 +1168,55 @@ fn recovery_refuses_changed_configuration_or_journal_metadata_before_apply() {
 }
 
 #[test]
+fn recovery_validates_runtime_only_components_before_projection_and_can_retry() {
+    let (mut world, _) = setup(false, false);
+    let handle = world
+        .entities_mut()
+        .spawn(Position::new(2.5, 2.5, 2.5))
+        .unwrap();
+    let schemas = world.schemas().clone();
+    world
+        .entities_mut()
+        .components_mut(handle)
+        .unwrap()
+        .insert(&schemas, &key("test:cache"), fields(7))
+        .unwrap();
+    let snapshot = Snapshot::capture(
+        meta(&world),
+        world.store(),
+        world.entities(),
+        world.registry(),
+    )
+    .unwrap();
+    let mut malformed = snapshot.clone();
+    let fields = &mut malformed.entities[0].components[0].fields;
+    fields.push(fields[0].clone());
+    let mut recovery = Recovery::new(world.world(), world.registry(), world.schemas());
+    assert!(recovery.restore_snapshot(&malformed).is_err());
+    assert_eq!(recovery.seq(), CommitSeq::INITIAL);
+    recovery.restore_snapshot(&snapshot).unwrap();
+    let restored = recovery.finish().unwrap();
+    assert_eq!(restored.entities().len(), 1);
+    assert!(
+        restored
+            .entities()
+            .get(restored.entities().handle_of(EntityId(1)).unwrap())
+            .unwrap()
+            .components
+            .is_empty()
+    );
+    assert_eq!(
+        world
+            .entities()
+            .get(handle)
+            .unwrap()
+            .components
+            .component(&key("test:cache")),
+        Some(&self::fields(7))
+    );
+}
+
+#[test]
 fn explicit_and_automatic_lifecycle_share_one_allocator_and_replay_validation() {
     let (mut world, _) = setup(true, true);
     let snapshot = world.capture_snapshot(meta(&world)).unwrap();

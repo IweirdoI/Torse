@@ -53,6 +53,7 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
         config: FileServerConfig,
     ) -> Result<SnapshotMeta, Fault> {
         config.validate()?;
+        crate::GenerationIdentity::inspect(lease.root())?;
         let checkpoint_path = lease.root().join("checkpoints");
         if !fs::symlink_metadata(&checkpoint_path)
             .map_err(|e| io_fault("inspect checkpoint directory", e))?
@@ -178,6 +179,7 @@ impl<A: HostAuthority, C: StorageCodec<A::Model> + Clone> FileServer<A, C> {
         R: RecoveryTarget<Model = A::Model, Authority = A>,
     {
         config.validate()?;
+        crate::GenerationIdentity::inspect(directory.root())?;
         let binding = Binding {
             world: directory.world(),
             epoch: directory.epoch(),

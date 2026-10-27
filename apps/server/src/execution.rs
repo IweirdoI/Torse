@@ -32,6 +32,12 @@ pub use prevalidation::{PrevalidationConfig, PrevalidationStats};
 mod streaming;
 
 pub struct ExecutionModel;
+/// Derived event tickets. They are rebuilt from committed events and current entity locations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EventTickets {
+    pub global: bool,
+    pub sections: std::collections::BTreeSet<SectionPos>,
+}
 impl AuthorityData for ExecutionModel {
     type Snapshot = ExecutionSnapshot;
     type Changes = ExecutionChanges;
@@ -221,6 +227,7 @@ fn checked_state_cached(
     }
     let mut event_ids = std::collections::BTreeSet::new();
     for event in &state.events {
+        event.event.dependencies()?;
         if event.id.0 == 0
             || event.id.0 >= state.next_event
             || !event_ids.insert(event.id.0)
@@ -268,6 +275,9 @@ fn checked_state_cached(
         let mut requests = std::collections::BTreeSet::new();
         let mut consumes = std::collections::BTreeSet::new();
         for (index, task) in work.tasks.iter().enumerate() {
+            for event in &task.schedule {
+                event.dependencies()?;
+            }
             if task
                 .transaction
                 .as_ref()
@@ -1139,6 +1149,9 @@ impl HostAuthority for ExecutionHost {
     fn prepare_next(&mut self) -> Result<Option<ExecutionPrepared>, Fault> {
         if let Some(prepared) = self.section_pending.take() {
             return Ok(Some(prepared));
+        }
+        if self.at_tick_boundary() && self.waiting_for_event_sections()? {
+            return Ok(None);
         }
         if self.shutdown_ready() {
             return Ok(None);

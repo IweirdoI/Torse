@@ -1,0 +1,15 @@
+Date: 2026-10-27
+OS: Windows 11 Pro 10.0.26200 x86_64
+Rust: rustc 1.93.1 (01f6ddf75 2026-02-11)
+Cargo: cargo 1.93.1 (083ac5135 2025-12-15)
+Build jobs: 1
+Source baseline: 6a8cab1 plus event-aware streaming implementation
+Workspace command: cargo test --workspace --all-targets --locked
+Workspace result: 792 passed, 0 failed, 0 ignored
+Residency limits: 4 sections, 33554432 I/O bytes
+Page policy: 8388608 bytes, 64 files
+I/O workers: 1
+Maximum simultaneous page operations: 1
+Event dependencies: up to 64 per event
+Mod command: cargo test -p torse-server --features mods --all-targets --locked
+Mod result: 182 passed, 0 failed, 0 ignored

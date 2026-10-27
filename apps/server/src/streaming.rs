@@ -13,29 +13,107 @@ impl ExecutionHost {
         &self.parked
     }
 
+    /// Resolve entity dependencies against live positions or parked identity indexes.
+    /// This is derived host state and never invokes a rule while restoring a world.
+    pub fn event_tickets(
+        &self,
+        due_only: bool,
+        max_sections: usize,
+    ) -> Result<EventTickets, Fault> {
+        let mut tickets = EventTickets::default();
+        for event in &self.runtime.events {
+            if due_only && event.event.tick > self.resume_point().tick {
+                continue;
+            }
+            match event.event.dependencies()? {
+                EventDependencies::Global => tickets.global = true,
+                EventDependencies::Scoped(dependencies) => {
+                    for dependency in dependencies {
+                        let section = match dependency {
+                            EventDependency::Section(pos) => Some(pos),
+                            EventDependency::Entity(id) => self
+                                .world()
+                                .entities()
+                                .handle_of(id)
+                                .and_then(|handle| self.world().entities().get(handle))
+                                .and_then(|entity| {
+                                    entity.position.section(self.world().store().side())
+                                })
+                                .or_else(|| {
+                                    self.parked.iter().find_map(|(pos, page)| {
+                                        page.entities.contains(&id).then_some(*pos)
+                                    })
+                                }),
+                        };
+                        if let Some(pos) = section {
+                            if tickets.sections.len() >= max_sections
+                                && !tickets.sections.contains(&pos)
+                            {
+                                return Err(Fault::resource_limit(
+                                    "event residency capacity exceeded",
+                                ));
+                            }
+                            tickets.sections.insert(pos);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(tickets)
+    }
+
+    pub fn waiting_for_event_sections(&self) -> Result<bool, Fault> {
+        Ok(self
+            .event_tickets(true, MAX_RESIDENT)?
+            .sections
+            .iter()
+            .any(|pos| self.world().store().section(*pos).is_none()))
+    }
+
+    pub fn section_is_event_pinned(&self, pos: SectionPos) -> Result<bool, Fault> {
+        let tickets = self.event_tickets(false, MAX_RESIDENT)?;
+        Ok(tickets.global || tickets.sections.contains(&pos))
+    }
+
     /// Residency is changed only between ticks and after admitted work settles.
     pub fn residency_ready(&self, unload: bool) -> bool {
         self.at_tick_boundary()
-            && self.pending.is_empty()
+            && (!unload || self.pending.is_empty())
             && self.frozen.is_none()
             && self.stopping.is_none()
             && self.section_pending.is_none()
-            && (!unload || self.runtime.events.is_empty())
+            && (!unload
+                || self
+                    .runtime
+                    .events
+                    .iter()
+                    .all(|e| matches!(e.event.dependencies(), Ok(EventDependencies::Scoped(_)))))
     }
 
     fn prepare_residency(&self, change: SectionChange) -> Result<ExecutionPrepared, Fault> {
         if !self.at_tick_boundary()
-            || !self.pending.is_empty()
+            || (!change.load && !self.pending.is_empty())
             || self.frozen.is_some()
             || self.stopping.is_some()
             || self.section_pending.is_some()
-            || (!change.load && !self.runtime.events.is_empty())
         {
             return Err(Fault::invalid_data(
-                "section transition requires an idle tick boundary; pending events pin unloads",
+                "section transition requires an idle tick boundary",
             ));
         }
         check_reference(&change, &self.parked)?;
+        if !change.load
+            && self.runtime.events.iter().any(|event| {
+                event
+                    .event
+                    .pins_section(change.page.sections[0].pos, |id| {
+                        change.reference.entities.contains(&id)
+                    })
+                    .unwrap_or(true)
+            })
+        {
+            return Err(Fault::invalid_data("pending event pins this section"));
+        }
         if change.load && self.world().store().len() >= MAX_RESIDENT {
             return Err(Fault::resource_limit("resident section capacity"));
         }
@@ -105,12 +183,37 @@ fn check_reference(
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
+    pub(crate) fn apply_residency_page(
+        &mut self,
+        page: Snapshot,
+        digest: Digest,
+        load: bool,
+        fresh: bool,
+        sink: &mut impl InvalidationSink,
+    ) -> Result<CommitStep, Fault> {
+        self.authority()?;
+        let change = SectionChange {
+            reference: reference(&page, digest),
+            page,
+            load,
+            fresh,
+        };
+        self.authority.section_pending = Some(self.authority.prepare_residency(change)?);
+        self.drive_one(sink)
+    }
     pub fn unload_section(
         &mut self,
         pages: &SectionPages,
         pos: SectionPos,
         sink: &mut impl InvalidationSink,
     ) -> Result<CommitStep, Fault> {
+        if self
+            .residency
+            .as_ref()
+            .is_some_and(|scheduler| !scheduler.is_idle())
+        {
+            return Err(Fault::invalid_data("page I/O is in flight"));
+        }
         let host = self.authority()?;
         let page = host.world().capture_section(pos, host.limits.runtime)?;
         let digest = pages.digest(&page)?;
@@ -199,7 +302,6 @@ impl ExecutionRecovery<'_> {
             || point.next_phase != 0
             || point.next_step != 0
             || before.work.is_some()
-            || (!change.load && !before.events.is_empty())
             || record.changes.outcome.is_some()
             || record.changes.cancelled.is_some()
             || !matches!(&record.changes.runtime, RuntimeUpdate::Full(state) if state == before)
@@ -209,6 +311,20 @@ impl ExecutionRecovery<'_> {
             ));
         }
         check_reference(change, &self.parked)?;
+        if !change.load {
+            for event in &before.events {
+                if event
+                    .event
+                    .pins_section(change.page.sections[0].pos, |id| {
+                        change.reference.entities.contains(&id)
+                    })?
+                {
+                    return Err(Fault::invalid_data(
+                        "section record unloads an event dependency",
+                    ));
+                }
+            }
+        }
         if !change.load {
             let mut candidate = self.parked.clone();
             candidate.insert(change.page.sections[0].pos, change.reference.clone());

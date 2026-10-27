@@ -7,6 +7,8 @@
 | [authority.rs](src/authority.rs) | 服务端本地权威、准备项、独立恢复和订阅失效适配接口 |
 | [checkpoint.rs](src/checkpoint.rs) | 检查点保留、维护与存储健康状态适配 |
 | [reclamation.rs](src/reclamation.rs) | 检查点、日志与分区页引用追踪及回收 |
+| [residency.rs](src/residency.rs) | 事件票据、驻留调度及有界页I/O工作线程 |
+| [generation.rs](src/generation.rs) | 生成器身份、版本和配置摘要的持久校验 |
 | [coordinator.rs](src/coordinator.rs) | 预留、发布、接纳、刷盘、持久确认、检查点与有界关闭 |
 | [directory.rs](src/directory.rs) | 世界目录排他锁与运行代数分配 |
 | [lifecycle.rs](src/lifecycle.rs) | 文件世界创建、只读恢复检查、激活与日志重开 |
@@ -187,7 +189,7 @@ shutdown消耗Server，先停止接纳，通知权威适配器按包含截止Tic
 
 [协调器测试](tests/coordinator.rs)检查调用次序、预留拒绝后的重试、失败后的持久门槛、输入身份、订阅失效、快照与有界关闭。[目录测试](tests/directory.rs)检查跨进程互斥、退出后解锁、逐字节截断与位翻转、代数递增和容量。[文件生命周期测试](tests/lifecycle.rs)覆盖恢复后续号、尾部保留、整条后缀缺失、初始化拒绝，以及发布后、接纳前突然退出。
 
-首次回收前校验完整旧日志，之后按持久保留点校验仍需保留的段。回收、只读预检、旧布局和清理中断验证见[存储回收记录](../../benchmarks/M3-storage-reclamation.md)。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。异步刷盘、自动脏区流送和硬件断电保证仍需单独验收，当前功能测试不代替性能或平台承诺。
+首次回收前校验完整旧日志，之后按持久保留点校验仍需保留的段。回收、只读预检、旧布局和清理中断验证见[存储回收记录](../../benchmarks/M3-storage-reclamation.md)。ExecutionHost和NetworkHub已补齐持久阶段任务、事件、请求结果、去重与授权连接，见[执行测试](tests/execution.rs)。页I/O与驻留调度见下文，日志刷盘继续同步执行，硬件断电保证仍需单独验收。
 
 ## Mod机器与UI模型
 
@@ -212,9 +214,21 @@ cargo run -p torse-server --features mods --example headless_client -- 127.0.0.1
 
 ExecutionHost已接入Server::unload_section、reload_section和install_section。调用方先持有世界目录锁，再装配SectionPages；恢复器使用with_section_pages接入同一页目录。页先同步发布，装卸记录再走原日志门槛；受影响的授权Peer通过独立控制失效，未相交连接保持。
 
-装卸限于没有已接纳输入或冻结规划的Tick起点，未来事件保守阻止卸载，票据继续生效。未驻留页保留实体身份和持久字段，活动表移除对象，重新装回后水位不变。分区页与未驻留索引均有容量限制，当前不自动回收孤立页。备份须包含日志、检查点及被引用的sections页；便携归档要求先装回全部分区。
+装卸限于没有冻结规划的Tick起点，卸载还要求没有待结算输入。装载允许已排队输入，避免到期事件等待分区时形成互相等待。旧事件保守阻止全部卸载；通过`EventDraft::with_dependencies`声明Section或Entity依赖后，只固定相关分区，实体票据跟随已提交位置。宿主从持久事件派生逻辑票据，既有SectionStore票据仍生效。到期依赖尚未驻留时暂停在Tick起点，装载完成后继续，不提前运行处理器。
 
-可运行durable_stream示例逐次验证park、load和grow，命令、格式与场景证据见[持久分区装卸](../../benchmarks/M3-section-streaming.md)。自动选区、异步I/O及生成版本迁移另行实现。
+未驻留页保留实体身份和持久字段，活动表移除对象，重新装回后水位不变。分区页与未驻留索引均有容量限制，孤立页可通过`collect_section_pages`清理。备份须包含日志、检查点、生成器描述及被引用的sections页。
+
+可运行durable_stream示例逐次验证park、load和grow，命令、格式与场景证据见[持久分区装卸](../../benchmarks/M3-section-streaming.md)。
+
+## 驻留调度与生成
+
+`enable_residency`接收ResidencyConfig、同世界SectionPages、可选GenerationSource及初始兴趣分区。`set_residency_interest`更新兴趣，调度器合并全部事件依赖后确定驻留集合。`drive_tick`自动轮询，也可调用`poll_residency`；每次至多派发或发布一个操作。驻留上限显式配置，单工作线程只允许一个在途操作，派发前预留页预算四倍的输入、编解码和交接空间。额度不足、驻留容量不足和没有可用来源分别返回明确状态。
+
+页读写和生成在独立工作线程执行，主线程不等待结果。返回结果在发布前重新核对当前兴趣、世界绑定、页引用、实体身份及准备状态；过期结果丢弃，I/O失败保留权威状态并允许重试。工作线程由Server拥有，世界租约释放前会完成并关闭；文件系统调用不能强制取消，因此关闭可能等待当前操作。存在在途结果时拒绝页回收，避免删除即将发布的引用。显式手工装卸接口继续提供同步入口。
+
+GenerationIdentity在`generation.bin`保存生成器内容键、正整数版本及参数摘要，种子和全部地形参数应进入摘要。已有描述不匹配时拒绝启用，普通启动和只读预检也校验描述文件完整性。装配方应在WorldLease阶段用`GenerationIdentity::verify`核对预期生成器，再开始运行代数；缺少描述时首次启用是显式注册。修改生成语义需要独立世界迁移，不覆盖现有描述。草稿文件不参与恢复。
+
+旧`capture_archive`继续要求全部分区驻留。`capture_residency_archive`在持久Tick边界读取未驻留页，按总预算生成完整ResidencyArchive，保留生成器身份，不改变运行中驻留状态。恢复时须提供匹配的生成器描述；内容或规则迁移仍使用既有显式迁移入口。输出超预算返回ResourceLimit，源世界保持原状。事件声明、生成器描述与归档格式见[载荷说明](../../crates/codec/EXECUTION.md)，验证见[事件感知流送](../../benchmarks/M3-event-streaming.md)。
 
 ## 实体碰撞体
 

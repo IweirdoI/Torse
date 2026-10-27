@@ -1,6 +1,7 @@
 //! Stable, bounded execution vocabulary shared with the journal and protocol.
 //! Frozen tasks contain stable content/identity references, never runtime handles.
 use crate::action::ActionTarget;
+pub use crate::event_dependencies::{EventDependencies, EventDependency, MAX_EVENT_DEPENDENCIES};
 use crate::{OrderingKey, Phase, Transaction, WorldAuthority};
 use std::collections::BTreeMap;
 use std::sync::Arc;

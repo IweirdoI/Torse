@@ -124,6 +124,16 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             .checked_add(1)
             .ok_or_else(|| Fault::invalid_data("tick exhausted"))?;
         let mut steps = 0;
+        if max_steps > 0
+            && let crate::residency::ResidencyProgress::Published(step) =
+                self.poll_residency(sink)?
+        {
+            match step {
+                crate::CommitStep::Durable(_) => steps = 1,
+                crate::CommitStep::Blocked(_) => return Ok(0),
+                crate::CommitStep::Idle => {}
+            }
+        }
         while steps < max_steps {
             let batch = self.drive_batch(sink, self.commit_batch_limit.min(max_steps - steps))?;
             steps += batch.committed;

@@ -8,6 +8,8 @@ pub mod bootstrap;
 mod checkpoint;
 mod coordinator;
 mod directory;
+mod generation;
+pub use generation::GenerationIdentity;
 pub mod execution;
 mod lifecycle;
 #[cfg(feature = "mods")]
@@ -15,6 +17,7 @@ pub mod mods;
 pub mod network;
 mod profiling;
 mod reclamation;
+pub mod residency;
 pub mod section_pages;
 pub mod systems;
 pub use execution::PlanningConfig;

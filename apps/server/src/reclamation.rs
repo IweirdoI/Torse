@@ -16,7 +16,13 @@ impl<C: StorageCodec<ExecutionModel> + Clone> FileServer<ExecutionHost, C> {
         pages: &SectionPages,
         retain: usize,
     ) -> Result<PageCollection, Fault> {
-        if retain == 0 || !self.authority()?.residency_ready(false) {
+        if retain == 0
+            || !self.authority()?.residency_ready(false)
+            || self
+                .residency
+                .as_ref()
+                .is_some_and(|scheduler| !scheduler.is_idle())
+        {
             return Err(Fault::invalid_data(
                 "page collection requires positive retention and an idle tick boundary",
             ));

@@ -766,3 +766,143 @@ fn migrated_fork_imports_into_a_new_directory_and_source_files_never_change() {
         Tick(1)
     );
 }
+
+#[test]
+fn residency_archive_merges_parked_pages_without_changing_the_running_world() {
+    let content = content(1, false);
+    let dir = Directory::new();
+    let root = dir.0.join("sections");
+    std::fs::create_dir(&root).unwrap();
+    let pages =
+        section_pages::SectionPages::new(root, base::budget(), base::codec_limits(), 64).unwrap();
+    let (mut world, actions) = world(&content);
+    let parked = SectionPos::new(0, 1, 0);
+    world.store_mut().request(parked).unwrap();
+    world
+        .store_mut()
+        .install(parked, Section::empty(2).unwrap())
+        .unwrap();
+    world.store_mut().finish_load(parked).unwrap();
+    let expected = world
+        .capture_snapshot(torse_sim::streaming::page_meta(&world))
+        .unwrap();
+    let mut server = base::Files::create_file(
+        dir.acquire(),
+        compatibility(&content),
+        base::Codec::new(base::codec_limits()).unwrap(),
+        base::file_policy(),
+        |binding| {
+            ExecutionHost::new(
+                binding,
+                world,
+                actions,
+                Vec::new(),
+                base::execution_limits(),
+            )
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        server
+            .unload_section(&pages, parked, &mut NoReplicas)
+            .unwrap(),
+        CommitStep::Durable(_)
+    ));
+    assert!(server.capture_archive(&content, base::budget()).is_err());
+    struct Source;
+    impl residency::GenerationSource for Source {
+        fn identity(&self) -> GenerationIdentity {
+            GenerationIdentity {
+                id: key("test:archive-generator"),
+                version: 1,
+                configuration: Digest([9; 32]),
+            }
+        }
+        fn generate(
+            &self,
+            _: residency::GenerationContext,
+            _: SectionPos,
+        ) -> Result<Snapshot, Fault> {
+            Err(Fault::invalid_data("archive test does not run generation"))
+        }
+    }
+    server
+        .enable_residency(
+            residency::ResidencyConfig {
+                max_resident: 4,
+                max_io_bytes: 32 * 1024 * 1024,
+            },
+            pages.clone(),
+            Some(std::sync::Arc::new(Source)),
+            &[SectionPos::ZERO, parked],
+        )
+        .unwrap();
+    let before = read_files(&dir.0.join("sections"));
+    let cursor = server.authority().unwrap().cursor();
+    let archive = server
+        .capture_residency_archive(&content, &pages, base::budget(), base::codec_limits())
+        .unwrap();
+    assert_eq!(archive.execution.world.snapshot.sections, expected.sections);
+    assert_eq!(archive.execution.world.snapshot.entities, expected.entities);
+    assert_eq!(
+        archive.execution.world.snapshot.next_entity_id,
+        expected.next_entity_id
+    );
+    assert_eq!(server.authority().unwrap().cursor(), cursor);
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .parked_sections()
+            .contains_key(&parked)
+    );
+    assert_eq!(read_files(&dir.0.join("sections")), before);
+    let mut bytes = Vec::new();
+    wire::encode(&archive, &mut bytes, base::budget(), base::codec_limits()).unwrap();
+    let restored: migration::ResidencyArchive =
+        wire::decode(&bytes, base::budget(), base::codec_limits()).unwrap();
+    assert_eq!(restored, archive);
+    let (template, actions) = self::world(&content);
+    let mut recovery = ExecutionRecovery::new(
+        server.binding(),
+        template.registry(),
+        template.schemas(),
+        actions,
+        Vec::new(),
+        base::execution_limits(),
+    );
+    assert!(
+        recovery
+            .restore_residency_archive(
+                &restored,
+                None,
+                &content,
+                base::budget(),
+                base::codec_limits()
+            )
+            .is_err()
+    );
+    recovery
+        .restore_residency_archive(
+            &restored,
+            restored.generation.as_ref(),
+            &content,
+            base::budget(),
+            base::codec_limits(),
+        )
+        .unwrap();
+    let recovered = recovery.finish(cursor).unwrap();
+    assert!(recovered.parked_sections().is_empty());
+    assert_eq!(recovered.world().store().len(), expected.sections.len());
+    assert!(
+        server
+            .capture_residency_archive(
+                &content,
+                &pages,
+                OutputBudget::new(1, 64),
+                base::codec_limits()
+            )
+            .is_err()
+    );
+    assert_eq!(read_files(&dir.0.join("sections")), before);
+}

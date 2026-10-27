@@ -19,6 +19,7 @@ mod body;
 pub mod clock;
 pub mod coordinator;
 pub mod durable;
+mod event_dependencies;
 mod lifecycle;
 pub mod movement;
 pub mod payload;

@@ -243,8 +243,9 @@ fn run() -> Result<(), Fault> {
         }
         if Instant::now() >= next {
             let started = Instant::now();
+            let before_tick = server.authority()?.resume_point().tick.0;
             server.drive_tick(&mut hub, 4096)?;
-            done += 1;
+            done += server.authority()?.resume_point().tick.0 - before_tick;
             next += interval;
             if started.elapsed() > interval {
                 eprintln!("tick_over_budget_ms={}", started.elapsed().as_millis());

@@ -60,6 +60,9 @@ impl SectionPages {
     pub fn max_files(&self) -> usize {
         self.max_files
     }
+    pub fn budget(&self) -> OutputBudget {
+        self.budget
+    }
     fn encode(&self, page: &Snapshot) -> Result<Vec<u8>, Fault> {
         if page.sections.len() != 1 {
             return Err(Fault::invalid_data("page requires exactly one section"));

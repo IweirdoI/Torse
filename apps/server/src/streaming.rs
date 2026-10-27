@@ -91,6 +91,16 @@ impl ExecutionHost {
     }
 
     fn prepare_residency(&self, change: SectionChange) -> Result<ExecutionPrepared, Fault> {
+        let _codec = self
+            .memory_pool()
+            .map(|pool| {
+                pool.reserve(
+                    MemoryClass::Codec,
+                    self.limits.runtime.max_bytes.saturating_mul(4),
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
         if !self.at_tick_boundary()
             || (!change.load && !self.pending.is_empty())
             || self.frozen.is_some()
@@ -128,7 +138,8 @@ impl ExecutionHost {
         let meta = world.meta();
         let changes = torse_world::ChangeSet::from_edits(meta, self.world().registry(), &[])
             .map_err(|e| Fault::invalid_data(e.to_string()))?;
-        let prepared = ExecutionPrepared {
+        let mut prepared = ExecutionPrepared {
+            memory: None,
             world: PreparedWorld {
                 normal: None,
                 section: Some(Box::new(world)),
@@ -147,6 +158,7 @@ impl ExecutionHost {
             },
         };
         wire::measure_inner(&prepared.record, self.limits.runtime, self.limits.codec)?;
+        self.account_residency(&mut prepared)?;
         Ok(prepared)
     }
 }

@@ -10,6 +10,8 @@ use core::fmt;
 mod identity;
 mod lifecycle;
 mod memory;
+mod memory_pool;
+pub use memory_pool::{MemoryLease, MemoryPool, MemoryUsage};
 mod replication;
 mod spatial;
 mod validation;

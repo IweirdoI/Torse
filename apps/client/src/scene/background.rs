@@ -102,6 +102,7 @@ pub(super) struct Background {
     generating: BTreeMap<SectionPos, Generation>,
     meshing: BTreeMap<SectionPos, Meshing>,
     stats: BackgroundStats,
+    config: ExecutorConfig,
 }
 
 impl Background {
@@ -111,6 +112,31 @@ impl Background {
             generating: BTreeMap::new(),
             meshing: BTreeMap::new(),
             stats: BackgroundStats::default(),
+            config,
+        })
+    }
+    pub fn replacement_with_memory(
+        &self,
+        memory: torse_types::MemoryPool,
+    ) -> Result<Self, torse_types::Fault> {
+        if self.pool.usage().jobs != 0 || !self.generating.is_empty() || !self.meshing.is_empty() {
+            return Err(torse_types::Fault::invalid_data(
+                "background memory requires an idle executor",
+            ));
+        }
+        Self::with_memory(self.config, memory)
+    }
+    pub fn with_memory(
+        config: ExecutorConfig,
+        memory: torse_types::MemoryPool,
+    ) -> Result<Self, torse_types::Fault> {
+        Ok(Self {
+            pool: Executor::with_memory(config, memory)
+                .map_err(|error| torse_types::Fault::resource_limit(error.to_string()))?,
+            generating: BTreeMap::new(),
+            meshing: BTreeMap::new(),
+            stats: BackgroundStats::default(),
+            config,
         })
     }
 
@@ -166,7 +192,7 @@ impl Background {
                         .unload(pos)
                         .map_err(|e| e.to_string())?;
                 }
-                scene.meshes.remove(&pos);
+                scene.forget_mesh(&pos);
                 scene.load_generations.remove(&pos);
             }
         }
@@ -196,7 +222,12 @@ impl Background {
                 continue;
             }
             match result {
-                Ok(Output::Generated(section)) => scene.install_generated(pos, section)?,
+                Ok(Output::Generated(section)) => {
+                    if !scene.install_generated(pos, section)? {
+                        self.stats.backpressure += 1;
+                        return Ok(());
+                    }
+                }
                 Err(JobError::Cancelled) => {}
                 other => return Err(format!("generation failed: {}", output_error(other))),
             }
@@ -264,8 +295,30 @@ impl Background {
                 break;
             }
             let task = self.meshing.get_mut(&pos).expect("pending mesh");
-            let Some(result) = task.job.try_take() else {
+            if !scene.sections.contains(&pos) || task.stamp != MeshStamp::capture(scene, pos) {
+                if let Some(result) = task.job.try_take() {
+                    drop(result);
+                    self.meshing.remove(&pos);
+                    self.stats.stale += 1;
+                }
                 continue;
+            }
+            let result = match task.job.try_take_charged(
+                torse_types::MemoryClass::Mesh,
+                torse_types::EvictionRank::Mesh { distance_sq: 1 },
+            ) {
+                Ok(Some(result)) => result,
+                Ok(None) => continue,
+                Err(ReserveError::Busy) => {
+                    self.stats.backpressure += 1;
+                    let center = scene
+                        .memory
+                        .as_ref()
+                        .map_or(SectionPos::ZERO, |memory| memory.center);
+                    scene.evict_one_mesh(center);
+                    continue;
+                }
+                Err(error) => return Err(format!("mesh memory transfer failed: {error:?}")),
             };
             let task = self.meshing.remove(&pos).expect("pending mesh");
             if !scene.sections.contains(&pos) || task.stamp != MeshStamp::capture(scene, pos) {
@@ -273,12 +326,17 @@ impl Background {
                 continue;
             }
             match result {
-                Ok(Output::Meshed(mesh)) => {
-                    scene.meshes.insert(pos, (task.stamp, mesh));
+                Ok((Output::Meshed(mesh), lease)) => {
+                    scene.install_mesh(pos, task.stamp, mesh, lease);
                     rebuilt.push(pos);
                 }
                 Err(JobError::Cancelled) => {}
-                other => return Err(format!("meshing failed: {}", output_error(other))),
+                Err(error) => return Err(format!("meshing failed: {error:?}")),
+                Ok((other, lease)) => {
+                    let error = output_error(Ok(other));
+                    drop(lease);
+                    return Err(format!("meshing failed: {error}"));
+                }
             }
         }
         self.cancel_old_meshes(scene);
@@ -300,14 +358,10 @@ impl Background {
             let side = scene.side as usize;
             let max_faces = side.pow(3) * 6;
             // Geometry, two per-vertex tint channels, indices, and two slots.
-            let face_bytes = 8 * size_of::<[f32; 3]>()
-                + 4 * size_of::<[f32; 2]>()
-                + 8 * size_of::<[f32; 3]>()
-                + 6 * size_of::<u32>()
-                + 2 * size_of::<u16>();
+            let face_bytes = 268;
             let task_budget = JobBudget {
                 input_bytes: (side + 2).pow(3) * size_of::<MeshSample>() + size_of::<MeshInput>(),
-                output_bytes: size_of::<MeshData>() + max_faces * face_bytes * 2,
+                output_bytes: size_of::<MeshData>() + max_faces * face_bytes * 2 + 8192,
             };
             let Some(lease) = self.reserve(task_budget)? else {
                 break;
@@ -329,7 +383,7 @@ impl Background {
                         JobError::OutputLimit
                     }
                 })?;
-                let bytes = size_of::<MeshData>() + mesh.allocated_bytes();
+                let bytes = super::memory::mesh_bytes(&mesh);
                 Ok(JobOutput {
                     value: Output::Meshed(mesh),
                     bytes,

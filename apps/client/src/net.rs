@@ -15,6 +15,7 @@ use torse_types::{
     Admission, BlockPos, Compatibility, ContentKey, Fault, OutputBudget, RejectCode, RequestSeq,
     SessionId,
 };
+use torse_types::{EvictionRank, FaultCode, MemoryClass, MemoryLease, MemoryPool, SubscriptionId};
 #[path = "prediction.rs"]
 mod prediction;
 
@@ -49,6 +50,11 @@ pub enum NetEvent {
     /// The server closed the connection with a reason.
     Closed(String),
 }
+#[derive(Debug)]
+pub struct IncomingEvent {
+    pub event: NetEvent,
+    _memory: Option<MemoryLease>,
+}
 
 /// Live client connection to a standalone server.
 pub struct Connection<T: Transport> {
@@ -60,6 +66,8 @@ pub struct Connection<T: Transport> {
     budget: OutputBudget,
     limits: CodecLimits,
     last_ping: Option<Instant>,
+    retired: Option<SubscriptionId>,
+    memory: Option<MemoryLease>,
 }
 
 impl<T: Transport> Connection<T> {
@@ -77,13 +85,47 @@ impl<T: Transport> Connection<T> {
             },
             limits: codec_limits(),
             last_ping: None,
+            retired: None,
+            memory: None,
         }
     }
 
     fn send(&mut self, message: ClientMessage) -> Result<(), Fault> {
+        let _memory = self
+            .memory
+            .as_ref()
+            .map(|lease| {
+                lease.pool().reserve(
+                    MemoryClass::Codec,
+                    self.budget.max_bytes.saturating_mul(2),
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
+        self.send_reserved(message)
+    }
+    fn send_reserved(&mut self, message: ClientMessage) -> Result<(), Fault> {
         let mut bytes = Vec::new();
         wire::encode(&message, &mut bytes, self.budget, self.limits)?;
         self.transport.send(bytes)
+    }
+    pub fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), Fault> {
+        if self.memory.is_some() || self.mirror.is_some() {
+            return Err(Fault::invalid_data(
+                "connection memory requires a fresh mirror",
+            ));
+        }
+        let memory = pool.reserve(
+            MemoryClass::Replica,
+            self.budget.max_bytes.saturating_mul(3),
+            EvictionRank::Pinned,
+        )?;
+        self.transport.attach_memory(pool)?;
+        self.memory = Some(memory);
+        Ok(())
+    }
+    pub fn snapshot(&self) -> Option<&ReplicaSnapshot> {
+        self.mirror.as_ref().map(|mirror| &mirror.state)
     }
 
     /// Start the handshake with the shared content compatibility.
@@ -99,8 +141,11 @@ impl<T: Transport> Connection<T> {
         if self.subscription_pending {
             return Err(Fault::resource_limit("subscription replacement pending"));
         }
-        if let Some(subscription) = self.mirror.as_ref().map(|mirror| mirror.subscription) {
+        if let Some(subscription) = self.mirror.as_ref().map(|mirror| mirror.subscription)
+            && self.retired != Some(subscription)
+        {
             self.send(ClientMessage::Unsubscribe { subscription })?;
+            self.retired = Some(subscription);
         }
         self.send(ClientMessage::Subscribe { sections })?;
         self.subscription_pending = true;
@@ -109,12 +154,13 @@ impl<T: Transport> Connection<T> {
 
     /// Submit one action call; sequence numbers start at one and never repeat.
     pub fn request(&mut self, call: torse_sim::durable::Call) -> Result<RequestSeq, Fault> {
-        self.request_seq = self
+        let next = self
             .request_seq
             .checked_add(1)
             .ok_or_else(|| Fault::resource_limit("request sequence exhausted"))?;
-        let seq = RequestSeq(self.request_seq);
+        let seq = RequestSeq(next);
         self.send(ClientMessage::Request { seq, call })?;
+        self.request_seq = next;
         Ok(seq)
     }
 
@@ -136,8 +182,20 @@ impl<T: Transport> Connection<T> {
         wish: [i8; 2],
         jump: bool,
     ) -> Result<Option<torse_world::Position>, Fault> {
+        if self.retired.is_some() {
+            return Ok(None);
+        }
+        let _memory = if let Some(pool) = self.memory.as_ref().map(MemoryLease::pool) {
+            match pool.reserve(MemoryClass::Codec, 262_144, EvictionRank::Pinned) {
+                Ok(lease) => Some(lease),
+                Err(error) if error.code == FaultCode::ResourceLimit => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         if let Some((session, input)) = self.prediction.step(world, wish, jump)? {
-            self.send(ClientMessage::Move(torse_protocol::MoveCommand {
+            self.send_reserved(ClientMessage::Move(torse_protocol::MoveCommand {
                 session,
                 seq: input.seq,
                 tick_hint: world.coordinator().resume_point().tick,
@@ -149,25 +207,47 @@ impl<T: Transport> Connection<T> {
     }
 
     /// Poll the transport and translate every completed frame.
-    pub fn poll(&mut self) -> Result<Vec<NetEvent>, Fault> {
+    pub fn poll(&mut self) -> Result<Vec<IncomingEvent>, Fault> {
         self.poll_at(Instant::now())
     }
 
-    fn poll_at(&mut self, now: Instant) -> Result<Vec<NetEvent>, Fault> {
+    fn poll_at(&mut self, now: Instant) -> Result<Vec<IncomingEvent>, Fault> {
         self.transport.poll()?;
         let mut events = Vec::new();
-        while let Some(bytes) = self.transport.receive()? {
+        loop {
+            let memory = if let Some(pool) = self.memory.as_ref().map(MemoryLease::pool) {
+                match pool.reserve(
+                    MemoryClass::Codec,
+                    self.budget.max_bytes.saturating_mul(4),
+                    EvictionRank::Pinned,
+                ) {
+                    Ok(lease) => Some(lease),
+                    Err(error) if error.code == FaultCode::ResourceLimit => break,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let Some(bytes) = self.transport.receive()? else {
+                break;
+            };
             let message: ServerMessage = wire::decode(&bytes, self.budget, self.limits)?;
             match self.handle(message, now)? {
-                Some(event) => events.push(event),
+                Some(event) => events.push(IncomingEvent {
+                    event,
+                    _memory: memory,
+                }),
                 None => continue,
             }
         }
         if self.last_ping.is_some_and(|last| {
             now.saturating_duration_since(last) >= torse_protocol::HEARTBEAT_INTERVAL
         }) {
-            self.send(ClientMessage::Ping)?;
-            self.last_ping = Some(now);
+            match self.send(ClientMessage::Ping) {
+                Ok(()) => self.last_ping = Some(now),
+                Err(error) if error.code == FaultCode::ResourceLimit => {}
+                Err(error) => return Err(error),
+            }
             self.transport.poll()?;
         }
         Ok(events)
@@ -186,6 +266,7 @@ impl<T: Transport> Connection<T> {
                 let mirror = ReplicaMirror::from_seed(seed)?;
                 self.mirror = Some(mirror);
                 self.subscription_pending = false;
+                self.retired = None;
                 Ok(Some(NetEvent::Baseline(snapshot)))
             }
             ServerMessage::Batch(batch) => {
@@ -288,6 +369,53 @@ fn codec_limits() -> CodecLimits {
 mod tests {
     use super::*;
     use torse_net::{MemoryTransport, TransportLimits};
+
+    #[test]
+    fn decode_pressure_retains_frames_and_events_hold_temporary_reservations() {
+        let pool = MemoryPool::new(torse_types::MemoryBudget::new(256 * 1024 * 1024));
+        let (client, mut server) = MemoryTransport::pair(default_limits()).unwrap();
+        let mut connection = Connection::new(client);
+        connection.attach_memory(pool.clone()).unwrap();
+        let mut bytes = Vec::new();
+        wire::encode(
+            &ServerMessage::Welcome {
+                binding: torse_types::Binding {
+                    world: torse_types::WorldId(7),
+                    epoch: torse_types::WorldEpoch(1),
+                    compatibility: crate::scene::Scene::compatibility().unwrap(),
+                },
+                session: SessionId(1),
+            },
+            &mut bytes,
+            connection.budget,
+            connection.limits,
+        )
+        .unwrap();
+        server.send(bytes).unwrap();
+        let resident = pool.usage().total;
+        let temporary = pool
+            .reserve(
+                MemoryClass::Resource,
+                256 * 1024 * 1024 - resident,
+                EvictionRank::Pinned,
+            )
+            .unwrap();
+        assert!(connection.poll().unwrap().is_empty());
+        drop(temporary);
+        let events = connection.poll().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            NetEvent::Welcomed {
+                session: SessionId(1)
+            }
+        ));
+        assert!(pool.usage().current[MemoryClass::Codec.index()] >= 32 * 1024 * 1024);
+        drop(events);
+        assert_eq!(pool.usage().current[MemoryClass::Codec.index()], 0);
+        drop(connection);
+        assert_eq!(pool.usage().total, 0);
+    }
 
     #[test]
     fn heartbeat_waits_for_welcome_and_sends_once_per_interval_without_catchup() {
@@ -441,7 +569,12 @@ mod tests {
             bytes
         };
         server.send(frame).expect("send");
-        let events = connection.poll().expect("poll");
+        let events: Vec<_> = connection
+            .poll()
+            .expect("poll")
+            .into_iter()
+            .map(|event| event.event)
+            .collect();
         match &events[..] {
             [NetEvent::Finished { seq, committed }] => {
                 assert_eq!(seq.0, 1);

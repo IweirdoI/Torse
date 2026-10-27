@@ -601,6 +601,13 @@ impl SectionStore {
             rank: torse_types::EvictionRank::Pinned,
         })
     }
+    /// Cell buffers plus conservative map-entry reservations, including retired revisions.
+    pub fn accounted_bytes(&self) -> u64 {
+        self.memory_resident()
+            .map_or(0, |resident| resident.bytes)
+            .saturating_add((self.sections.len() + self.retired.len()) as u64 * 4096)
+            .saturating_add(size_of::<Self>() as u64)
+    }
 }
 
 /// Snapshot of store occupancy.

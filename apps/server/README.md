@@ -2,6 +2,8 @@
 
 包名：`torse-server`。提供权威世界的持久执行、文件恢复、授权网络和可选Mod装配，可在无GPU环境中运行。主程序通过ExecutionHost驱动阶段任务，WorldHost保留可信本地事务示例。范围与证据见[执行与网络验证](../../benchmarks/B6-B7-execution-network.md)。
 
+主程序通过`--memory-mib N`设置共享逻辑内存上限，默认512MiB。世界、执行、存储、订阅、传输和并行工作使用同一MemoryPool；预算不足暂停可重试工作，提交序号保持不变，关闭控制消息保留专用空间。库宿主在恢复后、注册会话前调用`Server::attach_memory`，并使用`NetworkHub::with_memory`。预留口径、失败释放及不包含的内存范围见[共享内存记录](../../benchmarks/M6-shared-memory.md)。
+
 | 文件 | 职责 |
 |---|---|
 | [authority.rs](src/authority.rs) | 服务端本地权威、准备项、独立恢复和订阅失效适配接口 |

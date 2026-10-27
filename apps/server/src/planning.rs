@@ -134,6 +134,24 @@ impl ExecutionHost {
             let world = self.world();
             let limits = self.limits;
             let (executor, budget) = config.executor(limits)?;
+            let _memory = if let Some(pool) = self.memory_pool() {
+                let bytes = (budget.input_bytes as u64)
+                    .saturating_add(budget.output_bytes as u64)
+                    .saturating_mul(batch.len() as u64);
+                match pool.reserve(MemoryClass::Executor, bytes, EvictionRank::Pinned) {
+                    Ok(lease) => Some(lease),
+                    Err(error) if error.code == FaultCode::ResourceLimit => {
+                        for plan in rule.plan(self.world(), tick)? {
+                            tasks.push(self.freeze_plan(plan, phase, None)?);
+                        }
+                        next += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
             let results = run_scoped(executor, budget, batch.len(), |index| {
                 let result = (|| {
                     let plans = batch[index].plan(world, tick)?;

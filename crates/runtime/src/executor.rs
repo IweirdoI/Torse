@@ -5,6 +5,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use torse_types::{EvictionRank, MemoryClass, MemoryLease, MemoryPool};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutorConfig {
@@ -107,6 +108,8 @@ struct State<T> {
     result: Mutex<Option<Result<T, JobError>>>,
     budget: JobBudget,
     charges: Arc<Charges>,
+    output_bytes: AtomicUsize,
+    memory: Mutex<Option<MemoryLease>>,
 }
 
 impl<T> Drop for State<T> {
@@ -142,6 +145,8 @@ struct Shared<T> {
     stopped: Arc<AtomicBool>,
     charges: Arc<Charges>,
     config: ExecutorConfig,
+    memory: Option<MemoryPool>,
+    _queue_memory: Option<MemoryLease>,
 }
 
 /// Trusted CPU tasks must check cancellation regularly and must not block on
@@ -153,7 +158,28 @@ pub struct Executor<T> {
 
 impl<T: Send + 'static> Executor<T> {
     pub fn new(config: ExecutorConfig) -> io::Result<Self> {
+        Self::build(config, None)
+    }
+    pub fn with_memory(config: ExecutorConfig, memory: MemoryPool) -> io::Result<Self> {
+        Self::build(config, Some(memory))
+    }
+    fn build(config: ExecutorConfig, memory: Option<MemoryPool>) -> io::Result<Self> {
         config.validate()?;
+        let queue_bytes = config
+            .max_jobs
+            .checked_mul(size_of::<Task<T>>())
+            .ok_or_else(|| io::Error::other("executor queue size overflow"))?;
+        let queue_memory = memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    MemoryClass::Executor,
+                    queue_bytes as u64,
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()
+            .map_err(io::Error::other)?;
         let mut tasks = VecDeque::new();
         tasks
             .try_reserve_exact(config.max_jobs)
@@ -167,6 +193,8 @@ impl<T: Send + 'static> Executor<T> {
             stopped: Arc::new(AtomicBool::new(false)),
             charges: Arc::new(Charges::default()),
             config,
+            memory,
+            _queue_memory: queue_memory,
         });
         let mut executor = Self {
             shared,
@@ -205,6 +233,25 @@ impl<T: Send + 'static> Executor<T> {
         {
             return Err(ReserveError::Busy);
         }
+        let bytes = budget
+            .input_bytes
+            .checked_add(budget.output_bytes)
+            .and_then(|bytes| bytes.checked_add(size_of::<State<T>>()))
+            .ok_or(ReserveError::TooLarge)?;
+        let memory = shared
+            .memory
+            .as_ref()
+            .map(|pool| {
+                let limit = pool.budget();
+                if bytes as u64 > limit.class_limit(MemoryClass::Executor)
+                    || bytes as u64 > limit.total_bytes()
+                {
+                    return Err(ReserveError::TooLarge);
+                }
+                pool.reserve(MemoryClass::Executor, bytes as u64, EvictionRank::Pinned)
+                    .map_err(|_| ReserveError::Busy)
+            })
+            .transpose()?;
         charges.jobs.fetch_add(1, Ordering::AcqRel);
         charges
             .input
@@ -220,6 +267,8 @@ impl<T: Send + 'static> Executor<T> {
             result: Mutex::new(None),
             budget,
             charges: Arc::clone(charges),
+            output_bytes: AtomicUsize::new(0),
+            memory: Mutex::new(memory),
         });
         Ok(Reservation {
             state,
@@ -296,6 +345,45 @@ pub struct Job<T> {
 }
 
 impl<T> Job<T> {
+    /// Move a finished payload's existing reservation into its resident class.
+    /// A full destination class leaves the result available for a later retry.
+    #[allow(clippy::type_complexity)]
+    pub fn try_take_charged(
+        &mut self,
+        class: MemoryClass,
+        rank: EvictionRank,
+    ) -> Result<Option<Result<(T, Option<MemoryLease>), JobError>>, ReserveError> {
+        let mut result = self.state.result.lock().expect("job result lock");
+        if result.is_none() {
+            return Ok(None);
+        }
+        if self.state.token.is_cancelled() {
+            return Ok(result.take().map(|_| Err(JobError::Cancelled)));
+        }
+        let lease = if result.as_ref().is_some_and(Result::is_ok) {
+            self.state
+                .memory
+                .lock()
+                .expect("job memory lock")
+                .as_mut()
+                .map(|lease| {
+                    let bytes = self.state.output_bytes.load(Ordering::Acquire) as u64;
+                    let budget = lease.pool().budget();
+                    if bytes > budget.class_limit(class).min(budget.total_bytes()) {
+                        return Err(ReserveError::TooLarge);
+                    }
+                    lease
+                        .split(class, bytes, rank)
+                        .map_err(|_| ReserveError::Busy)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(result
+            .take()
+            .map(|result| result.map(|value| (value, lease))))
+    }
     /// Nonblocking. The caller owns and budgets a taken result separately.
     pub fn try_take(&mut self) -> Option<Result<T, JobError>> {
         self.state
@@ -379,6 +467,7 @@ fn worker<T: Send + 'static>(shared: Arc<Shared<T>>) {
                     if output.bytes > state.budget.output_bytes {
                         Err(JobError::OutputLimit)
                     } else {
+                        state.output_bytes.store(output.bytes, Ordering::Release);
                         Ok(output.value)
                     }
                 })

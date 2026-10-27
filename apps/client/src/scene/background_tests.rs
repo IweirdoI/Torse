@@ -10,6 +10,31 @@ fn config(workers: usize, jobs: usize) -> ExecutorConfig {
         max_output_bytes: 32 * 1024 * 1024,
     }
 }
+
+#[test]
+fn shared_task_pressure_preserves_intent_and_releases_completed_and_cancelled_work() {
+    use torse_types::{EvictionRank, MemoryBudget, MemoryClass, MemoryPool};
+    let pool = MemoryPool::new(MemoryBudget::new(128 * 1024 * 1024));
+    let mut scene = Scene::new_background(1).unwrap();
+    scene.attach_memory(pool.clone()).unwrap();
+    let used = pool.usage().total;
+    let held = pool
+        .reserve(
+            MemoryClass::Resource,
+            128 * 1024 * 1024 - used,
+            EvictionRank::Pinned,
+        )
+        .unwrap();
+    scene.stream_around(SectionPos::ZERO, 4).unwrap();
+    assert_eq!(scene.authority.store().len(), 1);
+    drop(held);
+    drain(&mut scene, SectionPos::ZERO);
+    assert_eq!(scene.sections.len(), 9);
+    scene.stream_around(SectionPos::new(10, 0, 0), 4).unwrap();
+    drop(scene);
+    assert_eq!(pool.usage().total, 0);
+    assert!(pool.usage().total_peak <= 128 * 1024 * 1024);
+}
 fn wait(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !predicate() {

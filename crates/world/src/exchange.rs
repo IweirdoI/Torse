@@ -99,6 +99,41 @@ pub struct SnapshotComponent {
     /// Field values, sorted by field identity.
     pub fields: Vec<(ContentKey, SnapshotValue)>,
 }
+impl SnapshotComponent {
+    /// Same conservative resident reservation as runtime component fields, without cloning.
+    pub fn accounted_bytes(&self) -> u64 {
+        fn key(key: &ContentKey) -> u64 {
+            (key.namespace().len() + key.path().len() + 1) as u64 + 8
+        }
+        fn value(value: &SnapshotValue, depth: u32) -> u64 {
+            if depth > crate::MAX_VALUE_DEPTH {
+                return u64::MAX;
+            }
+            let bytes = match value {
+                SnapshotValue::Content(id) => key(id),
+                SnapshotValue::Entity(_) => 16,
+                SnapshotValue::Text(text) => text.len() as u64,
+                SnapshotValue::List(values) => values.iter().fold(0u64, |bytes, item| {
+                    bytes.saturating_add(value_bytes(item, depth + 1))
+                }),
+                SnapshotValue::Record(values) => values.iter().fold(0u64, |bytes, (id, item)| {
+                    bytes
+                        .saturating_add(key(id))
+                        .saturating_add(value_bytes(item, depth + 1))
+                }),
+                _ => 0,
+            };
+            9u64.saturating_add(bytes)
+        }
+        fn value_bytes(item: &SnapshotValue, depth: u32) -> u64 {
+            value(item, depth)
+        }
+        let bytes = self.fields.iter().fold(8u64, |bytes, (id, item)| {
+            bytes.saturating_add(key(id)).saturating_add(value(item, 0))
+        });
+        4096u64.saturating_add(bytes.saturating_mul(64))
+    }
+}
 
 /// One entity inside a snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]

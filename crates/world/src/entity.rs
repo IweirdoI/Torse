@@ -313,6 +313,27 @@ impl EntityStore {
     pub const fn side(&self) -> u32 {
         self.side
     }
+    /// Owned slots, indexes, and conservative component-tree reservations.
+    pub fn accounted_bytes(&self) -> u64 {
+        let mut bytes = size_of::<Self>() as u64
+            + self.slots.capacity() as u64 * size_of::<Slot>() as u64
+            + self.free.capacity() as u64 * size_of::<u32>() as u64
+            + (self.index.len() + self.by_id.len()) as u64 * 4096;
+        for slots in self.index.values() {
+            bytes = bytes.saturating_add(slots.capacity() as u64 * 4);
+        }
+        for (_, entity) in self.iter() {
+            for schema in entity.components.ids() {
+                bytes = bytes.saturating_add(crate::component_memory_bytes(
+                    entity
+                        .components
+                        .component(schema)
+                        .expect("known component"),
+                ));
+            }
+        }
+        bytes
+    }
 
     /// Allocation watermark, including identities of entities already removed.
     /// `u128::MAX` denotes exhaustion; spawning never wraps or reuses an identity.

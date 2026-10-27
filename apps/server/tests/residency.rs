@@ -65,6 +65,67 @@ fn settle(server: &mut base::Files) {
     }
 }
 
+#[test]
+fn global_io_pressure_preserves_interest_and_releases_completed_page_buffers() {
+    let dir = Directory::new();
+    let pages = pages(&dir);
+    let pool = MemoryPool::new(MemoryBudget::new(128 * 1024 * 1024));
+    let mut server = create(&dir, Vec::new());
+    server
+        .attach_memory(pool.clone(), 48 * 1024 * 1024)
+        .unwrap();
+    let fresh = SectionPos::new(2, 0, 0);
+    server
+        .enable_residency(
+            config(),
+            pages,
+            Some(Arc::new(EmptyGenerator {
+                identity: identity(),
+                gate: None,
+            })),
+            &[SectionPos::ZERO, SectionPos::new(1, 0, 0), fresh],
+        )
+        .unwrap();
+    let held = pool
+        .reserve(
+            MemoryClass::Resource,
+            128 * 1024 * 1024 - pool.usage().total,
+            EvictionRank::Pinned,
+        )
+        .unwrap();
+    assert!(matches!(
+        server.poll_residency(&mut NoReplicas).unwrap(),
+        ResidencyProgress::BudgetBlocked
+    ));
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .store()
+            .section(fresh)
+            .is_none()
+    );
+    drop(held);
+    settle(&mut server);
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .world()
+            .store()
+            .section(fresh)
+            .is_some()
+    );
+    assert_eq!(
+        pool.usage().current[MemoryClass::Codec.index()],
+        48 * 1024 * 1024
+    );
+    assert!(pool.usage().peak[MemoryClass::Codec.index()] > 48 * 1024 * 1024);
+    drop(server);
+    assert_eq!(pool.usage().total, 0);
+}
+
 struct Rule {
     dependencies: Vec<EventDependency>,
     move_entity: bool,

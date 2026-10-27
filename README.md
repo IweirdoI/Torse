@@ -22,6 +22,7 @@ Torse目前处于早期开发阶段，已有可运行的图形客户端、独立
 | 持久化 | 日志、检查点、实体生命周期恢复、持久任务与定时事件、请求结果与去重 | [世界恢复](benchmarks/M3-local-world.md)、[执行与网络](benchmarks/B6-B7-execution-network.md) |
 | 联机 | TCP连接、授权基线与增量同步、多人编辑、越界拒绝、撤权与重连 | [联机编辑](benchmarks/M5-net-edit.md)、[授权验收](benchmarks/A8-acceptance.md) |
 | Mod扩展 | 公开SDK、Wasm包加载、机器加工、持久唤醒，以及机器状态与库存的共同提交 | [Mod持久执行](benchmarks/M4-mod-durable.md)、[Mod原子执行](benchmarks/M4-mod-atomic.md) |
+| 内存预算 | 主程序共享世界、资源、复制、编解码、任务和缓存预留，支持背压、重试及生命周期释放 | [共享内存](benchmarks/M6-shared-memory.md) |
 
 联网移动已接入服务端固定Tick结算、持久运动状态与客户端预测校正，宿主可替换批准范围并重建订阅基线。自动跟随玩家的兴趣策略、正式用户认证，以及图形界面对真实Mod机器的操作仍待装配。当前机器面板使用示例数据；放置与破坏尚未连接库存消耗和掉落。服务端使用有限世界，现有功能验证不代表大规模世界或高并发性能。
 

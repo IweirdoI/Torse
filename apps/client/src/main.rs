@@ -28,7 +28,7 @@ const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N
                     [--place KEY:X,Y,Z]...\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
                         [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]\n\
-       both modes accept [--content <dir>] to load a data-driven pack (atlas.toml,\n\
+       both modes accept [--memory-mib N; default 512] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
        atlas.png, world.toml) instead of the built-in fixture content";
 
 fn main() -> ExitCode {
@@ -50,6 +50,7 @@ fn main() -> ExitCode {
     let mut ui_preview = None;
     let mut places: Vec<(String, [i64; 3])> = Vec::new();
     let mut content: Option<String> = None;
+    let mut memory_mib = 512u64;
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -89,6 +90,13 @@ fn main() -> ExitCode {
             "--walk" => walk = true,
             "--connect" => connect = value(),
             "--content" => content = value(),
+            "--memory-mib" => match value().and_then(|value| value.parse::<u64>().ok()) {
+                Some(value @ 80..=16384) => memory_mib = value,
+                _ => {
+                    eprintln!("--memory-mib requires 80..=16384");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             "--probe-outside" => probe_outside = true,
             "--place" => match value().as_deref().map(parse_place) {
@@ -127,6 +135,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         let config = WindowConfig {
+            memory_mib,
             radius: if radius_set { radius } else { 4 },
             width,
             height,
@@ -142,6 +151,10 @@ fn main() -> ExitCode {
         };
         match run_window(config) {
             Ok(summary) => {
+                println!(
+                    "memory_current_bytes={} memory_peak_bytes={} memory_class_peak_bytes={:?}",
+                    summary.memory.total, summary.memory.total_peak, summary.memory.peak
+                );
                 println!(
                     "adapter={} backend={} present={} format={} frames={} streams={} rebuilds={} \
                      uploads={} screenshots={} actions_ok={} actions_rejected={} walk_ticks={} \
@@ -204,6 +217,7 @@ fn main() -> ExitCode {
             ui_preview,
             &places,
             content.as_deref(),
+            memory_mib,
         ) {
             Ok(summary) => {
                 println!("{summary}");
@@ -234,12 +248,28 @@ fn run(
     ui_preview: Option<ui::Mode>,
     places: &[(String, [i64; 3])],
     content: Option<&str>,
+    memory_mib: u64,
 ) -> Result<String, String> {
     let start = Instant::now();
+    let pool =
+        torse_types::MemoryPool::new(torse_types::MemoryBudget::new(memory_mib * 1024 * 1024));
+    let startup = pool
+        .reserve(
+            torse_types::MemoryClass::Codec,
+            64 * 1024 * 1024,
+            torse_types::EvictionRank::Pinned,
+        )
+        .map_err(|error| error.to_string())?;
+    let world_memory =
+        Scene::startup_world_reservation(&pool, radius).map_err(|error| error.to_string())?;
     let mut scene = match content {
         Some(directory) => Scene::new_game(radius, std::path::Path::new(directory))?,
         None => Scene::new(radius)?,
     };
+    scene
+        .attach_memory_prepared(pool.clone(), world_memory)
+        .map_err(|error| error.to_string())?;
+    drop(startup);
     for (material, [x, y, z]) in places {
         let key = torse_types::ContentKey::parse(material)
             .map_err(|error| format!("--place `{material}`: {error}"))?;
@@ -247,7 +277,17 @@ fn run(
             .apply_edit(true, &key, torse_types::BlockPos::new(*x, *y, *z), 0)
             .map_err(|error| format!("--place `{material}`: {error}"))?;
     }
+    let _frame = scene
+        .reserve_frame_memory(u64::from(width) * u64::from(height) * 16 + 64 * 1024 * 1024)
+        .map_err(|error| error.to_string())?;
     scene.refresh_meshes();
+    let _geometry = pool
+        .reserve(
+            torse_types::MemoryClass::Codec,
+            scene.geometry_work_bytes(),
+            torse_types::EvictionRank::Pinned,
+        )
+        .map_err(|error| error.to_string())?;
     let (vertices, indices, faces) = scene.geometry();
     if indices.is_empty() {
         return Err("scene produced no geometry".to_owned());

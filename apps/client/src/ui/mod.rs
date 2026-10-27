@@ -210,6 +210,16 @@ pub struct Hud<'a> {
     pub sensitivity: f64,
 }
 impl Layer {
+    pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) -> Result<(), String> {
+        self.text.attach_memory(pool.clone())?;
+        for icon in &mut self.skin.icons {
+            icon.attach_memory(pool.clone())?;
+        }
+        Ok(())
+    }
+    pub fn clear_caches(&mut self) {
+        self.text.clear_cache();
+    }
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Result<Self, String> {
         let text = Text::load()?;
         let resource = if text.chinese {

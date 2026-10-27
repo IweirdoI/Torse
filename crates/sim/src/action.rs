@@ -116,6 +116,11 @@ enum TargetKey {
 }
 
 impl ActorContext {
+    pub fn accounted_bytes(&self) -> u64 {
+        4096u64.saturating_add(
+            (self.permissions.len() + self.targets.len() + self.sections.len()) as u64 * 4096,
+        )
+    }
     /// Create a host identity with no permissions or object access.
     pub fn new(principal: ContentKey) -> Self {
         Self {

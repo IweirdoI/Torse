@@ -120,7 +120,9 @@ pub struct Scene {
     layers: i64,
     tint_provider: Option<Arc<dyn torse_assets::texture::PositionTintProvider>>,
     tint_provider_generation: u64,
+    memory: Option<memory::Memory>,
 }
+mod memory;
 
 /// One content pack for every client mode, matching the server demo assembly
 /// so the handshake compatibility and the block colours agree everywhere.
@@ -261,6 +263,7 @@ impl Scene {
             layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
+            memory: None,
         };
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)
@@ -311,6 +314,7 @@ impl Scene {
             layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
+            memory: None,
         };
         scene.install_snapshot(snapshot)?;
         Ok(scene)
@@ -433,7 +437,7 @@ impl Scene {
             .map_err(|error| error.to_string())?;
         // A reinstalled section can reuse the previous revision number, so the
         // cached mesh must go or the change would render as a no-op.
-        self.meshes.remove(&section.pos);
+        self.forget_mesh(&section.pos);
         self.assign_load_generation(section.pos)?;
         Ok(())
     }
@@ -460,11 +464,18 @@ impl Scene {
     }
 
     /// Apply one replica increment: replaced sections and entities, removals.
+    #[cfg(test)]
     pub fn apply_changes(&mut self, changes: &ReplicaChanges) -> Result<(), String> {
+        if !self.try_apply_changes(changes)? {
+            return Err("world memory admission deferred".to_owned());
+        }
+        Ok(())
+    }
+    fn apply_changes_unbudgeted(&mut self, changes: &ReplicaChanges) -> Result<(), String> {
         let symbols = self.resolve_states(&changes.states)?;
         for pos in &changes.removed_sections {
             let _ = self.authority.store_mut().unload(*pos);
-            self.meshes.remove(pos);
+            self.forget_mesh(pos);
             self.load_generations.remove(pos);
             self.sections.retain(|item| item != pos);
         }
@@ -616,12 +627,24 @@ impl Scene {
         if self.is_network() {
             return Err("network mirrors cannot settle local movement".to_owned());
         }
+        let growth = self
+            .reserve_memory(
+                torse_types::MemoryClass::World,
+                self.authority
+                    .entities()
+                    .accounted_bytes()
+                    .saturating_add(16384),
+                torse_types::EvictionRank::Pinned,
+            )
+            .map_err(|error| error.to_string())?;
         let handle = self
             .authority
             .entities_mut()
             .spawn(at)
             .map_err(|error| format!("spawn failed: {error}"))?;
         self.walker = Some(torse_sim::player::WalkerState::new(handle));
+        self.reconcile_world_memory(growth)
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -649,6 +672,23 @@ impl Scene {
         let Some(mut walker) = self.walker else {
             return Err("walk mode has no entity".to_owned());
         };
+        let growth = match self.reserve_memory(
+            torse_types::MemoryClass::World,
+            self.authority
+                .entities()
+                .accounted_bytes()
+                .saturating_add(16384),
+            torse_types::EvictionRank::Pinned,
+        ) {
+            Ok(lease) => lease,
+            Err(error) if error.code == torse_types::FaultCode::ResourceLimit => {
+                return self
+                    .walker_position()
+                    .map(|position| (position, walker.grounded))
+                    .ok_or_else(|| "walker entity is gone".to_owned());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         self.edit_counter += 1;
         let counter = self.edit_counter;
         let outcome = torse_sim::player::walker_step(
@@ -661,6 +701,8 @@ impl Scene {
             TransactionId(u128::from(counter)),
         );
         self.walker = Some(walker);
+        self.reconcile_world_memory(growth)
+            .map_err(|error| error.to_string())?;
         match outcome {
             Ok(result) => Ok(result),
             Err(torse_sim::player::StepError::EntityGone) => {
@@ -728,9 +770,22 @@ impl Scene {
         let torse_sim::action::ActionOutput::Mutation(transaction) = output else {
             return Err("place and break must be mutations".to_owned());
         };
+        let prepared = self
+            .authority
+            .prepare(&transaction)
+            .map_err(|error| format!("{error:?}"))?;
+        let growth = self
+            .reserve_memory(
+                torse_types::MemoryClass::World,
+                self.authority.growth_reservation(&prepared),
+                torse_types::EvictionRank::Pinned,
+            )
+            .map_err(|error| error.to_string())?;
         self.authority
-            .commit(&transaction)
+            .publish(prepared)
             .map_err(|fault| format!("{fault:?}"))?;
+        self.reconcile_world_memory(growth)
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -758,6 +813,9 @@ impl Scene {
     /// Splitting generation across frames keeps a crossing from stalling the
     /// frame; callers re-invoke until the window is complete.
     pub fn stream_around(&mut self, center: SectionPos, budget: usize) -> Result<(), String> {
+        if let Some(memory) = &mut self.memory {
+            memory.center = center;
+        }
         if self.generator.is_none() && self.layered.is_none() {
             return Ok(());
         }
@@ -765,6 +823,8 @@ impl Scene {
         if let Some(mut background) = self.background.take() {
             let result = background.stream(self, wanted, budget);
             self.background = Some(background);
+            self.reconcile_world_memory(None)
+                .map_err(|error| error.to_string())?;
             return result;
         }
         let mut generated = 0usize;
@@ -774,6 +834,18 @@ impl Scene {
                     break;
                 }
                 generated += 1;
+                let work_bytes = 1_048_576u64
+                    + u64::from(self.side).pow(3) * 16
+                    + u64::from(self.side).pow(2) * 32;
+                let _work = match self.reserve_memory(
+                    torse_types::MemoryClass::Executor,
+                    work_bytes,
+                    torse_types::EvictionRank::Pinned,
+                ) {
+                    Ok(lease) => lease,
+                    Err(error) if error.code == torse_types::FaultCode::ResourceLimit => break,
+                    Err(error) => return Err(error.to_string()),
+                };
                 let section = match self.layered.as_ref() {
                     Some(terrain) => terrain.generate(*pos),
                     None => self
@@ -783,7 +855,9 @@ impl Scene {
                         .generate(*pos),
                 }
                 .map_err(|error| error.to_string())?;
-                self.install_generated(*pos, section)?;
+                if !self.install_generated(*pos, section)? {
+                    break;
+                }
             }
         }
         for pos in self.sections.clone() {
@@ -794,11 +868,13 @@ impl Scene {
                         .unload(pos)
                         .map_err(|e| e.to_string())?;
                 }
-                self.meshes.remove(&pos);
+                self.forget_mesh(&pos);
                 self.load_generations.remove(&pos);
             }
         }
         self.sections = wanted;
+        self.reconcile_world_memory(None)
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -811,13 +887,25 @@ impl Scene {
         Ok(generation)
     }
 
-    fn install_generated(&mut self, pos: SectionPos, section: Section) -> Result<(), String> {
+    fn install_generated(&mut self, pos: SectionPos, section: Section) -> Result<bool, String> {
+        let bytes = size_of::<Section>() + section.allocated_bytes() + 8192;
+        let growth = match self.reserve_memory(
+            torse_types::MemoryClass::World,
+            bytes as u64,
+            torse_types::EvictionRank::Pinned,
+        ) {
+            Ok(lease) => lease,
+            Err(error) if error.code == torse_types::FaultCode::ResourceLimit => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
         let store = self.authority.store_mut();
         store.request(pos).map_err(|e| e.to_string())?;
         store.install(pos, section).map_err(|e| e.to_string())?;
         store.finish_load(pos).map_err(|e| e.to_string())?;
         self.assign_load_generation(pos)?;
-        Ok(())
+        self.reconcile_world_memory(growth)
+            .map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     fn wanted_sections(&self, center: SectionPos) -> Result<Vec<SectionPos>, String> {
@@ -859,33 +947,52 @@ impl Scene {
     ///
     /// Returns the rebuilt sections, so callers re-upload only what changed.
     pub fn refresh_meshes(&mut self) -> Vec<SectionPos> {
-        let store = self.authority.store();
-        let registry = self.authority.registry();
         let mut rebuilt = Vec::new();
-        for pos in &self.sections {
+        'sections: for pos in self.sections.clone() {
             let unchanged = self
                 .meshes
-                .get(pos)
-                .is_some_and(|(job, _)| job == &MeshStamp::capture(self, *pos));
+                .get(&pos)
+                .is_some_and(|(job, _)| job == &MeshStamp::capture(self, pos));
             if unchanged {
                 continue;
             }
-            let job = MeshStamp::capture(self, *pos);
+            let job = MeshStamp::capture(self, pos);
             let Some(_revision) = job.terrain.section_revision else {
                 continue;
             };
-            let mesh = build_mesh(self.side, *pos, |query| {
+            let Ok(work) = self.reserve_memory(
+                torse_types::MemoryClass::Executor,
+                memory::mesh_work_bytes(self.side),
+                torse_types::EvictionRank::Pinned,
+            ) else {
+                break;
+            };
+            let mesh = build_mesh(self.side, pos, |query| {
                 sample(
-                    store,
-                    registry,
+                    self.authority.store(),
+                    self.authority.registry(),
                     &self.state_materials,
                     &self.palette,
                     self.tint_provider.as_deref(),
                     query,
                 )
             });
-            self.meshes.insert(*pos, (job, mesh));
-            rebuilt.push(*pos);
+            let lease = match work {
+                Some(mut work) => loop {
+                    match work.split(
+                        torse_types::MemoryClass::Mesh,
+                        memory::mesh_bytes(&mesh) as u64,
+                        torse_types::EvictionRank::Mesh { distance_sq: 1 },
+                    ) {
+                        Ok(lease) => break Some(lease),
+                        Err(_) if self.evict_one_mesh(pos) => continue,
+                        Err(_) => break 'sections,
+                    }
+                },
+                None => None,
+            };
+            self.install_mesh(pos, job, mesh, lease);
+            rebuilt.push(pos);
         }
         rebuilt
     }
@@ -960,6 +1067,7 @@ impl Scene {
             layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
+            memory: None,
         };
         scene.placeable = Some(game.placeable_blocks());
         scene.layers = (game.height_limit() + i64::from(side) - 1) / i64::from(side);
@@ -976,7 +1084,11 @@ impl Scene {
         if self.layered.is_some() {
             return Err("background streaming needs the built-in generator".to_owned());
         }
-        let next = Background::new(config)?;
+        let next = if let Some(pool) = self.memory_pool() {
+            Background::with_memory(config, pool.clone()).map_err(|error| error.to_string())?
+        } else {
+            Background::new(config)?
+        };
         self.background = Some(next);
         Ok(())
     }
@@ -1131,6 +1243,37 @@ impl Scene {
             );
         }
         (vertices, indices, faces)
+    }
+
+    /// Summary without allocating a second copy of the entire scene geometry.
+    pub fn geometry_counts(&self) -> (usize, usize) {
+        let (mut vertices, mut faces) =
+            self.meshes
+                .values()
+                .fold((0, 0), |(vertices, faces), (_, mesh)| {
+                    (vertices + mesh.positions.len(), faces + mesh.face_count())
+                });
+        for (handle, entity) in self.authority.entities().iter() {
+            if Some(handle) != self.walker.map(|walker| walker.handle)
+                && entity
+                    .components
+                    .component(&torse_world::block_instance_schema())
+                    .is_none()
+            {
+                vertices += 24;
+                faces += 6;
+            }
+        }
+        (vertices, faces)
+    }
+
+    /// Cover growable vertex/index vectors and their simultaneous encoded copy.
+    pub fn geometry_work_bytes(&self) -> u64 {
+        let (vertices, faces) = self.geometry_counts();
+        (vertices as u64)
+            .saturating_mul(Vertex::STRIDE as u64 * 4)
+            .saturating_add((faces as u64).saturating_mul(6 * 4 * 3))
+            .saturating_add(8192)
     }
 
     /// Encode vertices into the interleaved GPU layout.

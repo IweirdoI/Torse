@@ -10,8 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use torse_types::{
-    ContentKey, ContentKeyError, EvictionRank, Fault, MemoryBudget, MemoryClass, MemoryLedger,
-    MemoryResident,
+    ContentKey, ContentKeyError, EvictionRank, Fault, MemoryBudget, MemoryClass, MemoryLease,
+    MemoryLedger, MemoryPool, MemoryResident,
 };
 
 /// Assigned 128-bit asset identity.
@@ -144,6 +144,7 @@ struct Resident {
     charge: torse_types::MemoryChargeId,
     keys: Vec<ContentKey>,
     paths: Vec<String>,
+    _memory: Option<MemoryLease>,
 }
 
 /// Resident CPU copies and the resource-class ledger that accounts them.
@@ -156,6 +157,7 @@ pub struct AssetCatalog {
     /// Monotonic revision also used for new handles, avoiding an ever-growing
     /// tombstone map for unloaded guids. Idempotent loads keep this revision.
     generation: u64,
+    memory: Option<MemoryPool>,
 }
 
 impl AssetCatalog {
@@ -167,7 +169,40 @@ impl AssetCatalog {
             keys: BTreeMap::new(),
             paths: BTreeMap::new(),
             generation: 0,
+            memory: None,
         }
+    }
+    pub fn with_memory(budget: MemoryBudget, memory: MemoryPool) -> Self {
+        Self {
+            memory: Some(memory),
+            ..Self::new(budget)
+        }
+    }
+    /// Attach an existing catalog atomically, before sharing it with consumers.
+    pub fn attach_memory(&mut self, memory: MemoryPool) -> Result<(), AssetError> {
+        if self.memory.is_some() {
+            return Err(AssetError::Budget(Fault::invalid_data(
+                "asset memory account already attached",
+            )));
+        }
+        let mut leases = Vec::new();
+        for (id, resident) in &self.resident {
+            leases.push((
+                *id,
+                memory
+                    .reserve(
+                        MemoryClass::Resource,
+                        resident.bytes.len() as u64,
+                        EvictionRank::ReloadableResource,
+                    )
+                    .map_err(AssetError::Budget)?,
+            ));
+        }
+        for (id, lease) in leases {
+            self.resident.get_mut(&id).expect("resident asset")._memory = Some(lease);
+        }
+        self.memory = Some(memory);
+        Ok(())
     }
 
     /// Value hosts copy into their asset-generation stamp.
@@ -228,6 +263,18 @@ impl AssetCatalog {
                 )));
             }
         }
+        let memory = self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    MemoryClass::Resource,
+                    bytes.len() as u64,
+                    EvictionRank::ReloadableResource,
+                )
+            })
+            .transpose()
+            .map_err(AssetError::Budget)?;
         let charge = self
             .ledger
             .charge(MemoryResident {
@@ -265,6 +312,7 @@ impl AssetCatalog {
                 charge,
                 keys,
                 paths,
+                _memory: memory,
             },
         );
         self.generation = generation;
@@ -359,6 +407,25 @@ impl AssetCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_resource_pressure_retries_and_releases_payloads() {
+        let pool = MemoryPool::new(MemoryBudget::new(64));
+        let mut catalog = AssetCatalog::with_memory(MemoryBudget::new(128), pool.clone());
+        let temporary = pool
+            .reserve(MemoryClass::Codec, 33, EvictionRank::Pinned)
+            .unwrap();
+        assert!(catalog.load(guid(1), &[1; 32], &[], &[]).is_err());
+        assert!(catalog.resident.is_empty());
+        assert_eq!(catalog.asset_generation(), 0);
+        drop(temporary);
+        let handle = catalog.load(guid(1), &[1; 32], &[], &[]).unwrap();
+        assert_eq!(pool.usage().current[MemoryClass::Resource.index()], 32);
+        catalog.unload(handle).unwrap();
+        assert_eq!(pool.usage().total, 0);
+        catalog.load(guid(1), &[2; 64], &[], &[]).unwrap();
+        drop(catalog);
+        assert_eq!(pool.usage().total, 0);
+    }
 
     fn guid(value: u128) -> AssetGuid {
         AssetGuid(value)
@@ -430,7 +497,7 @@ mod tests {
     #[test]
     fn raw_path_aliases_cannot_bypass_validation() {
         let mut catalog = catalog();
-        for path in ["../secret", "/absolute", "C:/outside", "a\\b"] {
+        for path in ["../secret", "/absolute", concat!("C:", "/outside"), "a\\b"] {
             assert!(matches!(
                 catalog.load(guid(1), b"copy", &[AssetAlias::Path(path.into())], &[]),
                 Err(AssetError::BadPath)

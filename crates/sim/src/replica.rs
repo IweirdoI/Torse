@@ -84,11 +84,13 @@ struct Subscription {
     next_seq: u64,
     queue: VecDeque<(WorldReplicaBatch, Cost)>,
     queued: Cost,
+    _memory: Option<torse_types::MemoryLease>,
 }
 
 /// Concrete source, following the A5b convention of deferring a generic trait
 /// until a second implementation needs it. It is not a transport or journal.
 pub struct ReplicaSource {
+    memory: Option<torse_types::MemoryPool>,
     world: WorldAuthority,
     binding: Binding,
     limits: ReplicaLimits,
@@ -100,6 +102,16 @@ pub struct ReplicaSource {
 }
 
 impl ReplicaSource {
+    /// Connect before opening subscriptions; live payloads keep their own reservations.
+    pub fn attach_memory(&mut self, memory: torse_types::MemoryPool) -> Result<(), Fault> {
+        if self.memory.is_some() || !self.subscriptions.is_empty() {
+            return Err(Fault::invalid_data(
+                "replica memory account requires a fresh source",
+            ));
+        }
+        self.memory = Some(memory);
+        Ok(())
+    }
     /// Residency invalidates affected subscriptions before any further output.
     pub fn publish_section(
         &mut self,
@@ -139,6 +151,7 @@ impl ReplicaSource {
             return Err(Fault::invalid_data("invalid replica binding or limits"));
         }
         Ok(Self {
+            memory: None,
             world,
             binding,
             limits,
@@ -197,6 +210,24 @@ impl ReplicaSource {
                 "replica subscription capacity exhausted",
             ));
         }
+        let bytes = self
+            .limits
+            .snapshot
+            .max_bytes
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(self.limits.queue.max_bytes.checked_mul(2)?))
+            .ok_or_else(|| Fault::resource_limit("replica memory reservation overflow"))?;
+        let memory = self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    torse_types::MemoryClass::Replica,
+                    bytes,
+                    torse_types::EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
         // Count envelope and state before copying even one owned world value.
         let state = project(
             &self.world,
@@ -227,6 +258,7 @@ impl ReplicaSource {
                 next_seq: 1,
                 queue: VecDeque::new(),
                 queued: Cost::default(),
+                _memory: memory,
             },
         );
         Ok(seed)
@@ -376,6 +408,7 @@ fn reset(sub: &mut Subscription) {
     sub.cache = ProjectionCache::default();
     sub.queue.clear();
     sub.queued = Cost::default();
+    sub._memory = None;
 }
 
 fn reset_required() -> Fault {

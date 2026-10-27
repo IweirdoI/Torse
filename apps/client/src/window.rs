@@ -51,6 +51,8 @@ const WALKER_EYE_OFFSET: f64 = 0.7;
 /// Startup parameters for the windowed run.
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
+    /// Shared CPU memory reservation ceiling in MiB.
+    pub memory_mib: u64,
     /// Section loading radius around the camera.
     pub radius: i64,
     /// Initial window size in logical pixels.
@@ -81,6 +83,8 @@ pub struct WindowConfig {
 /// Measurements reported when the window closes.
 #[derive(Clone, Debug, Default)]
 pub struct WindowSummary {
+    /// Logical shared reservation usage; excludes native allocator and GPU memory.
+    pub memory: torse_types::MemoryUsage,
     /// Adapter name reported by the backend.
     pub adapter: String,
     /// Backend selected for the surface.
@@ -211,10 +215,15 @@ struct WindowApp {
     pending_palette: Option<Palette>,
     summary: Option<WindowSummary>,
     failure: Option<String>,
+    rebuild_network: bool,
+    memory: torse_types::MemoryPool,
 }
 
 impl WindowApp {
     fn new(config: WindowConfig) -> Self {
+        let memory = torse_types::MemoryPool::new(torse_types::MemoryBudget::new(
+            config.memory_mib * 1024 * 1024,
+        ));
         let materials = ["base:stone", "base:glass_slab", "base:plant"]
             .into_iter()
             .map(|name| ContentKey::parse(name).expect("static material key"))
@@ -280,6 +289,8 @@ impl WindowApp {
             pending_palette: None,
             summary: None,
             failure: None,
+            rebuild_network: false,
+            memory,
         }
     }
 
@@ -296,13 +307,19 @@ impl WindowApp {
             None => Vec::new(),
         };
         for event in events {
-            if let Err(error) = self.apply_net_event(event, event_loop) {
+            if let Err(error) = self.apply_net_event(event.event) {
                 self.failure = Some(error);
                 event_loop.exit();
                 return false;
             }
         }
-
+        if self.rebuild_network
+            && let Err(error) = self.rebuild_network_scene()
+        {
+            self.failure = Some(error);
+            event_loop.exit();
+            return false;
+        }
         true
     }
 
@@ -317,6 +334,30 @@ impl WindowApp {
         if self.camera.is_none() {
             return;
         }
+        let frame_bytes = self.gpu.as_ref().map_or(0, |gpu| {
+            u64::from(gpu.config.width) * u64::from(gpu.config.height) * 16 + 64 * 1024 * 1024
+        });
+        let frame_memory = match self.scene.as_mut() {
+            Some(scene) => scene.reserve_frame_memory(frame_bytes),
+            None => self
+                .memory
+                .reserve(
+                    torse_types::MemoryClass::Codec,
+                    frame_bytes,
+                    torse_types::EvictionRank::Pinned,
+                )
+                .map(Some),
+        };
+        let _frame_memory = match frame_memory {
+            Ok(memory) => memory,
+            Err(_) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.ui.clear_caches();
+                    gpu.window.request_redraw();
+                }
+                return;
+            }
+        };
         if self.scene.is_none() {
             // Connected but no baseline yet: keep presenting cleared frames
             // so polling continues and the window does not sit on an
@@ -894,70 +935,31 @@ impl WindowApp {
     }
 
     /// Apply one decoded server event; errors stop the run.
-    fn apply_net_event(
-        &mut self,
-        event: crate::net::NetEvent,
-        _event_loop: &ActiveEventLoop,
-    ) -> Result<(), String> {
+    fn apply_net_event(&mut self, event: crate::net::NetEvent) -> Result<(), String> {
         use crate::net::NetEvent;
         match event {
             NetEvent::Welcomed { session } => {
                 self.session = Some(session.0);
             }
-            NetEvent::Baseline(snapshot) => {
-                // The mirror installs the y = 0 section layer; the eye must
-                // stay inside it or the pick ray stops at the first unloaded
-                // cell above the terrain.
-                let loaded_top = (snapshot.side as i64).min(snapshot.bounds.max_y);
-                let mut scene = Scene::from_snapshot(&snapshot)?;
-                scene.enable_background(crate::scene::background_config())?;
-                let eye = [4.0, (loaded_top as f32 - 2.0).max(4.0), 4.0];
-                if let Some(camera) = self.camera.as_mut() {
-                    camera.eye = eye;
-                    // Look nearly straight down: the scope is 32 by 16 blocks,
-                    // so a shallow view drifts out of the loaded area before
-                    // the ray reaches the floor.
-                    camera.pitch = -1.5;
-                    camera.yaw = 0.6;
-                }
-                self.reset_presentation_pose(eye);
-                self.scene = Some(scene);
-                if let Some(connection) = self.net.as_mut() {
-                    let scene = self.scene.as_mut().expect("installed scene");
-                    connection
-                        .refresh_player(scene.authority())
-                        .map_err(|e| e.to_string())?;
-                    if self.walk
-                        && let Some(id) = connection.player_entity()
-                    {
-                        scene.view_player(id);
-                    }
-                }
-                self.pending_palette = self.scene.as_ref().map(|scene| scene.palette().clone());
-                self.center = None;
-                self.uploaded = false;
-                if self.walk
-                    && let Some(position) = self.net.as_ref().zip(self.scene.as_ref()).and_then(
-                        |(connection, scene)| connection.player_position(scene.authority()),
-                    )
-                {
-                    self.reset_presentation_pose([
-                        position.x as f32,
-                        (position.y + WALKER_EYE_OFFSET) as f32,
-                        position.z as f32,
-                    ]);
-                }
+            NetEvent::Baseline(_snapshot) => {
+                self.invalidate_network_scene();
             }
             NetEvent::Increment(changes) => {
                 self.batches += 1;
+                if self.rebuild_network {
+                    return Ok(());
+                }
                 let Some(scene) = self.scene.as_mut() else {
                     return Err("increment before baseline".to_owned());
                 };
-                scene.apply_changes(&changes)?;
+                if !scene.try_apply_changes(&changes)? {
+                    self.invalidate_network_scene();
+                    return Ok(());
+                }
                 if let Some(connection) = self.net.as_mut() {
                     connection
                         .refresh_player(scene.authority())
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|error| error.to_string())?;
                     if self.walk
                         && let Some(id) = connection.player_entity()
                     {
@@ -969,18 +971,17 @@ impl WindowApp {
                 if let Some((connection, scene)) = self.net.as_mut().zip(self.scene.as_mut()) {
                     connection
                         .refresh_player(scene.authority())
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|error| error.to_string())?;
                     if self.walk {
                         if let Some(id) = connection.player_entity() {
                             scene.view_player(id);
                         }
                         if let Some(position) = connection.player_position(scene.authority()) {
-                            let eye = [
+                            self.correct_network_pose([
                                 position.x as f32,
                                 (position.y + WALKER_EYE_OFFSET) as f32,
                                 position.z as f32,
-                            ];
-                            self.correct_network_pose(eye);
+                            ]);
                         }
                     }
                 }
@@ -1006,6 +1007,62 @@ impl WindowApp {
             }
             NetEvent::Closed(reason) => return Err(reason),
         }
+        self.resume_requested_walk();
+        Ok(())
+    }
+    fn invalidate_network_scene(&mut self) {
+        self.scene = None;
+        self.pending_palette = None;
+        self.center = None;
+        self.uploaded = false;
+        self.rebuild_network = true;
+    }
+    fn rebuild_network_scene(&mut self) -> Result<(), String> {
+        let Some(snapshot) = self.net.as_ref().and_then(crate::net::Connection::snapshot) else {
+            return Ok(());
+        };
+        let loaded_top = (snapshot.side as i64).min(snapshot.bounds.max_y);
+        let mut scene = match Scene::from_snapshot_charged(snapshot, self.memory.clone()) {
+            Ok(scene) => scene,
+            Err(error) if error.code == torse_types::FaultCode::ResourceLimit => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        scene.enable_background(crate::scene::background_config())?;
+        if let Some(connection) = self.net.as_mut() {
+            connection
+                .refresh_player(scene.authority())
+                .map_err(|error| error.to_string())?;
+            if self.walk
+                && let Some(id) = connection.player_entity()
+            {
+                scene.view_player(id);
+            }
+        }
+        let position = self
+            .net
+            .as_ref()
+            .filter(|_| self.walk)
+            .and_then(|connection| connection.player_position(scene.authority()));
+        let eye = position.map_or([4.0, (loaded_top as f32 - 2.0).max(4.0), 4.0], |position| {
+            [
+                position.x as f32,
+                (position.y + WALKER_EYE_OFFSET) as f32,
+                position.z as f32,
+            ]
+        });
+        if let Some(camera) = self.camera.as_mut() {
+            camera.eye = eye;
+            camera.pitch = -1.5;
+            camera.yaw = 0.6;
+        }
+        self.reset_presentation_pose(eye);
+        self.pending_palette = Some(scene.palette().clone());
+        self.scene = Some(scene);
+        self.rebuild_network = false;
+        self.resume_requested_walk();
+        Ok(())
+    }
+    fn resume_requested_walk(&mut self) {
         if self.config.walk
             && !self.walk
             && self.net.is_some()
@@ -1014,9 +1071,7 @@ impl WindowApp {
         {
             self.enter_walk(camera.eye);
         }
-        Ok(())
     }
-
     /// Capture or release the mouse.
     ///
     /// Captured means hidden and re-centred after every motion event: the
@@ -1130,8 +1185,9 @@ impl WindowApp {
 
     fn finish(&mut self, event_loop: &ActiveEventLoop) {
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
-            let (vertices, _, faces) = scene.geometry();
+            let (vertices, faces) = scene.geometry_counts();
             self.summary = Some(WindowSummary {
+                memory: self.memory.usage(),
                 cpu: scene.background_stats(),
                 adapter: self.adapter.clone(),
                 backend: gpu.backend_name.clone(),
@@ -1160,7 +1216,7 @@ impl WindowApp {
                     .map(|position| [position.x, position.y, position.z]),
                 sections: scene.sections().len(),
                 meshes: scene.mesh_count(),
-                vertices: vertices.len(),
+                vertices,
                 faces,
                 elapsed_ms: self
                     .started
@@ -1191,6 +1247,18 @@ impl WindowApp {
 
 impl ApplicationHandler for WindowApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let _startup = match self.memory.reserve(
+            torse_types::MemoryClass::Codec,
+            64 * 1024 * 1024,
+            torse_types::EvictionRank::Pinned,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.failure = Some(error.to_string());
+                event_loop.exit();
+                return;
+            }
+        };
         let attributes = Window::default_attributes()
             .with_title("Torse client")
             .with_min_inner_size(LogicalSize::new(640, 360))
@@ -1255,6 +1323,15 @@ impl ApplicationHandler for WindowApp {
         } else {
             // A pack scene generates on the foreground thread; the built-in
             // fixture scene keeps the bounded background pool.
+            let world_memory =
+                match Scene::startup_world_reservation(&self.memory, self.config.radius) {
+                    Ok(memory) => memory,
+                    Err(error) => {
+                        self.failure = Some(error.to_string());
+                        event_loop.exit();
+                        return;
+                    }
+                };
             let built = match self.config.content.as_deref() {
                 Some(directory) => {
                     Scene::new_game(self.config.radius, std::path::Path::new(directory))
@@ -1262,7 +1339,16 @@ impl ApplicationHandler for WindowApp {
                 None => Scene::new_background(self.config.radius),
             };
             match built {
-                Ok(scene) => Some(scene),
+                Ok(mut scene) => {
+                    if let Err(error) =
+                        scene.attach_memory_prepared(self.memory.clone(), world_memory)
+                    {
+                        self.failure = Some(error.to_string());
+                        event_loop.exit();
+                        return;
+                    }
+                    Some(scene)
+                }
                 Err(error) => {
                     self.failure = Some(error);
                     event_loop.exit();
@@ -1310,7 +1396,8 @@ impl ApplicationHandler for WindowApp {
                     }
                 };
             let handshake = connection
-                .hello(compatibility)
+                .attach_memory(self.memory.clone())
+                .and_then(|()| connection.hello(compatibility))
                 .and_then(|()| connection.subscribe(demo_scope().to_vec()));
             if let Err(error) = handshake {
                 self.failure = Some(format!("handshake failed: {error}"));
@@ -1323,7 +1410,14 @@ impl ApplicationHandler for WindowApp {
         let ui = {
             let (device, _) = context.parts();
             match crate::ui::Layer::new(device, config.format) {
-                Ok(ui) => ui,
+                Ok(mut ui) => {
+                    if let Err(error) = ui.attach_memory(self.memory.clone()) {
+                        self.failure = Some(error);
+                        event_loop.exit();
+                        return;
+                    }
+                    ui
+                }
                 Err(error) => {
                     self.failure = Some(error);
                     event_loop.exit();
@@ -1752,6 +1846,7 @@ mod tests {
 
     fn app() -> WindowApp {
         let mut app = WindowApp::new(WindowConfig {
+            memory_mib: 512,
             radius: 1,
             width: 960,
             height: 540,

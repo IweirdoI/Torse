@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
-use torse_types::{Fault, FaultCode};
+use torse_types::{EvictionRank, Fault, FaultCode, MemoryClass, MemoryLease, MemoryPool};
 #[derive(Clone, Copy, Debug)]
 pub struct TransportLimits {
     pub frame: usize,
@@ -12,6 +12,13 @@ pub struct TransportLimits {
     pub poll_bytes: usize,
 }
 impl TransportLimits {
+    fn reserve(self, pool: &MemoryPool) -> Result<MemoryLease, Fault> {
+        let bytes = (self.queued_bytes as u64)
+            .checked_mul(6)
+            .and_then(|bytes| bytes.checked_add((self.queued_frames as u64).checked_mul(128)?))
+            .ok_or_else(|| Fault::resource_limit("transport memory reservation overflow"))?;
+        pool.reserve(MemoryClass::Replica, bytes, EvictionRank::Pinned)
+    }
     fn validate(self) -> Result<(), Fault> {
         if self.frame == 0
             || self.frame > u32::MAX as usize
@@ -25,6 +32,11 @@ impl TransportLimits {
     }
 }
 pub trait Transport {
+    fn attach_memory(&mut self, _pool: MemoryPool) -> Result<(), Fault> {
+        Err(Fault::incompatible(
+            "transport does not support shared memory reservations",
+        ))
+    }
     fn send(&mut self, frame: Vec<u8>) -> Result<(), Fault>;
     fn receive(&mut self) -> Result<Option<Vec<u8>>, Fault>;
     fn poll(&mut self) -> Result<(), Fault>;
@@ -40,6 +52,7 @@ pub struct MemoryTransport {
     input: Arc<Mutex<Queue>>,
     output: Arc<Mutex<Queue>>,
     limits: TransportLimits,
+    memory: Option<MemoryLease>,
 }
 fn closed() -> Fault {
     Fault::new(FaultCode::InvalidState, "transport closed")
@@ -61,16 +74,25 @@ impl MemoryTransport {
                 input: a.clone(),
                 output: b.clone(),
                 limits,
+                memory: None,
             },
             Self {
                 input: b,
                 output: a,
                 limits,
+                memory: None,
             },
         ))
     }
 }
 impl Transport for MemoryTransport {
+    fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), Fault> {
+        if self.memory.is_some() {
+            return Err(Fault::invalid_data("transport memory already attached"));
+        }
+        self.memory = Some(self.limits.reserve(&pool)?);
+        Ok(())
+    }
     fn send(&mut self, frame: Vec<u8>) -> Result<(), Fault> {
         let mut out = self.output.lock().map_err(|_| closed())?;
         if out.closed {
@@ -109,10 +131,11 @@ impl Transport for MemoryTransport {
         for queue in [&self.input, &self.output] {
             if let Ok(mut q) = queue.lock() {
                 q.closed = true;
-                q.frames.clear();
+                q.frames = VecDeque::new();
                 q.bytes = 0;
             }
         }
+        self.memory = None;
     }
 }
 impl Drop for MemoryTransport {
@@ -130,6 +153,7 @@ pub struct TcpTransport {
     queued: usize,
     ready_bytes: usize,
     closed: bool,
+    memory: Option<MemoryLease>,
 }
 impl TcpTransport {
     pub fn new(stream: TcpStream, limits: TransportLimits) -> Result<Self, Fault> {
@@ -146,6 +170,7 @@ impl TcpTransport {
             queued: 0,
             ready_bytes: 0,
             closed: false,
+            memory: None,
         })
     }
     fn pump(&mut self) -> Result<(), Fault> {
@@ -224,6 +249,13 @@ fn io_fault(e: std::io::Error) -> Fault {
     Fault::new(FaultCode::InvalidState, format!("transport I/O: {e}"))
 }
 impl Transport for TcpTransport {
+    fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), Fault> {
+        if self.memory.is_some() {
+            return Err(Fault::invalid_data("transport memory already attached"));
+        }
+        self.memory = Some(self.limits.reserve(&pool)?);
+        Ok(())
+    }
     fn send(&mut self, frame: Vec<u8>) -> Result<(), Fault> {
         if self.closed {
             return Err(closed());
@@ -264,16 +296,44 @@ impl Transport for TcpTransport {
     }
     fn close(&mut self) {
         self.closed = true;
-        self.input.clear();
-        self.ready.clear();
-        self.output.clear();
+        self.input = Vec::new();
+        self.ready = VecDeque::new();
+        self.output = VecDeque::new();
         self.queued = 0;
         self.ready_bytes = 0;
         let _ = self.stream.shutdown(Shutdown::Both);
+        self.memory = None;
     }
 }
 impl Drop for TcpTransport {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use torse_types::MemoryBudget;
+    #[test]
+    fn transport_reservations_cover_queue_lifetimes_and_close() {
+        let limits = TransportLimits {
+            frame: 64,
+            queued_frames: 4,
+            queued_bytes: 256,
+            poll_bytes: 64,
+        };
+        let pool = MemoryPool::new(MemoryBudget::new(4096));
+        let (mut a, mut b) = MemoryTransport::pair(limits).unwrap();
+        a.attach_memory(pool.clone()).unwrap();
+        b.attach_memory(pool.clone()).unwrap();
+        assert_eq!(pool.usage().total, 4096);
+        a.send(vec![1; 64]).unwrap();
+        assert_eq!(b.receive().unwrap().unwrap(), [1; 64]);
+        a.close();
+        assert_eq!(pool.usage().total, 2048);
+        assert_eq!(a.input.lock().unwrap().frames.capacity(), 0);
+        drop(b);
+        assert_eq!(pool.usage().total, 0);
     }
 }

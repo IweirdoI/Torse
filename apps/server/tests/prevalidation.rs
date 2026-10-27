@@ -78,6 +78,24 @@ fn config(workers: usize) -> PrevalidationConfig {
 }
 
 #[test]
+fn shared_prevalidation_reservations_release_after_the_committed_window() {
+    let dir = Directory::new();
+    let pool = MemoryPool::new(MemoryBudget::new(256 * 1024 * 1024));
+    let mut server = create(&dir, load());
+    server
+        .attach_memory(pool.clone(), 48 * 1024 * 1024)
+        .unwrap();
+    server.set_prevalidation(Some(config(4))).unwrap();
+    server.drive_tick(&mut NoReplicas, 1024).unwrap();
+    assert!(server.authority().unwrap().prevalidation_stats().prepared > 0);
+    assert!(server.authority().unwrap().prevalidation_stats().hits > 0);
+    let retained = pool.usage().current[MemoryClass::Executor.index()];
+    assert!(pool.usage().peak[MemoryClass::Executor.index()] > retained);
+    drop(server);
+    assert_eq!(pool.usage().total, 0);
+}
+
+#[test]
 fn serial_one_and_four_workers_preserve_exact_records_and_authorized_projection_with_busy_retries()
 {
     for (contended, mixed) in [(false, false), (true, false), (false, true)] {

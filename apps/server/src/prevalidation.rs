@@ -48,6 +48,7 @@ pub(super) struct PrevalidationCache {
     end: usize,
     entries: Vec<Option<Prevalidated>>,
     stats: PrevalidationStats,
+    memory: Option<MemoryLease>,
 }
 
 enum Prevalidated {
@@ -167,7 +168,8 @@ impl ExecutionHost {
         if same && (cache.start..cache.end).contains(&start) {
             return;
         }
-        cache.entries.clear();
+        cache.entries = Vec::new();
+        cache.memory = None;
         cache.table = Some(Arc::clone(&work.tasks));
         cache.point = Some(self.resume_point());
         cache.start = start;
@@ -188,6 +190,21 @@ impl ExecutionHost {
             cache.stats.skipped += 1;
             return;
         }
+        let mut memory = if let Some(pool) = self.memory_pool() {
+            match pool.reserve(
+                MemoryClass::Executor,
+                (count as u64).saturating_mul(config.max_job_bytes as u64),
+                EvictionRank::Pinned,
+            ) {
+                Ok(lease) => Some(lease),
+                Err(_) => {
+                    cache.stats.skipped += 1;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let world = self.world();
         let tasks = &work.tasks;
         let result = run_scoped(
@@ -244,6 +261,14 @@ impl ExecutionHost {
             .sum();
         cache.stats.peak_cached_bytes = cache.stats.peak_cached_bytes.max(bytes);
         cache.stats.prepared += cache.entries.iter().flatten().count() as u64;
+        let retained = bytes + cache.entries.capacity() * size_of::<Option<Prevalidated>>();
+        if let Some(lease) = &mut memory
+            && lease.resize(retained as u64).is_err()
+        {
+            cache.entries = Vec::new();
+            return;
+        }
+        cache.memory = memory;
     }
 
     pub(super) fn cached_prevalidation(&self) -> Option<torse_sim::PreparedChange> {
@@ -297,9 +322,22 @@ impl ExecutionHost {
                 *entry = None;
             }
         } else {
-            cache.entries.clear();
+            cache.entries = Vec::new();
             cache.table = None;
             cache.point = None;
+        }
+        let retained = cache
+            .entries
+            .iter()
+            .flatten()
+            .map(Prevalidated::charge)
+            .sum::<usize>()
+            + cache.entries.capacity() * size_of::<Option<Prevalidated>>();
+        if let Some(lease) = &mut cache.memory {
+            let _ = lease.resize(retained as u64);
+        }
+        if retained == 0 {
+            cache.memory = None;
         }
     }
 }

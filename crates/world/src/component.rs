@@ -358,6 +358,16 @@ pub fn component_size(fields: &ComponentFields) -> Result<u64, ComponentError> {
     Ok(bytes)
 }
 
+/// Conservative resident reservation for owned values and tree/container metadata.
+/// This is a logical charge; spare native allocation capacity is not an RSS measurement.
+pub fn component_memory_bytes(fields: &ComponentFields) -> u64 {
+    4096u64.saturating_add(
+        component_size(fields)
+            .unwrap_or(MAX_COMPONENT_BYTES)
+            .saturating_mul(64),
+    )
+}
+
 fn validate_value(
     field: &ContentKey,
     field_type: ComponentFieldType,

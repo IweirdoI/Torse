@@ -24,6 +24,17 @@ pub type ServerMessage = torse_protocol::ServerMessage<
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
     Server<ExecutionHost, J, S>
 {
+    /// Reserve journal/checkpoint capacity and connect the recovered authority to one account.
+    pub fn attach_memory(&mut self, pool: MemoryPool, storage_bytes: u64) -> Result<(), Fault> {
+        self.authority()?;
+        if self.storage_memory.is_some() {
+            return Err(Fault::invalid_data("server memory already attached"));
+        }
+        let storage = pool.reserve(MemoryClass::Codec, storage_bytes, EvictionRank::Pinned)?;
+        self.authority.attach_memory(pool)?;
+        self.storage_memory = Some(storage);
+        Ok(())
+    }
     pub fn register_session(
         &mut self,
         viewer: Viewer,
@@ -203,6 +214,9 @@ struct Peer<T> {
     waiting: BTreeSet<u64>,
     closed: bool,
     last_tick: Tick,
+    deferred: Option<ReplicaScope>,
+    codec: Option<MemoryLease>,
+    memory: Option<MemoryLease>,
 }
 pub struct NetworkHub<T> {
     peers: BTreeMap<u128, Peer<T>>,
@@ -210,6 +224,8 @@ pub struct NetworkHub<T> {
     sessions: SessionRegistry,
     limits: NetworkLimits,
     binding: Binding,
+    memory: Option<MemoryPool>,
+    codec: Option<MemoryLease>,
 }
 impl<T: Transport> NetworkHub<T> {
     pub fn new(binding: Binding, limits: NetworkLimits) -> Result<Self, Fault> {
@@ -237,12 +253,50 @@ impl<T: Transport> NetworkHub<T> {
             )?,
             limits,
             binding,
+            memory: None,
+            codec: None,
         })
     }
-    pub fn add(&mut self, transport: T, policy: PeerPolicy, tick: Tick) -> Result<u128, Fault> {
+    pub fn with_memory(
+        binding: Binding,
+        limits: NetworkLimits,
+        memory: MemoryPool,
+    ) -> Result<Self, Fault> {
+        Ok(Self {
+            codec: Some(
+                memory.reserve(
+                    MemoryClass::Codec,
+                    limits
+                        .budget
+                        .max_bytes
+                        .saturating_mul(2)
+                        .saturating_add(65_536),
+                    EvictionRank::Pinned,
+                )?,
+            ),
+            memory: Some(memory),
+            ..Self::new(binding, limits)?
+        })
+    }
+    pub fn add(&mut self, mut transport: T, policy: PeerPolicy, tick: Tick) -> Result<u128, Fault> {
         if self.peers.len() >= self.limits.peers || self.next == u128::MAX {
             return Err(Fault::resource_limit("peer capacity"));
         }
+        let memory = self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                transport.attach_memory(pool.clone())?;
+                let bytes = policy
+                    .actor
+                    .accounted_bytes()
+                    .saturating_mul(2)
+                    .saturating_add(policy.scope.sections.len() as u64 * 8192)
+                    .saturating_add(self.limits.movement_bytes)
+                    .saturating_add(self.limits.outstanding as u64 * 512);
+                pool.reserve(MemoryClass::Executor, bytes, EvictionRank::Pinned)
+            })
+            .transpose()?;
         let id = self.next;
         self.next += 1;
         self.peers.insert(
@@ -256,6 +310,9 @@ impl<T: Transport> NetworkHub<T> {
                 waiting: BTreeSet::new(),
                 closed: false,
                 last_tick: tick,
+                deferred: None,
+                codec: None,
+                memory,
             },
         );
         Ok(id)
@@ -293,6 +350,24 @@ impl<T: Transport> NetworkHub<T> {
         if peer.closed {
             return Err(Fault::invalid_data("closed peer"));
         }
+        let policy_bytes = policy
+            .actor
+            .accounted_bytes()
+            .saturating_mul(2)
+            .saturating_add(policy.scope.sections.len() as u64 * 8192)
+            .saturating_add(self.limits.movement_bytes)
+            .saturating_add(self.limits.outstanding as u64 * 512);
+        let mut growth = peer
+            .memory
+            .as_ref()
+            .map(|lease| {
+                lease.pool().reserve(
+                    MemoryClass::Executor,
+                    policy_bytes.saturating_sub(lease.bytes()),
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
         if let Some(viewer) = peer.viewer {
             let invalidated = server.replace_session_scope(
                 viewer.session,
@@ -323,6 +398,10 @@ impl<T: Transport> NetworkHub<T> {
             }
         }
         peer.policy = policy;
+        peer.deferred = None;
+        if let (Some(memory), Some(growth)) = (&mut peer.memory, &mut growth) {
+            memory.absorb(growth, policy_bytes)?;
+        }
         Ok(())
     }
 
@@ -331,6 +410,20 @@ impl<T: Transport> NetworkHub<T> {
         message: ServerMessage,
         limits: NetworkLimits,
     ) -> Result<(), Fault> {
+        let _memory = if peer.codec.is_none() {
+            peer.memory
+                .as_ref()
+                .map(|lease| {
+                    lease.pool().reserve(
+                        MemoryClass::Codec,
+                        limits.budget.max_bytes.saturating_mul(2),
+                        EvictionRank::Pinned,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let mut bytes = Vec::new();
         wire::encode(&message, &mut bytes, limits.budget, limits.codec)?;
         peer.transport.send(bytes)
@@ -450,9 +543,22 @@ impl<T: Transport> NetworkHub<T> {
                         limits,
                     );
                 }
-                let seed = server.open_replica(viewer.session, scope, limits.budget)?;
-                peer.subscriptions.insert(seed.subscription.0);
-                Self::send(peer, ServerMessage::Seed(seed), limits)
+                match server.open_replica(viewer.session, scope.clone(), limits.budget) {
+                    Ok(seed) => {
+                        peer.subscriptions.insert(seed.subscription.0);
+                        Self::send(peer, ServerMessage::Seed(seed), limits)
+                    }
+                    Err(error)
+                        if error.code == FaultCode::ResourceLimit && peer.memory.is_some() =>
+                    {
+                        if peer.deferred.is_some() {
+                            return Err(Fault::resource_limit("pending subscription capacity"));
+                        }
+                        peer.deferred = Some(scope);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
             ClientMessage::Unsubscribe { subscription } => {
                 if !peer.subscriptions.remove(&subscription.0) {
@@ -489,6 +595,9 @@ impl<T: Transport> NetworkHub<T> {
             if peer.closed {
                 continue;
             }
+            // Keep one control allowance for the hub's lifetime. Full resident
+            // budgets must still allow an unsubscribe or close to be decoded.
+            peer.codec = self.codec.take();
             let result = (|| -> Result<(), Fault> {
                 if tick.0.saturating_sub(peer.last_tick.0) > self.limits.idle_ticks {
                     return Err(Fault::invalid_data("idle peer"));
@@ -506,6 +615,21 @@ impl<T: Transport> NetworkHub<T> {
                     }
                 }
                 if let Some(viewer) = peer.viewer {
+                    if let Some(scope) = peer.deferred.as_ref() {
+                        if !scope.sections.is_subset(&peer.policy.scope.sections) {
+                            return Err(Fault::invalid_data("deferred scope lost authorization"));
+                        }
+                        match server.open_replica(viewer.session, scope.clone(), self.limits.budget)
+                        {
+                            Ok(seed) => {
+                                peer.deferred = None;
+                                peer.subscriptions.insert(seed.subscription.0);
+                                Self::send(peer, ServerMessage::Seed(seed), self.limits)?;
+                            }
+                            Err(error) if error.code == FaultCode::ResourceLimit => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
                     let waiting: Vec<_> = peer.waiting.iter().copied().collect();
                     for seq in waiting {
                         let id = RequestId {
@@ -546,6 +670,7 @@ impl<T: Transport> NetworkHub<T> {
                 }
                 peer.transport.poll()
             })();
+            self.codec = peer.codec.take();
             if result.is_err() {
                 peer.closed = true;
                 peer.transport.close();

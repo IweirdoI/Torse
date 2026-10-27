@@ -2901,6 +2901,7 @@ name = "torse-runtime"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "torse-types",
 ]
 
 [[package]]

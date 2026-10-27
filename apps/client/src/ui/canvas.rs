@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use ab_glyph::{Font, FontVec, ScaleFont, point};
 use torse_assets::{AssetCatalog, AssetGuid, AssetHandle};
-use torse_types::MemoryBudget;
+use torse_types::{EvictionRank, MemoryBudget, MemoryClass, MemoryLease, MemoryPool};
 
 pub struct Sprite {
     pub width: u32,
@@ -15,6 +15,11 @@ pub struct Sprite {
     handle: AssetHandle,
 }
 impl Sprite {
+    pub fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), String> {
+        self.assets
+            .attach_memory(pool)
+            .map_err(|error| error.to_string())
+    }
     pub fn decode(bytes: &[u8], expected: (u32, u32), guid: AssetGuid) -> Result<Self, String> {
         let mut decoder = png::Decoder::new(Cursor::new(bytes));
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -189,6 +194,7 @@ struct Raster {
     x: i32,
     y: i32,
     advance: i32,
+    _memory: Option<MemoryLease>,
 }
 pub struct Text {
     font: FontVec,
@@ -196,6 +202,9 @@ pub struct Text {
     pub chinese: bool,
     /// Physical pixels per logical point of requested text size.
     scale: u16,
+    font_bytes: u64,
+    pressure: bool,
+    memory: Option<(MemoryPool, MemoryLease)>,
 }
 impl Text {
     pub fn load() -> Result<Self, String> {
@@ -217,21 +226,49 @@ impl Text {
             paths
         };
         for path in paths {
-            if let Ok(bytes) = std::fs::read(path)
-                && let Ok(font) = FontVec::try_from_vec(bytes)
+            if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= 32 * 1024 * 1024)
+                && let Ok(bytes) = std::fs::read(path)
             {
+                let font_bytes = bytes.len() as u64;
+                let Ok(font) = FontVec::try_from_vec(bytes) else {
+                    continue;
+                };
                 return Ok(Self {
                     chinese: font.glyph_id('\u{52a0}').0 != 0,
                     font,
                     glyphs: BTreeMap::new(),
                     scale: 1,
+                    font_bytes,
+                    pressure: false,
+                    memory: None,
                 });
             }
         }
         Err("UI font unavailable; set TORSE_UI_FONT to a TTF, OTF or TTC file".into())
     }
+    pub fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), String> {
+        if self.memory.is_some() || !self.glyphs.is_empty() {
+            return Err("text memory requires a fresh cache".into());
+        }
+        let lease = pool
+            .reserve(
+                MemoryClass::Resource,
+                self.font_bytes.saturating_add(1024 * 4096),
+                EvictionRank::Pinned,
+            )
+            .map_err(|error| error.to_string())?;
+        self.memory = Some((pool, lease));
+        Ok(())
+    }
+    pub fn clear_cache(&mut self) {
+        self.glyphs.clear();
+    }
     /// Set the physical pixel multiplier for subsequent measure and draw.
     pub fn set_scale(&mut self, scale: u16) {
+        if self.pressure {
+            self.glyphs.clear();
+            self.pressure = false;
+        }
         self.scale = scale.max(1);
     }
 
@@ -248,7 +285,30 @@ impl Text {
             if let Some(outline) = self.font.outline_glyph(glyph) {
                 let bounds = outline.px_bounds();
                 let (width, height) = (bounds.width() as u32, bounds.height() as u32);
-                let mut pixels = vec![0; (width * height) as usize];
+                let memory = self
+                    .memory
+                    .as_ref()
+                    .map(|(pool, _)| {
+                        pool.reserve(
+                            MemoryClass::Mesh,
+                            u64::from(width) * u64::from(height),
+                            EvictionRank::UnsubscribedDerived,
+                        )
+                    })
+                    .transpose();
+                let Ok(memory) = memory else {
+                    self.pressure = true;
+                    return Raster {
+                        pixels: Vec::new(),
+                        width: 0,
+                        height: 0,
+                        x: 0,
+                        y: 0,
+                        advance,
+                        _memory: None,
+                    };
+                };
+                let mut pixels = vec![0; width as usize * height as usize];
                 outline.draw(|x, y, coverage| {
                     // Steepen the coverage ramp: anti-aliased edges at
                     // small CJK sizes turn to mush once the logical canvas
@@ -264,6 +324,7 @@ impl Text {
                     x: bounds.min.x as i32,
                     y: bounds.min.y as i32,
                     advance,
+                    _memory: memory,
                 }
             } else {
                 Raster {
@@ -273,6 +334,7 @@ impl Text {
                     x: 0,
                     y: 0,
                     advance,
+                    _memory: None,
                 }
             }
         })

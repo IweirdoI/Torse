@@ -28,6 +28,8 @@ use runtime_budget::RuntimeBudget;
 #[path = "prevalidation.rs"]
 mod prevalidation;
 pub use prevalidation::{PrevalidationConfig, PrevalidationStats};
+#[path = "execution_memory.rs"]
+mod memory;
 #[path = "player_control.rs"]
 mod player_control;
 #[path = "streaming.rs"]
@@ -170,12 +172,14 @@ pub struct ExecutionHost {
     budget_cache: RefCell<RuntimeBudget>,
     prevalidation: Option<PrevalidationConfig>,
     prevalidated: RefCell<prevalidation::PrevalidationCache>,
+    memory: Option<memory::Resident>,
 }
 pub struct ExecutionPrepared {
     world: PreparedWorld,
     record: CommitRecord<ExecutionChanges>,
     remove_pending: Vec<RequestId>,
     runtime: RuntimeState,
+    memory: Option<memory::Prepared>,
 }
 struct PreparedWorld {
     normal: Option<torse_sim::PreparedChange>,
@@ -396,6 +400,7 @@ impl ExecutionHost {
             },
         )?;
         Ok(Self {
+            memory: None,
             players: BTreeMap::new(),
             source: ReplicaSource::new(world, binding, limits.replicas)?,
             parked: BTreeMap::new(),
@@ -764,6 +769,7 @@ impl ExecutionHost {
             RuntimeUpdate::Full(runtime.clone())
         };
         Ok(ExecutionPrepared {
+            memory: None,
             record: CommitRecord {
                 meta: changes.meta,
                 changes: ExecutionChanges {
@@ -1189,116 +1195,16 @@ impl HostAuthority for ExecutionHost {
         }
     }
     fn prepare_next(&mut self) -> Result<Option<ExecutionPrepared>, Fault> {
-        if let Some(prepared) = self.section_pending.take() {
-            return Ok(Some(prepared));
-        }
-        if self.at_tick_boundary() && self.waiting_for_event_sections()? {
-            return Ok(None);
-        }
-        if self.shutdown_ready() {
-            return Ok(None);
-        }
-        // Reject future admissions immediately, even if shutdown begins after
-        // their execution phase. This control record never advances the phase.
-        if let Some(q) = self
-            .pending
-            .iter()
-            .find(|q| self.stopping.is_some_and(|end| q.tick > end))
-        {
-            let request = Accepted {
-                id: q.request.id,
-                input: q.request.input.clone(),
-            };
-            let world = self.source.prepare_barrier().map_err(commit_fault)?;
-            let mut state = self.runtime.clone();
-            add_receipt(
-                &mut state,
-                &request,
-                Reply {
-                    status: ReplyStatus::Rejected(RejectCode::Stopping),
-                    fields: ComponentFields::new(),
-                    at: world.meta().cursor,
-                },
-                self.limits,
-            );
-            fit_state(
-                &mut state,
-                self.limits,
-                self.resume_point(),
-                self.binding.world,
-            )?;
-            let mut prepared = self.record(world, state, vec![request.id])?;
-            prepared.record.changes.cancelled = Some(request);
-            return Ok(Some(prepared));
-        }
-        if let Some(work) = &self.runtime.work {
-            if let Some(task) = work.tasks.get(work.next as usize) {
-                self.fill_prevalidation();
-                return self.prepare_task(task).map(Some);
-            }
-            let mut state = self.runtime.clone();
-            state.work = None;
-            let advance = self.source.prepare_phase_advance().map_err(commit_fault)?;
-            return self.record(advance, state, Vec::new()).map(Some);
-        }
-        // Retain a pure phase plan while journal reservation is blocked; no input,
-        // event, result or identity is consumed until publication succeeds.
-        if self.frozen.is_none() {
-            self.frozen = Some(self.collect_phase()?);
-        }
-        let work = self.frozen.as_ref().expect("phase was collected").clone();
-        let mut state = self.runtime.clone();
-        state.work = Some(work);
-        // Untrusted request load becomes bounded deferral, never a world fault.
-        // Native rules are trusted planners and must fit their declared phase budget.
-        loop {
-            if fit_state(
-                &mut state,
-                self.limits,
-                self.resume_point(),
-                self.binding.world,
-            )
-            .is_ok()
-            {
-                break;
-            }
-            let work = state.work.as_mut().expect("phase work");
-            let Some(index) = work.tasks.iter().rposition(|t| t.request.is_some()) else {
-                return Err(Fault::resource_limit(
-                    "native phase output exceeds runtime capacity",
-                ));
-            };
-            if work.tasks.len() == 1 {
-                let t = &mut Arc::make_mut(&mut work.tasks)[index];
-                t.transaction = None;
-                t.output.clear();
-                t.status = ReplyStatus::Rejected(RejectCode::QuotaExceeded);
-                fit_state(
-                    &mut state,
-                    self.limits,
-                    self.resume_point(),
-                    self.binding.world,
-                )?;
-                break;
-            }
-            Arc::make_mut(&mut work.tasks).remove(index);
-        }
-        let remove_pending = state
-            .work
-            .as_ref()
-            .expect("phase work")
-            .tasks
-            .iter()
-            .filter_map(|t| t.request.as_ref().map(|r| r.id))
-            .collect();
-        self.record(
-            self.source.prepare_barrier().map_err(commit_fault)?,
-            state,
-            remove_pending,
-        )
-        .map(Some)
+        self.prepare_with_memory()
     }
-    fn publish(&mut self, prepared: ExecutionPrepared) -> Result<Publication, Fault> {
+    fn publish(&mut self, mut prepared: ExecutionPrepared) -> Result<Publication, Fault> {
+        if self.memory.is_some() && prepared.memory.is_none() {
+            return Err(Fault::new(
+                FaultCode::InvalidState,
+                "publication lacks memory reservation",
+            ));
+        }
+        let accounting = prepared.memory.take();
         let publication = if let Some(section) = prepared.world.section {
             self.source.publish_section(*section)
         } else {
@@ -1332,6 +1238,7 @@ impl HostAuthority for ExecutionHost {
             live.completed = live.completed.max(request.id.seq.0);
         }
         self.runtime = prepared.runtime;
+        self.publish_memory(accounting)?;
         self.release_prevalidation();
         for r in self
             .runtime
@@ -1625,5 +1532,118 @@ impl RecoveryTarget for ExecutionRecovery<'_> {
         )?;
         host.parked = self.parked;
         Ok(host)
+    }
+}
+
+impl ExecutionHost {
+    fn prepare_unbudgeted(&mut self) -> Result<Option<ExecutionPrepared>, Fault> {
+        if let Some(prepared) = self.section_pending.take() {
+            return Ok(Some(prepared));
+        }
+        if self.at_tick_boundary() && self.waiting_for_event_sections()? {
+            return Ok(None);
+        }
+        if self.shutdown_ready() {
+            return Ok(None);
+        }
+        // Reject future admissions immediately, even if shutdown begins after
+        // their execution phase. This control record never advances the phase.
+        if let Some(q) = self
+            .pending
+            .iter()
+            .find(|q| self.stopping.is_some_and(|end| q.tick > end))
+        {
+            let request = Accepted {
+                id: q.request.id,
+                input: q.request.input.clone(),
+            };
+            let world = self.source.prepare_barrier().map_err(commit_fault)?;
+            let mut state = self.runtime.clone();
+            add_receipt(
+                &mut state,
+                &request,
+                Reply {
+                    status: ReplyStatus::Rejected(RejectCode::Stopping),
+                    fields: ComponentFields::new(),
+                    at: world.meta().cursor,
+                },
+                self.limits,
+            );
+            fit_state(
+                &mut state,
+                self.limits,
+                self.resume_point(),
+                self.binding.world,
+            )?;
+            let mut prepared = self.record(world, state, vec![request.id])?;
+            prepared.record.changes.cancelled = Some(request);
+            return Ok(Some(prepared));
+        }
+        if let Some(work) = &self.runtime.work {
+            if let Some(task) = work.tasks.get(work.next as usize) {
+                self.fill_prevalidation();
+                return self.prepare_task(task).map(Some);
+            }
+            let mut state = self.runtime.clone();
+            state.work = None;
+            let advance = self.source.prepare_phase_advance().map_err(commit_fault)?;
+            return self.record(advance, state, Vec::new()).map(Some);
+        }
+        // Retain a pure phase plan while journal reservation is blocked; no input,
+        // event, result or identity is consumed until publication succeeds.
+        if self.frozen.is_none() {
+            self.frozen = Some(self.collect_phase()?);
+        }
+        let work = self.frozen.as_ref().expect("phase was collected").clone();
+        let mut state = self.runtime.clone();
+        state.work = Some(work);
+        // Untrusted request load becomes bounded deferral, never a world fault.
+        // Native rules are trusted planners and must fit their declared phase budget.
+        loop {
+            if fit_state(
+                &mut state,
+                self.limits,
+                self.resume_point(),
+                self.binding.world,
+            )
+            .is_ok()
+            {
+                break;
+            }
+            let work = state.work.as_mut().expect("phase work");
+            let Some(index) = work.tasks.iter().rposition(|t| t.request.is_some()) else {
+                return Err(Fault::resource_limit(
+                    "native phase output exceeds runtime capacity",
+                ));
+            };
+            if work.tasks.len() == 1 {
+                let t = &mut Arc::make_mut(&mut work.tasks)[index];
+                t.transaction = None;
+                t.output.clear();
+                t.status = ReplyStatus::Rejected(RejectCode::QuotaExceeded);
+                fit_state(
+                    &mut state,
+                    self.limits,
+                    self.resume_point(),
+                    self.binding.world,
+                )?;
+                break;
+            }
+            Arc::make_mut(&mut work.tasks).remove(index);
+        }
+        let remove_pending = state
+            .work
+            .as_ref()
+            .expect("phase work")
+            .tasks
+            .iter()
+            .filter_map(|t| t.request.as_ref().map(|r| r.id))
+            .collect();
+        self.record(
+            self.source.prepare_barrier().map_err(commit_fault)?,
+            state,
+            remove_pending,
+        )
+        .map(Some)
     }
 }

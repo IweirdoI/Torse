@@ -117,6 +117,55 @@ pub struct WorldAuthority {
 }
 
 impl WorldAuthority {
+    /// Resident logical world charge, separate from rebuildable projections and jobs.
+    pub fn accounted_bytes(&self) -> u64 {
+        self.store
+            .accounted_bytes()
+            .saturating_add(self.entities.accounted_bytes())
+    }
+
+    /// Additional reservation that covers changed section buffers and entity-store growth.
+    /// Keep the old resident charge until publication, then reconcile to actual residency.
+    pub fn growth_reservation(&self, prepared: &PreparedChange) -> u64 {
+        let section = (self.store.side() as u64)
+            .pow(3)
+            .saturating_mul(8)
+            .saturating_add(8192);
+        let mut bytes = section.saturating_mul(prepared.touched().len() as u64);
+        if !prepared.entity_moves().is_empty() || prepared.entity_lifecycle().is_some() {
+            bytes = bytes.saturating_add(self.entities.accounted_bytes());
+        }
+        for edit in prepared.component_edits() {
+            if let Some(fields) = &edit.fields {
+                bytes = bytes.saturating_add(torse_world::component_memory_bytes(fields));
+            }
+        }
+        if let Some(lifecycle) = prepared.entity_lifecycle() {
+            bytes = bytes.saturating_add(
+                (lifecycle.spawned.len() + lifecycle.despawned.len()) as u64 * 16384,
+            );
+            for entity in &lifecycle.spawned {
+                for fields in entity.components.values() {
+                    bytes = bytes.saturating_add(torse_world::component_memory_bytes(fields));
+                }
+            }
+        }
+        bytes
+    }
+    pub fn section_growth_reservation(&self, page: &Snapshot) -> u64 {
+        let mut bytes = (self.store.side() as u64)
+            .pow(3)
+            .saturating_mul(8)
+            .saturating_add(8192)
+            .saturating_add(self.entities.accounted_bytes());
+        for entity in &page.entities {
+            bytes = bytes.saturating_add(16384);
+            for component in &entity.components {
+                bytes = bytes.saturating_add(component.accounted_bytes());
+            }
+        }
+        bytes
+    }
     pub fn capture_section(
         &self,
         pos: torse_types::SectionPos,

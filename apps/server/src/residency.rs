@@ -170,6 +170,7 @@ pub(crate) struct ResidencyScheduler {
     worker: Worker,
     busy: bool,
     ready: Option<Completed>,
+    memory: Option<MemoryLease>,
 }
 
 impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
@@ -212,6 +213,7 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
             worker,
             busy: false,
             ready: None,
+            memory: None,
         });
         Ok(())
     }
@@ -293,11 +295,18 @@ impl ResidencyScheduler {
             match self.worker.receiver.try_recv() {
                 Ok(result) => {
                     self.busy = false;
-                    self.ready = Some(result?);
+                    match result {
+                        Ok(completed) => self.ready = Some(completed),
+                        Err(error) => {
+                            self.memory = None;
+                            return Err(error);
+                        }
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => return Ok(ResidencyProgress::Pending),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.busy = false;
+                    self.memory = None;
                     return Err(Fault::new(
                         FaultCode::StorageUnavailable,
                         "page I/O worker disconnected",
@@ -313,6 +322,8 @@ impl ResidencyScheduler {
                 !required.contains(&pos) && !tickets.global
             };
             if !wanted {
+                drop(completed);
+                self.memory = None;
                 return Ok(ResidencyProgress::Pending);
             }
             if !server.authority.residency_ready(!completed.load) {
@@ -320,14 +331,22 @@ impl ResidencyScheduler {
                 return Ok(ResidencyProgress::Pending);
             }
             // Pure preparation revalidates revisions, parked references, and entity identity.
-            match server.apply_residency_page(
+            let applied = server.apply_residency_page(
                 completed.page,
                 completed.digest,
                 completed.load,
                 completed.fresh,
                 sink,
-            ) {
+            );
+            self.memory = None;
+            match applied {
                 Ok(step) => return Ok(ResidencyProgress::Published(step)),
+                Err(error)
+                    if error.code == FaultCode::ResourceLimit
+                        && server.state() == crate::ServerState::Running =>
+                {
+                    return Ok(ResidencyProgress::BudgetBlocked);
+                }
                 Err(error)
                     if error.code == FaultCode::InvalidData
                         && server.state() == crate::ServerState::Running =>
@@ -349,6 +368,17 @@ impl ResidencyScheduler {
         if charge > self.config.max_io_bytes {
             return Ok(ResidencyProgress::BudgetBlocked);
         }
+        let memory = if let Some(pool) = server.authority.memory_pool() {
+            match pool.reserve(MemoryClass::Codec, charge, EvictionRank::Pinned) {
+                Ok(lease) => Some(lease),
+                Err(error) if error.code == FaultCode::ResourceLimit => {
+                    return Ok(ResidencyProgress::BudgetBlocked);
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let world = server.authority.world();
         let missing = required
             .iter()
@@ -393,6 +423,7 @@ impl ResidencyScheduler {
             .try_send(request)
             .map_err(|_| Fault::new(FaultCode::StorageUnavailable, "page I/O queue unavailable"))?;
         self.busy = true;
+        self.memory = memory;
         Ok(ResidencyProgress::Pending)
     }
 }

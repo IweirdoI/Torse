@@ -14,13 +14,13 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--listen ADDRESS] [--ticks N; 0=continuous] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
+            "usage: torse-server <world-directory> [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N; 0=continuous] [--players N; 0..16] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--listen ADDRESS] [--ticks N] [--players N; 0..16] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
+            "torse-server <world-directory> [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N] [--players N; 0..16] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     }
@@ -37,8 +37,16 @@ fn run() -> Result<(), Fault> {
     let mut prevalidation = None;
     let mut component_prevalidation = false;
     let mut commit_batch = 16;
+    let mut memory_mib = 512u64;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--memory-mib" => {
+                memory_mib = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| (16..=16384).contains(n))
+                    .ok_or_else(|| Fault::invalid_data("memory budget must be 16..16384 MiB"))?;
+            }
             "--players" => {
                 players = args
                     .next()
@@ -114,6 +122,13 @@ fn run() -> Result<(), Fault> {
     if machine_operators && mod_dirs.is_empty() {
         return Err(Fault::invalid_data("--machine-operators requires --mod"));
     }
+    let memory =
+        torse_types::MemoryPool::new(torse_types::MemoryBudget::new(memory_mib * 1024 * 1024));
+    let startup = memory.reserve(
+        torse_types::MemoryClass::Codec,
+        base::budget().max_bytes.saturating_mul(4),
+        torse_types::EvictionRank::Pinned,
+    )?;
     let (mut world, actions, rules, machine_targets) = if mod_dirs.is_empty() {
         let (world, actions) = base::world()?;
         (
@@ -150,6 +165,10 @@ fn run() -> Result<(), Fault> {
     let limits = base::execution_limits();
     let mut policy = base::file_policy();
     policy.journal.max_pending_records = commit_batch;
+    let storage_bytes = policy
+        .journal
+        .max_pending_bytes
+        .saturating_add(policy.server.snapshot_budget.max_bytes.saturating_mul(4));
     let directory = WorldDirectory::acquire(&path, base::WORLD, 65_536)?;
     let codec = base::Codec::new(base::codec_limits())?;
     let mut server = if path.join("checkpoints/manifest.log").exists() {
@@ -168,6 +187,8 @@ fn run() -> Result<(), Fault> {
             ExecutionHost::new(binding, world, actions, rules, limits)
         })?
     };
+    server.attach_memory(memory.clone(), storage_bytes)?;
+    drop(startup);
     server.set_parallel_planning(planning)?;
     server.set_prevalidation(prevalidation)?;
     server.set_commit_batch_limit(commit_batch)?;
@@ -205,7 +226,7 @@ fn run() -> Result<(), Fault> {
     );
     let limits = base::network_limits();
     limits.validate_timing(base::TICK_PERIOD)?;
-    let mut hub = NetworkHub::new(server.binding(), limits)?;
+    let mut hub = NetworkHub::with_memory(server.binding(), limits, memory.clone())?;
     let mut peers: Vec<u128> = Vec::new();
     // Anchor the demo revocation to the first connection, not process start.
     let mut revoke_at: Option<u64> = None;
@@ -300,6 +321,11 @@ fn run() -> Result<(), Fault> {
     let tick = server.authority()?.resume_point().tick;
     let report = server.shutdown(Tick(tick.0), &mut hub)?;
     println!("closed durable_seq={} ticks={done}", report.through.seq.0);
+    let usage = memory.usage();
+    println!(
+        "memory_current_bytes={} memory_peak_bytes={} memory_class_peak_bytes={:?}",
+        usage.total, usage.total_peak, usage.peak
+    );
     Ok(())
 }
 fn main() -> std::process::ExitCode {

@@ -73,6 +73,53 @@ fn reservations_and_completed_results_keep_all_capacity_charged() {
     ));
 }
 
+#[test]
+fn shared_process_pressure_retries_and_finished_output_transfers_its_reservation() {
+    use torse_types::MemoryBudget;
+    let memory = MemoryPool::new(MemoryBudget::new(4096).with_class_limit(MemoryClass::Mesh, 8));
+    let executor = Executor::with_memory(config(2), memory.clone()).unwrap();
+    let baseline = memory.usage().total;
+    let pinned = memory
+        .reserve(MemoryClass::World, 4096 - baseline, EvictionRank::Pinned)
+        .unwrap();
+    assert!(matches!(
+        executor.try_reserve(budget()),
+        Err(ReserveError::Busy)
+    ));
+    drop(pinned);
+    let mut job = executor
+        .try_reserve(budget())
+        .unwrap()
+        .submit(Priority::Visible, |_| {
+            Ok(JobOutput {
+                value: vec![3; 8],
+                bytes: 8,
+            })
+        });
+    wait(|| executor.usage().running == 0 && executor.usage().queued == 0);
+    let held = memory
+        .reserve(MemoryClass::Mesh, 8, EvictionRank::Pinned)
+        .unwrap();
+    assert!(matches!(
+        job.try_take_charged(MemoryClass::Mesh, EvictionRank::UnsubscribedDerived),
+        Err(ReserveError::Busy)
+    ));
+    drop(held);
+    let (bytes, charge) = job
+        .try_take_charged(MemoryClass::Mesh, EvictionRank::UnsubscribedDerived)
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, [3; 8]);
+    drop(job);
+    wait(|| executor.usage().jobs == 0);
+    assert_eq!(memory.usage().current[MemoryClass::Mesh.index()], 8);
+    drop(bytes);
+    drop(charge);
+    drop(executor);
+    assert_eq!(memory.usage().total, 0);
+}
+
 struct InputDrop(Arc<AtomicUsize>);
 impl Drop for InputDrop {
     fn drop(&mut self) {

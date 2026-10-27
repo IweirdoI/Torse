@@ -40,10 +40,11 @@ pub struct Surface {
 /// Materials used by one session, addressed by a small integer.
 #[derive(Clone, Debug)]
 pub struct Palette {
-    slots: BTreeMap<(ContentKey, AlphaMode), u16>,
-    surfaces: Vec<Surface>,
+    slots: Arc<BTreeMap<(ContentKey, AlphaMode), u16>>,
+    surfaces: Arc<Vec<Surface>>,
     assets: Arc<AssetCatalog>,
     mips: Vec<ResidentMip>,
+    memory: Option<Arc<torse_types::MemoryLease>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,6 +80,28 @@ fn resident_mips(mips: Vec<MipLevel>) -> Result<(Arc<AssetCatalog>, Vec<Resident
 }
 
 impl Palette {
+    pub fn attach_memory(
+        &mut self,
+        pool: torse_types::MemoryPool,
+    ) -> Result<(), torse_types::Fault> {
+        let bytes = self.slots.len() as u64 * 4096
+            + self.surfaces.len() as u64 * size_of::<Surface>() as u64
+            + 4096;
+        let metadata = pool.reserve(
+            torse_types::MemoryClass::Resource,
+            bytes,
+            torse_types::EvictionRank::Pinned,
+        )?;
+        let catalog = Arc::get_mut(&mut self.assets).ok_or_else(|| {
+            torse_types::Fault::invalid_data("palette memory must attach before sharing")
+        })?;
+        catalog.attach_memory(pool).map_err(|error| match error {
+            torse_assets::AssetError::Budget(fault) => fault,
+            other => torse_types::Fault::invalid_data(other.to_string()),
+        })?;
+        self.memory = Some(Arc::new(metadata));
+        Ok(())
+    }
     /// Resolve every material referenced by the content registry.
     pub fn build(registry: &BlockStateRegistry, pack: &TexturePack) -> Result<Self, String> {
         if u64::from(registry.state_count()) > u64::from(u16::MAX) + 1 {
@@ -143,10 +166,11 @@ impl Palette {
 
         let (assets, mips) = resident_mips(pack.mips(MIP_LEVELS)?)?;
         Ok(Self {
-            slots,
-            surfaces,
+            slots: Arc::new(slots),
+            surfaces: Arc::new(surfaces),
             assets,
             mips,
+            memory: None,
         })
     }
 
@@ -312,10 +336,11 @@ impl Palette {
     pub fn empty_for_tests() -> Self {
         let (assets, mips) = resident_mips(Self::test_mips()).unwrap();
         Self {
-            slots: BTreeMap::new(),
-            surfaces: Vec::new(),
+            slots: Arc::new(BTreeMap::new()),
+            surfaces: Arc::new(Vec::new()),
             assets,
             mips,
+            memory: None,
         }
     }
 
@@ -323,16 +348,17 @@ impl Palette {
     pub fn single_for_tests(rect: [f32; 4], tint: [f32; 3], alpha: AlphaMode) -> Self {
         let (assets, mips) = resident_mips(Self::test_mips()).unwrap();
         Self {
-            slots: BTreeMap::new(),
-            surfaces: vec![Surface {
+            slots: Arc::new(BTreeMap::new()),
+            surfaces: Arc::new(vec![Surface {
                 rect,
                 tint,
                 tint_source: None,
                 animation: None,
                 alpha,
-            }],
+            }]),
             assets,
             mips,
+            memory: None,
         }
     }
 }

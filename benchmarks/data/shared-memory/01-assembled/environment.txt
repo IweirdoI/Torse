@@ -1,0 +1,11 @@
+Date: 2026-10-28
+Platform: Windows x86_64-pc-windows-msvc
+Rust: 1.93.1
+CPU: Intel Core i9-14900HX
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+Backend: Vulkan, Mailbox
+Profile: dev and test, locked dependencies, CARGO_BUILD_JOBS=1
+Code base: c21ae914a1fbaa7c25492b2f8237d9f623779643 with this change
+Content: built-in demonstration world and base resource pack
+Budget scope: logical reservations, not RSS or GPU allocations
+Suite: workspace all targets; server all targets with mods

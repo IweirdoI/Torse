@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 torse-types = { path = "../types" }
 torse-world = { path = "../world" }
+
+[dev-dependencies]
+torse-content = { path = "../content" }

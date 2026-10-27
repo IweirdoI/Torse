@@ -80,6 +80,7 @@ pub struct BlockStateRegistry {
     /// Number of allocated state identifiers including the empty sentinel.
     state_count: u32,
     collision_reach: ([u8; 3], [u8; 3]),
+    authority_digest: torse_types::Digest,
 }
 
 impl BlockStateRegistry {
@@ -92,6 +93,7 @@ impl BlockStateRegistry {
         let mut registry = Self {
             state_count: 1,
             slots: vec![u32::MAX],
+            authority_digest: content.authority_digest,
             ..Self::default()
         };
 
@@ -245,6 +247,11 @@ impl BlockStateRegistry {
     /// Return the definition that owns a state identifier.
     pub fn definition(&self, state: BlockStateId) -> Option<&BlockDefinition> {
         self.entry_of(state).map(|entry| &entry.definition)
+    }
+
+    /// Compiled authority identity, including light transport declarations.
+    pub const fn authority_digest(&self) -> torse_types::Digest {
+        self.authority_digest
     }
 
     /// Return the block identity that owns a state identifier.

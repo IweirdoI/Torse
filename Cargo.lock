@@ -2981,6 +2981,7 @@ dependencies = [
 name = "torse-world-services"
 version = "0.1.0"
 dependencies = [
+ "torse-content",
  "torse-types",
  "torse-world",
 ]

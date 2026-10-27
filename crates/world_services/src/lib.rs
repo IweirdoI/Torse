@@ -7,12 +7,14 @@
 //! - [`collision`] answers and moves against block collision shapes.
 //!
 //! Navigation provides a bounded lattice search with caller-supplied traversal policy.
-//! Lighting and streaming remain application responsibilities.
+//! Lighting provides bounded emitted-light jobs and revision-checked derived caches.
+//! Streaming policy remains an application responsibility.
 
 #![forbid(unsafe_code)]
 
 pub mod collision;
 pub mod generation;
+pub mod lighting;
 pub mod navigation;
 
 pub use collision::{

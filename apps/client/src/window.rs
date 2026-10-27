@@ -1236,6 +1236,9 @@ impl ApplicationHandler for WindowApp {
             window,
         });
         self.scene = scene;
+        if let Some(notice) = self.scene.as_ref().and_then(Scene::startup_notice) {
+            self.last_result = notice.to_owned();
+        }
         if let Some(keys) = self.scene.as_ref().and_then(Scene::placeable_blocks) {
             self.materials = keys.iter().take(3).cloned().collect();
             self.material = 0;

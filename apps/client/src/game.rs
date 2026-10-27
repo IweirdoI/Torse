@@ -43,6 +43,8 @@ pub struct GamePack {
     pub biomes: BTreeMap<String, BiomeColours>,
     /// Biome used when the table or the region lookup has no better answer.
     pub default_biome: String,
+    /// Limitations that must be shown when this preview pack is opened.
+    pub startup_notice: Option<String>,
 }
 
 /// Colour set of one biome, in sRGB bytes.
@@ -158,6 +160,10 @@ impl GamePack {
         let source = format!("{}/atlas.toml", descriptor.pack.namespace);
         let texture = texture_pack(&descriptor, atlas)?;
         let content = content_pack(&descriptor, &source)?;
+        let startup_notice = model_preview_notice(&descriptor);
+        if let Some(notice) = &startup_notice {
+            eprintln!("warning: {}: {notice}", index.display());
+        }
         Ok(Self {
             content,
             texture,
@@ -165,6 +171,7 @@ impl GamePack {
             world,
             biomes: descriptor.biomes,
             default_biome: descriptor.pack.biome,
+            startup_notice,
         })
     }
 
@@ -563,6 +570,19 @@ fn parse_shape(value: &str, bounds: Option<Bounds>) -> Result<Shape, String> {
         }
         other => Err(format!("unsupported shape `{other}`")),
     }
+}
+
+/// The atlas index contains no model quads. Accepting its names is only a
+/// metadata preview; callers must carry this notice to the visible client.
+fn model_preview_notice(descriptor: &Descriptor) -> Option<String> {
+    let count = descriptor
+        .blocks
+        .values()
+        .filter(|block| block.shape == "model")
+        .count();
+    (count != 0).then(|| format!(
+        "Preview warning: {count} model block(s) are invisible (no geometry, collision or selection)"
+    ))
 }
 
 /// Map one index name onto the kernel mipmap strategy.
@@ -1098,11 +1118,34 @@ mod tests {
         torse_content::compile(pack).expect("empty visual model compiles");
 
         descriptor.blocks.insert(
-            "bad".to_owned(),
+            "zz_bad".to_owned(),
             block_spec("mesh", "opaque", "base:material/stone"),
         );
         let error = content_pack(&descriptor, "base/atlas.toml").unwrap_err();
-        assert_eq!(error, "base:bad: unsupported shape `mesh`");
+        assert_eq!(error, "base:zz_bad: unsupported shape `mesh`");
+    }
+
+    #[test]
+    fn model_preview_reports_missing_geometry_and_ordinary_shapes_are_quiet() {
+        let mut descriptor = empty_descriptor();
+        descriptor.blocks.insert(
+            "stone".into(),
+            block_spec("full_cube", "opaque", "base:material/stone"),
+        );
+        assert!(model_preview_notice(&descriptor).is_none());
+        descriptor.blocks.insert(
+            "log".into(),
+            block_spec("model", "opaque", "base:material/log"),
+        );
+        descriptor.blocks.insert(
+            "plant".into(),
+            block_spec("model", "mask", "base:material/plant"),
+        );
+        let notice = model_preview_notice(&descriptor).expect("model warning");
+        assert!(notice.contains("2 model block(s)"));
+        for limitation in ["invisible", "geometry", "collision", "selection"] {
+            assert!(notice.contains(limitation));
+        }
     }
 
     #[test]
@@ -1119,6 +1162,31 @@ mod tests {
                 max: bounds.max,
             })
         );
+
+        for invalid in [
+            Bounds {
+                min: [f32::NAN, 0.0, 0.0],
+                max: [1.0; 3],
+            },
+            Bounds {
+                min: [0.0; 3],
+                max: [f32::INFINITY, 1.0, 1.0],
+            },
+            Bounds {
+                min: [-0.1, 0.0, 0.0],
+                max: [1.0; 3],
+            },
+            Bounds {
+                min: [0.0; 3],
+                max: [1.1, 1.0, 1.0],
+            },
+            Bounds {
+                min: [0.0; 3],
+                max: [0.0, 1.0, 1.0],
+            },
+        ] {
+            assert!(parse_shape("box", Some(invalid)).is_err());
+        }
         assert_eq!(
             parse_shape("box", None).unwrap_err(),
             "box geometry needs bounds"

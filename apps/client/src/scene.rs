@@ -120,6 +120,7 @@ pub struct Scene {
     layers: i64,
     tint_provider: Option<Arc<dyn torse_assets::texture::PositionTintProvider>>,
     tint_provider_generation: u64,
+    startup_notice: Option<String>,
 }
 
 /// One content pack for every client mode, matching the server demo assembly
@@ -253,6 +254,7 @@ impl Scene {
             layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
+            startup_notice: None,
         };
         scene.load_around(SectionPos::ZERO)?;
         Ok(scene)
@@ -303,6 +305,7 @@ impl Scene {
             layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
+            startup_notice: None,
         };
         scene.install_snapshot(snapshot)?;
         Ok(scene)
@@ -311,6 +314,11 @@ impl Scene {
     /// Material palette used by the terrain shader.
     pub fn palette(&self) -> &Palette {
         &self.palette
+    }
+
+    /// Preview limitations shown when the window opens this scene.
+    pub fn startup_notice(&self) -> Option<&str> {
+        self.startup_notice.as_deref()
     }
 
     /// Replace the location-dependent tint data used while building meshes.
@@ -952,6 +960,7 @@ impl Scene {
             layers: 1,
             tint_provider: None,
             tint_provider_generation: 0,
+            startup_notice: game.startup_notice.clone(),
         };
         scene.placeable = Some(game.placeable_blocks());
         scene.layers = (game.height_limit() + i64::from(side) - 1) / i64::from(side);

@@ -623,6 +623,25 @@ impl ExecutionHost {
                         task.status = ReplyStatus::ReadOnly;
                         task.output = fields;
                     }
+                    Ok(ActionOutput::Atomic(group)) => {
+                        for member in &group.members {
+                            for rule in &self.rules {
+                                task.schedule.extend(rule.action_events(
+                                    self.world(),
+                                    point.tick,
+                                    member,
+                                )?);
+                                if task.schedule.len() > self.limits.events {
+                                    return Err(Fault::resource_limit("action event budget"));
+                                }
+                            }
+                        }
+                        task.transaction =
+                            Some(StoredTransactionGroup::capture(self.world(), &group)?);
+                    }
+                    Ok(ActionOutput::Invoke(_)) => {
+                        task.status = ReplyStatus::Rejected(RejectCode::InvalidData);
+                    }
                     Err(reason) => task.status = ReplyStatus::Rejected(reason),
                 }
                 tasks.push(task);

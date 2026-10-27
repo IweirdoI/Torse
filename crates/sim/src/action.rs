@@ -16,7 +16,7 @@ use torse_world::{
 };
 use torse_world_services::Aabb;
 
-use crate::{OrderingKey, Phase, Transaction, WorldAuthority};
+use crate::{MAX_GROUP_MEMBERS, OrderingKey, Phase, Transaction, TransactionGroup, WorldAuthority};
 
 /// Add one optional native module's schema and action declarations to a pack.
 ///
@@ -193,11 +193,31 @@ pub struct ActionRequest {
     pub ordering: OrderingKey,
 }
 
+/// A subordinate action. Identity, origin and arbitration order are inherited
+/// from the outer request; callers cannot supply a transaction source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionInvocation {
+    pub action: ContentKey,
+    pub api_version: u32,
+    pub target: ActionTarget,
+    pub parameters: ComponentFields,
+}
+
+/// Maximum nested dispatch depth and total invocations in one request.
+pub const MAX_ACTION_DEPTH: usize = 4;
+pub const MAX_ACTION_INVOCATIONS: usize = 16;
+
 /// A bounded query result or an unpublished mutation plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionOutput {
     Query(ComponentFields),
     Mutation(Box<Transaction>),
+    /// Native composition requests. Every child passes normal dispatch checks
+    /// using the same actor; all children observe the same authoritative state.
+    Invoke(Vec<ActionInvocation>),
+    /// Normalized dispatcher output. Native handlers cannot return this variant:
+    /// only dispatch may combine separately authorized owner-authored plans.
+    Atomic(Box<TransactionGroup>),
 }
 
 /// Read-only authority access restricted to host-granted objects.
@@ -430,6 +450,22 @@ impl ActionService {
         phase: Phase,
         request: &ActionRequest,
     ) -> Result<ActionOutput, RejectCode> {
+        self.dispatch(world, actor, phase, request, 0, &mut 0)
+    }
+
+    fn dispatch(
+        &self,
+        world: &WorldAuthority,
+        actor: &ActorContext,
+        phase: Phase,
+        request: &ActionRequest,
+        depth: usize,
+        calls: &mut usize,
+    ) -> Result<ActionOutput, RejectCode> {
+        *calls += 1;
+        if depth >= MAX_ACTION_DEPTH || *calls > MAX_ACTION_INVOCATIONS {
+            return Err(RejectCode::QuotaExceeded);
+        }
         let action = self
             .registry
             .actions()
@@ -493,7 +529,40 @@ impl ActionService {
         let output = handler
             .implementation
             .plan(&ActionView { world, actor }, request)?;
+        if let ActionOutput::Invoke(invocations) = output {
+            if action.kind != ActionKind::Mutation {
+                return Err(RejectCode::InvalidData);
+            }
+            if invocations.is_empty() || invocations.len() > MAX_GROUP_MEMBERS {
+                return Err(RejectCode::QuotaExceeded);
+            }
+            let mut members = Vec::new();
+            for invocation in invocations {
+                let child = ActionRequest {
+                    action: invocation.action,
+                    api_version: invocation.api_version,
+                    origin: request.origin,
+                    target: invocation.target,
+                    parameters: invocation.parameters,
+                    transaction: request.transaction,
+                    ordering: request.ordering,
+                };
+                match self.dispatch(world, actor, phase, &child, depth + 1, calls)? {
+                    ActionOutput::Mutation(tx) => members.push(*tx),
+                    ActionOutput::Atomic(group) => members.extend(group.members),
+                    _ => return Err(RejectCode::InvalidData),
+                }
+                if members.len() > MAX_GROUP_MEMBERS {
+                    return Err(RejectCode::QuotaExceeded);
+                }
+            }
+            check_group_budget(&members, action.max_items, action.max_bytes)?;
+            let group = TransactionGroup::new(request.transaction, request.ordering, members)?;
+            world.prepare_group(&group).map_err(prepare_rejection)?;
+            return Ok(ActionOutput::Atomic(Box::new(group)));
+        }
         match &output {
+            ActionOutput::Atomic(_) => return Err(RejectCode::PermissionDenied),
             ActionOutput::Query(fields) if action.kind == ActionKind::Query => {
                 ComponentSet::validate(world.schemas(), &action.result_schema, fields)
                     .map_err(|_| RejectCode::InvalidData)?;
@@ -543,13 +612,68 @@ impl ActionService {
                 // Reuse preparation to reject malformed native output. The
                 // returned plan must still be prepared again at commit time,
                 // after earlier sorted transactions have changed the world.
-                world.prepare(tx).map_err(|error| match error {
-                    crate::PrepareError::Rejected(code) => code,
-                    crate::PrepareError::SequenceExhausted => RejectCode::QuotaExceeded,
-                })?;
+                world.prepare(tx).map_err(prepare_rejection)?;
             }
             _ => return Err(RejectCode::InvalidData),
         }
         Ok(output)
     }
+}
+
+fn prepare_rejection(error: crate::PrepareError) -> RejectCode {
+    match error {
+        crate::PrepareError::Rejected(code) => code,
+        crate::PrepareError::SequenceExhausted => RejectCode::QuotaExceeded,
+    }
+}
+
+// Conservative in-memory plan accounting, independent of storage or wire
+// encoding. Each composed descriptor caps the entire subtree it authorizes.
+fn check_group_budget(
+    members: &[Transaction],
+    max_items: u32,
+    max_bytes: u64,
+) -> Result<(), RejectCode> {
+    let mut items = 0u64;
+    let mut bytes = 0u64;
+    for tx in members {
+        let entries = tx.preconditions.len()
+            + tx.mutations.len()
+            + tx.clearance.len()
+            + tx.movements.len()
+            + tx.components.len()
+            + tx.spawns.len()
+            + tx.despawns.len();
+        items = items.saturating_add(entries as u64);
+        bytes = bytes
+            .saturating_add(128 + key_bytes(&tx.source))
+            .saturating_add((entries as u64).saturating_mul(128));
+        for edit in &tx.components {
+            bytes = bytes.saturating_add(key_bytes(&edit.schema));
+            for fields in edit.previous.iter().chain(edit.fields.iter()) {
+                bytes = bytes
+                    .saturating_add(component_size(fields).map_err(|_| RejectCode::QuotaExceeded)?);
+            }
+        }
+        for components in tx.spawns.iter().map(|spawn| &spawn.components).chain(
+            tx.despawns
+                .iter()
+                .map(|despawn| &despawn.previous.components),
+        ) {
+            items = items.saturating_add(components.len() as u64);
+            for (schema, fields) in components {
+                bytes = bytes
+                    .saturating_add(key_bytes(schema))
+                    .saturating_add(component_size(fields).map_err(|_| RejectCode::QuotaExceeded)?);
+            }
+        }
+        if items > u64::from(max_items) || bytes > max_bytes {
+            return Err(RejectCode::QuotaExceeded);
+        }
+    }
+    Ok(())
+}
+
+fn key_bytes(key: &ContentKey) -> u64 {
+    (key.namespace().len() + 1 + key.path().len()) as u64
 }

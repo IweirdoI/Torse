@@ -114,9 +114,10 @@ pub struct ActionDescriptor {
     pub target_constraints: Vec<ContentKey>,
     /// Simulation phase in which the action is eligible to execute.
     pub phase: ActionPhase,
-    /// Maximum logical result entries allowed for this action.
+    /// Maximum logical query entries, or transaction entries in a composed subtree.
     pub max_items: u32,
-    /// Maximum encoded result bytes allowed for this action.
+    /// Maximum query bytes, or conservative native plan bytes in a composed subtree.
+    /// Durable hosts independently enforce their storage and wire budgets.
     pub max_bytes: u64,
     /// Module-owned implementation selected during assembly.
     pub handler: HandlerBinding,

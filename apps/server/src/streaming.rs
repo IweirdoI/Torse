@@ -6,12 +6,21 @@ use crate::{
 use torse_storage::CommitJournal;
 use torse_world::Snapshot;
 
-const MAX_PARKED: usize = 4096;
 const MAX_RESIDENT: usize = 4096;
 
 impl ExecutionHost {
     pub fn parked_sections(&self) -> &BTreeMap<SectionPos, ParkedSection> {
         &self.parked
+    }
+
+    /// Residency is changed only between ticks and after admitted work settles.
+    pub fn residency_ready(&self, unload: bool) -> bool {
+        self.at_tick_boundary()
+            && self.pending.is_empty()
+            && self.frozen.is_none()
+            && self.stopping.is_none()
+            && self.section_pending.is_none()
+            && (!unload || self.runtime.events.is_empty())
     }
 
     fn prepare_residency(&self, change: SectionChange) -> Result<ExecutionPrepared, Fault> {
@@ -85,7 +94,7 @@ fn check_reference(
     } else if change.load {
         parked.get(&pos) == Some(&change.reference)
     } else {
-        !parked.contains_key(&pos) && parked.len() < MAX_PARKED
+        !parked.contains_key(&pos)
     };
     if !valid {
         return Err(Fault::invalid_data("invalid section residency history"));
@@ -200,6 +209,11 @@ impl ExecutionRecovery<'_> {
             ));
         }
         check_reference(change, &self.parked)?;
+        if !change.load {
+            let mut candidate = self.parked.clone();
+            candidate.insert(change.page.sections[0].pos, change.reference.clone());
+            wire::measure_inner(&candidate, self.limits.runtime, self.limits.codec)?;
+        }
         let pages = self
             .section_pages
             .as_ref()
@@ -226,9 +240,9 @@ impl ExecutionRecovery<'_> {
         if self.parked.is_empty() {
             return Ok(());
         }
-        if self.parked.len() > MAX_PARKED {
-            return Err(Fault::resource_limit("parked section capacity"));
-        }
+        // Persistent indexes are bounded by encoded bytes and items, rather
+        // than imposing a fixed number of explored sections on every host.
+        wire::measure_inner(&self.parked, self.limits.runtime, self.limits.codec)?;
         let pages = self
             .section_pages
             .as_ref()
@@ -245,5 +259,48 @@ impl ExecutionRecovery<'_> {
             self.recovery.parked_page_valid(&page)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parked_index_accepts_more_than_4096_sections_within_its_budget() {
+        let (world, _) = crate::bootstrap::world().unwrap();
+        let page = world
+            .capture_section(SectionPos::ZERO, crate::bootstrap::budget())
+            .unwrap();
+        let digest = Digest([0; 32]);
+        let parked: BTreeMap<_, _> = (1..=4097)
+            .map(|x| {
+                (
+                    SectionPos::new(x, 0, 0),
+                    ParkedSection {
+                        digest,
+                        entities: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let change = SectionChange {
+            reference: reference(&page, digest),
+            page,
+            load: false,
+            fresh: false,
+        };
+        check_reference(&change, &parked).unwrap();
+        wire::measure_inner(
+            &parked,
+            crate::bootstrap::budget(),
+            crate::bootstrap::codec_limits(),
+        )
+        .unwrap();
+        let tiny = OutputBudget {
+            max_items: 64,
+            max_bytes: 1024,
+        };
+        assert!(wire::measure_inner(&parked, tiny, crate::bootstrap::codec_limits()).is_err());
     }
 }

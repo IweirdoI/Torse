@@ -31,6 +31,16 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         self.authority()?;
         self.authority.register_session(viewer, actor, scope)
     }
+    pub fn replace_session_scope(
+        &mut self,
+        session: SessionId,
+        actor: ActorContext,
+        scope: ReplicaScope,
+    ) -> Result<(), Fault> {
+        self.authority()?;
+        self.authority.replace_session_scope(session, actor, scope)
+    }
+
     pub fn open_replica(
         &mut self,
         session: SessionId,
@@ -236,6 +246,42 @@ impl<T: Transport> NetworkHub<T> {
         }
         self.cleanup(server)
     }
+    /// Trusted application-driven scope replacement. Re-seed live subscriptions
+    /// before retiring sections so residency invalidation cannot close this peer.
+    pub fn replace_policy<
+        J: CommitJournal<ExecutionModel>,
+        S: HostCheckpointStore<ExecutionModel>,
+    >(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+        id: u128,
+        policy: PeerPolicy,
+    ) -> Result<(), Fault> {
+        let peer = self
+            .peers
+            .get_mut(&id)
+            .ok_or_else(|| Fault::invalid_data("unknown peer"))?;
+        if peer.closed {
+            return Err(Fault::invalid_data("closed peer"));
+        }
+        if let Some(viewer) = peer.viewer {
+            server.replace_session_scope(
+                viewer.session,
+                policy.actor.clone(),
+                policy.scope.clone(),
+            )?;
+            for old in std::mem::take(&mut peer.subscriptions) {
+                server.close_replica(SubscriptionId(old))?;
+            }
+            let seed =
+                server.open_replica(viewer.session, policy.scope.clone(), self.limits.budget)?;
+            peer.subscriptions.insert(seed.subscription.0);
+            Self::send(peer, ServerMessage::Seed(seed), self.limits)?;
+        }
+        peer.policy = policy;
+        Ok(())
+    }
+
     fn send(
         peer: &mut Peer<T>,
         message: ServerMessage,

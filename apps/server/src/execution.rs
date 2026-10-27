@@ -459,6 +459,27 @@ impl ExecutionHost {
         );
         Ok(())
     }
+    /// Replace trusted grants without resetting the session request sequence.
+    pub fn replace_session_scope(
+        &mut self,
+        session: SessionId,
+        actor: ActorContext,
+        scope: ReplicaScope,
+    ) -> Result<(), Fault> {
+        if scope.sections.len() > self.limits.replicas.max_sections
+            || actor.section_count() > torse_sim::action::MAX_ACTOR_SECTIONS
+        {
+            return Err(Fault::resource_limit("session scope too large"));
+        }
+        let live = self
+            .sessions
+            .get_mut(&session.0)
+            .ok_or_else(|| Fault::invalid_data("unknown session"))?;
+        live.actor = actor;
+        live.scope = scope;
+        Ok(())
+    }
+
     pub fn revoke_session(&mut self, session: SessionId) -> Vec<SubscriptionId> {
         self.sessions
             .remove(&session.0)

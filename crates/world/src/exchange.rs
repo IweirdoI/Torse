@@ -497,7 +497,7 @@ impl Snapshot {
                     for value in list {
                         resolved.push(resolve(*value, &mapping)?);
                     }
-                    SectionStorage::Dense(resolved)
+                    SectionStorage::Dense(resolved.into())
                 }
             };
             let data =

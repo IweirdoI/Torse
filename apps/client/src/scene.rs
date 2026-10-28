@@ -519,7 +519,8 @@ impl Scene {
     }
 
     /// Shape of one cell for picking: empty, or the block's render bounds.
-    /// `None` marks cells the ray must not traverse (unloaded or outside).
+    /// `None` stops at unknown cells. Outside the vertical world bounds is
+    /// known empty space for picking, while edits still enforce those bounds.
     fn shape_at(&self, pos: BlockPos) -> Option<Option<RenderBox>> {
         match self.authority.store().query(pos) {
             TerrainQuery::Ready(state) => {
@@ -533,7 +534,8 @@ impl Scene {
                         .and_then(shape_box),
                 )
             }
-            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => None,
+            TerrainQuery::NotLoaded => None,
+            TerrainQuery::OutOfBounds => Some(None),
         }
     }
 
@@ -1986,6 +1988,52 @@ mod tests {
         // Radius 1 leaves everything past 31 blocks unloaded on the x axis.
         let outcome = scene.pick([30.5, 40.0, 8.5], [1.0, 0.0, 0.0], 256.0);
         assert_eq!(outcome, PickOutcome::Miss);
+    }
+
+    #[test]
+    fn picking_from_outside_vertical_bounds_keeps_unknown_sections_blocking() {
+        let mut scene = Scene::new(0).unwrap();
+        let stone = key("base:stone");
+        scene
+            .apply_edit(true, &stone, BlockPos::new(8, 14, 8), 0)
+            .unwrap();
+        // y=63 is inside this world's bounds but has not been loaded. A ray
+        // starting above the world may pass outside space, never this gap.
+        assert_eq!(
+            scene.pick([8.5, 65.5, 8.5], [0.0, -1.0, 0.0], 64.0),
+            PickOutcome::Miss
+        );
+        // Unknown horizontal sections also stop a ray before known terrain.
+        assert_eq!(
+            scene.pick([-1.5, 14.5, 8.5], [1.0, 0.0, 0.0], 64.0),
+            PickOutcome::Miss
+        );
+        let below = scene.pick([8.5, -1.5, 8.5], [0.0, 1.0, 0.0], 64.0);
+        let PickOutcome::Hit(hit) = below else {
+            panic!("expected the lowest loaded block");
+        };
+        assert_eq!(hit.block, BlockPos::new(8, 0, 8));
+        assert_eq!(hit.face, [0, -1, 0]);
+    }
+
+    #[test]
+    fn replica_bounds_with_negative_top_allow_entry_from_above() {
+        let mut snapshot = replica_snapshot();
+        snapshot.bounds = WorldBounds::new(-32, -16).unwrap();
+        snapshot.sections = vec![stone_layer_section(SectionPos::new(0, -2, 0))];
+        snapshot.entities.clear();
+        let scene = Scene::from_snapshot(&snapshot).unwrap();
+        let outcome = scene.pick([8.5, -14.5, 8.5], [0.0, -1.0, 0.0], 64.0);
+        let PickOutcome::Hit(hit) = outcome else {
+            panic!("expected the mirrored floor");
+        };
+        assert_eq!(hit.block, BlockPos::new(8, -32, 8));
+        assert_eq!(hit.face, [0, 1, 0]);
+        assert!((hit.distance - 16.5).abs() < 1e-4);
+        assert_eq!(
+            scene.pick([8.5, -14.5, 8.5], [0.0, -1.0, 0.0], 16.0),
+            PickOutcome::Miss
+        );
     }
 
     fn stone_layer_section(pos: SectionPos) -> SnapshotSection {

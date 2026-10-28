@@ -2024,6 +2024,59 @@ mod tests {
         assert!(action_for(Some(&scene), &PickOutcome::Miss, MouseButton::Right, &slab).is_none());
     }
 
+    #[test]
+    fn camera_above_height_limit_can_edit_legal_targets_and_complete_top_slabs() {
+        let mut scene = Scene::new(0).unwrap();
+        scene.enable_lighting().unwrap();
+        let stone = key("base:stone");
+        let slab = key("base:glass_slab");
+        let max_y = scene.authority().store().bounds().max_y;
+        let support = BlockPos::new(8, max_y - 2, 8);
+        let top = BlockPos::new(8, max_y - 1, 8);
+        let eye = [8.5, max_y as f32 + 1.5, 8.5];
+        scene.apply_edit(true, &stone, support, 0).unwrap();
+        let aim = scene.pick(eye, [0.0, -1.0, 0.0], PICK_RANGE);
+        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &stone).unwrap();
+        assert_eq!(intent, (true, top, 0));
+        scene
+            .apply_edit(intent.0, &stone, intent.1, intent.2)
+            .unwrap();
+
+        let aim = scene.pick(eye, [0.0, -1.0, 0.0], PICK_RANGE);
+        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &stone).unwrap();
+        assert_eq!(intent.1.y, max_y);
+        let seq = scene.authority().seq();
+        assert!(
+            scene
+                .apply_edit(intent.0, &stone, intent.1, intent.2)
+                .is_err()
+        );
+        assert_eq!(scene.authority().seq(), seq);
+        let intent = action_for(Some(&scene), &aim, MouseButton::Left, &stone).unwrap();
+        scene
+            .apply_edit(intent.0, &stone, intent.1, intent.2)
+            .unwrap();
+
+        scene.apply_edit(true, &slab, top, 0).unwrap();
+        let aim = scene.pick(eye, [0.0, -1.0, 0.0], PICK_RANGE);
+        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &slab).unwrap();
+        assert_eq!(intent, (true, top, 1));
+        scene
+            .apply_edit(intent.0, &slab, intent.1, intent.2)
+            .unwrap();
+        let state = scene.authority().store().query(top).ready().unwrap();
+        assert_eq!(
+            scene.authority().registry().definition_key(state),
+            Some(&key("base:glass"))
+        );
+
+        assert_eq!(scene.pick(eye, [0.0, -1.0, 0.0], 1.0), PickOutcome::Miss);
+        assert_eq!(
+            scene.pick(eye, [0.0, 1.0, 0.0], PICK_RANGE),
+            PickOutcome::Miss
+        );
+    }
+
     fn app() -> WindowApp {
         let mut app = WindowApp::new(WindowConfig {
             sections: None,

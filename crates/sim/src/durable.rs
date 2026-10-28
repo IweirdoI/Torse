@@ -208,6 +208,8 @@ impl StoredTransactionGroup {
                     .relocations
                     .iter()
                     .any(|relocation| relocation.policy > 1)
+                || (!member.relocations.is_empty()
+                    && member.source != crate::action::relocation_source())
             {
                 return Err(Fault::invalid_data("invalid relocation"));
             }

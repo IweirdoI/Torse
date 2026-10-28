@@ -506,3 +506,24 @@ fn a_second_relocation_in_one_transaction_is_rejected() {
     assert_eq!(position(&world, id).to_bits(), origin.to_bits());
     assert_eq!(world.seq(), CommitSeq::INITIAL);
 }
+
+#[test]
+fn a_relocation_with_a_forged_source_is_rejected() {
+    let mut world = world();
+    load(&mut world, SectionPos::ZERO);
+    let origin = Position::new(0.5, 0.5, 0.5);
+    let (id, expected) = place(&mut world, EntityCollider::Disabled, origin);
+    let mut forged = Transaction::new(TransactionId(1), key("test:game"), ordering());
+    forged.relocate_entity(
+        id,
+        expected,
+        Position::new(1.5, 0.5, 0.5),
+        DestinationPolicy::Clear,
+    );
+    assert_eq!(
+        rejection(world.commit(&forged).unwrap()),
+        RejectCode::PermissionDenied
+    );
+    assert_eq!(position(&world, id).to_bits(), origin.to_bits());
+    assert_eq!(world.seq(), CommitSeq::INITIAL);
+}

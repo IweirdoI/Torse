@@ -639,6 +639,10 @@ impl CommitCoordinator {
             .is_none_or(|n| n > torse_world::MAX_COMPONENT_EDITS);
         let mut lifecycle_batch = None;
         for member in &group.members {
+            if !member.relocations.is_empty() && member.source != crate::action::relocation_source()
+            {
+                return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
+            }
             if has_duplicate_targets(member) {
                 return Err(PrepareError::Rejected(RejectCode::InvalidData));
             }
@@ -916,6 +920,11 @@ impl CommitCoordinator {
         store: &SectionStore,
         transaction: &Transaction,
     ) -> Result<PreparedChange, PrepareError> {
+        if !transaction.relocations.is_empty()
+            && transaction.source != crate::action::relocation_source()
+        {
+            return Err(PrepareError::Rejected(RejectCode::PermissionDenied));
+        }
         if (transaction.mutations.is_empty()
             && transaction.movements.is_empty()
             && transaction.components.is_empty()

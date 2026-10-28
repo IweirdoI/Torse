@@ -82,6 +82,17 @@ impl SectionUploadQueue {
         &mut self,
         center: SectionPos,
         limits: FrameLimits,
+        size: impl FnMut(SectionPos) -> Option<usize>,
+    ) -> Result<Vec<SectionPos>, &'static str> {
+        self.select_where(center, limits, |_| true, size)
+    }
+
+    /// Defer ineligible sections without losing their pending edits.
+    pub fn select_where(
+        &mut self,
+        center: SectionPos,
+        limits: FrameLimits,
+        mut eligible: impl FnMut(SectionPos) -> bool,
         mut size: impl FnMut(SectionPos) -> Option<usize>,
     ) -> Result<Vec<SectionPos>, &'static str> {
         let mut pending: Vec<_> = self.pending.iter().copied().collect();
@@ -98,6 +109,9 @@ impl SectionUploadQueue {
         for pos in pending {
             if selected.len() >= limits.uploads {
                 break;
+            }
+            if !eligible(pos) {
+                continue;
             }
             let Some(bytes) = size(pos) else {
                 self.pending.remove(&pos);
@@ -122,6 +136,37 @@ impl SectionUploadQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deferred_visibility_preserves_edits_without_expanding_geometry() {
+        let mut queue = SectionUploadQueue::default();
+        let section = SectionPos::ZERO;
+        queue.extend([section]);
+        let limits = FrameLimits {
+            generation: 1,
+            meshing: 1,
+            uploads: 1,
+            upload_bytes: 8,
+        };
+        assert!(
+            queue
+                .select_where(
+                    section,
+                    limits,
+                    |_| false,
+                    |_| panic!("deferred geometry must not be expanded")
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(queue.pending.contains(&section));
+        assert_eq!(
+            queue
+                .select_where(section, limits, |_| true, |_| Some(8))
+                .unwrap(),
+            [section]
+        );
+        assert!(queue.pending.is_empty());
+    }
     #[test]
     fn sudden_load_backs_off_then_recovers_without_changing_hard_limits() {
         let limits = FrameLimits {

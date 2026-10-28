@@ -40,7 +40,8 @@ pub use archive::{
 };
 pub use block_instance::{BlockInstance, block_instance_schema};
 pub use collider::{
-    COLLIDER_SCALE, EntityCollider, MAX_COLLIDER_EXTENT, collider_owner, collider_schema,
+    COLLIDER_SCALE, EntityCollider, MAX_COLLIDER_EXTENT, collider_owner, collider_permission,
+    collider_schema,
 };
 pub use component::{
     ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue,
@@ -65,7 +66,8 @@ pub use palette::{MAX_PALETTE_STATES, PaletteCells};
 pub use player_motion::{PlayerMotion, player_motion_schema};
 pub use registry::{BlockStateId, BlockStateRegistry, EMPTY_BLOCK_KEY, RegistryError};
 pub use section::{
-    DEFAULT_SECTION_SIDE, MAX_SECTION_SIDE, Section, SectionError, SectionStorage, linear_index,
+    DEFAULT_SECTION_SIDE, DenseCells, MAX_SECTION_SIDE, Section, SectionError, SectionStorage,
+    linear_index,
 };
 pub use store::{
     BlockEdit, SectionPhase, SectionStore, StoreError, StoreStats, TICKET_QUOTA_PER_KIND,

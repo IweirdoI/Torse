@@ -48,6 +48,19 @@ pub fn movement_call(entity: EntityId, input: MoveInput) -> Call {
     }
 }
 impl ExecutionHost {
+    /// Resident players pin their durable sections independently of interest
+    /// admission. Unbound players remain available for a later connection.
+    pub(crate) fn player_sections(&self) -> std::collections::BTreeSet<SectionPos> {
+        self.world()
+            .entities()
+            .iter()
+            .filter_map(|(_, entity)| {
+                PlayerMotion::of(entity).ok()??;
+                entity.position.section(self.world().store().side())
+            })
+            .collect()
+    }
+
     /// Bind an existing host-created player to a parent session. The private child
     /// session carries durable receipts without consuming the parent's request sequence.
     pub fn bind_player(

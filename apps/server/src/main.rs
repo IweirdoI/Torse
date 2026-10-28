@@ -14,13 +14,13 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--tls-cert PEM --tls-key PEM --client-ca PEM --users TOML] [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N; 0=continuous] [--players N; 0..16] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
+            "usage: torse-server <world-directory> [--tls-cert PEM --tls-key PEM --client-ca PEM --users TOML] [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N; 0=continuous] [--players N; 0..16] [--follow-radius N; 0..64] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--tls-cert PEM --tls-key PEM --client-ca PEM --users TOML] [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N] [--players N; 0..16] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
+            "torse-server <world-directory> [--tls-cert PEM --tls-key PEM --client-ca PEM --users TOML] [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N] [--players N; 0..16] [--follow-radius N; 0..64] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     }
@@ -28,6 +28,7 @@ fn run() -> Result<(), Fault> {
     let mut address = "127.0.0.1:7777".to_owned();
     let mut ticks = 0u64;
     let mut fill = false;
+    let mut follow_radius = None;
     let mut players = 0usize;
     let mut editors = false;
     let mut revoke_after = 0u64;
@@ -41,6 +42,14 @@ fn run() -> Result<(), Fault> {
     let (mut tls_cert, mut tls_key, mut client_ca, mut users) = (None, None, None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--follow-radius" => {
+                follow_radius = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|n| *n <= 64)
+                        .ok_or_else(|| Fault::invalid_data("follow radius must be 0..64"))?,
+                );
+            }
             "--tls-cert" => {
                 tls_cert = Some(
                     args.next()
@@ -244,6 +253,14 @@ fn run() -> Result<(), Fault> {
         .saturating_add(policy.server.snapshot_budget.max_bytes.saturating_mul(4));
     let directory = WorldDirectory::acquire(&path, base::WORLD, 65_536)?;
     let codec = base::Codec::new(base::codec_limits())?;
+    let page_root = path.join("sections");
+    std::fs::create_dir_all(&page_root).map_err(|e| Fault::invalid_data(e.to_string()))?;
+    let pages = torse_server::section_pages::SectionPages::new(
+        page_root,
+        base::budget(),
+        base::codec_limits(),
+        64,
+    )?;
     let mut server = if path.join("checkpoints/manifest.log").exists() {
         base::Files::open_file(directory, compatibility, codec, policy, |binding| {
             Ok(ExecutionRecovery::new(
@@ -253,7 +270,8 @@ fn run() -> Result<(), Fault> {
                 actions,
                 rules,
                 limits,
-            ))
+            )
+            .with_section_pages(pages.clone()))
         })?
     } else {
         base::Files::create_file(directory, compatibility, codec, policy, |binding| {
@@ -288,6 +306,25 @@ fn run() -> Result<(), Fault> {
     let limits = base::network_limits();
     limits.validate_timing(base::TICK_PERIOD)?;
     let mut hub = NetworkHub::with_memory(server.binding(), limits, memory.clone())?;
+    if let Some(radius) = follow_radius {
+        let initial: Vec<_> = server.authority()?.world().store().positions().collect();
+        server.enable_residency(
+            torse_server::residency::ResidencyConfig {
+                max_resident: 64,
+                max_io_bytes: base::budget().max_bytes.saturating_mul(4),
+            },
+            pages,
+            None,
+            &initial,
+        )?;
+        hub.enable_player_follow(
+            &server,
+            torse_server::network::PlayerFollow {
+                radius,
+                max_sections: base::execution_limits().replicas.max_sections,
+            },
+        )?;
+    }
     let tls = if let Some((tls, users)) = security {
         users.validate_world(
             server.authority()?.world(),

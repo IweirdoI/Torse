@@ -336,6 +336,9 @@ impl MeshData {
 
 /// Build a section mesh.
 ///
+/// Sides must be in `1..=64`, matching authoritative section storage. Invalid
+/// sides or unrepresentable block extents return an empty mesh without sampling.
+/// Use a bounded entry point to distinguish invalid input from an empty section.
 /// `sample` must describe one immutable view throughout the build. Full-cube
 /// occupancy is sampled first; visible cells and slow-path neighbours may be
 /// sampled again. Callers with a shared budget must reserve
@@ -345,8 +348,12 @@ pub fn build_mesh(
     section: SectionPos,
     sample: impl Fn(BlockPos) -> MeshSample,
 ) -> MeshData {
-    build_mesh_inner(side, section, sample, || false, None, None, MeshMode::Faces)
-        .expect("uncancelled unrestricted meshing succeeds")
+    build_mesh_inner(side, section, sample, || false, None, None, MeshMode::Faces).unwrap_or_else(
+        |_| MeshData {
+            section,
+            ..MeshData::default()
+        },
+    )
 }
 
 /// Unoptimized semantic reference, useful for geometry and CPU comparisons.
@@ -364,7 +371,10 @@ pub fn build_mesh_reference(
         None,
         MeshMode::Reference,
     )
-    .expect("uncancelled unrestricted meshing succeeds")
+    .unwrap_or_else(|_| MeshData {
+        section,
+        ..MeshData::default()
+    })
 }
 
 /// Synchronous counterpart of the bounded occupancy/run mesher.
@@ -373,8 +383,12 @@ pub fn build_mesh_optimized(
     section: SectionPos,
     sample: impl Fn(BlockPos) -> MeshSample,
 ) -> MeshData {
-    build_mesh_inner(side, section, sample, || false, None, None, MeshMode::Runs)
-        .expect("uncancelled unrestricted meshing succeeds")
+    build_mesh_inner(side, section, sample, || false, None, None, MeshMode::Runs).unwrap_or_else(
+        |_| MeshData {
+            section,
+            ..MeshData::default()
+        },
+    )
 }
 
 /// Mesh one section and charge the occupancy table to `ledger` until it returns.
@@ -401,6 +415,8 @@ pub enum MeshBuildError {
     OutputLimit,
     /// The occupancy table did not fit in the mesh-class budget.
     Memory,
+    /// Side is outside `1..=64`, or the section's block extent overflows i64.
+    InvalidInput,
 }
 
 /// Bound face output before allocation and check cancellation at each y slice.
@@ -461,6 +477,18 @@ enum MeshMode {
     Runs,
 }
 
+fn checked_origin(side: u32, section: SectionPos) -> Option<[i64; 3]> {
+    if !(1..=64).contains(&side) {
+        return None;
+    }
+    let mut origin = [0; 3];
+    for (out, coordinate) in origin.iter_mut().zip([section.x, section.y, section.z]) {
+        *out = coordinate.checked_mul(i64::from(side))?;
+        out.checked_add(i64::from(side) - 1)?;
+    }
+    Some(origin)
+}
+
 fn build_mesh_inner(
     side: u32,
     section: SectionPos,
@@ -473,11 +501,7 @@ fn build_mesh_inner(
     if cancelled() {
         return Err(MeshBuildError::Cancelled);
     }
-    let origin = [
-        section.x.saturating_mul(i64::from(side)),
-        section.y.saturating_mul(i64::from(side)),
-        section.z.saturating_mul(i64::from(side)),
-    ];
+    let origin = checked_origin(side, section).ok_or(MeshBuildError::InvalidInput)?;
     let mut mesh = MeshData {
         section,
         ..MeshData::default()
@@ -1471,6 +1495,94 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn invalid_extents_never_sample_or_charge_scratch() {
+        let sample = |_| -> MeshSample { panic!("invalid section must not sample") };
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(0));
+        for (side, section) in [
+            (0, SectionPos::ZERO),
+            (65, SectionPos::ZERO),
+            (u32::MAX, SectionPos::ZERO),
+            (2, SectionPos::new(i64::MAX, 0, 0)),
+            (2, SectionPos::new(0, i64::MIN, 0)),
+            (3, SectionPos::new(0, 0, i64::MAX / 3)),
+        ] {
+            for mode in [MeshMode::Reference, MeshMode::Faces, MeshMode::Runs] {
+                assert_eq!(
+                    build_mesh_inner(
+                        side,
+                        section,
+                        sample,
+                        || false,
+                        Some(usize::MAX / 16),
+                        Some(&mut ledger),
+                        mode
+                    ),
+                    Err(MeshBuildError::InvalidInput)
+                );
+            }
+            assert_eq!(ledger.total_usage(), 0);
+            for mesh in [
+                build_mesh(side, section, sample),
+                build_mesh_reference(side, section, sample),
+                build_mesh_optimized(side, section, sample),
+            ] {
+                assert!(mesh.is_empty());
+                assert_eq!(mesh.section, section);
+            }
+            assert_eq!(
+                build_mesh_bounded(side, section, sample, || false, 4),
+                Err(MeshBuildError::InvalidInput)
+            );
+            assert_eq!(
+                build_mesh_optimized_bounded(side, section, sample, || false, 4),
+                Err(MeshBuildError::InvalidInput)
+            );
+            assert_eq!(
+                build_mesh_accounted(side, section, sample, &mut ledger),
+                Err(MeshBuildError::InvalidInput)
+            );
+            assert_eq!(
+                build_mesh_bounded(side, section, sample, || true, 4),
+                Err(MeshBuildError::Cancelled)
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_legal_and_negative_sections_keep_geometry() {
+        for side in [1_u32, 2, 3, 64] {
+            let width = i64::from(side);
+            for coordinate in [i64::MIN / width, (i64::MAX - (width - 1)) / width, -2] {
+                let section = SectionPos::new(coordinate, coordinate, coordinate);
+                let origin = checked_origin(side, section).unwrap();
+                let sample = |pos: BlockPos| {
+                    if [pos.x, pos.y, pos.z] == origin {
+                        MeshSample::Ready(RenderBlock::uniform(1))
+                    } else {
+                        MeshSample::NotLoaded
+                    }
+                };
+                let expected = build_mesh_reference(side, section, sample);
+                assert_eq!(expected.face_count(), 6);
+                assert_eq!(build_mesh(side, section, sample), expected);
+                assert_eq!(
+                    build_mesh_bounded(side, section, sample, || false, 6).unwrap(),
+                    expected
+                );
+                let runs =
+                    build_mesh_optimized_bounded(side, section, sample, || false, 6).unwrap();
+                assert_eq!(runs.face_count(), 6);
+                assert_eq!(runs.section, section);
+                assert!(
+                    runs.positions
+                        .iter()
+                        .all(|p| p.iter().all(|n| (0.0..=1.0).contains(n)))
+                );
+            }
+        }
+    }
+
     fn reference(
         side: u32,
         section: SectionPos,
@@ -1530,7 +1642,7 @@ mod tests {
 
     #[test]
     fn dense_rows_match_the_reference_including_64_bit_boundaries() {
-        for side in [0, 1, 3, 32, 33, 64, 65] {
+        for side in [1, 3, 32, 33, 64] {
             let optimized = build_mesh(side, SectionPos::ZERO, |pos| solid_sample(side, pos));
             let expected = reference(side, SectionPos::ZERO, |pos| solid_sample(side, pos));
             assert_eq!(optimized, expected, "side={side}");

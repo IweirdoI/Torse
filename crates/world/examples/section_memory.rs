@@ -3,10 +3,10 @@ use torse_world::{BlockStateId, Section, SectionStorage};
 
 fn main() {
     for states in [1, 2, 4, 256, 257] {
-        let cells = (0..32usize.pow(3))
+        let cells: Vec<_> = (0..32usize.pow(3))
             .map(|i| BlockStateId((i % states) as u16))
             .collect();
-        let section = Section::from_storage(32, SectionStorage::Dense(cells)).unwrap();
+        let section = Section::from_storage(32, SectionStorage::Dense(cells.into())).unwrap();
         println!(
             "states={states} cell_bytes={} section_bytes={} dense_reference=65536",
             section.allocated_bytes(),

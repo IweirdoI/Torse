@@ -232,6 +232,11 @@ impl<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>
         Ok(())
     }
 
+    /// Last admitted host interest, excluding independent event and player pins.
+    pub fn residency_interest(&self) -> Option<&BTreeSet<SectionPos>> {
+        self.residency.as_ref().map(|scheduler| &scheduler.desired)
+    }
+
     /// At most one publication or one dispatch per call; never waits for a page operation.
     /// An I/O failure leaves authority unchanged and permits the next call to retry.
     pub fn poll_residency(
@@ -285,7 +290,11 @@ impl ResidencyScheduler {
             .authority()?
             .event_tickets(false, self.config.max_resident)?;
         let mut required = self.desired.clone();
-        for pos in tickets.sections {
+        for pos in tickets
+            .sections
+            .into_iter()
+            .chain(server.authority()?.player_sections())
+        {
             if required.len() >= self.config.max_resident && !required.contains(&pos) {
                 return Ok(ResidencyProgress::CapacityBlocked);
             }

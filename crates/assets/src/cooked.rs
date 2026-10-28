@@ -191,7 +191,14 @@ impl CookedResources {
         scratch
             .resize(temporary as u64)
             .map_err(|e| e.to_string())?;
-        let atlas = Atlas::decode(&bytes).map_err(|e| format!("{}: {e}", row.path))?;
+        let atlas = Atlas::decode_with_limits(
+            &bytes,
+            crate::texture::DecodeLimits {
+                max_source_bytes: self.limits.max_source_bytes,
+                max_rgba_bytes: self.limits.max_image_bytes,
+            },
+        )
+        .map_err(|e| format!("{}: {e}", row.path))?;
         if atlas.width() != width || atlas.height() != height || atlas.pixels().len() != rgba {
             return Err("decoded PNG dimensions differ from header".into());
         }

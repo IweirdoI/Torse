@@ -130,6 +130,258 @@ fn tick(server: &mut base::Files, hub: &mut NetworkHub<MemoryTransport>) {
     hub.poll(server).unwrap();
 }
 
+fn enable_follow(
+    dir: &Directory,
+    server: &mut base::Files,
+    hub: &mut NetworkHub<MemoryTransport>,
+    radius: u32,
+) {
+    let root = dir.0.join("sections");
+    std::fs::create_dir_all(&root).unwrap();
+    let pages = torse_server::section_pages::SectionPages::new(
+        root,
+        base::budget(),
+        base::codec_limits(),
+        64,
+    )
+    .unwrap();
+    let initial: Vec<_> = server
+        .authority()
+        .unwrap()
+        .world()
+        .store()
+        .positions()
+        .collect();
+    server
+        .enable_residency(
+            torse_server::residency::ResidencyConfig {
+                max_resident: 4,
+                max_io_bytes: 32 * 1024 * 1024,
+            },
+            pages,
+            None,
+            &initial,
+        )
+        .unwrap();
+    hub.enable_player_follow(
+        server,
+        PlayerFollow {
+            radius,
+            max_sections: 3,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn following_unions_peer_interests_and_removes_disconnected_intentions() {
+    let dir = Directory::new();
+    let mut server = create_with(&dir, |world| {
+        let handle = world.entities().handle_of(EntityId(4)).unwrap();
+        world
+            .entities_mut()
+            .move_to(handle, Position::new(20.5, 3.0, 4.5))
+            .unwrap();
+    });
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    enable_follow(&dir, &mut server, &mut hub, 0);
+    let (_, mut first) = add(&mut hub, &server, Some(EntityId(3)));
+    let (second_id, mut second) = add(&mut hub, &server, Some(EntityId(4)));
+    hello(&mut first, &server);
+    hello(&mut second, &server);
+    hub.poll(&mut server).unwrap();
+    for client in [&mut first, &mut second] {
+        assert!(
+            receive(client)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::Seed(s) if s.state.sections.len() == 1))
+        );
+    }
+    assert_eq!(
+        server.residency_interest().unwrap(),
+        &base::scope().sections
+    );
+    hub.revoke(&mut server, second_id).unwrap();
+    hub.poll(&mut server).unwrap();
+    assert_eq!(
+        server.residency_interest().unwrap(),
+        &[SectionPos::ZERO].into()
+    );
+}
+
+#[test]
+fn following_retries_replica_pressure_without_replaying_movement() {
+    let dir = Directory::new();
+    let pool = MemoryPool::new(
+        MemoryBudget::new(512 * 1024 * 1024)
+            .with_class_limit(MemoryClass::Replica, 256 * 1024 * 1024),
+    );
+    let mut server = create(&dir);
+    server
+        .attach_memory(pool.clone(), 48 * 1024 * 1024)
+        .unwrap();
+    let mut hub =
+        NetworkHub::with_memory(server.binding(), base::network_limits(), pool.clone()).unwrap();
+    enable_follow(&dir, &mut server, &mut hub, 1);
+    let (_, mut client) = add(&mut hub, &server, Some(EntityId(3)));
+    let held = pool
+        .reserve(
+            MemoryClass::Replica,
+            pool.budget().class_limit(MemoryClass::Replica)
+                - pool.usage().current[MemoryClass::Replica.index()],
+            EvictionRank::Pinned,
+        )
+        .unwrap();
+    hello(&mut client, &server);
+    let position = pose(&server, 3);
+    for _ in 0..4 {
+        hub.poll(&mut server).unwrap();
+        assert!(
+            !receive(&mut client)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::Seed(_)))
+        );
+    }
+    assert_eq!(pose(&server, 3), position);
+    drop(held);
+    hub.poll(&mut server).unwrap();
+    assert!(
+        receive(&mut client)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Seed(_)))
+    );
+    assert_eq!(pose(&server, 3), position);
+    drop(hub);
+    drop(server);
+    assert_eq!(pool.usage().total, 0);
+}
+
+#[test]
+fn following_retires_old_replica_loads_new_window_and_preserves_move_sequences() {
+    let dir = Directory::new();
+    let third = SectionPos::new(2, 0, 0);
+    let mut server = create_with(&dir, |world| {
+        let handle = world.entities().handle_of(EntityId(3)).unwrap();
+        world
+            .entities_mut()
+            .move_to(handle, Position::new(15.6, 3.0, 4.5))
+            .unwrap();
+        let floor = world.store().section(SectionPos::ZERO).unwrap().clone();
+        world.store_mut().request(third).unwrap();
+        world.store_mut().install(third, floor).unwrap();
+        world.store_mut().finish_load(third).unwrap();
+    });
+    let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
+    enable_follow(&dir, &mut server, &mut hub, 1);
+    let (id, mut client) = add(&mut hub, &server, Some(EntityId(3)));
+    let approved = torse_sim::replica::ReplicaScope {
+        sections: [SectionPos::ZERO, SectionPos::new(1, 0, 0), third].into(),
+    };
+    hub.replace_policy(
+        &mut server,
+        id,
+        PeerPolicy {
+            actor: ActorContext::new(base::key("test:player")),
+            scope: approved,
+        },
+    )
+    .unwrap();
+    hello(&mut client, &server);
+    hub.poll(&mut server).unwrap();
+    let old = receive(&mut client)
+        .into_iter()
+        .find_map(|m| match m {
+            ServerMessage::Seed(seed) => {
+                assert_eq!(seed.state.sections.len(), 2);
+                Some(seed.subscription)
+            }
+            _ => None,
+        })
+        .unwrap();
+    for _ in 0..200 {
+        if server
+            .authority()
+            .unwrap()
+            .parked_sections()
+            .contains_key(&third)
+        {
+            break;
+        }
+        tick(&mut server, &mut hub);
+        receive(&mut client);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        server
+            .authority()
+            .unwrap()
+            .parked_sections()
+            .contains_key(&third)
+    );
+    let mut replacement = None;
+    let mut confirmed = 0;
+    for seq in 1..=2 {
+        movement(&mut client, 1, seq, [127, 0], false);
+        hub.poll(&mut server).unwrap();
+        // A previous idle step may already occupy this tick; the queued input
+        // must still settle once, with its own monotonically confirmed sequence.
+        tick(&mut server, &mut hub);
+        tick(&mut server, &mut hub);
+        for message in receive(&mut client) {
+            match message {
+                ServerMessage::Seed(seed) => replacement = Some(seed),
+                ServerMessage::Player(player) => confirmed = confirmed.max(player.input_seq),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(confirmed, 2);
+    assert!((pose(&server, 3).x - 16.03).abs() < 1e-8);
+    assert!(server.take_replica(old, base::budget()).is_err());
+    let x = pose(&server, 3).x;
+    for _ in 0..12 {
+        hub.poll(&mut server).unwrap();
+    }
+    assert_eq!(pose(&server, 3).x, x);
+    for _ in 0..200 {
+        hub.poll(&mut server).unwrap();
+        for message in receive(&mut client) {
+            if let ServerMessage::Seed(seed) = message {
+                replacement = Some(seed);
+            }
+        }
+        if replacement.is_some() {
+            break;
+        }
+        tick(&mut server, &mut hub);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let seed = replacement.expect("new window baseline");
+    assert_eq!(seed.state.sections.len(), 3);
+    assert_ne!(seed.subscription, old);
+    send(
+        &mut client,
+        ClientMessage::Subscribe {
+            sections: vec![SectionPos::new(99, 0, 0)],
+        },
+    );
+    hub.poll(&mut server).unwrap();
+    assert!(
+        receive(&mut client)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Rejected(RejectCode::PermissionDenied)))
+    );
+    hub.revoke(&mut server, id).unwrap();
+    let (_, mut reconnected) = add(&mut hub, &server, Some(EntityId(3)));
+    hello(&mut reconnected, &server);
+    hub.poll(&mut server).unwrap();
+    assert!(
+        receive(&mut reconnected)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::Player(p) if p.input_seq == 0))
+    );
+}
+
 #[test]
 fn two_players_publish_collision_resolved_moves_with_independent_input_sequences() {
     let dir = Directory::new();

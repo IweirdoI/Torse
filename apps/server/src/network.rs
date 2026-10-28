@@ -14,8 +14,11 @@ use torse_sim::durable::Receipt;
 use torse_sim::replica::{ReplicaScope, WorldReplicaBatch, WorldReplicaSeed};
 use torse_storage::CommitJournal;
 use torse_types::*;
+#[path = "network_interest.rs"]
+mod interest;
 #[path = "network_player.rs"]
 mod player;
+pub use interest::PlayerFollow;
 
 pub type ClientMessage = torse_protocol::ClientMessage<torse_sim::durable::Call>;
 pub type ServerMessage = torse_protocol::ServerMessage<
@@ -222,6 +225,8 @@ struct Peer<T> {
     deferred: Option<ReplicaScope>,
     codec: Option<MemoryLease>,
     memory: Option<MemoryLease>,
+    follow_scope: Option<ReplicaScope>,
+    follow_ready: bool,
 }
 pub struct NetworkHub<T> {
     peers: BTreeMap<u128, Peer<T>>,
@@ -234,6 +239,7 @@ pub struct NetworkHub<T> {
     authentication: Option<Arc<dyn IdentityVerifier>>,
     _authentication_memory: Option<MemoryLease>,
     connection_timeout: Option<Duration>,
+    follow: Option<PlayerFollow>,
 }
 impl<T: Transport> NetworkHub<T> {
     pub fn new(binding: Binding, limits: NetworkLimits) -> Result<Self, Fault> {
@@ -266,6 +272,7 @@ impl<T: Transport> NetworkHub<T> {
             authentication: None,
             _authentication_memory: None,
             connection_timeout: None,
+            follow: None,
         })
     }
     pub fn with_memory(
@@ -332,6 +339,8 @@ impl<T: Transport> NetworkHub<T> {
                 deferred: None,
                 codec: None,
                 memory,
+                follow_scope: None,
+                follow_ready: false,
             },
         );
         Ok(id)
@@ -447,6 +456,9 @@ impl<T: Transport> NetworkHub<T> {
                 for old in std::mem::take(&mut peer.subscriptions) {
                     server.close_replica(SubscriptionId(old))?;
                 }
+                if self.follow.is_some() && peer.player.is_some() {
+                    return Ok(());
+                }
                 let seed = server.open_replica(
                     viewer.session,
                     policy.scope.clone(),
@@ -464,6 +476,8 @@ impl<T: Transport> NetworkHub<T> {
         }
         peer.policy = policy;
         peer.deferred = None;
+        peer.follow_scope = None;
+        peer.follow_ready = false;
         if let (Some(memory), Some(growth)) = (&mut peer.memory, &mut growth) {
             memory.absorb(growth, policy_bytes)?;
         }
@@ -499,6 +513,7 @@ impl<T: Transport> NetworkHub<T> {
         server: &mut Server<ExecutionHost, J, S>,
         message: ClientMessage,
         limits: NetworkLimits,
+        following: bool,
     ) -> Result<(), Fault> {
         match message {
             ClientMessage::Hello {
@@ -593,7 +608,7 @@ impl<T: Transport> NetworkHub<T> {
                 let viewer = peer
                     .viewer
                     .ok_or_else(|| Fault::invalid_data("handshake required"))?;
-                if peer.subscriptions.len() >= limits.subscriptions {
+                if !following && peer.subscriptions.len() >= limits.subscriptions {
                     return Err(Fault::resource_limit("peer subscription capacity"));
                 }
                 let scope = ReplicaScope {
@@ -607,6 +622,9 @@ impl<T: Transport> NetworkHub<T> {
                         ServerMessage::Rejected(RejectCode::PermissionDenied),
                         limits,
                     );
+                }
+                if following {
+                    return Ok(());
                 }
                 match server.open_replica(viewer.session, scope.clone(), limits.budget) {
                     Ok(seed) => {
@@ -633,6 +651,7 @@ impl<T: Transport> NetworkHub<T> {
                         limits,
                     );
                 }
+                peer.follow_ready = false;
                 server.close_replica(subscription)
             }
             ClientMessage::Ping => {
@@ -662,6 +681,11 @@ impl<T: Transport> NetworkHub<T> {
     ) -> Result<(), Fault> {
         if server.binding() != self.binding {
             return Err(Fault::invalid_data("hub binding mismatch"));
+        }
+        if self.follow.is_some() {
+            // Give residency one bounded opportunity before enqueuing the next
+            // tick's continuous movement requests, otherwise unload can starve.
+            server.poll_residency(self)?;
         }
         let tick = server.authority()?.resume_point().tick;
         let mut users: BTreeSet<_> = self
@@ -747,12 +771,25 @@ impl<T: Transport> NetworkHub<T> {
                     }
                     peer.last_tick = tick;
                     peer.last_activity = now;
-                    Self::handle(peer, &mut self.sessions, server, message, self.limits)?;
+                    let following = self.follow.is_some() && peer.player.is_some();
+                    Self::handle(
+                        peer,
+                        &mut self.sessions,
+                        server,
+                        message,
+                        self.limits,
+                        following,
+                    )?;
                     if peer.closed {
                         return Ok(());
                     }
                 }
                 if let Some(viewer) = peer.viewer {
+                    if let Some(config) = self.follow
+                        && peer.player.is_some()
+                    {
+                        Self::update_follow(peer, server, config, self.limits)?;
+                    }
                     if let Some(scope) = peer.deferred.as_ref() {
                         if !scope.sections.is_subset(&peer.policy.scope.sections) {
                             return Err(Fault::invalid_data("deferred scope lost authorization"));
@@ -814,7 +851,8 @@ impl<T: Transport> NetworkHub<T> {
                 peer.transport.close();
             }
         }
-        self.cleanup(server)
+        self.cleanup(server)?;
+        self.update_follow_residency(server)
     }
     fn cleanup<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>(
         &mut self,
@@ -857,6 +895,10 @@ impl<T: Transport> InvalidationSink for NetworkHub<T> {
                 .iter()
                 .any(|id| peer.subscriptions.contains(&id.0))
             {
+                if self.follow.is_some() && peer.player.is_some() {
+                    peer.follow_ready = false;
+                    continue;
+                }
                 peer.closed = true;
                 peer.transport.close();
                 peer.waiting.clear();

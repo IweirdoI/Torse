@@ -335,7 +335,7 @@ impl View<'_> {
                             scene.authority.registry().occlusion_mask(state) == 0x3f
                         }
                         TerrainQuery::NotLoaded => true,
-                        TerrainQuery::OutOfBounds => false,
+                        TerrainQuery::OutOfBounds | TerrainQuery::Exterior => false,
                     }
                 };
                 let sa = covered(da);

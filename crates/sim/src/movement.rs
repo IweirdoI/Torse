@@ -509,6 +509,7 @@ impl CollisionSource for CollisionView<'_> {
             }
             TerrainQuery::NotLoaded => CollisionCell::NotLoaded,
             TerrainQuery::OutOfBounds => CollisionCell::OutOfBounds,
+            TerrainQuery::Exterior => CollisionCell::Empty,
         }
     }
 }

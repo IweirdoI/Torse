@@ -535,7 +535,7 @@ impl Scene {
                 )
             }
             TerrainQuery::NotLoaded => None,
-            TerrainQuery::OutOfBounds => Some(None),
+            TerrainQuery::OutOfBounds | TerrainQuery::Exterior => Some(None),
         }
     }
 
@@ -1459,7 +1459,7 @@ fn sample(
             })
         }
         TerrainQuery::NotLoaded => MeshSample::NotLoaded,
-        TerrainQuery::OutOfBounds => MeshSample::OutOfBounds,
+        TerrainQuery::OutOfBounds | TerrainQuery::Exterior => MeshSample::OutOfBounds,
     }
 }
 

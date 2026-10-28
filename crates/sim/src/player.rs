@@ -102,7 +102,10 @@ pub fn plan_step(
             TerrainQuery::Ready(state) => {
                 tx.read_block(pos, state);
             }
-            _ => return Err(RejectCode::NotLoaded),
+            TerrainQuery::Exterior => {}
+            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => {
+                return Err(RejectCode::NotLoaded);
+            }
         }
     }
     tx.components.push(ComponentEdit {
@@ -379,6 +382,7 @@ fn wedged(world: &WorldAuthority, handle: EntityHandle, id: EntityId) -> Result<
                 }
                 torse_world::TerrainQuery::NotLoaded => CollisionCell::NotLoaded,
                 torse_world::TerrainQuery::OutOfBounds => CollisionCell::OutOfBounds,
+                torse_world::TerrainQuery::Exterior => CollisionCell::Empty,
             }
         }
     }

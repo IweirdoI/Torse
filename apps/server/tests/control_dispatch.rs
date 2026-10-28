@@ -77,6 +77,16 @@ fn transports() -> (MemoryTransport, MemoryTransport) {
     .unwrap()
 }
 
+fn transports_with_queue(queued_frames: usize) -> (MemoryTransport, MemoryTransport) {
+    MemoryTransport::pair(TransportLimits {
+        frame: 8_388_608,
+        queued_frames,
+        queued_bytes: 16_777_216,
+        poll_bytes: 262_144,
+    })
+    .unwrap()
+}
+
 fn send(client: &mut impl Transport, message: ClientMessage) {
     let mut bytes = Vec::new();
     wire::encode(&message, &mut bytes, base::budget(), base::codec_limits()).unwrap();
@@ -400,4 +410,38 @@ fn missing_dispatcher_and_disconnect_do_not_widen_the_connection() {
     hub.poll(&mut server).unwrap();
     assert!(!hub.contains(peer));
     assert_eq!(recorder.disconnected.lock().expect("lock").len(), 1);
+}
+
+#[test]
+fn rejected_control_ready_does_not_disconnect_an_unestablished_extension() {
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let (mut hub, recorder) = attach(&server, ControlPolicy::Reject);
+    let (host, mut client) = transports_with_queue(1);
+    let peer = hub
+        .add(
+            host,
+            PeerPolicy {
+                actor: ActorContext::new(base::key("test:player")),
+                scope: base::scope(),
+            },
+            server.authority().unwrap().resume_point().tick,
+        )
+        .unwrap();
+
+    hello(&mut client, &server);
+    hub.poll(&mut server).unwrap();
+    // Leave Welcome in the one-frame outgoing queue, then make ControlReady
+    // fail to enqueue. The enclosing poll retires the peer.
+    send(
+        &mut client,
+        ClientMessage::ControlOffer {
+            api: CONTROL_API_VERSION,
+        },
+    );
+    hub.poll(&mut server).unwrap();
+
+    assert!(!hub.contains(peer));
+    assert!(recorder.established.lock().expect("lock").is_empty());
+    assert!(recorder.disconnected.lock().expect("lock").is_empty());
 }

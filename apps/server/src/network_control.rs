@@ -79,7 +79,9 @@ enum Admit {
 impl PeerLink {
     fn new(tick: Tick) -> Self {
         Self {
-            established: true,
+            // This becomes true only after ControlReady is accepted by the
+            // transport and the paired established callback has run.
+            established: false,
             queue: VecDeque::new(),
             bytes: 0,
             tick,
@@ -188,6 +190,10 @@ impl<T: Transport> NetworkHub<T> {
         let tick = server.authority()?.resume_point().tick;
         peer.control_link = Some(PeerLink::new(tick));
         Self::send(peer, ServerMessage::ControlReady { api }, limits)?;
+        peer.control_link
+            .as_mut()
+            .expect("control link was just installed")
+            .established = true;
         plane.dispatch.on_established(peer_id, viewer);
         Ok(())
     }

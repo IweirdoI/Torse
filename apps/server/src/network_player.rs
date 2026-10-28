@@ -14,9 +14,29 @@ pub(super) struct Control {
     received_tick: Tick,
     received: u32,
 }
+impl Control {
+    pub(super) fn new(entity: EntityId, capacity: usize) -> Self {
+        Self {
+            entity,
+            viewer: None,
+            buffer: MoveInputBuffer::new(capacity),
+            next_request: 1,
+            pending: None,
+            scheduled: None,
+            confirmed: 0,
+            received_tick: Tick(0),
+            received: 0,
+        }
+    }
+}
 impl<T: Transport> NetworkHub<T> {
     /// Assign a host-created player before Hello. Client input can never select an entity.
     pub fn assign_player(&mut self, peer: u128, entity: EntityId) -> Result<(), Fault> {
+        if self.authentication.is_some() {
+            return Err(Fault::invalid_data(
+                "authenticated players are assigned by user policy",
+            ));
+        }
         if entity.0 == 0
             || self
                 .peers
@@ -34,17 +54,7 @@ impl<T: Transport> NetworkHub<T> {
                 "player assignment requires a fresh peer",
             ));
         }
-        peer.player = Some(Control {
-            entity,
-            viewer: None,
-            buffer: MoveInputBuffer::new(self.limits.movement_inputs),
-            next_request: 1,
-            pending: None,
-            scheduled: None,
-            confirmed: 0,
-            received_tick: Tick(0),
-            received: 0,
-        });
+        peer.player = Some(Control::new(entity, self.limits.movement_inputs));
         Ok(())
     }
     pub(super) fn send_player<

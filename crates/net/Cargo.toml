@@ -9,3 +9,9 @@ license.workspace = true
 torse-types = { path = "../types" }
 torse-sim = { path = "../sim" }
 torse-world = { path = "../world" }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "=2.2.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+rcgen = "0.14"

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+pub mod authentication;
 mod authority;
 pub mod bootstrap;
 mod checkpoint;

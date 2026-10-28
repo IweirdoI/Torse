@@ -34,3 +34,8 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "GPL-3.0-only"
+
+# Keep large native TLS/Wasm links within Windows PDB type-record limits.
+# Tests inherit this profile; assertions and overflow checks stay enabled.
+[profile.dev]
+debug = "limited"

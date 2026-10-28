@@ -28,6 +28,8 @@ const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N
                     [--place KEY:X,Y,Z]...\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
                         [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]\n\
+                        [--connect ADDRESS] [--walk] [--section X,Y,Z]...\n\
+                        [--tls-ca PEM --tls-cert PEM --tls-key PEM --server-name DNS]\n\
        both modes accept [--memory-mib N; default 512] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
        atlas.png, world.toml) instead of the built-in fixture content";
 
@@ -51,6 +53,8 @@ fn main() -> ExitCode {
     let mut places: Vec<(String, [i64; 3])> = Vec::new();
     let mut content: Option<String> = None;
     let mut memory_mib = 512u64;
+    let (mut tls_ca, mut tls_cert, mut tls_key, mut server_name) = (None, None, None, None);
+    let mut sections = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         let argument = arguments[index].clone();
@@ -90,6 +94,28 @@ fn main() -> ExitCode {
             "--walk" => walk = true,
             "--connect" => connect = value(),
             "--content" => content = value(),
+            "--tls-ca" => tls_ca = value(),
+            "--tls-cert" => tls_cert = value(),
+            "--tls-key" => tls_key = value(),
+            "--server-name" => server_name = value(),
+            "--section" => {
+                let parsed = value().and_then(|value| {
+                    value
+                        .split(',')
+                        .map(str::parse::<i64>)
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok()
+                });
+                match parsed.as_deref() {
+                    Some([x, y, z]) if sections.len() < 64 => {
+                        sections.push(torse_types::SectionPos::new(*x, *y, *z))
+                    }
+                    _ => {
+                        eprintln!("--section requires X,Y,Z and at most 64 sections");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             "--memory-mib" => match value().and_then(|value| value.parse::<u64>().ok()) {
                 Some(value @ 80..=16384) => memory_mib = value,
                 _ => {
@@ -129,12 +155,37 @@ fn main() -> ExitCode {
         index += 1;
     }
 
+    let tls = match (tls_ca, tls_cert, tls_key, server_name) {
+        (None, None, None, None) => None,
+        (Some(ca), Some(certificate), Some(key), Some(server_name))
+            if window && connect.is_some() =>
+        {
+            Some(net::TlsClient {
+                ca,
+                certificate,
+                key,
+                server_name,
+            })
+        }
+        _ => {
+            eprintln!(
+                "TLS requires --window --connect and all of --tls-ca, --tls-cert, --tls-key, --server-name"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    if !sections.is_empty() && (!window || connect.is_none()) {
+        eprintln!("--section requires --window --connect");
+        return ExitCode::FAILURE;
+    }
     if window {
         if !places.is_empty() {
             eprintln!("--place is only available with --capture");
             return ExitCode::FAILURE;
         }
         let config = WindowConfig {
+            sections: (!sections.is_empty()).then_some(sections),
+            tls,
             memory_mib,
             radius: if radius_set { radius } else { 4 },
             width,

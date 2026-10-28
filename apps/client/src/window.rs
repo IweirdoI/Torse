@@ -51,6 +51,9 @@ const WALKER_EYE_OFFSET: f64 = 0.7;
 /// Startup parameters for the windowed run.
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
+    /// Explicit section interest; absent keeps the local demonstration scope.
+    pub sections: Option<Vec<torse_types::SectionPos>>,
+    pub tls: Option<crate::net::TlsClient>,
     /// Shared CPU memory reservation ceiling in MiB.
     pub memory_mib: u64,
     /// Section loading radius around the camera.
@@ -1387,7 +1390,11 @@ impl ApplicationHandler for WindowApp {
                 }
             };
             let mut connection: crate::net::Connection<torse_net::TcpTransport> =
-                match crate::net::Connection::connect(&address) {
+                match crate::net::Connection::connect(
+                    &address,
+                    self.config.tls.as_ref(),
+                    &self.memory,
+                ) {
                     Ok(connection) => connection,
                     Err(error) => {
                         self.failure = Some(format!("connect failed: {error}"));
@@ -1398,7 +1405,14 @@ impl ApplicationHandler for WindowApp {
             let handshake = connection
                 .attach_memory(self.memory.clone())
                 .and_then(|()| connection.hello(compatibility))
-                .and_then(|()| connection.subscribe(demo_scope().to_vec()));
+                .and_then(|()| {
+                    connection.subscribe(
+                        self.config
+                            .sections
+                            .clone()
+                            .unwrap_or_else(|| demo_scope().to_vec()),
+                    )
+                });
             if let Err(error) = handshake {
                 self.failure = Some(format!("handshake failed: {error}"));
                 event_loop.exit();
@@ -1846,6 +1860,8 @@ mod tests {
 
     fn app() -> WindowApp {
         let mut app = WindowApp::new(WindowConfig {
+            sections: None,
+            tls: None,
             memory_mib: 512,
             radius: 1,
             width: 960,

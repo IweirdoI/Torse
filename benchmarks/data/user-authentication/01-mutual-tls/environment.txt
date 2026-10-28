@@ -1,0 +1,14 @@
+Date: 2026-10-28
+Platform: Windows x86_64-pc-windows-msvc
+Rust: 1.93.1
+CPU: Intel Core i9-14900HX
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+Backend: Vulkan, Mailbox
+Profile: dev and test, limited debug information, locked dependencies, CARGO_BUILD_JOBS=1
+Code base: ab732c8c509144b0ae1c63547d25d8281d83b02c with this change
+Content: built-in demonstration world and base resource pack
+Budget scope: logical reservations, not RSS or GPU allocations
+Suite: workspace all targets; server all targets with mods
+TLS: rustls 0.23.46, ring 0.17.14, rustls-pemfile 2.2.0
+Certificates: runtime-generated local fixture, rcgen 0.14.10, no key committed
+Users: Alice editor on player 3, Bob read-only on player 4, two approved sections each

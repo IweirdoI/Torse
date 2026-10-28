@@ -14,13 +14,13 @@ fn run() -> Result<(), Fault> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         println!(
-            "usage: torse-server <world-directory> [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N; 0=continuous] [--players N; 0..16] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
+            "usage: torse-server <world-directory> [--tls-cert PEM --tls-key PEM --client-ca PEM --users TOML] [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N; 0=continuous] [--players N; 0..16] [--fill] [--editors] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     };
     if path == "--help" {
         println!(
-            "torse-server <world-directory> [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N] [--players N; 0..16] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
+            "torse-server <world-directory> [--tls-cert PEM --tls-key PEM --client-ca PEM --users TOML] [--memory-mib N; default 512] [--listen ADDRESS] [--ticks N] [--players N; 0..16] [--mod DIRECTORY] [--machine-operators] [--planning-workers N] [--prevalidate-workers N] [--prevalidate-components; 64MiB/job] [--commit-batch N; default 16]"
         );
         return Ok(());
     }
@@ -38,8 +38,33 @@ fn run() -> Result<(), Fault> {
     let mut component_prevalidation = false;
     let mut commit_batch = 16;
     let mut memory_mib = 512u64;
+    let (mut tls_cert, mut tls_key, mut client_ca, mut users) = (None, None, None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--tls-cert" => {
+                tls_cert = Some(
+                    args.next()
+                        .ok_or_else(|| Fault::invalid_data("missing TLS certificate path"))?,
+                )
+            }
+            "--tls-key" => {
+                tls_key = Some(
+                    args.next()
+                        .ok_or_else(|| Fault::invalid_data("missing TLS key path"))?,
+                )
+            }
+            "--client-ca" => {
+                client_ca = Some(
+                    args.next()
+                        .ok_or_else(|| Fault::invalid_data("missing client CA path"))?,
+                )
+            }
+            "--users" => {
+                users = Some(
+                    args.next()
+                        .ok_or_else(|| Fault::invalid_data("missing user policy path"))?,
+                )
+            }
             "--memory-mib" => {
                 memory_mib = args
                     .next()
@@ -118,9 +143,30 @@ fn run() -> Result<(), Fault> {
         config.components = true;
         config.max_job_bytes = 64 * 1024 * 1024;
     }
-    std::fs::create_dir_all(&path).map_err(|e| Fault::invalid_data(e.to_string()))?;
     if machine_operators && mod_dirs.is_empty() {
         return Err(Fault::invalid_data("--machine-operators requires --mod"));
+    }
+    let secure = match (tls_cert, tls_key, client_ca, users) {
+        (None, None, None, None) => None,
+        (Some(cert), Some(key), Some(ca), Some(users)) if !editors && !machine_operators => {
+            Some((cert, key, ca, users))
+        }
+        _ => {
+            return Err(Fault::invalid_data(
+                "mutual TLS requires --tls-cert, --tls-key, --client-ca and --users; demo grants cannot be combined",
+            ));
+        }
+    };
+    use std::net::ToSocketAddrs;
+    if secure.is_none()
+        && address
+            .to_socket_addrs()
+            .map_err(|_| Fault::invalid_data("listen address resolution failed"))?
+            .any(|address| !address.ip().is_loopback())
+    {
+        return Err(Fault::incompatible(
+            "public listeners require mutual TLS and a user policy",
+        ));
     }
     let memory =
         torse_types::MemoryPool::new(torse_types::MemoryBudget::new(memory_mib * 1024 * 1024));
@@ -129,6 +175,33 @@ fn run() -> Result<(), Fault> {
         base::budget().max_bytes.saturating_mul(4),
         torse_types::EvictionRank::Pinned,
     )?;
+    let _tls_configuration = secure
+        .as_ref()
+        .map(|(cert, key, ca, _)| -> Result<_, Fault> {
+            memory.reserve(
+                torse_types::MemoryClass::Resource,
+                torse_net::tls::configuration_reservation(&[
+                    std::path::Path::new(cert),
+                    std::path::Path::new(key),
+                    std::path::Path::new(ca),
+                ])?,
+                torse_types::EvictionRank::Pinned,
+            )
+        })
+        .transpose()?;
+    let security = secure
+        .map(|(cert, key, ca, users)| -> Result<_, Fault> {
+            let tls = torse_net::tls::server_config(
+                std::path::Path::new(&cert),
+                std::path::Path::new(&key),
+                std::path::Path::new(&ca),
+            )?;
+            let users =
+                torse_server::authentication::CertificateUsers::load(std::path::Path::new(&users))?;
+            Ok((tls, users))
+        })
+        .transpose()?;
+    std::fs::create_dir_all(&path).map_err(|e| Fault::invalid_data(e.to_string()))?;
     let (mut world, actions, rules, machine_targets) = if mod_dirs.is_empty() {
         let (world, actions) = base::world()?;
         (
@@ -212,21 +285,46 @@ fn run() -> Result<(), Fault> {
         ));
     }
     let mut player_peers = std::collections::BTreeMap::new();
+    let limits = base::network_limits();
+    limits.validate_timing(base::TICK_PERIOD)?;
+    let mut hub = NetworkHub::with_memory(server.binding(), limits, memory.clone())?;
+    let tls = if let Some((tls, users)) = security {
+        users.validate_world(
+            server.authority()?.world(),
+            base::execution_limits().replicas.max_sections,
+        )?;
+        hub.require_authentication(std::sync::Arc::new(users))?;
+        Some(tls)
+    } else {
+        None
+    };
+    hub.set_connection_timeout(Duration::from_secs(60))?;
     let listener = TcpListener::bind(&address).map_err(|e| Fault::invalid_data(e.to_string()))?;
+    if tls.is_none()
+        && !listener
+            .local_addr()
+            .map_err(|_| Fault::invalid_data("listener address"))?
+            .ip()
+            .is_loopback()
+    {
+        return Err(Fault::incompatible("unprotected listener must be loopback"));
+    }
     listener
         .set_nonblocking(true)
         .map_err(|e| Fault::invalid_data(e.to_string()))?;
     println!(
-        "listening={} epoch={} tick={}",
+        "listening={} epoch={} tick={} security={}",
         listener
             .local_addr()
             .map_err(|e| Fault::invalid_data(e.to_string()))?,
         server.binding().epoch.0,
-        server.authority()?.resume_point().tick.0
+        server.authority()?.resume_point().tick.0,
+        if tls.is_some() {
+            "mutual-tls"
+        } else {
+            "loopback-demo"
+        }
     );
-    let limits = base::network_limits();
-    limits.validate_timing(base::TICK_PERIOD)?;
-    let mut hub = NetworkHub::with_memory(server.binding(), limits, memory.clone())?;
     let mut peers: Vec<u128> = Vec::new();
     // Anchor the demo revocation to the first connection, not process start.
     let mut revoke_at: Option<u64> = None;
@@ -243,7 +341,12 @@ fn run() -> Result<(), Fault> {
         for _ in 0..16 {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let stream = TcpTransport::new(stream, transport)?;
+                    let stream = match &tls {
+                        Some(config) => {
+                            TcpTransport::tls_server(stream, transport, config.clone())?
+                        }
+                        None => TcpTransport::new(stream, transport)?,
+                    };
                     let scope = base::scope();
                     let actor = if editors {
                         // Editors may edit inside the approved scope; the
@@ -273,9 +376,10 @@ fn run() -> Result<(), Fault> {
                     if let Ok(id) = hub.add(stream, policy, server.authority()?.resume_point().tick)
                     {
                         player_peers.retain(|peer, _| hub.contains(*peer));
-                        if let Some(player) = player_ids
-                            .iter()
-                            .find(|id| !player_peers.values().any(|used| used == *id))
+                        if tls.is_none()
+                            && let Some(player) = player_ids
+                                .iter()
+                                .find(|id| !player_peers.values().any(|used| used == *id))
                         {
                             hub.assign_player(id, *player)?;
                             player_peers.insert(id, *player);

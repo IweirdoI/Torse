@@ -426,6 +426,9 @@ impl ExecutionHost {
     pub fn world(&self) -> &WorldAuthority {
         self.source.world()
     }
+    pub(crate) fn replica_section_limit(&self) -> usize {
+        self.limits.replicas.max_sections
+    }
     pub fn runtime(&self) -> &RuntimeState {
         &self.runtime
     }

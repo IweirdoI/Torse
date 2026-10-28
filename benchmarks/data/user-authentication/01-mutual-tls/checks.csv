@@ -1,0 +1,6 @@
+scenario,configuration,result,exit_code
+public_plaintext_listener,default,refused_before_world_creation,1
+partial_tls_configuration,default,refused_before_window_creation,1
+server_mods_link,full_debug,PDB_LIMIT_12,101
+workspace,limited_debug,827_passed_0_failed_0_ignored,0
+server_mods,limited_debug,197_passed_0_failed_0_ignored,0

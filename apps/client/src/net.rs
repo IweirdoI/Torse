@@ -67,6 +67,7 @@ pub struct Connection<T: Transport> {
     limits: CodecLimits,
     last_ping: Option<Instant>,
     retired: Option<SubscriptionId>,
+    tls_configuration: Option<MemoryLease>,
     memory: Option<MemoryLease>,
 }
 
@@ -86,6 +87,7 @@ impl<T: Transport> Connection<T> {
             limits: codec_limits(),
             last_ping: None,
             retired: None,
+            tls_configuration: None,
             memory: None,
         }
     }
@@ -309,20 +311,67 @@ impl<T: Transport> Connection<T> {
 
 impl Connection<torse_net::TcpTransport> {
     /// Connect over TCP to a standalone server.
-    pub fn connect(address: &str) -> Result<Connection<torse_net::TcpTransport>, Fault> {
-        let stream = std::net::TcpStream::connect(address)
-            .map_err(|error| Fault::invalid_data(error.to_string()))?;
-        let transport = torse_net::TcpTransport::new(
-            stream,
-            torse_net::TransportLimits {
-                frame: 8_388_608,
-                queued_frames: 32,
-                queued_bytes: 16_777_216,
-                poll_bytes: 262_144,
-            },
-        )?;
-        Ok(Connection::new(transport))
+    pub fn connect(
+        address: &str,
+        tls: Option<&TlsClient>,
+        pool: &MemoryPool,
+    ) -> Result<Connection<torse_net::TcpTransport>, Fault> {
+        use std::net::ToSocketAddrs;
+        let endpoint = address
+            .to_socket_addrs()
+            .map_err(|_| Fault::invalid_data("server address resolution failed"))?
+            .next()
+            .ok_or_else(|| Fault::invalid_data("empty server address"))?;
+        if tls.is_none() && !endpoint.ip().is_loopback() {
+            return Err(Fault::incompatible("remote connections require mutual TLS"));
+        }
+        let stream =
+            std::net::TcpStream::connect_timeout(&endpoint, std::time::Duration::from_secs(5))
+                .map_err(|error| Fault::invalid_data(error.to_string()))?;
+        let limits = torse_net::TransportLimits {
+            frame: 8_388_608,
+            queued_frames: 32,
+            queued_bytes: 16_777_216,
+            poll_bytes: 262_144,
+        };
+        let tls_configuration = tls
+            .map(|tls| -> Result<_, Fault> {
+                pool.reserve(
+                    MemoryClass::Resource,
+                    torse_net::tls::configuration_reservation(&[
+                        std::path::Path::new(&tls.ca),
+                        std::path::Path::new(&tls.certificate),
+                        std::path::Path::new(&tls.key),
+                    ])?,
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
+        let transport = match tls {
+            Some(tls) => torse_net::TcpTransport::tls_client(
+                stream,
+                limits,
+                torse_net::tls::client_config(
+                    std::path::Path::new(&tls.ca),
+                    std::path::Path::new(&tls.certificate),
+                    std::path::Path::new(&tls.key),
+                )?,
+                &tls.server_name,
+            )?,
+            None => torse_net::TcpTransport::new(stream, limits)?,
+        };
+        let mut connection = Connection::new(transport);
+        connection.tls_configuration = tls_configuration;
+        Ok(connection)
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct TlsClient {
+    pub ca: String,
+    pub certificate: String,
+    pub key: String,
+    pub server_name: String,
 }
 
 /// Build the same place or break call the local scene commits, for the

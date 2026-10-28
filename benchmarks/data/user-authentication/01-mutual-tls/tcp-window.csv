@@ -1,0 +1,4 @@
+"role","budget_mib","frames","walk_ticks","batches","session","requests_sent","requests_rejected","sections","meshes","ticks","durable_seq","memory_current_bytes","memory_peak_bytes"
+"server","512","","","","","","","","","240","2949","17030416","389062864"
+"alice","512","241","24","36","1","3","0","2","2","","","232459932","320163228"
+"bob","512","241","24","36","3","11","10","2","2","","","232460547","320163176"

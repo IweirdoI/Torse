@@ -2,6 +2,8 @@
 
 包名：`torse-server`。提供权威世界的持久执行、文件恢复、授权网络和可选Mod装配，可在无GPU环境中运行。主程序通过ExecutionHost驱动阶段任务，WorldHost保留可信本地事务示例。范围与证据见[执行与网络验证](../../benchmarks/B6-B7-execution-network.md)。
 
+明文演示只允许回环地址。对外监听必须配置`--tls-cert`、`--tls-key`、`--client-ca`和`--users`，按验证后的证书指纹选择用户权限、范围和玩家，不能叠加全局演示授权。重复登录、错误或过期凭据及重放的拒绝语义见[用户认证与连接策略](../../benchmarks/M5-user-authentication.md)。
+
 主程序通过`--memory-mib N`设置共享逻辑内存上限，默认512MiB。世界、执行、存储、订阅、传输和并行工作使用同一MemoryPool；预算不足暂停可重试工作，提交序号保持不变，关闭控制消息保留专用空间。库宿主在恢复后、注册会话前调用`Server::attach_memory`，并使用`NetworkHub::with_memory`。预留口径、失败释放及不包含的内存范围见[共享内存记录](../../benchmarks/M6-shared-memory.md)。
 
 | 文件 | 职责 |
@@ -92,7 +94,7 @@ Server的Tick驱动默认每批1条，可用`set_commit_batch_limit`设置1到10
 
 复现对照与故障验证见[运行态与批量提交](../../benchmarks/M6-runtime-commit.md)。当前简单事务的并行预验证实验未显示收益，因此继续使用串行事务准备与发布。
 
-NetworkHub通过应用协议版本3接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。真实用户认证与TLS尚待装配。
+NetworkHub通过应用协议版本3接收意图，可信actor由PeerPolicy和会话绑定。结果、查询、基线、增量及移动确认都经过DurableSeq门槛。撤权控制直接清空未发队列并关闭受影响Peer，慢连接不阻塞世界。图形客户端已接入授权镜像、编辑请求、独立移动输入和预测校正。双向TLS与按用户授权已接入，明文演示限制在回环地址。
 
 ## 联网玩家
 

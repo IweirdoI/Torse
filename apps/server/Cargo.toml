@@ -13,6 +13,8 @@ torse-diagnostics = { path = "../../crates/diagnostics" }
 torse-runtime = { path = "../../crates/runtime" }
 crc32c = "=0.6.8"
 sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 torse-codec = { path = "../../crates/codec" }
 torse-storage = { path = "../../crates/storage" }
 torse-types = { path = "../../crates/types" }

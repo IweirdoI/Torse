@@ -1,8 +1,11 @@
 //! Authenticated session/application assembly. Polling does bounded work outside
 //! the commit path. Only durable reads, seeds, results and deltas enter transports.
+use crate::authentication::IdentityVerifier;
 use crate::execution::{ExecutionHost, ExecutionModel};
 use crate::{HostAuthority, HostCheckpointStore, InvalidationSink, Server};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use torse_codec::{CodecLimits, wire};
 use torse_net::{SessionRegistry, Transport};
 use torse_protocol::PROTOCOL_VERSION;
@@ -206,6 +209,7 @@ pub struct PeerPolicy {
     pub scope: ReplicaScope,
 }
 struct Peer<T> {
+    user: Option<ContentKey>,
     player: Option<player::Control>,
     transport: T,
     policy: PeerPolicy,
@@ -214,6 +218,7 @@ struct Peer<T> {
     waiting: BTreeSet<u64>,
     closed: bool,
     last_tick: Tick,
+    last_activity: Instant,
     deferred: Option<ReplicaScope>,
     codec: Option<MemoryLease>,
     memory: Option<MemoryLease>,
@@ -226,6 +231,9 @@ pub struct NetworkHub<T> {
     binding: Binding,
     memory: Option<MemoryPool>,
     codec: Option<MemoryLease>,
+    authentication: Option<Arc<dyn IdentityVerifier>>,
+    _authentication_memory: Option<MemoryLease>,
+    connection_timeout: Option<Duration>,
 }
 impl<T: Transport> NetworkHub<T> {
     pub fn new(binding: Binding, limits: NetworkLimits) -> Result<Self, Fault> {
@@ -255,6 +263,9 @@ impl<T: Transport> NetworkHub<T> {
             binding,
             memory: None,
             codec: None,
+            authentication: None,
+            _authentication_memory: None,
+            connection_timeout: None,
         })
     }
     pub fn with_memory(
@@ -279,6 +290,12 @@ impl<T: Transport> NetworkHub<T> {
         })
     }
     pub fn add(&mut self, mut transport: T, policy: PeerPolicy, tick: Tick) -> Result<u128, Fault> {
+        if self.authentication.is_some()
+            && transport.security() == torse_net::tls::TransportSecurity::Unprotected
+        {
+            transport.close();
+            return Err(Fault::incompatible("authenticated hub requires mutual TLS"));
+        }
         if self.peers.len() >= self.limits.peers || self.next == u128::MAX {
             return Err(Fault::resource_limit("peer capacity"));
         }
@@ -302,6 +319,7 @@ impl<T: Transport> NetworkHub<T> {
         self.peers.insert(
             id,
             Peer {
+                user: None,
                 player: None,
                 transport,
                 policy,
@@ -310,12 +328,50 @@ impl<T: Transport> NetworkHub<T> {
                 waiting: BTreeSet::new(),
                 closed: false,
                 last_tick: tick,
+                last_activity: Instant::now(),
                 deferred: None,
                 codec: None,
                 memory,
             },
         );
         Ok(id)
+    }
+    /// Install before accepting peers. A user may have only one live connection.
+    pub fn require_authentication(
+        &mut self,
+        verifier: Arc<dyn IdentityVerifier>,
+    ) -> Result<(), Fault> {
+        if !self.peers.is_empty() || self.authentication.is_some() {
+            return Err(Fault::invalid_data("authentication requires a fresh hub"));
+        }
+        let memory = self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    MemoryClass::Resource,
+                    verifier.accounted_bytes(),
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
+        self.authentication = Some(verifier);
+        self.connection_timeout
+            .get_or_insert(Duration::from_secs(60));
+        self._authentication_memory = memory;
+        Ok(())
+    }
+    pub fn user(&self, id: u128) -> Option<&ContentKey> {
+        self.peers.get(&id)?.user.as_ref()
+    }
+    pub fn set_connection_timeout(&mut self, timeout: Duration) -> Result<(), Fault> {
+        if timeout < torse_protocol::HEARTBEAT_INTERVAL * 3 {
+            return Err(Fault::invalid_data(
+                "connection timeout requires three heartbeat intervals",
+            ));
+        }
+        self.connection_timeout = Some(timeout);
+        Ok(())
     }
     pub fn contains(&self, id: u128) -> bool {
         self.peers.contains_key(&id)
@@ -349,6 +405,15 @@ impl<T: Transport> NetworkHub<T> {
             .ok_or_else(|| Fault::invalid_data("unknown peer"))?;
         if peer.closed {
             return Err(Fault::invalid_data("closed peer"));
+        }
+        if peer
+            .user
+            .as_ref()
+            .is_some_and(|user| user != policy.actor.principal())
+        {
+            return Err(Fault::invalid_data(
+                "scope replacement cannot change the authenticated user",
+            ));
         }
         let policy_bytes = policy
             .actor
@@ -587,10 +652,30 @@ impl<T: Transport> NetworkHub<T> {
         &mut self,
         server: &mut Server<ExecutionHost, J, S>,
     ) -> Result<(), Fault> {
+        self.poll_at(server, Instant::now())
+    }
+    /// An explicit monotonic clock permits deterministic connection-deadline tests.
+    pub fn poll_at<J: CommitJournal<ExecutionModel>, S: HostCheckpointStore<ExecutionModel>>(
+        &mut self,
+        server: &mut Server<ExecutionHost, J, S>,
+        now: Instant,
+    ) -> Result<(), Fault> {
         if server.binding() != self.binding {
             return Err(Fault::invalid_data("hub binding mismatch"));
         }
         let tick = server.authority()?.resume_point().tick;
+        let mut users: BTreeSet<_> = self
+            .peers
+            .values()
+            .filter(|peer| !peer.closed)
+            .filter_map(|peer| peer.user.clone())
+            .collect();
+        let mut players: BTreeSet<_> = self
+            .peers
+            .values()
+            .filter(|peer| !peer.closed)
+            .filter_map(|peer| peer.player.as_ref().map(|player| player.entity))
+            .collect();
         for peer in self.peers.values_mut() {
             if peer.closed {
                 continue;
@@ -599,7 +684,16 @@ impl<T: Transport> NetworkHub<T> {
             // budgets must still allow an unsubscribe or close to be decoded.
             peer.codec = self.codec.take();
             let result = (|| -> Result<(), Fault> {
-                if tick.0.saturating_sub(peer.last_tick.0) > self.limits.idle_ticks {
+                if tick.0.saturating_sub(peer.last_tick.0) > self.limits.idle_ticks
+                    || (if peer.viewer.is_none() && self.authentication.is_some() {
+                        Some(Duration::from_secs(15))
+                    } else {
+                        self.connection_timeout
+                    })
+                    .is_some_and(|timeout| {
+                        now.saturating_duration_since(peer.last_activity) > timeout
+                    })
+                {
                     return Err(Fault::invalid_data("idle peer"));
                 }
                 peer.transport.poll()?;
@@ -607,8 +701,52 @@ impl<T: Transport> NetworkHub<T> {
                     let Some(bytes) = peer.transport.receive()? else {
                         break;
                     };
-                    let message = wire::decode(&bytes, self.limits.budget, self.limits.codec)?;
+                    let message: ClientMessage =
+                        wire::decode(&bytes, self.limits.budget, self.limits.codec)?;
+                    if matches!(&message, ClientMessage::Hello { .. })
+                        && let Some(verifier) = &self.authentication
+                    {
+                        if peer.viewer.is_some() {
+                            return Err(Fault::invalid_data("duplicate authenticated handshake"));
+                        }
+                        if !matches!(
+                            peer.transport.security(),
+                            torse_net::tls::TransportSecurity::MutualTls(_)
+                        ) {
+                            return Err(Fault::incompatible("TLS identity is not verified"));
+                        }
+                        let grant = verifier.verify(peer.transport.security())?;
+                        grant.validate(server.authority()?.replica_section_limit())?;
+                        if users.contains(&grant.user)
+                            || grant.player.is_some_and(|entity| players.contains(&entity))
+                        {
+                            return Err(Fault::incompatible(
+                                "authenticated user or player is already connected",
+                            ));
+                        }
+                        let policy_bytes = grant
+                            .actor
+                            .accounted_bytes()
+                            .saturating_mul(2)
+                            .saturating_add(grant.scope.sections.len() as u64 * 8192)
+                            .saturating_add(self.limits.movement_bytes)
+                            .saturating_add(self.limits.outstanding as u64 * 512);
+                        if let Some(memory) = &mut peer.memory {
+                            memory.resize(policy_bytes)?;
+                        }
+                        users.insert(grant.user.clone());
+                        peer.user = Some(grant.user);
+                        peer.policy = PeerPolicy {
+                            actor: grant.actor,
+                            scope: grant.scope,
+                        };
+                        peer.player = grant.player.map(|entity| {
+                            players.insert(entity);
+                            player::Control::new(entity, self.limits.movement_inputs)
+                        });
+                    }
                     peer.last_tick = tick;
+                    peer.last_activity = now;
                     Self::handle(peer, &mut self.sessions, server, message, self.limits)?;
                     if peer.closed {
                         return Ok(());

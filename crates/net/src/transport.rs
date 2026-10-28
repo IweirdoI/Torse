@@ -32,6 +32,9 @@ impl TransportLimits {
     }
 }
 pub trait Transport {
+    fn security(&self) -> crate::tls::TransportSecurity {
+        crate::tls::TransportSecurity::Unprotected
+    }
     fn attach_memory(&mut self, _pool: MemoryPool) -> Result<(), Fault> {
         Err(Fault::incompatible(
             "transport does not support shared memory reservations",
@@ -145,6 +148,7 @@ impl Drop for MemoryTransport {
 }
 pub struct TcpTransport {
     stream: TcpStream,
+    tls: Option<crate::tls::Tls>,
     limits: TransportLimits,
     input: Vec<u8>,
     ready: VecDeque<Vec<u8>>,
@@ -154,6 +158,7 @@ pub struct TcpTransport {
     ready_bytes: usize,
     closed: bool,
     memory: Option<MemoryLease>,
+    tls_memory: Option<MemoryLease>,
 }
 impl TcpTransport {
     pub fn new(stream: TcpStream, limits: TransportLimits) -> Result<Self, Fault> {
@@ -162,6 +167,7 @@ impl TcpTransport {
         stream.set_nodelay(true).map_err(io_fault)?;
         Ok(Self {
             stream,
+            tls: None,
             limits,
             input: Vec::new(),
             ready: VecDeque::new(),
@@ -171,16 +177,43 @@ impl TcpTransport {
             ready_bytes: 0,
             closed: false,
             memory: None,
+            tls_memory: None,
         })
     }
+    pub fn tls_server(
+        stream: TcpStream,
+        limits: TransportLimits,
+        config: Arc<rustls::ServerConfig>,
+    ) -> Result<Self, Fault> {
+        let mut transport = Self::new(stream, limits)?;
+        transport.tls = Some(crate::tls::Tls::server(config)?);
+        Ok(transport)
+    }
+    pub fn tls_client(
+        stream: TcpStream,
+        limits: TransportLimits,
+        config: Arc<rustls::ClientConfig>,
+        name: &str,
+    ) -> Result<Self, Fault> {
+        let mut transport = Self::new(stream, limits)?;
+        transport.tls = Some(crate::tls::Tls::client(config, name)?);
+        Ok(transport)
+    }
     fn pump(&mut self) -> Result<(), Fault> {
+        if let Some(tls) = &mut self.tls {
+            tls.pump(&mut self.stream, self.limits.poll_bytes.div_ceil(2))?;
+        }
         let mut remaining = self.limits.poll_bytes;
         let mut buffer = [0u8; 8192];
         let mut operations = 64;
         while remaining > 0 && operations > 0 {
             operations -= 1;
             let n = buffer.len().min(remaining);
-            match self.stream.read(&mut buffer[..n]) {
+            let read = match &mut self.tls {
+                Some(tls) => tls.connection.reader().read(&mut buffer[..n]),
+                None => self.stream.read(&mut buffer[..n]),
+            };
+            match read {
                 Ok(0) => return Err(closed()),
                 Ok(n) => {
                     if n > self
@@ -226,7 +259,12 @@ impl TcpTransport {
                 break;
             };
             let end = front.len().min(self.offset + remaining);
-            match self.stream.write(&front[self.offset..end]) {
+            let written = match &mut self.tls {
+                Some(tls) => tls.connection.writer().write(&front[self.offset..end]),
+                None => self.stream.write(&front[self.offset..end]),
+            };
+            match written {
+                Ok(0) if self.tls.is_some() => break,
                 Ok(0) => return Err(closed()),
                 Ok(n) => {
                     remaining -= n;
@@ -242,6 +280,9 @@ impl TcpTransport {
                 Err(e) => return Err(io_fault(e)),
             }
         }
+        if let Some(tls) = &mut self.tls {
+            tls.pump(&mut self.stream, self.limits.poll_bytes.div_ceil(2))?;
+        }
         Ok(())
     }
 }
@@ -249,11 +290,29 @@ fn io_fault(e: std::io::Error) -> Fault {
     Fault::new(FaultCode::InvalidState, format!("transport I/O: {e}"))
 }
 impl Transport for TcpTransport {
+    fn security(&self) -> crate::tls::TransportSecurity {
+        self.tls.as_ref().map_or(
+            crate::tls::TransportSecurity::Unprotected,
+            crate::tls::Tls::security,
+        )
+    }
     fn attach_memory(&mut self, pool: MemoryPool) -> Result<(), Fault> {
         if self.memory.is_some() {
             return Err(Fault::invalid_data("transport memory already attached"));
         }
-        self.memory = Some(self.limits.reserve(&pool)?);
+        let memory = self.limits.reserve(&pool)?;
+        self.tls_memory = self
+            .tls
+            .as_ref()
+            .map(|_| {
+                pool.reserve(
+                    MemoryClass::Replica,
+                    crate::tls::RESERVATION_BYTES,
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()?;
+        self.memory = Some(memory);
         Ok(())
     }
     fn send(&mut self, frame: Vec<u8>) -> Result<(), Fault> {
@@ -302,6 +361,8 @@ impl Transport for TcpTransport {
         self.queued = 0;
         self.ready_bytes = 0;
         let _ = self.stream.shutdown(Shutdown::Both);
+        self.tls = None;
+        self.tls_memory = None;
         self.memory = None;
     }
 }

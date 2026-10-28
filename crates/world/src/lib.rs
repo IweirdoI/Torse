@@ -40,7 +40,8 @@ pub use archive::{
 };
 pub use block_instance::{BlockInstance, block_instance_schema};
 pub use collider::{
-    COLLIDER_SCALE, EntityCollider, MAX_COLLIDER_EXTENT, collider_owner, collider_schema,
+    COLLIDER_SCALE, EntityCollider, MAX_COLLIDER_EXTENT, collider_owner, collider_permission,
+    collider_schema,
 };
 pub use component::{
     ComponentError, ComponentFields, ComponentSchemas, ComponentSet, ComponentValue,

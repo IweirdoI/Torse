@@ -14,6 +14,11 @@ pub fn collider_schema() -> ContentKey {
 pub fn collider_owner() -> ContentKey {
     key("core:module/physics")
 }
+/// Host permission required to plan a body transition. It is not implied by
+/// inventory, visibility, or the caller's module name.
+pub fn collider_permission() -> ContentKey {
+    key("core:permission/collider")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntityCollider {

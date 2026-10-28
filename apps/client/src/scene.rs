@@ -61,11 +61,13 @@ pub struct Vertex {
     pub tint: [f32; 3],
     /// Position tint for the overlay material.
     pub overlay_tint: [f32; 3],
+    /// Negative selects directional shading; otherwise resolved brightness.
+    pub light: f32,
 }
 
 impl Vertex {
     /// Bytes per interleaved vertex.
-    pub const STRIDE: usize = 64;
+    pub const STRIDE: usize = 68;
 
     fn write(&self, out: &mut Vec<u8>) {
         for value in self
@@ -81,6 +83,7 @@ impl Vertex {
         for value in self.tint.iter().chain(self.overlay_tint.iter()) {
             out.extend_from_slice(&value.to_le_bytes());
         }
+        out.extend_from_slice(&self.light.to_le_bytes());
     }
 }
 
@@ -122,7 +125,9 @@ pub struct Scene {
     tint_provider_generation: u64,
     memory: Option<memory::Memory>,
     startup_notice: Option<String>,
+    lighting: Option<lighting::Lighting>,
 }
+mod lighting;
 mod memory;
 
 /// One content pack for every client mode, matching the server demo assembly
@@ -254,6 +259,7 @@ impl Scene {
             side,
             radius,
             meshes: BTreeMap::new(),
+            lighting: None,
             sections: Vec::new(),
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
@@ -306,6 +312,7 @@ impl Scene {
             side: snapshot.side,
             radius: 0,
             meshes: BTreeMap::new(),
+            lighting: None,
             sections: Vec::new(),
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
@@ -592,6 +599,7 @@ impl Scene {
                     overlay_material: u32::MAX,
                     tint: [1.0; 3],
                     overlay_tint: [1.0; 3],
+                    light: -1.0,
                 });
             }
         }
@@ -984,15 +992,9 @@ impl Scene {
             ) else {
                 break;
             };
+            let view = self.lighting.as_ref().map(|lighting| lighting.view(self));
             let mesh = build_mesh_optimized(self.side, pos, |query| {
-                sample(
-                    self.authority.store(),
-                    self.authority.registry(),
-                    &self.state_materials,
-                    &self.palette,
-                    self.tint_provider.as_deref(),
-                    query,
-                )
+                sample_visual(self, view.as_ref(), query)
             });
             let lease = match work {
                 Some(mut work) => loop {
@@ -1072,6 +1074,7 @@ impl Scene {
             side,
             radius,
             meshes: BTreeMap::new(),
+            lighting: None,
             sections: Vec::new(),
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
@@ -1112,6 +1115,9 @@ impl Scene {
     }
 
     pub fn refresh_visuals(&mut self, budget: usize) -> Result<Vec<SectionPos>, String> {
+        if budget > 0 {
+            self.refresh_lighting(16_384)?;
+        }
         let Some(mut background) = self.background.take() else {
             return Ok(self.refresh_meshes_bounded(budget));
         };
@@ -1166,7 +1172,7 @@ impl Scene {
         let (_, mesh) = self.meshes.get(&pos)?;
         let offset = [
             pos.x as f32 * self.side as f32,
-            0.0,
+            pos.y as f32 * self.side as f32,
             pos.z as f32 * self.side as f32,
         ];
         let mut vertices = Vec::with_capacity(mesh.positions.len());
@@ -1188,6 +1194,7 @@ impl Scene {
                 },
                 tint: mesh.tints[index],
                 overlay_tint: mesh.overlay_tints[index],
+                light: mesh.shades[index],
             });
         }
         indices.extend(mesh.indices.iter().copied());
@@ -1219,7 +1226,7 @@ impl Scene {
         for (pos, (_, mesh)) in &self.meshes {
             let offset = [
                 pos.x as f32 * self.side as f32,
-                0.0,
+                pos.y as f32 * self.side as f32,
                 pos.z as f32 * self.side as f32,
             ];
             let base = vertices.len() as u32;
@@ -1240,6 +1247,7 @@ impl Scene {
                     },
                     tint: mesh.tints[index],
                     overlay_tint: mesh.overlay_tints[index],
+                    light: mesh.shades[index],
                 });
             }
             indices.extend(mesh.indices.iter().map(|value| base + value));
@@ -1375,6 +1383,7 @@ fn push_entity_box(
                 overlay_material: u32::MAX,
                 tint: [1.0; 3],
                 overlay_tint: [1.0; 3],
+                light: -1.0,
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -1429,11 +1438,33 @@ fn sample(
                 face_overlays: Some(materials.overlays),
                 face_tints: Some(face_tints),
                 face_overlay_tints: Some(face_overlay_tints),
+                face_shades: None,
             })
         }
         TerrainQuery::NotLoaded => MeshSample::NotLoaded,
         TerrainQuery::OutOfBounds => MeshSample::OutOfBounds,
     }
+}
+
+fn sample_visual(
+    scene: &Scene,
+    lighting: Option<&lighting::View<'_>>,
+    pos: BlockPos,
+) -> MeshSample {
+    let mut value = sample(
+        scene.authority.store(),
+        scene.authority.registry(),
+        &scene.state_materials,
+        &scene.palette,
+        scene.tint_provider.as_deref(),
+        pos,
+    );
+    if let (Some(view), MeshSample::Ready(block)) = (lighting, &mut value)
+        && block.bounds.is_some()
+    {
+        view.shade(scene, pos, block);
+    }
+    value
 }
 
 fn render_box(shape: &Shape) -> Option<RenderBox> {
@@ -1670,6 +1701,7 @@ mod tests {
             overlay_material: u32::MAX,
             tint: [1.0; 3],
             overlay_tint: [1.0; 3],
+            light: -1.0,
         }];
         let bytes = Scene::vertex_bytes(&vertices);
         assert_eq!(bytes.len(), Vertex::STRIDE);
@@ -2003,6 +2035,22 @@ mod tests {
         // Streaming must not fabricate terrain around the mirror.
         scene.load_around(SectionPos::new(5, 0, 5)).expect("noop");
         assert_eq!(scene.sections().len(), 2);
+    }
+
+    #[test]
+    fn both_geometry_paths_preserve_vertical_section_offsets() {
+        let mut snapshot = replica_snapshot();
+        snapshot.entities.clear();
+        snapshot.sections = vec![SnapshotSection {
+            pos: SectionPos::new(0, 1, 0),
+            cells: SnapshotCells::Uniform(BlockStateId(7)),
+        }];
+        let mut scene = Scene::from_snapshot(&snapshot).unwrap();
+        scene.refresh_meshes();
+        let (vertices, _) = scene.section_geometry(SectionPos::new(0, 1, 0)).unwrap();
+        assert!(vertices.iter().all(|v| v.position[1] >= 16.0));
+        assert!(vertices.iter().any(|v| v.position[1] == 32.0));
+        assert_eq!(scene.geometry().0, vertices);
     }
 
     #[test]

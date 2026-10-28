@@ -328,6 +328,17 @@ fn run(
             .apply_edit(true, &key, torse_types::BlockPos::new(*x, *y, *z), 0)
             .map_err(|error| format!("--place `{material}`: {error}"))?;
     }
+    scene.enable_lighting()?;
+    let mut resolved = false;
+    for _ in 0..4096 {
+        if scene.refresh_lighting(16_384)? {
+            resolved = true;
+            break;
+        }
+    }
+    if !resolved {
+        return Err("lighting did not fit the capture budget".into());
+    }
     let _frame = scene
         .reserve_frame_memory(u64::from(width) * u64::from(height) * 16 + 64 * 1024 * 1024)
         .map_err(|error| error.to_string())?;
@@ -346,8 +357,11 @@ fn run(
     let vertex_bytes = Scene::vertex_bytes(&vertices);
 
     let mut renderer = Renderer::new(width, height)?;
+    renderer.attach_memory(pool.clone());
     renderer.set_palette(scene.palette());
-    renderer.upload_section(torse_types::SectionPos::ZERO, &vertex_bytes, &indices);
+    if !renderer.upload_section(torse_types::SectionPos::ZERO, &vertex_bytes, &indices) {
+        return Err("terrain upload metadata exceeds memory budget".into());
+    }
 
     let (eye, target) = match view {
         "player" => {
@@ -357,10 +371,12 @@ fn run(
         _ => ([40.0, 18.0, 40.0], [0.0, 6.0, 0.0]),
     };
     let camera = Camera::new(eye, target);
-    renderer.render(
+    if !renderer.render(
         camera.view_projection(width as f32 / height as f32),
         camera.eye,
-    );
+    ) {
+        return Err("transparent sorting exceeds memory budget".into());
+    }
     if let Some(mode) = ui_preview {
         renderer.render_ui(mode)?;
     }

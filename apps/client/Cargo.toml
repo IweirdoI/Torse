@@ -5,6 +5,9 @@ edition.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+gpu-tests = []
+
 [dependencies]
 ab_glyph = "=0.2.32"
 pollster = "0.4.0"

@@ -1,0 +1,5 @@
+scenario,x,y,r,g,b
+near_red_far_blue,64,32,211,116,179
+reversed_section_assignment,64,32,211,116,179
+brightness_0_2,32,32,52,52,52
+brightness_1_0,96,32,255,255,255

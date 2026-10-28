@@ -8,6 +8,9 @@ pub(super) fn eligible(block: RenderBlock) -> bool {
         && block
             .face_overlays
             .is_none_or(|faces| faces.iter().all(Option::is_none))
+        && block
+            .face_shades
+            .is_none_or(|faces| faces.iter().all(|face| face.iter().all(|n| *n == face[0])))
 }
 
 pub(super) fn emit(
@@ -115,6 +118,27 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn varying_corner_brightness_prevents_merging_and_reaches_vertices() {
+        let mut block = RenderBlock::uniform(1);
+        block.face_shades = Some([[32, 64, 128, 255]; 6]);
+        let sample = |p: BlockPos| {
+            if p.y == 0 && p.z == 0 && (0..2).contains(&p.x) {
+                MeshSample::Ready(block)
+            } else {
+                MeshSample::NotLoaded
+            }
+        };
+        let reference = build_mesh(2, SectionPos::ZERO, sample);
+        let optimized =
+            build_mesh_optimized_bounded(2, SectionPos::ZERO, sample, || false, 48).unwrap();
+        assert_eq!(reference, optimized);
+        assert_eq!(
+            &optimized.shades[..4],
+            &[32.0 / 255.0, 64.0 / 255.0, 128.0 / 255.0, 1.0]
+        );
+    }
 
     // Rasterize axis-aligned quads at half-cell resolution. This compares
     // coverage, winding, materials and tints independently of quad splitting.

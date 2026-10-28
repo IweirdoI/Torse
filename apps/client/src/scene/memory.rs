@@ -22,6 +22,18 @@ pub(super) fn mesh_work_bytes(side: u32) -> u64 {
         .saturating_add(32768 + 16384)
 }
 impl Scene {
+    pub(super) fn resize_visual_control(&mut self) -> Result<(), Fault> {
+        if let Some(memory) = &mut self.memory {
+            let wanted = ((self.radius * 2 + 1).pow(2) * self.layers) as u64;
+            memory._control.resize(
+                wanted
+                    .saturating_mul(256)
+                    .saturating_add(self.state_materials.len() as u64 * 4096)
+                    .saturating_add(4096),
+            )?;
+        }
+        Ok(())
+    }
     pub fn startup_world_reservation(pool: &MemoryPool, radius: i64) -> Result<MemoryLease, Fault> {
         if !(0..=16).contains(&radius) {
             return Err(Fault::invalid_data("scene radius must be 0..=16"));

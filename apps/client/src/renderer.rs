@@ -67,6 +67,7 @@ struct VertexIn {
     @location(4) overlay_material: u32,
     @location(5) tint: vec3<f32>,
     @location(6) overlay_tint: vec3<f32>,
+    @location(7) light: f32,
 };
 
 struct VertexOut {
@@ -78,6 +79,7 @@ struct VertexOut {
     @location(4) tint: vec3<f32>,
     @location(5) overlay_tint: vec3<f32>,
     @location(6) world: vec3<f32>,
+    @location(7) light: f32,
 };
 
 fn sample_surface(surface: Surface, uv: vec2<f32>) -> vec4<f32> {
@@ -141,6 +143,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     out.tint = input.tint;
     out.overlay_tint = input.overlay_tint;
     out.world = input.position;
+    out.light = input.light;
     return out;
 }
 
@@ -190,7 +193,7 @@ fn fs_main(
     let sky = srgb_encode(vec3<f32>(0.66, 0.74, 0.80));
     let distance = length(input.world - camera.eye.xyz);
     let fog = clamp(1.0 - exp(-distance * 0.0028), 0.0, 0.72);
-    let lit = color * face_shade(normal);
+    let lit = color * select(input.light, face_shade(normal), input.light < 0.0);
     return vec4<f32>(srgb_decode(mix(lit, sky, fog)), alpha);
 }
 "#;
@@ -256,7 +259,7 @@ pub const SKY: Color = Color {
 const MAX_LINE_VERTICES: usize = 24;
 
 /// Bytes per terrain vertex: position, normal, uv, and one material slot.
-const VERTEX_STRIDE: usize = 64;
+const VERTEX_STRIDE: usize = 68;
 
 /// Material table bytes: rect plus tint per surface.
 const SURFACE_BYTES: u64 = 64;
@@ -270,6 +273,9 @@ pub struct GpuContext {
     device: Device,
     queue: Queue,
     pipeline: RenderPipeline,
+    transparent_pipeline: RenderPipeline,
+    memory: Option<torse_types::MemoryPool>,
+    view_projection: std::cell::Cell<[f32; 16]>,
     line_pipeline: RenderPipeline,
     sky_pipeline: RenderPipeline,
     camera: Buffer,
@@ -300,7 +306,88 @@ struct PaletteBinding {
 struct SectionBuffers {
     vertices: Buffer,
     indices: Buffer,
-    index_count: u32,
+    opaque_count: u32,
+    transparent: Vec<TransparentFace>,
+    _memory: Option<torse_types::MemoryLease>,
+}
+
+struct TransparentFace {
+    center: [f32; 3],
+    first_index: u32,
+}
+
+fn split_faces(
+    bytes: &[u8],
+    indices: &[u32],
+    surfaces: &[crate::texture::Surface],
+) -> Option<(Vec<u32>, u32, Vec<TransparentFace>)> {
+    if !bytes.len().is_multiple_of(VERTEX_STRIDE)
+        || !indices.len().is_multiple_of(6)
+        || indices.len() > u32::MAX as usize
+    {
+        return None;
+    }
+    let mut opaque = Vec::with_capacity(indices.len());
+    let mut blended = Vec::new();
+    let mut faces = Vec::new();
+    let u32_at = |vertex: &[u8], offset| {
+        u32::from_le_bytes(vertex[offset..offset + 4].try_into().expect("vertex field"))
+    };
+    for quad in indices.chunks_exact(6) {
+        let mut center = [0.0; 3];
+        let first = bytes.get(
+            quad[0] as usize * VERTEX_STRIDE..quad[0] as usize * VERTEX_STRIDE + VERTEX_STRIDE,
+        )?;
+        let blend = [u32_at(first, 32), u32_at(first, 36)]
+            .into_iter()
+            .any(|slot| {
+                surfaces
+                    .get(slot as usize)
+                    .is_some_and(|s| s.alpha == torse_content::AlphaMode::Blend)
+            });
+        for index in quad {
+            let vertex = bytes.get(
+                *index as usize * VERTEX_STRIDE..*index as usize * VERTEX_STRIDE + VERTEX_STRIDE,
+            )?;
+            for axis in 0..3 {
+                center[axis] += f32::from_le_bytes(
+                    vertex[axis * 4..axis * 4 + 4]
+                        .try_into()
+                        .expect("position field"),
+                ) / 6.0;
+            }
+        }
+        if center.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        if blend {
+            faces.push(TransparentFace {
+                center,
+                first_index: blended.len() as u32,
+            });
+            blended.extend_from_slice(quad);
+        } else {
+            opaque.extend_from_slice(quad);
+        }
+    }
+    let count = opaque.len() as u32;
+    for face in &mut faces {
+        face.first_index += count;
+    }
+    opaque.extend_from_slice(&blended);
+    faces.shrink_to_fit();
+    Some((opaque, count, faces))
+}
+
+fn face_depth(matrix: &[f32; 16], center: [f32; 3]) -> f32 {
+    matrix[3] * center[0] + matrix[7] * center[1] + matrix[11] * center[2] + matrix[15]
+}
+
+fn compare_faces(
+    a: (f32, torse_types::SectionPos, u32),
+    b: (f32, torse_types::SectionPos, u32),
+) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
 }
 
 impl GpuContext {
@@ -425,6 +512,11 @@ impl GpuContext {
                 offset: 52,
                 shader_location: 6,
             },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 64,
+                shader_location: 7,
+            },
         ];
         let terrain_vertex_state = VertexState {
             module: &terrain_shader,
@@ -436,32 +528,40 @@ impl GpuContext {
                 attributes: &attributes,
             })],
         };
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("client terrain pipeline"),
-            layout: Some(&terrain_pipeline_layout),
-            vertex: terrain_vertex_state,
-            fragment: Some(FragmentState {
-                module: &terrain_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(ColorTargetState {
-                    format: color_format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_pipeline = |transparent| {
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("client terrain pipeline"),
+                layout: Some(&terrain_pipeline_layout),
+                vertex: terrain_vertex_state.clone(),
+                fragment: Some(FragmentState {
+                    module: &terrain_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: color_format,
+                        blend: Some(if transparent {
+                            BlendState::ALPHA_BLENDING
+                        } else {
+                            BlendState::REPLACE
+                        }),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(!transparent),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline(false);
+        let transparent_pipeline = make_pipeline(true);
         // The outline only reads depth, so it never occludes the terrain it
         // marks. It ignores texture coordinates and material slots.
         let line_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -559,6 +659,9 @@ impl GpuContext {
             device,
             queue,
             pipeline,
+            transparent_pipeline,
+            memory: None,
+            view_projection: std::cell::Cell::new([0.0; 16]),
             line_pipeline,
             sky_pipeline,
             camera,
@@ -578,12 +681,17 @@ impl GpuContext {
         (&self.device, &self.queue)
     }
 
+    pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) {
+        assert!(self.terrain.is_empty());
+        self.memory = Some(pool);
+    }
+
     /// Upload the atlas and material table used by the terrain pass.
     ///
-    /// Calling this again replaces the previous pack. Sections keep their
-    /// vertex buffers because material slots are session-stable; content must
-    /// be recompiled when the pack changes its material set.
+    /// Replacing the pack clears sections because alpha classification and
+    /// material slots belong to that pack. The host uploads its new meshes.
     pub fn set_palette(&mut self, palette: &Palette) {
+        self.terrain.clear();
         self.animation_origin = Instant::now();
         let materials = self.device.create_buffer(&BufferDescriptor {
             label: Some("client material table"),
@@ -692,11 +800,51 @@ impl GpuContext {
         section: torse_types::SectionPos,
         vertex_bytes: &[u8],
         indices: &[u32],
-    ) {
+    ) -> bool {
         if vertex_bytes.is_empty() || indices.is_empty() {
             self.terrain.remove(&section);
-            return;
+            return true;
         }
+        use torse_types::{EvictionRank, MemoryClass};
+        let metadata = match self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    MemoryClass::Mesh,
+                    (indices.len() / 6 * size_of::<TransparentFace>() + 512) as u64,
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(_) => return false,
+        };
+        let _scratch = match self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    MemoryClass::Codec,
+                    (indices.len() * 12 + 512) as u64,
+                    EvictionRank::Pinned,
+                )
+            })
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(_) => return false,
+        };
+        let surfaces = self
+            .palette
+            .as_ref()
+            .map_or(&[][..], |p| p.surfaces.as_slice());
+        let Some((indices, opaque_count, transparent)) =
+            split_faces(vertex_bytes, indices, surfaces)
+        else {
+            return false;
+        };
         use wgpu::util::DeviceExt;
         let buffers = SectionBuffers {
             vertices: self
@@ -710,12 +858,15 @@ impl GpuContext {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("client terrain indices"),
-                    contents: &by_index_bytes(indices),
+                    contents: &by_index_bytes(&indices),
                     usage: BufferUsages::INDEX,
                 }),
-            index_count: indices.len() as u32,
+            opaque_count,
+            transparent,
+            _memory: metadata,
         };
         self.terrain.insert(section, buffers);
+        true
     }
 
     /// Drop the buffers of unloaded sections.
@@ -730,6 +881,7 @@ impl GpuContext {
 
     /// Stage the camera matrix for the next frame.
     pub fn write_camera(&self, view_projection: [f32; 16], eye: [f32; 3]) {
+        self.view_projection.set(view_projection);
         self.queue
             .write_buffer(&self.camera, 0, &matrix_bytes(view_projection));
         let mut position = [0f32; 4];
@@ -756,7 +908,41 @@ impl GpuContext {
         encoder: &mut CommandEncoder,
         color: &TextureView,
         depth: &TextureView,
-    ) {
+    ) -> bool {
+        let count = self
+            .terrain
+            .values()
+            .map(|section| section.transparent.len())
+            .sum::<usize>();
+        let _sort = match self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    torse_types::MemoryClass::Codec,
+                    (count * size_of::<(f32, torse_types::SectionPos, &SectionBuffers, u32)>())
+                        as u64,
+                    torse_types::EvictionRank::Pinned,
+                )
+            })
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(_) => return false,
+        };
+        let mut transparent = Vec::with_capacity(count);
+        let matrix = self.view_projection.get();
+        for (pos, section) in &self.terrain {
+            for face in &section.transparent {
+                transparent.push((
+                    face_depth(&matrix, face.center),
+                    *pos,
+                    section,
+                    face.first_index,
+                ));
+            }
+        }
+        transparent.sort_unstable_by(|a, b| compare_faces((a.0, a.1, a.3), (b.0, b.1, b.3)));
         if let Some(palette) = &self.palette {
             self.queue.write_buffer(
                 &palette.materials,
@@ -794,12 +980,18 @@ impl GpuContext {
             pass.set_bind_group(0, &self.camera_bind, &[]);
             pass.set_bind_group(1, &palette.bind, &[]);
             for section in self.terrain.values() {
-                if section.index_count == 0 {
+                if section.opaque_count == 0 {
                     continue;
                 }
                 pass.set_vertex_buffer(0, section.vertices.slice(..));
                 pass.set_index_buffer(section.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..section.index_count, 0, 0..1);
+                pass.draw_indexed(0..section.opaque_count, 0, 0..1);
+            }
+            pass.set_pipeline(&self.transparent_pipeline);
+            for (_, _, section, index) in transparent {
+                pass.set_vertex_buffer(0, section.vertices.slice(..));
+                pass.set_index_buffer(section.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(index..index + 6, 0, 0..1);
             }
         }
         if self.line_count > 0 {
@@ -808,6 +1000,7 @@ impl GpuContext {
             pass.set_vertex_buffer(0, self.line_buffer.slice(..));
             pass.draw(0..self.line_count, 0..1);
         }
+        true
     }
 }
 
@@ -822,6 +1015,9 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) {
+        self.context.attach_memory(pool);
+    }
     /// Create a headless renderer.
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         let session = torse_render::open_headless()?;
@@ -882,12 +1078,12 @@ impl Renderer {
         section: torse_types::SectionPos,
         vertex_bytes: &[u8],
         indices: &[u32],
-    ) {
-        self.context.upload_section(section, vertex_bytes, indices);
+    ) -> bool {
+        self.context.upload_section(section, vertex_bytes, indices)
     }
 
     /// Render one frame into the offscreen target.
-    pub fn render(&mut self, view_projection: [f32; 16], eye: [f32; 3]) {
+    pub fn render(&mut self, view_projection: [f32; 16], eye: [f32; 3]) -> bool {
         self.context.write_camera(view_projection, eye);
         let mut encoder = self
             .context
@@ -895,9 +1091,14 @@ impl Renderer {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("client frame"),
             });
-        self.context
-            .encode_draw(&mut encoder, &self.color_view, &self.depth_view);
+        if !self
+            .context
+            .encode_draw(&mut encoder, &self.color_view, &self.depth_view)
+        {
+            return false;
+        }
         self.context.queue.submit([encoder.finish()]);
+        true
     }
 
     /// Draw the same UI used by the window into an offscreen capture.
@@ -1066,6 +1267,178 @@ const fn align_256(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn gpu_brightness_and_global_transparency_are_order_independent() {
+        use crate::scene::{Scene, Vertex};
+        use torse_types::SectionPos;
+        let folder =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.work/krn026-gpu");
+        std::fs::create_dir_all(&folder).unwrap();
+        let pool = torse_types::MemoryPool::new(torse_types::MemoryBudget::new(128 * 1024 * 1024));
+        let mut renderer = Renderer::new(128, 64).unwrap();
+        renderer.attach_memory(pool.clone());
+        let surface = crate::texture::Surface {
+            rect: [0.0, 0.0, 1.0, 1.0],
+            tint: [1.0; 3],
+            tint_source: None,
+            animation: None,
+            alpha: torse_content::AlphaMode::Blend,
+        };
+        renderer.set_palette(&Palette::pixels_for_tests(
+            vec![surface],
+            [255, 255, 255, 128],
+        ));
+        let indices = [0, 1, 2, 0, 2, 3];
+        let quad = |z: f32, tint, light, min: f32, max: f32| {
+            [
+                [min * z, -0.8 * z, z],
+                [max * z, -0.8 * z, z],
+                [max * z, 0.8 * z, z],
+                [min * z, 0.8 * z, z],
+            ]
+            .map(|position| Vertex {
+                position,
+                normal: [0.0, 0.0, -1.0],
+                material: 0,
+                overlay_material: u32::MAX,
+                tint,
+                overlay_tint: [1.0; 3],
+                light,
+                uv: [0.5; 2],
+            })
+        };
+        let mut matrix = [0.0; 16];
+        matrix[0] = 1.0;
+        matrix[5] = 1.0;
+        matrix[10] = 1.0;
+        matrix[11] = 1.0;
+        matrix[14] = -0.5;
+        let near = Scene::vertex_bytes(&quad(1.0, [1.0, 0.0, 0.0], 1.0, -0.8, 0.8));
+        let far = Scene::vertex_bytes(&quad(2.0, [0.0, 0.0, 1.0], 1.0, -0.8, 0.8));
+        let mut center = Vec::new();
+        for reversed in [false, true] {
+            let (a, b) = if reversed {
+                (&far, &near)
+            } else {
+                (&near, &far)
+            };
+            assert!(renderer.upload_section(SectionPos::ZERO, a, &indices));
+            assert!(renderer.upload_section(SectionPos::new(1, 0, 0), b, &indices));
+            assert!(renderer.render(matrix, [0.0; 3]));
+            let path = folder.join(if reversed {
+                "02-transparent-reversed.png"
+            } else {
+                "01-transparent.png"
+            });
+            renderer.save_png(path.to_str().unwrap()).unwrap();
+            let image =
+                torse_assets::texture::Atlas::decode(&std::fs::read(path).unwrap()).unwrap();
+            let pixel = &image.pixels()[(32 * 128 + 64) * 4..(32 * 128 + 64) * 4 + 3];
+            assert!(pixel[0] > pixel[2]);
+            center.push(pixel.to_vec());
+        }
+        assert_eq!(center[0], center[1]);
+        renderer.set_palette(&Palette::pixels_for_tests(
+            vec![crate::texture::Surface {
+                alpha: torse_content::AlphaMode::Opaque,
+                ..surface
+            }],
+            [255; 4],
+        ));
+        assert!(renderer.upload_section(
+            SectionPos::ZERO,
+            &Scene::vertex_bytes(&quad(1.0, [1.0; 3], 0.2, -0.9, -0.1)),
+            &indices
+        ));
+        assert!(renderer.upload_section(
+            SectionPos::new(1, 0, 0),
+            &Scene::vertex_bytes(&quad(1.0, [1.0; 3], 1.0, 0.1, 0.9)),
+            &indices
+        ));
+        assert!(renderer.render(matrix, [0.0; 3]));
+        let path = folder.join("03-brightness.png");
+        renderer.save_png(path.to_str().unwrap()).unwrap();
+        let image = torse_assets::texture::Atlas::decode(&std::fs::read(path).unwrap()).unwrap();
+        let left = image.pixels()[(32 * 128 + 32) * 4];
+        let right = image.pixels()[(32 * 128 + 96) * 4];
+        assert!(right > left + 100);
+        drop(renderer);
+        assert_eq!(pool.usage().total, 0);
+    }
+
+    #[test]
+    fn opaque_and_masked_faces_precede_blended_faces_and_invalid_uploads_fail() {
+        let base = Palette::single_for_tests(
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0; 3],
+            torse_content::AlphaMode::Opaque,
+        )
+        .surfaces()[0];
+        let surfaces = [
+            base,
+            crate::texture::Surface {
+                alpha: torse_content::AlphaMode::Blend,
+                ..base
+            },
+            crate::texture::Surface {
+                alpha: torse_content::AlphaMode::Mask,
+                ..base
+            },
+        ];
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (quad, material) in [1, 0, 2].into_iter().enumerate() {
+            let z = quad as f32;
+            for position in [[0.0, 0.0, z], [1.0, 0.0, z], [1.0, 1.0, z], [0.0, 1.0, z]] {
+                vertices.push(crate::scene::Vertex {
+                    position,
+                    material,
+                    overlay_material: u32::MAX,
+                    light: 1.0,
+                    ..Default::default()
+                });
+            }
+            let start = (quad * 4) as u32;
+            indices.extend([start, start + 1, start + 2, start, start + 2, start + 3]);
+        }
+        let bytes = crate::scene::Scene::vertex_bytes(&vertices);
+        let (sorted, opaque, faces) = split_faces(&bytes, &indices, &surfaces).unwrap();
+        assert_eq!(opaque, 12);
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].first_index, 12);
+        assert_eq!(&sorted[12..], &indices[..6]);
+        assert!((faces[0].center[0] - 0.5).abs() < 1e-6);
+        assert!(split_faces(&bytes[..bytes.len() - 1], &indices, &surfaces).is_none());
+        assert!(split_faces(&bytes, &[999; 6], &surfaces).is_none());
+    }
+    #[test]
+    fn transparent_order_uses_camera_depth_and_changes_when_view_reverses() {
+        let mut matrix = [0.0; 16];
+        matrix[11] = 1.0;
+        let mut faces = [
+            (
+                face_depth(&matrix, [0.0, 0.0, 2.0]),
+                torse_types::SectionPos::ZERO,
+                0,
+            ),
+            (
+                face_depth(&matrix, [0.0, 0.0, 10.0]),
+                torse_types::SectionPos::new(1, 0, 0),
+                6,
+            ),
+        ];
+        faces.sort_by(|a, b| compare_faces(*a, *b));
+        assert_eq!(faces[0].2, 6);
+        matrix[11] = -1.0;
+        matrix[15] = 20.0;
+        for face in &mut faces {
+            face.0 = face_depth(&matrix, [0.0, 0.0, if face.2 == 6 { 10.0 } else { 2.0 }]);
+        }
+        faces.sort_by(|a, b| compare_faces(*a, *b));
+        assert_eq!(faces[0].2, 0);
+    }
 
     #[test]
     fn write_png_reports_file_errors() {

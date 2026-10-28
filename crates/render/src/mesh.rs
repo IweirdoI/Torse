@@ -182,6 +182,9 @@ pub struct RenderBlock {
     pub face_tints: Option<[[f32; 3]; 6]>,
     /// Linear tint per overlay face; `None` uses white.
     pub face_overlay_tints: Option<[[f32; 3]; 6]>,
+    /// Resolved per-corner brightness in face-quad order, 0..=255.
+    /// None retains the consumer's directional shading policy.
+    pub face_shades: Option<[[u8; 4]; 6]>,
 }
 
 impl RenderBlock {
@@ -195,6 +198,7 @@ impl RenderBlock {
         face_overlays: None,
         face_tints: None,
         face_overlay_tints: None,
+        face_shades: None,
     };
 
     /// Full cube using one material on every face.
@@ -208,6 +212,7 @@ impl RenderBlock {
             face_overlays: None,
             face_tints: None,
             face_overlay_tints: None,
+            face_shades: None,
         }
     }
 
@@ -275,7 +280,7 @@ pub struct MeshData {
     pub tints: Vec<[f32; 3]>,
     /// Overlay vertex tint per emitted vertex.
     pub overlay_tints: Vec<[f32; 3]>,
-    /// Directional face shading policy per vertex: one enables it, zero disables it.
+    /// Negative selects directional shading; 0..=1 is resolved vertex brightness.
     pub shades: Vec<f32>,
 }
 
@@ -576,6 +581,7 @@ struct FaceAppearance {
     overlay: Option<u16>,
     tint: [f32; 3],
     overlay_tint: [f32; 3],
+    shades: [f32; 4],
 }
 
 impl FaceAppearance {
@@ -585,6 +591,9 @@ impl FaceAppearance {
             overlay: block.overlay_for(face),
             tint: block.tint_for(face),
             overlay_tint: block.overlay_tint_for(face),
+            shades: block.face_shades.map_or([-1.0; 4], |faces| {
+                faces[face.index() as usize].map(|v| f32::from(v) / 255.0)
+            }),
         }
     }
 }
@@ -621,7 +630,7 @@ fn emit_face(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
-    mesh.shades.extend([-1.0; 4]);
+    mesh.shades.extend(appearance.shades);
 }
 
 fn emit_cross(mesh: &mut MeshData, block: &RenderBlock, cell: [f32; 3]) {
@@ -672,7 +681,7 @@ fn emit_quad(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
-    mesh.shades.extend([-1.0; 4]);
+    mesh.shades.extend(appearance.shades);
 }
 
 /// Resolved visual surface ready for a mesh; no content registry access is needed.
@@ -764,6 +773,7 @@ pub fn append_model(
                     overlay: quad.overlay,
                     tint: quad.tint,
                     overlay_tint: quad.overlay_tint,
+                    shades: [-1.0; 4],
                 },
             );
             let begin = mesh.shades.len() - 4;

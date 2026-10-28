@@ -177,6 +177,7 @@ struct WindowApp {
     pack: bool,
     center: Option<SectionPos>,
     uploaded: bool,
+    entity_sequence: Option<u64>,
     frames: u32,
     streams: usize,
     rebuilds: usize,
@@ -257,6 +258,7 @@ impl WindowApp {
             pack: false,
             center: None,
             uploaded: false,
+            entity_sequence: None,
             frames: 0,
             streams: 0,
             rebuilds: 0,
@@ -621,7 +623,14 @@ impl WindowApp {
                 return;
             }
         };
-        if !uploads.is_empty() || !self.uploaded {
+        let sequence = self
+            .scene
+            .as_ref()
+            .expect("camera implies scene")
+            .authority()
+            .seq()
+            .0;
+        if !uploads.is_empty() || !self.uploaded || self.entity_sequence != Some(sequence) {
             let scene = self.scene.as_ref().expect("camera implies scene");
             if let Some(gpu) = self.gpu.as_mut() {
                 // Re-upload only the changed sections; untouched terrain keeps
@@ -630,21 +639,28 @@ impl WindowApp {
                 for pos in &uploads {
                     if let Some((vertices, indices)) = scene.section_geometry(*pos) {
                         let bytes = Scene::vertex_bytes(&vertices);
-                        gpu.context.upload_section(*pos, &bytes, &indices);
+                        if !gpu.context.upload_section(*pos, &bytes, &indices) {
+                            self.pending_uploads.extend([*pos]);
+                        } else {
+                            self.uploads += 1;
+                        }
                     }
                 }
                 // Entity bodies change without mesh rebuilds; refresh them
                 // alongside any terrain upload.
-                let (entity_vertices, entity_indices) = scene.entity_geometry();
-                let entity_bytes = Scene::vertex_bytes(&entity_vertices);
-                gpu.context.upload_section(
-                    crate::renderer::ENTITY_SLOT,
-                    &entity_bytes,
-                    &entity_indices,
-                );
+                if self.entity_sequence != Some(sequence) {
+                    let (entity_vertices, entity_indices) = scene.entity_geometry();
+                    let entity_bytes = Scene::vertex_bytes(&entity_vertices);
+                    if gpu.context.upload_section(
+                        crate::renderer::ENTITY_SLOT,
+                        &entity_bytes,
+                        &entity_indices,
+                    ) {
+                        self.entity_sequence = Some(sequence);
+                    }
+                }
             }
             self.uploaded = true;
-            self.uploads += uploads.len();
         }
         // Unloaded sections must stop drawing even when nothing rebuilt this
         // frame; retention is cheap and the entity slot survives it.
@@ -715,8 +731,13 @@ impl WindowApp {
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("client window frame"),
         });
-        gpu.context
-            .encode_draw(&mut encoder, &view, &gpu.depth_view);
+        if !gpu
+            .context
+            .encode_draw(&mut encoder, &view, &gpu.depth_view)
+        {
+            gpu.window.request_redraw();
+            return;
+        }
         gpu.ui.prepare(
             device,
             queue,
@@ -1046,6 +1067,7 @@ impl WindowApp {
         self.pending_palette = None;
         self.center = None;
         self.uploaded = false;
+        self.entity_sequence = None;
         self.pending_uploads.clear();
         self.rebuild_network = true;
     }
@@ -1060,6 +1082,7 @@ impl WindowApp {
             Err(error) => return Err(error.to_string()),
         };
         scene.enable_background(crate::scene::background_config())?;
+        scene.enable_lighting()?;
         if let Some(connection) = self.net.as_mut() {
             connection
                 .refresh_player(scene.authority())
@@ -1345,7 +1368,8 @@ impl ApplicationHandler for WindowApp {
         surface.configure(&session.device, &config);
         let depth = create_depth(&session.device, config.width, config.height);
         let depth_view = depth.create_view(&TextureViewDescriptor::default());
-        let context = GpuContext::new(session.device, session.queue, config.format);
+        let mut context = GpuContext::new(session.device, session.queue, config.format);
+        context.attach_memory(self.memory.clone());
         eprintln!("{}", torse_render::startup_line(&info, Some(present)));
 
         let scene = if self.config.connect.is_some() {
@@ -1376,6 +1400,11 @@ impl ApplicationHandler for WindowApp {
                         scene.attach_memory_prepared(self.memory.clone(), world_memory)
                     {
                         self.failure = Some(error.to_string());
+                        event_loop.exit();
+                        return;
+                    }
+                    if let Err(error) = scene.enable_lighting() {
+                        self.failure = Some(error);
                         event_loop.exit();
                         return;
                     }

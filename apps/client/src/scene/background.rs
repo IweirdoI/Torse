@@ -29,6 +29,13 @@ pub(super) struct MeshStamp {
     tint_provider_generation: u64,
     tint_provider_revision: u64,
     loads: [Option<u64>; 7],
+    visual: Option<VisualStamp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VisualStamp {
+    lighting: [[u64; 2]; 27],
+    neighbors: [Option<(Revision, u64)>; 27],
 }
 
 fn ready_revision(store: &SectionStore, pos: SectionPos) -> Option<Revision> {
@@ -65,6 +72,31 @@ impl MeshStamp {
                 .as_ref()
                 .map_or(0, |provider| provider.revision(pos)),
             loads,
+            visual: scene.lighting.as_ref().map(|lighting| VisualStamp {
+                lighting: std::array::from_fn(|index| {
+                    let Some(neighbor) = pos
+                        .x
+                        .checked_add((index % 3) as i64 - 1)
+                        .zip(pos.y.checked_add((index / 9) as i64 - 1))
+                        .zip(pos.z.checked_add(((index / 3) % 3) as i64 - 1))
+                        .map(|((x, y), z)| SectionPos::new(x, y, z))
+                    else {
+                        return [0; 2];
+                    };
+                    lighting.stamp(scene, neighbor)
+                }),
+                neighbors: std::array::from_fn(|index| {
+                    let neighbor = SectionPos::new(
+                        pos.x.checked_add((index % 3) as i64 - 1)?,
+                        pos.y.checked_add((index / 9) as i64 - 1)?,
+                        pos.z.checked_add(((index / 3) % 3) as i64 - 1)?,
+                    );
+                    Some((
+                        ready_revision(scene.authority.store(), neighbor)?,
+                        scene.load_generations.get(&neighbor).copied().unwrap_or(0),
+                    ))
+                }),
+            }),
         }
     }
 }
@@ -416,18 +448,12 @@ impl MeshInput {
             .map_err(|e| e.to_string())?;
         let extent = scene.side as usize + 2;
         let mut cells = Vec::with_capacity(extent.pow(3));
+        let view = scene.lighting.as_ref().map(|lighting| lighting.view(scene));
         for y in -1..=i64::from(scene.side) {
             for z in -1..=i64::from(scene.side) {
                 for x in -1..=i64::from(scene.side) {
                     cells.push(match origin.checked_add(x, y, z) {
-                        Ok(p) => sample(
-                            scene.authority.store(),
-                            scene.authority.registry(),
-                            &scene.state_materials,
-                            &scene.palette,
-                            scene.tint_provider.as_deref(),
-                            p,
-                        ),
+                        Ok(p) => sample_visual(scene, view.as_ref(), p),
                         Err(_) => MeshSample::OutOfBounds,
                     });
                 }

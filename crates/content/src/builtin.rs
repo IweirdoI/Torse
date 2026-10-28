@@ -249,7 +249,7 @@ fn block(
     let material = key(&format!("base:material/{}", id.path()));
     BlockDefinition {
         id,
-        definition_version: 1,
+        definition_version: if face_mask == 0x3f { 2 } else { 1 },
         state_schema,
         render_profile: RenderProfile {
             shape: render_shape,
@@ -266,7 +266,7 @@ fn block(
         },
         occlusion_profile: OcclusionProfile { face_mask },
         light_transport: LightTransport {
-            absorption: 0.0,
+            absorption: if face_mask == 0x3f { 1.0 } else { 0.0 },
             emission: 0.0,
         },
         interaction_profile: InteractionProfile {

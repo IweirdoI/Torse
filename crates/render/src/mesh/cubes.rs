@@ -15,14 +15,14 @@ pub(super) fn eligible(block: RenderBlock) -> bool {
 
 pub(super) fn emit(
     mesh: &mut MeshData,
+    occupancy: &RowOccupancy,
     side: u32,
     origin: [i64; 3],
     sample: &impl Fn(BlockPos) -> MeshSample,
     cancelled: &impl Fn() -> bool,
     limit: Option<usize>,
-) -> Result<bool, MeshBuildError> {
+) -> Result<(), MeshBuildError> {
     let side = side as usize;
-    let mut rows = vec![0u64; side * side];
     let position = |cell: [usize; 3]| {
         BlockPos::new(
             origin[0] + cell[0] as i64,
@@ -30,21 +30,8 @@ pub(super) fn emit(
             origin[2] + cell[2] as i64,
         )
     };
-    for y in 0..side {
-        if cancelled() {
-            return Err(MeshBuildError::Cancelled);
-        }
-        for z in 0..side {
-            for x in 0..side {
-                if let MeshSample::Ready(block) = sample(position([x, y, z]))
-                    && eligible(block)
-                {
-                    rows[z + side * y] |= 1u64 << x;
-                }
-            }
-        }
-    }
-    let occupied = |cell: [usize; 3]| rows[cell[2] + side * cell[1]] & (1u64 << cell[0]) != 0;
+    let occupied =
+        |cell: [usize; 3]| occupancy.row(cell[1] as i64, cell[2] as i64) & (1u64 << cell[0]) != 0;
     for face in Face::ALL {
         let normal = face.axis();
         let (a, b) = match normal {
@@ -80,7 +67,7 @@ pub(super) fn emit(
                     let MeshSample::Ready(block) = sample(position(cell)) else {
                         return None;
                     };
-                    if face_culled(face, &block, sample, position(cell)) {
+                    if !eligible(block) || face_culled(face, &block, sample, position(cell)) {
                         return None;
                     }
                     Some((cell, FaceAppearance::new(&block, face)))
@@ -106,11 +93,7 @@ pub(super) fn emit(
             }
         }
     }
-    Ok(rows
-        .iter()
-        .map(|row| row.count_ones() as usize)
-        .sum::<usize>()
-        == side * side * side)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -198,7 +181,7 @@ mod tests {
                 MeshSample::NotLoaded
             }
         };
-        let ordinary = build_mesh(8, SectionPos::ZERO, sample);
+        let ordinary = build_mesh_reference(8, SectionPos::ZERO, sample);
         let ordinary_calls = calls.replace(0);
         let merged =
             build_mesh_optimized_bounded(8, SectionPos::ZERO, sample, || false, 8usize.pow(3) * 6)

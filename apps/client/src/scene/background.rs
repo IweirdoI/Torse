@@ -391,9 +391,25 @@ impl Background {
             let max_faces = side.pow(3) * 6;
             // Geometry, two per-vertex tint channels, indices, and two slots.
             let face_bytes = 268;
+            let scratch_bytes = torse_render::occupancy_scratch_bytes(scene.side);
             let task_budget = JobBudget {
                 input_bytes: (side + 2).pow(3) * size_of::<MeshSample>() + size_of::<MeshInput>(),
-                output_bytes: size_of::<MeshData>() + max_faces * face_bytes * 2 + 32768 + 8192,
+                output_bytes: size_of::<MeshData>()
+                    + max_faces * face_bytes * 2
+                    + 8192
+                    + scratch_bytes as usize,
+            };
+            let scratch = match scene.reserve_memory(
+                torse_types::MemoryClass::Mesh,
+                scratch_bytes,
+                torse_types::EvictionRank::Pinned,
+            ) {
+                Ok(scratch) => scratch,
+                Err(error) if error.code == torse_types::FaultCode::ResourceLimit => {
+                    self.stats.backpressure += 1;
+                    break;
+                }
+                Err(error) => return Err(error.to_string()),
             };
             let Some(lease) = self.reserve(task_budget)? else {
                 break;
@@ -401,6 +417,9 @@ impl Background {
             // Reservation precedes the only owned input copy.
             let input = MeshInput::capture(scene, pos)?;
             let job = lease.submit(Priority::Visible, move |cancel| {
+                // Queued and running work own the scratch lease, including
+                // while cancellation waits for the worker to finish.
+                let _scratch = scratch;
                 let mesh = build_mesh_optimized_bounded(
                     input.side,
                     pos,

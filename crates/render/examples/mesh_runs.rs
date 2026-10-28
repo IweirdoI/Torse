@@ -1,7 +1,7 @@
 //! Reproducible CPU-only reference/run-mesher comparison.
 use std::hint::black_box;
 use std::time::Instant;
-use torse_render::{MeshSample, RenderBlock, build_mesh, build_mesh_optimized_bounded};
+use torse_render::{MeshSample, RenderBlock, build_mesh_optimized_bounded, build_mesh_reference};
 use torse_types::{BlockPos, SectionPos};
 
 fn main() {
@@ -28,7 +28,7 @@ fn main() {
                 )
                 .unwrap()
             } else {
-                build_mesh(16, SectionPos::ZERO, sample)
+                build_mesh_reference(16, SectionPos::ZERO, sample)
             };
             faces = mesh.face_count();
             bytes = mesh.byte_size();

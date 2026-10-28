@@ -1,0 +1,4 @@
+scenario,side,rounds,reference_us,optimized_us,reference_samples,optimized_samples
+solid_row_faces,32,20,83508,23483,229376,44680
+empty_row_faces,32,20,9288,3184,32768,32768
+solid_merged_runs,16,100,37704,34120,,

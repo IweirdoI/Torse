@@ -29,7 +29,6 @@ use crate::pick::{PickHit, PickOutcome, cast_ray};
 use crate::texture::{Palette, TexturePack};
 
 mod background;
-mod pace;
 pub use background::BackgroundStats;
 use background::{Background, MeshStamp};
 

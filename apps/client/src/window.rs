@@ -62,6 +62,8 @@ pub struct WindowConfig {
     pub tls: Option<crate::net::TlsClient>,
     /// Shared CPU memory reservation ceiling in MiB.
     pub memory_mib: u64,
+    /// Independent logical resident geometry payload ceiling in MiB.
+    pub geometry_mib: u64,
     /// Section loading radius around the camera.
     pub radius: i64,
     /// Initial window size in logical pixels.
@@ -92,6 +94,8 @@ pub struct WindowConfig {
 /// Measurements reported when the window closes.
 #[derive(Clone, Debug, Default)]
 pub struct WindowSummary {
+    pub geometry: crate::renderer::GeometryUsage,
+    pub draws: crate::renderer::DrawStats,
     /// Logical shared reservation usage; excludes native allocator and GPU memory.
     pub memory: torse_types::MemoryUsage,
     /// Adapter name reported by the backend.
@@ -609,13 +613,42 @@ impl WindowApp {
         self.rebuilds += rebuilt.len();
         self.pending_uploads.extend(rebuilt);
         let scene = self.scene.as_ref().expect("camera implies scene");
+        if let Some(gpu) = self.gpu.as_mut() {
+            let camera = self.camera.as_ref().expect("active scene camera");
+            let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
+            gpu.context
+                .write_camera(camera.view_projection(aspect), camera.eye);
+            gpu.context.set_section_focus(center);
+            gpu.context.retain_sections(scene.sections());
+            let side = scene.authority().store().side();
+            self.pending_uploads
+                .extend(scene.sections().iter().copied().filter(|pos| {
+                    !gpu.context.has_section(*pos)
+                        && scene.section_geometry_bytes(*pos).is_some_and(|bytes| {
+                            bytes > 0 && gpu.context.should_upload(*pos, side, bytes)
+                        })
+                }));
+            if !gpu.context.has_section(crate::renderer::ENTITY_SLOT)
+                && !scene.authority().entities().is_empty()
+            {
+                self.entity_sequence = None;
+            }
+        }
         self.pending_uploads
             .retain(|p| scene.sections().contains(&p));
-        let uploads = match self
-            .pending_uploads
-            .select(center, self.work_budget.limits(), |p| {
-                scene.section_geometry_bytes(p)
-            }) {
+        let uploads = match self.pending_uploads.select_where(
+            center,
+            self.work_budget.limits(),
+            |p| {
+                self.gpu.as_ref().is_some_and(|gpu| {
+                    scene.section_geometry_bytes(p).is_none_or(|bytes| {
+                        gpu.context
+                            .should_upload(p, scene.authority().store().side(), bytes)
+                    })
+                })
+            },
+            |p| scene.section_geometry_bytes(p),
+        ) {
             Ok(uploads) => uploads,
             Err(error) => {
                 self.failure = Some(error.to_owned());
@@ -1242,6 +1275,8 @@ impl WindowApp {
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
             let (vertices, faces) = scene.geometry_counts();
             self.summary = Some(WindowSummary {
+                geometry: gpu.context.geometry_usage(),
+                draws: gpu.context.draw_stats(),
                 memory: self.memory.usage(),
                 cpu: scene.background_stats(),
                 adapter: self.adapter.clone(),
@@ -1369,6 +1404,7 @@ impl ApplicationHandler for WindowApp {
         let depth = create_depth(&session.device, config.width, config.height);
         let depth_view = depth.create_view(&TextureViewDescriptor::default());
         let mut context = GpuContext::new(session.device, session.queue, config.format);
+        context.set_geometry_limit(self.config.geometry_mib * 1024 * 1024);
         context.attach_memory(self.memory.clone());
         eprintln!("{}", torse_render::startup_line(&info, Some(present)));
 
@@ -1924,6 +1960,7 @@ mod tests {
             sections: None,
             tls: None,
             memory_mib: 512,
+            geometry_mib: 64,
             radius: 1,
             width: 960,
             height: 540,

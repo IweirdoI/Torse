@@ -12,6 +12,8 @@
 //! material's alpha mode. Materials come from [`crate::texture::Palette`].
 
 use std::collections::BTreeMap;
+mod residency;
+use residency::{Bounds, admission, priority};
 use std::fs::File;
 use std::time::{Duration, Instant};
 
@@ -276,6 +278,12 @@ pub struct GpuContext {
     transparent_pipeline: RenderPipeline,
     memory: Option<torse_types::MemoryPool>,
     view_projection: std::cell::Cell<[f32; 16]>,
+    eye: std::cell::Cell<[f32; 3]>,
+    focus: torse_types::SectionPos,
+    geometry_limit: u64,
+    geometry_bytes: u64,
+    geometry_evictions: u64,
+    draw_stats: std::cell::Cell<DrawStats>,
     line_pipeline: RenderPipeline,
     sky_pipeline: RenderPipeline,
     camera: Buffer,
@@ -309,11 +317,33 @@ struct SectionBuffers {
     opaque_count: u32,
     transparent: Vec<TransparentFace>,
     _memory: Option<torse_types::MemoryLease>,
+    bytes: u64,
+    bounds: Bounds,
+}
+
+/// Logical published vertex/index payload, independent of CPU memory accounts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GeometryUsage {
+    pub limit: u64,
+    pub bytes: u64,
+    pub sections: usize,
+    pub evictions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrawStats {
+    pub visible_sections: usize,
+    pub culled_sections: usize,
 }
 
 struct TransparentFace {
     center: [f32; 3],
     first_index: u32,
+}
+
+struct GeometryAdmission {
+    victims: Vec<torse_types::SectionPos>,
+    _memory: Option<torse_types::MemoryLease>,
 }
 
 fn split_faces(
@@ -662,6 +692,12 @@ impl GpuContext {
             transparent_pipeline,
             memory: None,
             view_projection: std::cell::Cell::new([0.0; 16]),
+            eye: std::cell::Cell::new([0.0; 3]),
+            focus: torse_types::SectionPos::ZERO,
+            geometry_limit: 64 * 1024 * 1024,
+            geometry_bytes: 0,
+            geometry_evictions: 0,
+            draw_stats: std::cell::Cell::new(DrawStats::default()),
             line_pipeline,
             sky_pipeline,
             camera,
@@ -686,12 +722,82 @@ impl GpuContext {
         self.memory = Some(pool);
     }
 
+    pub fn set_geometry_limit(&mut self, bytes: u64) -> bool {
+        if bytes < self.geometry_bytes {
+            return false;
+        }
+        self.geometry_limit = bytes;
+        true
+    }
+
+    pub fn geometry_usage(&self) -> GeometryUsage {
+        GeometryUsage {
+            limit: self.geometry_limit,
+            bytes: self.geometry_bytes,
+            sections: self.terrain.len(),
+            evictions: self.geometry_evictions,
+        }
+    }
+
+    pub fn draw_stats(&self) -> DrawStats {
+        self.draw_stats.get()
+    }
+
+    pub fn set_section_focus(&mut self, center: torse_types::SectionPos) {
+        self.focus = center;
+    }
+
+    pub fn has_section(&self, pos: torse_types::SectionPos) -> bool {
+        self.terrain.contains_key(&pos)
+    }
+
+    fn admission(&self, section: torse_types::SectionPos, bytes: u64) -> Option<GeometryAdmission> {
+        let memory = self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(
+                    torse_types::MemoryClass::Codec,
+                    self.terrain.len() as u64 * 128 + 512,
+                    torse_types::EvictionRank::Pinned,
+                )
+            })
+            .transpose()
+            .ok()?;
+        let rank = priority(section, self.focus);
+        let victims = admission(
+            self.geometry_limit,
+            self.geometry_bytes,
+            self.terrain.get(&section).map_or(0, |b| b.bytes),
+            bytes,
+            !self.terrain.contains_key(&section) && self.terrain.len() >= 4096,
+            self.terrain
+                .iter()
+                .filter(|(pos, _)| **pos != section && **pos != ENTITY_SLOT)
+                .filter(|(pos, _)| section == ENTITY_SLOT || priority(**pos, self.focus) > rank)
+                .map(|(pos, b)| (*pos, b.bytes, priority(*pos, self.focus))),
+        )?;
+        Some(GeometryAdmission {
+            victims,
+            _memory: memory,
+        })
+    }
+
+    /// Borrow-only upload admission. Keep deferred CPU meshes until visible and
+    /// closer geometry can fit; no GPU or expanded vertex data is allocated.
+    pub fn should_upload(&self, section: torse_types::SectionPos, side: u32, bytes: usize) -> bool {
+        bytes == 0
+            || (Bounds::section(section, side).visible(&self.view_projection.get(), self.eye.get())
+                && self.admission(section, bytes as u64).is_some())
+    }
+
     /// Upload the atlas and material table used by the terrain pass.
     ///
     /// Replacing the pack clears sections because alpha classification and
     /// material slots belong to that pack. The host uploads its new meshes.
     pub fn set_palette(&mut self, palette: &Palette) {
         self.terrain.clear();
+        self.geometry_bytes = 0;
         self.animation_origin = Instant::now();
         let materials = self.device.create_buffer(&BufferDescriptor {
             label: Some("client material table"),
@@ -802,9 +908,31 @@ impl GpuContext {
         indices: &[u32],
     ) -> bool {
         if vertex_bytes.is_empty() || indices.is_empty() {
-            self.terrain.remove(&section);
+            if let Some(old) = self.terrain.remove(&section) {
+                self.geometry_bytes -= old.bytes;
+            }
             return true;
         }
+        if indices.len() > u32::MAX as usize || !indices.len().is_multiple_of(6) {
+            return false;
+        }
+        let Some(bounds) = Bounds::vertices(vertex_bytes, VERTEX_STRIDE) else {
+            return false;
+        };
+        let Some(bytes) = (indices.len() as u64)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(vertex_bytes.len() as u64))
+        else {
+            return false;
+        };
+        if vertex_bytes.len() as u64 > self.device.limits().max_buffer_size
+            || indices.len() as u64 * 4 > self.device.limits().max_buffer_size
+        {
+            return false;
+        }
+        let Some(plan) = self.admission(section, bytes) else {
+            return false;
+        };
         use torse_types::{EvictionRank, MemoryClass};
         let metadata = match self
             .memory
@@ -864,8 +992,21 @@ impl GpuContext {
             opaque_count,
             transparent,
             _memory: metadata,
+            bytes,
+            bounds,
         };
-        self.terrain.insert(section, buffers);
+        // Validation and resource construction finish before any old entry is
+        // removed. wgpu retains submitted resources until in-flight work ends.
+        for victim in plan.victims {
+            if let Some(old) = self.terrain.remove(&victim) {
+                self.geometry_bytes -= old.bytes;
+                self.geometry_evictions += 1;
+            }
+        }
+        if let Some(old) = self.terrain.insert(section, buffers) {
+            self.geometry_bytes -= old.bytes;
+        }
+        self.geometry_bytes += bytes;
         true
     }
 
@@ -877,11 +1018,13 @@ impl GpuContext {
     pub fn retain_sections(&mut self, keep: &[torse_types::SectionPos]) {
         self.terrain
             .retain(|pos, _| keep.contains(pos) || *pos == ENTITY_SLOT);
+        self.geometry_bytes = self.terrain.values().map(|b| b.bytes).sum();
     }
 
     /// Stage the camera matrix for the next frame.
     pub fn write_camera(&self, view_projection: [f32; 16], eye: [f32; 3]) {
         self.view_projection.set(view_projection);
+        self.eye.set(eye);
         self.queue
             .write_buffer(&self.camera, 0, &matrix_bytes(view_projection));
         let mut position = [0f32; 4];
@@ -909,9 +1052,21 @@ impl GpuContext {
         color: &TextureView,
         depth: &TextureView,
     ) -> bool {
+        let matrix = self.view_projection.get();
+        let visible = |section: &SectionBuffers| section.bounds.visible(&matrix, self.eye.get());
+        let visible_sections = self
+            .terrain
+            .values()
+            .filter(|section| visible(section))
+            .count();
+        self.draw_stats.set(DrawStats {
+            visible_sections,
+            culled_sections: self.terrain.len() - visible_sections,
+        });
         let count = self
             .terrain
             .values()
+            .filter(|section| visible(section))
             .map(|section| section.transparent.len())
             .sum::<usize>();
         let _sort = match self
@@ -931,8 +1086,10 @@ impl GpuContext {
             Err(_) => return false,
         };
         let mut transparent = Vec::with_capacity(count);
-        let matrix = self.view_projection.get();
         for (pos, section) in &self.terrain {
+            if !visible(section) {
+                continue;
+            }
             for face in &section.transparent {
                 transparent.push((
                     face_depth(&matrix, face.center),
@@ -980,7 +1137,7 @@ impl GpuContext {
             pass.set_bind_group(0, &self.camera_bind, &[]);
             pass.set_bind_group(1, &palette.bind, &[]);
             for section in self.terrain.values() {
-                if section.opaque_count == 0 {
+                if section.opaque_count == 0 || !visible(section) {
                     continue;
                 }
                 pass.set_vertex_buffer(0, section.vertices.slice(..));
@@ -1015,6 +1172,15 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn set_geometry_limit(&mut self, bytes: u64) -> bool {
+        self.context.set_geometry_limit(bytes)
+    }
+    pub fn geometry_usage(&self) -> GeometryUsage {
+        self.context.geometry_usage()
+    }
+    pub fn draw_stats(&self) -> DrawStats {
+        self.context.draw_stats()
+    }
     pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) {
         self.context.attach_memory(pool);
     }
@@ -1267,6 +1433,93 @@ const fn align_256(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn gpu_geometry_budget_preserves_replacements_and_recovers_evicted_sections() {
+        use crate::scene::{Scene, Vertex};
+        use torse_types::{MemoryBudget, MemoryPool, SectionPos};
+        let pool = MemoryPool::new(MemoryBudget::new(32 * 1024 * 1024));
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.attach_memory(pool.clone());
+        renderer.set_palette(&Palette::pixels_for_tests(
+            vec![crate::texture::Surface {
+                rect: [0., 0., 1., 1.],
+                tint: [1.; 3],
+                tint_source: None,
+                animation: None,
+                alpha: torse_content::AlphaMode::Opaque,
+            }],
+            [255; 4],
+        ));
+        let quad = |offset: f32| {
+            Scene::vertex_bytes(
+                &[
+                    [-0.5 + offset, -0.5, 0.5],
+                    [0.5 + offset, -0.5, 0.5],
+                    [0.5 + offset, 0.5, 0.5],
+                    [-0.5 + offset, 0.5, 0.5],
+                ]
+                .map(|position| Vertex {
+                    position,
+                    normal: [0., 0., -1.],
+                    uv: [0.5; 2],
+                    material: 0,
+                    overlay_material: u32::MAX,
+                    tint: [1.; 3],
+                    overlay_tint: [1.; 3],
+                    light: 1.,
+                }),
+            )
+        };
+        let bytes = quad(0.);
+        let indices = [0, 1, 2, 0, 2, 3];
+        let payload = bytes.len() as u64 + 24;
+        assert!(renderer.set_geometry_limit(payload * 2));
+        let near = SectionPos::ZERO;
+        let far = SectionPos::new(8, 0, 0);
+        let middle = SectionPos::new(1, 0, 0);
+        assert!(renderer.upload_section(near, &bytes, &indices));
+        assert!(renderer.upload_section(far, &quad(4.), &indices));
+        let matrix = [
+            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+        ];
+        assert!(renderer.render(matrix, [10.; 3]));
+        assert_eq!(renderer.draw_stats().visible_sections, 1);
+        assert_eq!(renderer.draw_stats().culled_sections, 1);
+        let folder =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.work/krn031-gpu");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("01-frustum.png");
+        renderer.save_png(path.to_str().unwrap()).unwrap();
+        let image = torse_assets::texture::Atlas::decode(&std::fs::read(path).unwrap()).unwrap();
+        assert!(image.pixels()[(32 * 64 + 32) * 4] > 240);
+        assert!(renderer.upload_section(middle, &bytes, &indices));
+        assert!(!renderer.context.has_section(far));
+        assert_eq!(renderer.geometry_usage().evictions, 1);
+        assert_eq!(renderer.geometry_usage().bytes, payload * 2);
+        assert!(!renderer.upload_section(SectionPos::new(9, 0, 0), &bytes, &indices));
+        assert!(!renderer.upload_section(near, &bytes, &[999; 6]));
+        let oversized = [bytes.clone(), bytes.clone(), bytes.clone()].concat();
+        assert!(!renderer.upload_section(near, &oversized, &indices));
+        assert!(renderer.context.has_section(near));
+        assert!(renderer.context.has_section(middle));
+        assert!(!renderer.set_geometry_limit(payload));
+        renderer.context.set_section_focus(far);
+        assert!(renderer.upload_section(far, &bytes, &indices));
+        assert!(renderer.context.has_section(far));
+        assert!(!renderer.context.has_section(near));
+        assert!(renderer.upload_section(ENTITY_SLOT, &bytes, &indices));
+        renderer.context.set_section_focus(near);
+        assert!(renderer.upload_section(near, &bytes, &indices));
+        assert!(renderer.context.has_section(ENTITY_SLOT));
+        renderer.context.retain_sections(&[]);
+        assert_eq!(renderer.geometry_usage().bytes, payload);
+        assert!(renderer.upload_section(ENTITY_SLOT, &[], &[]));
+        assert_eq!(renderer.geometry_usage().bytes, 0);
+        drop(renderer);
+        assert_eq!(pool.usage().total, 0);
+    }
 
     #[cfg(feature = "gpu-tests")]
     #[test]

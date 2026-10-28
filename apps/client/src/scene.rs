@@ -748,6 +748,16 @@ impl Scene {
         target: BlockPos,
         half: u32,
     ) -> Result<(), String> {
+        let _preview_memory = if self.lighting.is_some() {
+            self.reserve_memory(
+                torse_types::MemoryClass::Executor,
+                lighting::PREVIEW_BYTES,
+                torse_types::EvictionRank::Pinned,
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
         self.edit_counter += 1;
         let counter = self.edit_counter;
         let action = if place {
@@ -802,6 +812,7 @@ impl Scene {
         self.authority
             .publish(prepared)
             .map_err(|fault| format!("{fault:?}"))?;
+        self.preview_lighting(&[target])?;
         self.reconcile_world_memory(growth)
             .map_err(|error| error.to_string())?;
         Ok(())

@@ -2,6 +2,8 @@
 use super::*;
 use torse_types::{Binding, EvictionRank, MemoryClass, MemoryLease, MemoryPool};
 use torse_world_services::lighting::{LightJob, LightLimits, LightSection};
+mod preview;
+pub(super) const PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 
 const WORK_BYTES: u64 = 16 * 1024 * 1024;
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -23,10 +25,16 @@ struct Cached {
     // Presentation keeps the previous complete image while a replacement is
     // calculated. This is never used by authoritative lighting queries.
     data: LightSection,
+    levels: Box<[u8]>,
     current: bool,
     load: Option<u64>,
     _memory: Option<MemoryLease>,
     generation: u64,
+}
+impl Cached {
+    fn bytes(&self) -> usize {
+        self.data.allocated_bytes() + self.levels.len() + 256
+    }
 }
 pub(super) struct Lighting {
     binding: Binding,
@@ -69,7 +77,7 @@ impl Lighting {
             for pos in removed {
                 self.advance_generation()?;
                 if let Some(old) = self.entries[kind].remove(&pos) {
-                    self.cache_bytes[kind] -= old.data.allocated_bytes() + 256;
+                    self.cache_bytes[kind] -= old.bytes();
                 }
             }
             // Validate each dependency set once per update, rather than once
@@ -109,9 +117,9 @@ impl Lighting {
             }
             let previous_bytes = self.entries[pending.kind]
                 .get(&pending.target)
-                .map_or(0, |old| old.data.allocated_bytes() + 256);
-            let bytes =
-                self.cache_bytes[pending.kind] - previous_bytes + result.allocated_bytes() + 256;
+                .map_or(0, Cached::bytes);
+            let result_bytes = result.allocated_bytes() + result.levels().len() + 256;
+            let bytes = self.cache_bytes[pending.kind] - previous_bytes + result_bytes;
             if bytes > CACHE_BYTES {
                 return Ok(());
             }
@@ -119,11 +127,7 @@ impl Lighting {
                 .memory
                 .as_ref()
                 .map(|pool| {
-                    pool.reserve(
-                        MemoryClass::Mesh,
-                        (result.allocated_bytes() + 256) as u64,
-                        EvictionRank::Pinned,
-                    )
+                    pool.reserve(MemoryClass::Mesh, result_bytes as u64, EvictionRank::Pinned)
                 })
                 .transpose()
             {
@@ -137,7 +141,7 @@ impl Lighting {
                         .iter()
                         .any(|v| *v != if pending.kind == 1 { 15 } else { 0 })
                 },
-                |old| old.data.levels() != result.levels(),
+                |old| old.levels.as_ref() != result.levels(),
             );
             let generation = if changed {
                 self.advance_generation()?;
@@ -152,6 +156,12 @@ impl Lighting {
             self.entries[pending.kind].insert(
                 pending.target,
                 Cached {
+                    levels: pending
+                        .result
+                        .as_ref()
+                        .expect("resolved light result")
+                        .levels()
+                        .into(),
                     data: pending.result.expect("resolved light result"),
                     current: true,
                     load: scene.load_generations.get(&pending.target).copied(),
@@ -253,7 +263,7 @@ impl View<'_> {
         };
         self.grids[kind]
             .get(&section)
-            .map(|entry| entry.data.levels()[torse_world::linear_index(self.side, local)])
+            .map(|entry| entry.levels[torse_world::linear_index(self.side, local)])
     }
     pub fn shade(&self, scene: &Scene, pos: BlockPos, block: &mut RenderBlock) {
         let mut faces = [[255; 4]; 6];
@@ -350,6 +360,18 @@ impl View<'_> {
 }
 
 impl Scene {
+    // The caller reserves PREVIEW_BYTES before committing an edit. Preview
+    // propagation is disposable presentation; exact jobs still validate the
+    // committed terrain and replace it with a complete result.
+    pub(super) fn preview_lighting(&mut self, positions: &[BlockPos]) -> Result<(), String> {
+        if let Some(mut lighting) = self.lighting.take() {
+            let result = lighting.preview_opened(self, positions);
+            self.lighting = Some(lighting);
+            result?;
+        }
+        Ok(())
+    }
+
     pub fn enable_lighting(&mut self) -> Result<(), String> {
         if self.lighting.is_none() {
             // Direct skylight needs the columns above the visible terrain.
@@ -712,5 +734,135 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn breaking_repeatedly_exposes_lit_faces_before_exact_relighting() {
+        for start_x in [8, 14] {
+            let mut scene = scene();
+            let stone = scene
+                .authority
+                .registry()
+                .default_state(&key("base:stone"))
+                .unwrap();
+            for x in start_x..=start_x + 3 {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, 8, 8), stone)
+                    .unwrap();
+            }
+            scene.enable_lighting().unwrap();
+            resolve(&mut scene);
+            // Do not run another lighting job between these edits. The old
+            // resolved grids contain zero in every originally solid cell.
+            for x in start_x..start_x + 3 {
+                let pos = BlockPos::new(x, 8, 8);
+                scene.apply_edit(false, &key("base:stone"), pos, 0).unwrap();
+                let shades = block(&scene, BlockPos::new(x + 1, 8, 8))
+                    .face_shades
+                    .unwrap();
+                assert!(shades[0].iter().all(|v| *v > 80), "x={x}: {shades:?}");
+            }
+            resolve(&mut scene);
+            let shades = block(&scene, BlockPos::new(start_x + 3, 8, 8))
+                .face_shades
+                .unwrap();
+            assert!(shades[0].iter().all(|v| *v > 80));
+        }
+    }
+
+    #[test]
+    fn breaking_in_a_dark_sealed_space_does_not_invent_light() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        for x in -16..48 {
+            for z in -16..32 {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, 12, z), stone)
+                    .unwrap();
+            }
+        }
+        for x in [8, 9] {
+            scene
+                .authority
+                .store_mut()
+                .edit(BlockPos::new(x, 8, 8), stone)
+                .unwrap();
+        }
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        scene
+            .apply_edit(false, &key("base:stone"), BlockPos::new(8, 8, 8), 0)
+            .unwrap();
+        assert!(
+            block(&scene, BlockPos::new(9, 8, 8)).face_shades.unwrap()[0]
+                .iter()
+                .all(|v| *v < 40)
+        );
+    }
+
+    #[test]
+    fn opening_the_world_ceiling_uses_exterior_skylight() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let pos = BlockPos::new(8, 15, 8);
+        scene.authority.store_mut().edit(pos, stone).unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        scene.apply_edit(false, &key("base:stone"), pos, 0).unwrap();
+        assert_eq!(
+            scene.lighting.as_ref().unwrap().view(&scene).light(1, pos),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn edit_preview_budget_rejection_preserves_terrain_and_lighting() {
+        let mut scene = scene();
+        let pool = MemoryPool::new(torse_types::MemoryBudget::new(128 * 1024 * 1024));
+        scene.attach_memory(pool.clone()).unwrap();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let pos = BlockPos::new(8, 8, 8);
+        scene.authority.store_mut().edit(pos, stone).unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        let generation = scene.lighting.as_ref().unwrap().generation;
+        let held = pool
+            .reserve(
+                MemoryClass::Resource,
+                pool.budget().total_bytes() - pool.usage().total - 1,
+                EvictionRank::Pinned,
+            )
+            .unwrap();
+        assert!(scene.apply_edit(false, &key("base:stone"), pos, 0).is_err());
+        assert_eq!(
+            scene.authority.store().query(pos),
+            TerrainQuery::Ready(stone)
+        );
+        assert_eq!(scene.lighting.as_ref().unwrap().generation, generation);
+        drop(held);
+        scene.apply_edit(false, &key("base:stone"), pos, 0).unwrap();
+        assert_eq!(
+            scene.authority.store().query(pos),
+            TerrainQuery::Ready(BlockStateId::EMPTY)
+        );
+        resolve(&mut scene);
+        drop(scene);
+        assert_eq!(pool.usage().total, 0);
     }
 }

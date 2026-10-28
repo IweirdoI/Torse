@@ -109,12 +109,12 @@ impl PeerLink {
         if budget.policy == ControlPolicy::Reject {
             return Admit::Rejected;
         }
+        // Control samples describe the latest client intent. Once the queue is
+        // full, keeping any older sample would make the dispatcher act on stale
+        // input before the newest one. Coalescing therefore replaces the whole
+        // queued prefix with the incoming sample.
         let mut dropped = Vec::new();
-        while !self.queue.is_empty()
-            && (self.queue.len() >= budget.queue_messages
-                || self.bytes.saturating_add(size) > budget.queue_bytes)
-        {
-            let old = self.queue.pop_back().expect("queue was not empty");
+        while let Some(old) = self.queue.pop_front() {
             self.bytes = self.bytes.saturating_sub(old.payload.len() as u64);
             dropped.push(old.seq);
         }

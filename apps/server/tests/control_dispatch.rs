@@ -115,6 +115,13 @@ fn attach(
     server: &base::Files,
     policy: ControlPolicy,
 ) -> (NetworkHub<MemoryTransport>, Arc<Recorder>) {
+    attach_with_budget(server, budget(policy))
+}
+
+fn attach_with_budget(
+    server: &base::Files,
+    control_budget: ControlBudget,
+) -> (NetworkHub<MemoryTransport>, Arc<Recorder>) {
     let mut hub = NetworkHub::new(server.binding(), base::network_limits()).unwrap();
     let recorder = Arc::new(Recorder {
         events: Mutex::new(Vec::new()),
@@ -122,7 +129,7 @@ fn attach(
         disconnected: Mutex::new(Vec::new()),
     });
     let hook = recorder.clone();
-    hub.set_control(budget(policy), Box::new(Hook(hook)))
+    hub.set_control(control_budget, Box::new(Hook(hook)))
         .unwrap();
     (hub, recorder)
 }
@@ -270,6 +277,68 @@ fn full_queue_coalesces_to_the_newest_sample_or_rejects_it() {
             assert_eq!(payloads, vec![vec![1]]);
         }
     }
+}
+
+#[test]
+fn coalescing_a_multi_entry_queue_discards_every_stale_sample() {
+    let dir = Directory::new();
+    let mut server = create(&dir);
+    let (mut hub, recorder) = attach_with_budget(
+        &server,
+        ControlBudget {
+            messages_per_tick: 4,
+            queue_messages: 3,
+            queue_bytes: 16,
+            max_message_bytes: 8,
+            policy: ControlPolicy::Coalesce,
+        },
+    );
+    let (host, mut client) = transports();
+    hub.add(
+        host,
+        PeerPolicy {
+            actor: ActorContext::new(base::key("test:player")),
+            scope: base::scope(),
+        },
+        server.authority().unwrap().resume_point().tick,
+    )
+    .unwrap();
+    hello(&mut client, &server);
+    send(
+        &mut client,
+        ClientMessage::ControlOffer {
+            api: CONTROL_API_VERSION,
+        },
+    );
+    for seq in 1..=4 {
+        send(
+            &mut client,
+            ClientMessage::Control {
+                seq,
+                payload: vec![seq as u8],
+            },
+        );
+    }
+    hub.poll(&mut server).unwrap();
+    let accepted: Vec<_> = receive(&mut client)
+        .into_iter()
+        .filter_map(|message| match message {
+            ServerMessage::ControlAck { seq, accepted } => Some((seq, accepted)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        accepted,
+        vec![(1, false), (2, false), (3, false), (4, true)]
+    );
+    let payloads: Vec<_> = recorder
+        .events
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|event| event.payload.clone())
+        .collect();
+    assert_eq!(payloads, vec![vec![4]]);
 }
 
 #[test]

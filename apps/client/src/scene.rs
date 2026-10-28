@@ -1959,8 +1959,7 @@ mod tests {
         scene
             .apply_edit(true, &plant, target, 0)
             .expect("place plant");
-        // A panel is a thin vertical slab along x: its sampled bounds hug the
-        // cell's x midline while y spans the full cell.
+        // Crossed quads span the cell; selection uses a separate tight box.
         let (plant_min_x, plant_max_x, _plant_min_y, plant_max_y) = {
             match scene.authority.store().query(target) {
                 TerrainQuery::Ready(state) => {
@@ -1980,11 +1979,42 @@ mod tests {
                 other => panic!("plant state: {other:?}"),
             }
         };
-        assert!(
-            plant_min_x >= target.x as f32 + 0.44 && plant_max_x <= target.x as f32 + 0.56,
-            "plant x range [{plant_min_x}, {plant_max_x}] must hug the panel"
-        );
+        assert!((plant_min_x - target.x as f32).abs() < 1e-4);
+        assert!((plant_max_x - (target.x as f32 + 1.0)).abs() < 1e-4);
         assert!((plant_max_y - (target.y as f32 + 1.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn crossed_plant_uses_a_tight_pick_box_and_outline_without_blocking_walking() {
+        let mut scene = Scene::new(0).unwrap();
+        let plant = key("base:plant");
+        let pos = BlockPos::new(8, 14, 8);
+        scene.apply_edit(true, &plant, pos, 0).unwrap();
+        scene
+            .apply_edit(true, &key("base:stone"), BlockPos::new(10, 14, 8), 0)
+            .unwrap();
+        let state = scene.authority().store().query(pos).ready().unwrap();
+        let registry = scene.authority().registry();
+        assert_eq!(registry.render_shape(state), Some(Shape::Cross));
+        assert!(registry.collision_shape(state).is_none());
+        let hit = scene.pick([6.5, 14.5, 8.5], [1.0, 0.0, 0.0], 64.0);
+        let PickOutcome::Hit(hit) = hit else {
+            panic!("expected the plant");
+        };
+        assert_eq!(hit.block, pos);
+        assert!((hit.entry[0] - 8.125).abs() < 1e-5);
+        let bytes = scene.outline_bytes(&hit);
+        assert_eq!(bytes.len(), 24 * Vertex::STRIDE);
+        for vertex in bytes.chunks_exact(Vertex::STRIDE) {
+            let x = f32::from_le_bytes(vertex[..4].try_into().unwrap());
+            assert!((8.1209..=8.8791).contains(&x));
+        }
+        let outside = scene.pick([6.5, 14.5, 8.05], [1.0, 0.0, 0.0], 64.0);
+        assert!(matches!(outside, PickOutcome::Hit(hit) if hit.block == BlockPos::new(10, 14, 8)));
+        let at = Position::new(8.5, 14.4, 8.5);
+        assert_eq!(scene.spawn_walker(at).unwrap(), at);
+        let moved = scene.step_walker([1.0, 0.0, 0.0], false, 0.05).unwrap().0;
+        assert!(moved.x > at.x);
     }
 
     #[test]

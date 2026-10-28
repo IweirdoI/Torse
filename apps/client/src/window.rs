@@ -1180,11 +1180,26 @@ impl WindowApp {
         // or the per-frame check re-arms capture.
         let grab = grab && self.focused;
         if let Some(gpu) = self.gpu.as_ref() {
-            self.grabbed = if grab {
-                gpu.window
-                    .set_cursor_grab(CursorGrabMode::Locked)
-                    .or_else(|_| gpu.window.set_cursor_grab(CursorGrabMode::Confined))
-                    .is_ok()
+            self.grabbed = if grab && gpu.window.has_focus() && !self.ui.modal() {
+                // On Windows Locked pins the current desktop position, even
+                // outside this window. Hidden Confined instead clips to the
+                // client center and keeps both button routing and raw motion.
+                gpu.window.set_cursor_visible(false);
+                let result = gpu.window.set_cursor_grab(CursorGrabMode::Confined);
+                #[cfg(not(target_os = "windows"))]
+                let result = result.or_else(|_| {
+                    gpu.window.set_cursor_grab(CursorGrabMode::Locked)?;
+                    gpu.window
+                        .set_cursor_position(winit::dpi::PhysicalPosition::new(
+                            gpu.config.width / 2,
+                            gpu.config.height / 2,
+                        ))
+                });
+                if let Err(error) = &result {
+                    let _ = gpu.window.set_cursor_grab(CursorGrabMode::None);
+                    self.last_result = format!("Mouse capture failed: {error}");
+                }
+                result.is_ok()
             } else {
                 let _ = gpu.window.set_cursor_grab(CursorGrabMode::None);
                 false

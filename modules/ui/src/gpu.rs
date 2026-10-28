@@ -137,9 +137,21 @@ impl Overlay {
             ],
         })
     }
-    pub fn upload(&mut self, device: &Device, queue: &Queue, canvas: &Canvas, scale: u32) {
+    pub fn upload(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        canvas: &Canvas,
+        scale: u32,
+    ) -> Result<(), String> {
         let pixel_width = canvas.pixel_width();
         let pixel_height = canvas.pixel_height();
+        if pixel_width > device.limits().max_texture_dimension_2d
+            || pixel_height > device.limits().max_texture_dimension_2d
+            || scale == 0
+        {
+            return Err("UI overlay exceeds device dimensions or has zero scale".into());
+        }
         if self.image.width() != pixel_width || self.image.height() != pixel_height {
             self.image = Self::texture(device, pixel_width, pixel_height);
             self.binding = Self::bind(device, &self.layout, &self.image, &self.params);
@@ -166,6 +178,7 @@ impl Overlay {
                 depth_or_array_layers: 1,
             },
         );
+        Ok(())
     }
     pub fn draw(&self, encoder: &mut CommandEncoder, target: &TextureView) {
         let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {

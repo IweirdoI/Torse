@@ -26,6 +26,7 @@ members = [
     "modules/inventory",
     "modules/crafting",
     "modules/energy",
+    "modules/ui",
 ]
 resolver = "3"
 

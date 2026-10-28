@@ -24,6 +24,15 @@ impl Sprite {
         let mut decoder = png::Decoder::new(Cursor::new(bytes));
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+        let dimensions = (reader.info().width, reader.info().height);
+        if dimensions != expected
+            || dimensions.0 == 0
+            || dimensions.1 == 0
+            || dimensions.0 > 1024
+            || dimensions.1 > 1024
+        {
+            return Err("UI sprite dimensions do not match its bounded declaration".into());
+        }
         let mut data = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut data).map_err(|e| e.to_string())?;
         if (info.width, info.height) != expected {
@@ -79,8 +88,8 @@ impl Rect {
     pub fn contains(self, p: [i32; 2]) -> bool {
         p[0] >= self.x
             && p[1] >= self.y
-            && p[0] < self.x + self.w as i32
-            && p[1] < self.y + self.h as i32
+            && i64::from(p[0]) < i64::from(self.x) + i64::from(self.w)
+            && i64::from(p[1]) < i64::from(self.y) + i64::from(self.h)
     }
 }
 /// Retained UI raster over physical pixels.
@@ -98,16 +107,41 @@ pub struct Canvas {
     /// Physical pixels per logical pixel.
     pub scale: u32,
     pixels: Vec<u8>,
+    _memory: Option<MemoryLease>,
 }
 impl Canvas {
     pub fn new(width: u32, height: u32, scale: u32) -> Self {
+        Self::try_new(width, height, scale, None).expect("bounded UI canvas")
+    }
+    /// Allocate at most 64 MiB, optionally charged to the host's shared pool.
+    pub fn try_new(
+        width: u32,
+        height: u32,
+        scale: u32,
+        memory: Option<&MemoryPool>,
+    ) -> Result<Self, String> {
         let scale = scale.max(1);
-        Self {
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|n| n.checked_mul(u64::from(scale).pow(2)))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or("UI canvas size overflow")?;
+        if width == 0 || height == 0 || scale > 8 || bytes > 64 * 1024 * 1024 {
+            return Err("UI canvas dimensions exceed the raster budget".into());
+        }
+        let lease = memory
+            .map(|pool| {
+                pool.reserve(MemoryClass::Codec, bytes, EvictionRank::Pinned)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        Ok(Self {
             width,
             height,
             scale,
-            pixels: vec![0; (width * scale * height * scale * 4) as usize],
-        }
+            pixels: vec![0; bytes as usize],
+            _memory: lease,
+        })
     }
     /// Physical buffer width.
     pub fn pixel_width(&self) -> u32 {
@@ -150,13 +184,34 @@ impl Canvas {
         }
     }
     pub fn fill(&mut self, rect: Rect, color: [u8; 4]) {
-        for y in rect.y.max(0)..(rect.y + rect.h as i32).min(self.height as i32) {
-            for x in rect.x.max(0)..(rect.x + rect.w as i32).min(self.width as i32) {
+        let end_x = (i64::from(rect.x) + i64::from(rect.w)).clamp(0, i64::from(self.width)) as i32;
+        let end_y = (i64::from(rect.y) + i64::from(rect.h)).clamp(0, i64::from(self.height)) as i32;
+        for y in rect.y.max(0)..end_y {
+            for x in rect.x.max(0)..end_x {
                 self.blend(x, y, color);
             }
         }
     }
     pub fn sprite(&mut self, sprite: &Sprite, rect: Rect, border: u32) {
+        self.sprite_region(
+            sprite,
+            Rect::new(0, 0, sprite.width, sprite.height),
+            rect,
+            border,
+        );
+    }
+
+    /// Nine-slice one validated atlas region, clipping work to the canvas.
+    pub fn sprite_region(&mut self, sprite: &Sprite, source: Rect, rect: Rect, border: u32) {
+        if source.x < 0
+            || source.y < 0
+            || source.w == 0
+            || source.h == 0
+            || u64::from(source.x as u32) + u64::from(source.w) > u64::from(sprite.width)
+            || u64::from(source.y as u32) + u64::from(source.h) > u64::from(sprite.height)
+        {
+            return;
+        }
         let pixels = sprite
             .assets
             .get(sprite.handle)
@@ -172,14 +227,18 @@ impl Canvas {
                 b + (p - b) * (src - 2 * b) / (dst - 2 * b).max(1)
             }
         };
-        for y in 0..rect.h {
-            let sy = map(y, rect.h, sprite.height);
-            for x in 0..rect.w {
-                let sx = map(x, rect.w, sprite.width);
+        let start_x = (-i64::from(rect.x)).max(0).min(i64::from(rect.w)) as u32;
+        let start_y = (-i64::from(rect.y)).max(0).min(i64::from(rect.h)) as u32;
+        let end_x = (i64::from(self.width) - i64::from(rect.x)).clamp(0, i64::from(rect.w)) as u32;
+        let end_y = (i64::from(self.height) - i64::from(rect.y)).clamp(0, i64::from(rect.h)) as u32;
+        for y in start_y..end_y {
+            let sy = source.y as u32 + map(y, rect.h, source.h);
+            for x in start_x..end_x {
+                let sx = source.x as u32 + map(x, rect.w, source.w);
                 let i = ((sy * sprite.width + sx) * 4) as usize;
                 self.blend(
-                    rect.x + x as i32,
-                    rect.y + y as i32,
+                    (i64::from(rect.x) + i64::from(x)) as i32,
+                    (i64::from(rect.y) + i64::from(y)) as i32,
                     pixels[i..i + 4].try_into().unwrap(),
                 );
             }
@@ -207,6 +266,23 @@ pub struct Text {
     memory: Option<(MemoryPool, MemoryLease)>,
 }
 impl Text {
+    /// Load a host-supplied font without depending on platform font discovery.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        if bytes.len() > 32 * 1024 * 1024 {
+            return Err("UI font exceeds its source budget".into());
+        }
+        let font_bytes = bytes.len() as u64;
+        let font = FontVec::try_from_vec(bytes).map_err(|error| error.to_string())?;
+        Ok(Self {
+            chinese: font.glyph_id('\u{52a0}').0 != 0,
+            font,
+            glyphs: BTreeMap::new(),
+            scale: 1,
+            font_bytes,
+            pressure: false,
+            memory: None,
+        })
+    }
     pub fn load() -> Result<Self, String> {
         let paths = if let Some(path) = std::env::var_os("TORSE_UI_FONT") {
             vec![PathBuf::from(path)]

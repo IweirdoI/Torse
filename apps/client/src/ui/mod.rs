@@ -1,16 +1,13 @@
 //! Client UI foundation: a flat dark theme drawn on the canvas, HUD, modal
 //! focus, and a clearly labeled machine preview. No UI control has access to
 //! authoritative mutation.
-mod canvas;
-mod gpu;
-mod style;
+use torse_ui::{canvas, gpu, style};
 
 use canvas::{Canvas, Rect, Sprite, Text};
 use gpu::Overlay;
 use std::collections::BTreeMap;
-use style::{
-    BORDER, CHIP_BG, CHIP_BORDER, FIELD_BG, GROUP_BG, MUTED, SEPARATOR, TEXT, TITLE_TEXT, WINDOW_BG,
-};
+use style::{MUTED, SEPARATOR, TEXT, TITLE_TEXT};
+use torse_ui::{Part, Theme};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -44,9 +41,8 @@ pub enum Action {
 pub struct State {
     pub mode: Mode,
     pub cursor: [f64; 2],
-    armed: Option<Action>,
     pub frame_limit: crate::frame_pacing::FrameLimit,
-    dragging_fps: bool,
+    capture: torse_ui::Pointer<Action>,
 }
 impl State {
     pub fn modal(&self) -> bool {
@@ -54,34 +50,30 @@ impl State {
     }
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
-        self.armed = None;
-        self.dragging_fps = false;
+        self.capture.cancel();
+    }
+    fn event(event: Option<torse_ui::Event<Action>>) -> Option<Action> {
+        match event? {
+            torse_ui::Event::Activated(action) => Some(action),
+            torse_ui::Event::Changed(Action::FrameRate(_), fps) => Some(Action::FrameRate(fps)),
+            _ => None,
+        }
     }
     pub fn pointer(&mut self, down: bool, size: [u32; 2]) -> Option<Action> {
         let layout = Layout::new(size);
-        if self.mode == Mode::Pause
-            && (self.dragging_fps
-                || (down && layout.fps_slider().contains(layout.point(self.cursor))))
-        {
-            self.dragging_fps = down;
-            self.armed = None;
-            return Some(Action::FrameRate(layout.fps_value(self.cursor)));
-        }
-        let hit = Layout::new(size).hit(self.mode, self.cursor);
-        if down {
-            self.armed = hit;
-            None
-        } else {
-            self.armed.take().filter(|a| Some(*a) == hit)
-        }
+        let controls = layout.controls(self.mode);
+        self.capture.cursor = layout.point(self.cursor);
+        Self::event(self.capture.button(down, &controls))
     }
     pub fn motion(&mut self, cursor: [f64; 2], size: [u32; 2]) -> Option<Action> {
         self.cursor = cursor;
-        (self.mode == Mode::Pause && self.dragging_fps)
-            .then(|| Action::FrameRate(Layout::new(size).fps_value(cursor)))
+        let layout = Layout::new(size);
+        Self::event(
+            self.capture
+                .motion(layout.point(cursor), &layout.controls(self.mode)),
+        )
     }
 }
-
 struct Layout {
     scale: u32,
     width: u32,
@@ -163,18 +155,32 @@ impl Layout {
         let p = self.panel(Mode::Pause);
         Rect::new(p.x + 14, p.y + 196, p.w.saturating_sub(28), 16)
     }
-    fn fps_value(&self, cursor: [f64; 2]) -> u16 {
-        let track = self.fps_slider();
-        let fraction = ((cursor[0] / f64::from(self.scale) - f64::from(track.x))
-            / f64::from(track.w.saturating_sub(1).max(1)))
-        .clamp(0.0, 1.0);
-        crate::frame_pacing::MIN_FPS
-            + (fraction * f64::from(crate::frame_pacing::MAX_FPS - crate::frame_pacing::MIN_FPS))
-                .round() as u16
-    }
     fn close(&self, mode: Mode) -> Rect {
         let p = self.panel(mode);
         Rect::new(p.x + p.w as i32 - 22, p.y + 3, 18, 16)
+    }
+    fn controls(&self, mode: Mode) -> Vec<torse_ui::Control<Action>> {
+        if mode == Mode::Game {
+            return Vec::new();
+        }
+        let mut controls: Vec<_> = self
+            .buttons(mode)
+            .into_iter()
+            .map(|(key, rect, _)| torse_ui::Control::Button { key, rect })
+            .collect();
+        controls.push(torse_ui::Control::Button {
+            key: Action::Resume,
+            rect: self.close(mode),
+        });
+        if mode == Mode::Pause {
+            controls.push(torse_ui::Control::Slider {
+                key: Action::FrameRate(0),
+                rect: self.fps_slider(),
+                min: crate::frame_pacing::MIN_FPS,
+                max: crate::frame_pacing::MAX_FPS,
+            });
+        }
+        controls
     }
     fn hit(&self, mode: Mode, cursor: [f64; 2]) -> Option<Action> {
         if mode == Mode::Game {
@@ -243,6 +249,8 @@ pub struct Layer {
     text: Text,
     labels: BTreeMap<&'static str, &'static str>,
     last: Option<View>,
+    theme: Theme,
+    memory: Option<torse_types::MemoryPool>,
 }
 pub struct Hud<'a> {
     pub material: usize,
@@ -256,10 +264,12 @@ pub struct Hud<'a> {
 }
 impl Layer {
     pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) -> Result<(), String> {
+        self.theme.attach_memory(pool.clone())?;
         self.text.attach_memory(pool.clone())?;
         for icon in &mut self.skin.icons {
             icon.attach_memory(pool.clone())?;
         }
+        self.memory = Some(pool);
         Ok(())
     }
     pub fn clear_caches(&mut self) {
@@ -287,6 +297,12 @@ impl Layer {
                 .filter_map(|line| line.split_once('='))
                 .collect(),
             last: None,
+            memory: None,
+            theme: if let Some(directory) = std::env::var_os("TORSE_UI_SKIN") {
+                Theme::load_dir(std::path::Path::new(&directory))?
+            } else {
+                Theme::load_default()?
+            },
         })
     }
     pub fn prepare(
@@ -308,9 +324,9 @@ impl Layer {
             names: hud.names.into_iter().take(3).collect(),
             sensitivity: (hud.sensitivity * 100.0).round() as u16,
             hover: layout.hit(state.mode, state.cursor),
-            pressed: state.armed,
+            pressed: state.capture.active(),
             frame_limit: state.frame_limit,
-            dragging_fps: state.dragging_fps,
+            dragging_fps: state.capture.dragging(),
             close_hot: {
                 let p = [
                     (state.cursor[0] / f64::from(layout.scale)) as i32,
@@ -323,11 +339,21 @@ impl Layer {
         if self.last.as_ref() == Some(&view) {
             return;
         }
-        let mut canvas = Canvas::new(layout.width, layout.height, layout.scale);
+        let Ok(mut canvas) = Canvas::try_new(
+            layout.width,
+            layout.height,
+            layout.scale,
+            self.memory.as_ref(),
+        ) else {
+            self.text.clear_cache();
+            return;
+        };
         self.paint(&mut canvas, &layout, &view);
         // The canvas already matches the surface one to one; the shader
         // must not divide again.
-        self.overlay.upload(device, queue, &canvas, 1);
+        if self.overlay.upload(device, queue, &canvas, 1).is_err() {
+            return;
+        }
         self.last = Some(view);
     }
     pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
@@ -371,12 +397,13 @@ impl Layer {
         let h = l.height as i32;
         self.paint_hud(c, l, v, w, h);
         if v.mode == Mode::Game {
-            style::crosshair(c, w / 2, h / 2);
+            self.theme
+                .paint(c, Part::Crosshair, Rect::new(w / 2 - 7, h / 2 - 7, 16, 16));
             return;
         }
         c.fill(Rect::new(0, 0, l.width, l.height), [8, 9, 11, 130]);
         let p = l.panel(v.mode);
-        style::frame(c, p, WINDOW_BG, BORDER);
+        self.theme.paint(c, Part::Window, p);
         let title = if v.mode == Mode::Pause {
             "menu_title"
         } else {
@@ -389,7 +416,15 @@ impl Layer {
             12,
             TITLE_TEXT,
         );
-        style::close_glyph(c, l.close(v.mode), v.close_hot);
+        self.theme.paint(
+            c,
+            if v.close_hot {
+                Part::CloseHover
+            } else {
+                Part::Close
+            },
+            l.close(v.mode),
+        );
         style::hline(c, p.x, p.y + 21, p.w, SEPARATOR);
         if v.mode == Mode::Pause {
             self.paint_pause(c, l, v, p);
@@ -397,21 +432,20 @@ impl Layer {
             self.paint_machine(c, p);
         }
         for (action, rect, key) in l.buttons(v.mode) {
-            style::button(
+            self.theme.button(
                 c,
                 rect,
                 v.hover == Some(action),
                 v.pressed == Some(action) && v.hover == Some(action),
             );
-            let text = if action == Action::ToggleFrameLimit {
-                format!(
-                    "[{}] {}",
-                    if v.frame_limit.enabled { "x" } else { " " },
-                    self.labels.get(key).copied().unwrap_or("?")
-                )
-            } else {
-                self.labels.get(key).copied().unwrap_or("?").to_owned()
-            };
+            if action == Action::ToggleFrameLimit {
+                self.theme.checkbox(
+                    c,
+                    Rect::new(rect.x + 4, rect.y + 3, 14, 14),
+                    v.frame_limit.enabled,
+                );
+            }
+            let text = self.labels.get(key).copied().unwrap_or("?").to_owned();
             let label = text.as_str();
             let tw = self.text.measure(label, 12).min(rect.w.saturating_sub(12));
             let color = if v.hover == Some(action) {
@@ -440,7 +474,8 @@ impl Layer {
         let packaged = v.names.is_empty();
         for i in 0..3 {
             let x = slot_x + i as i32 * 26;
-            style::slot(c, Rect::new(x, slot_y, 24, 24), i == v.material);
+            self.theme
+                .slot(c, Rect::new(x, slot_y, 24, 24), i == v.material);
             if packaged {
                 c.sprite(&self.skin.icons[i], Rect::new(x + 4, slot_y + 4, 16, 16), 0);
             }
@@ -486,7 +521,7 @@ impl Layer {
             "hud_connecting"
         };
         let info_w = self.text.measure(self.labels[info], 11) + 12;
-        style::frame(c, Rect::new(8, 8, info_w, 20), CHIP_BG, CHIP_BORDER);
+        self.theme.paint(c, Part::Chip, Rect::new(8, 8, info_w, 20));
         self.label(c, info, Rect::new(14, 11, info_w, 14), 11, TEXT);
         self.shadow_label(
             c,
@@ -496,7 +531,7 @@ impl Layer {
         );
         if !v.result.is_empty() {
             let rw = l.width.saturating_sub(16);
-            style::frame(c, Rect::new(8, 32, rw, 20), CHIP_BG, CHIP_BORDER);
+            self.theme.paint(c, Part::Chip, Rect::new(8, 32, rw, 20));
             self.text.draw(
                 c,
                 &v.result,
@@ -516,7 +551,7 @@ impl Layer {
             TEXT,
         );
         let field = l.sensitivity_field();
-        style::frame(c, field, FIELD_BG, BORDER);
+        self.theme.paint(c, Part::Field, field);
         let value = format!("{:.2}", f64::from(v.sensitivity) / 100.0);
         let tw = self.text.measure(&value, 11);
         self.text.draw(
@@ -542,11 +577,11 @@ impl Layer {
             TEXT,
         );
         let track = l.fps_slider();
-        style::frame(c, track, style::TRACK_BG, BORDER);
+        self.theme.paint(c, Part::Track, track);
         let fraction = f32::from(v.frame_limit.fps - crate::frame_pacing::MIN_FPS)
             / f32::from(crate::frame_pacing::MAX_FPS - crate::frame_pacing::MIN_FPS);
         let x = track.x + (fraction * track.w.saturating_sub(8) as f32).round() as i32;
-        style::button(
+        self.theme.button(
             c,
             Rect::new(x, track.y + 1, 8, track.h.saturating_sub(2)),
             v.dragging_fps,
@@ -568,9 +603,11 @@ impl Layer {
             (p.x + p.w as i32 - 110, "machine_output", None, "empty"),
         ];
         for (gx, label, icon, caption) in groups {
-            style::frame(c, Rect::new(gx, p.y + 42, 96, 58), GROUP_BG, SEPARATOR);
+            self.theme
+                .paint(c, Part::Group, Rect::new(gx, p.y + 42, 96, 58));
             self.centre(c, label, Rect::new(gx, p.y + 46, 96, 12), 10, TEXT);
-            style::slot(c, Rect::new(gx + 36, p.y + 58, 24, 24), false);
+            self.theme
+                .slot(c, Rect::new(gx + 36, p.y + 58, 24, 24), false);
             if let Some(index) = icon {
                 c.sprite(
                     &self.skin.icons[index],
@@ -590,7 +627,8 @@ impl Layer {
             10,
             TEXT,
         );
-        style::progress(c, Rect::new(mid.x, p.y + 62, mid.w, 8), 0.75);
+        self.theme
+            .progress(c, Rect::new(mid.x, p.y + 62, mid.w, 8), 0.75);
         let ratio = "3 / 4";
         let tw = self.text.measure(ratio, 10) + 4;
         self.text.draw(

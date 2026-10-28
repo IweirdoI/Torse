@@ -3048,7 +3048,6 @@ dependencies = [
 name = "torse-client"
 version = "0.1.0"
 dependencies = [
- "ab_glyph",
  "png",
  "pollster",
  "serde",
@@ -3063,6 +3062,7 @@ dependencies = [
  "torse-runtime",
  "torse-sim",
  "torse-types",
+ "torse-ui",
  "torse-world",
  "torse-world-services",
  "wgpu",
@@ -3277,6 +3277,19 @@ dependencies = [
 [[package]]
 name = "torse-types"
 version = "0.1.0"
+
+[[package]]
+name = "torse-ui"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "png",
+ "serde",
+ "toml 0.9.12+spec-1.1.0",
+ "torse-assets",
+ "torse-types",
+ "wgpu",
+]
 
 [[package]]
 name = "torse-world"

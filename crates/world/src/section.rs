@@ -2,7 +2,9 @@
 //!
 //! Uniform sections own no cell buffer. Low-diversity sections pack local
 //! palette indices; high-diversity sections retain direct state identifiers.
-//! Layout changes do not change cell queries or exchange formats.
+//! A dense section counts its states and shrinks on the write that makes a
+//! palette or a single value smaller. Layout changes do not change cell
+//! queries or exchange formats.
 //!
 //! Linear indexing follows the architecture note: `x + side * (z + side * y)`.
 //! The encoding is internal, but fixing it here keeps tests and future
@@ -22,13 +24,113 @@ pub const DEFAULT_SECTION_SIDE: u32 = 32;
 /// cells, which bounds any single allocation made by storage.
 pub const MAX_SECTION_SIDE: u32 = 64;
 
+/// Direct identifiers for a high-diversity section, plus private state counts.
+///
+/// The counts are not part of the cell query. They exist so a write that
+/// removes the last cell of a state can shrink without scanning the section.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenseCells {
+    cells: Vec<BlockStateId>,
+    states: Vec<BlockStateId>,
+    counts: Vec<u32>,
+}
+
+impl DenseCells {
+    fn from_cells(cells: Vec<BlockStateId>) -> Self {
+        let mut order = cells.clone();
+        order.sort_unstable();
+        let mut states = Vec::new();
+        let mut counts = Vec::new();
+        for cell in order {
+            if states.last() == Some(&cell) {
+                *counts
+                    .last_mut()
+                    .expect("a state is recorded with its count") += 1;
+            } else {
+                states.push(cell);
+                counts.push(1);
+            }
+        }
+        states.shrink_to_fit();
+        counts.shrink_to_fit();
+        Self {
+            cells,
+            states,
+            counts,
+        }
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.cells.capacity() * size_of::<BlockStateId>()
+            + self.states.capacity() * size_of::<BlockStateId>()
+            + self.counts.capacity() * size_of::<u32>()
+    }
+
+    /// Update one cell. `Some` replaces the whole section layout.
+    fn write(&mut self, index: usize, state: BlockStateId) -> Option<SectionStorage> {
+        let previous = self.cells[index];
+        let before = self.states.len();
+        let old = self
+            .states
+            .binary_search(&previous)
+            .expect("dense census contains the previous state");
+        self.counts[old] -= 1;
+        if self.counts[old] == 0 {
+            self.states.remove(old);
+            self.counts.remove(old);
+        }
+        match self.states.binary_search(&state) {
+            Ok(found) => self.counts[found] += 1,
+            Err(insert_at) => {
+                self.states.insert(insert_at, state);
+                self.counts.insert(insert_at, 1);
+            }
+        }
+        self.cells[index] = state;
+        if self.states.len() >= before {
+            return None;
+        }
+        if self.states.len() == 1 {
+            return Some(SectionStorage::Uniform(self.states[0]));
+        }
+        if self.states.len() <= crate::MAX_PALETTE_STATES {
+            let packed = crate::PaletteCells::build(self.cells.iter().copied(), self.cells.len())?;
+            return Some(SectionStorage::Palette(Box::new(packed)));
+        }
+        None
+    }
+}
+
+impl std::ops::Deref for DenseCells {
+    type Target = [BlockStateId];
+
+    fn deref(&self) -> &Self::Target {
+        &self.cells
+    }
+}
+
+impl<'a> IntoIterator for &'a DenseCells {
+    type Item = &'a BlockStateId;
+    type IntoIter = std::slice::Iter<'a, BlockStateId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.cells.iter()
+    }
+}
+
+impl From<Vec<BlockStateId>> for DenseCells {
+    fn from(cells: Vec<BlockStateId>) -> Self {
+        Self::from_cells(cells)
+    }
+}
+
 /// Internal cell layout of a section.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SectionStorage {
     /// Every cell holds the same state.
     Uniform(BlockStateId),
     /// One state identifier per cell, in linear index order.
-    Dense(Vec<BlockStateId>),
+    Dense(DenseCells),
     /// Local symbols encoded in the minimum number of bits per cell.
     Palette(Box<crate::PaletteCells>),
 }
@@ -43,7 +145,6 @@ pub struct Section {
     side: u32,
     revision: Revision,
     storage: SectionStorage,
-    dense_probe: Option<(BlockStateId, u32)>,
     dense_edits: u32,
 }
 
@@ -65,7 +166,6 @@ impl Section {
             side,
             revision: Revision::INITIAL,
             storage: SectionStorage::Uniform(fill),
-            dense_probe: None,
             dense_edits: 0,
         })
     }
@@ -101,7 +201,6 @@ impl Section {
             side,
             revision: Revision::INITIAL,
             storage,
-            dense_probe: None,
             dense_edits: 0,
         };
         section.compact();
@@ -140,7 +239,7 @@ impl Section {
     pub fn allocated_bytes(&self) -> usize {
         match &self.storage {
             SectionStorage::Uniform(_) => 0,
-            SectionStorage::Dense(cells) => cells.capacity() * size_of::<BlockStateId>(),
+            SectionStorage::Dense(cells) => cells.allocated_bytes(),
             SectionStorage::Palette(cells) => {
                 size_of::<crate::PaletteCells>() + cells.allocated_bytes()
             }
@@ -162,21 +261,21 @@ impl Section {
 
     /// Reconsider dense storage after bulk changes without advancing revision.
     /// Imports and every full section's worth of dense edits also do this.
+    /// A write that drops a state shrinks immediately when the census already
+    /// shows that a palette or a single value fits.
     pub fn compact(&mut self) {
-        if let SectionStorage::Dense(cells) = &self.storage {
-            let fill = cells[0];
-            let count = cells.iter().filter(|s| **s == fill).count();
-            if count == cells.len() {
-                self.storage = SectionStorage::Uniform(fill);
-                self.dense_probe = None;
-            } else if let Some(packed) =
-                crate::PaletteCells::build(cells.iter().copied(), cells.len())
-            {
-                self.storage = SectionStorage::Palette(Box::new(packed));
-                self.dense_probe = None;
-            } else {
-                self.dense_probe = Some((fill, count as u32));
+        let next = match &self.storage {
+            SectionStorage::Dense(cells) if cells.states.len() == 1 => {
+                Some(SectionStorage::Uniform(cells.states[0]))
             }
+            SectionStorage::Dense(cells) if cells.states.len() <= crate::MAX_PALETTE_STATES => {
+                crate::PaletteCells::build(cells.iter().copied(), cells.len())
+                    .map(|packed| SectionStorage::Palette(Box::new(packed)))
+            }
+            _ => None,
+        };
+        if let Some(next) = next {
+            self.storage = next;
         }
         self.dense_edits = 0;
     }
@@ -207,29 +306,20 @@ impl Section {
             let values = (0..len).map(|i| if i == index { state } else { fill });
             self.storage = crate::PaletteCells::build(values.clone(), len)
                 .map(|packed| SectionStorage::Palette(Box::new(packed)))
-                .unwrap_or_else(|| SectionStorage::Dense(values.collect()));
+                .unwrap_or_else(|| SectionStorage::Dense(values.collect::<Vec<_>>().into()));
             self.compact();
         } else if let SectionStorage::Palette(packed) = &mut self.storage {
             if !packed.set(index, state) {
                 let mut cells: Vec<_> = self.values().collect();
                 cells[index] = state;
-                self.storage = SectionStorage::Dense(cells);
+                self.storage = SectionStorage::Dense(cells.into());
                 self.compact();
             } else if packed.states().len() == 1 {
                 self.storage = SectionStorage::Uniform(packed.states()[0]);
             }
         } else if let SectionStorage::Dense(cells) = &mut self.storage {
-            cells[index] = state;
-            let (fill, mut count) = self.dense_probe.expect("dense representation has a probe");
-            count -= u32::from(previous == fill);
-            count += u32::from(state == fill);
-            self.dense_probe = Some((fill, count));
-            if self
-                .dense_probe
-                .is_some_and(|(_, count)| count as usize == cells.len())
-            {
-                self.storage = SectionStorage::Uniform(self.dense_probe.unwrap().0);
-                self.dense_probe = None;
+            if let Some(next) = cells.write(index, state) {
+                self.storage = next;
                 self.dense_edits = 0;
             } else {
                 self.dense_edits += 1;
@@ -476,7 +566,8 @@ mod tests {
             let cells: Vec<_> = (0..32usize.pow(3))
                 .map(|i| BlockStateId((i % symbols) as u16))
                 .collect();
-            let section = Section::from_storage(32, SectionStorage::Dense(cells.clone())).unwrap();
+            let section =
+                Section::from_storage(32, SectionStorage::Dense(cells.clone().into())).unwrap();
             let SectionStorage::Palette(packed) = section.storage() else {
                 panic!("expected packed cells");
             };
@@ -562,10 +653,10 @@ mod tests {
 
     #[test]
     fn a_unique_symbol_can_be_replaced_at_palette_capacity() {
-        let cells = (0..32usize.pow(3))
+        let cells: Vec<_> = (0..32usize.pow(3))
             .map(|i| BlockStateId(if i < 255 { i as u16 + 1 } else { 0 }))
             .collect();
-        let mut section = Section::from_storage(32, SectionStorage::Dense(cells)).unwrap();
+        let mut section = Section::from_storage(32, SectionStorage::Dense(cells.into())).unwrap();
         section.set(local(0, 0, 0), BlockStateId(u16::MAX)).unwrap();
         let SectionStorage::Palette(packed) = section.storage() else {
             panic!()
@@ -588,7 +679,39 @@ mod tests {
         assert_eq!(section, before);
         assert_eq!(section.set(local(1, 1, 1), BlockStateId(1)), Ok(false));
         assert!(Section::from_storage(32, section.storage().clone()).is_err());
-        assert!(Section::from_storage(16, SectionStorage::Dense(vec![])).is_err());
+        assert!(Section::from_storage(16, SectionStorage::Dense(Vec::new().into())).is_err());
+    }
+
+    #[test]
+    fn dense_shrinks_when_a_state_disappears_without_editing_every_cell() {
+        let mut section = Section::empty(16).unwrap();
+        for i in 0..257 {
+            section
+                .set(section.local_of(i), BlockStateId(i as u16 + 1))
+                .unwrap();
+        }
+        assert!(matches!(section.storage(), SectionStorage::Dense(_)));
+        for i in 1..257 {
+            section
+                .set(section.local_of(i), BlockStateId::EMPTY)
+                .unwrap();
+        }
+        assert!(
+            matches!(section.storage(), SectionStorage::Palette(_)),
+            "two remaining states pack without a full-section edit sweep"
+        );
+        assert_eq!(section.get(section.local_of(0)), Ok(BlockStateId(1)));
+        assert_eq!(section.get(section.local_of(1)), Ok(BlockStateId::EMPTY));
+        assert!(section.allocated_bytes() < section.cell_count() * size_of::<BlockStateId>());
+        section
+            .set(section.local_of(0), BlockStateId::EMPTY)
+            .unwrap();
+        assert_eq!(
+            section.storage(),
+            &SectionStorage::Uniform(BlockStateId::EMPTY)
+        );
+        assert_eq!(section.allocated_bytes(), 0);
+        assert!(section.values().all(|value| value == BlockStateId::EMPTY));
     }
 
     #[test]

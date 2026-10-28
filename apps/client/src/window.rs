@@ -27,6 +27,7 @@ use crate::pick::PickOutcome;
 use crate::renderer::GpuContext;
 use crate::scene::Scene;
 use crate::texture::Palette;
+use torse_render::{FrameBudget, FrameLimits, SectionUploadQueue};
 use torse_sim::PresentationClock;
 use torse_types::{BlockPos, ContentKey, SectionPos};
 use torse_world::Position;
@@ -36,7 +37,12 @@ const PICK_RANGE: f32 = 64.0;
 /// Sections generated per frame while streaming; spreading the work keeps
 /// the frame time bounded at the cost of populating a window over a few
 /// frames.
-const STREAM_BUDGET: usize = 4;
+const FRAME_LIMITS: FrameLimits = FrameLimits {
+    generation: 4,
+    meshing: 4,
+    uploads: 4,
+    upload_bytes: 8 * 1024 * 1024,
+};
 /// Fixed logic step in seconds. A presentation frame may run several of these
 /// and must not stretch one step to match the frame.
 const LOGIC_STEP_SECONDS: f64 = 1.0 / 20.0;
@@ -157,6 +163,8 @@ struct Gpu {
 }
 
 struct WindowApp {
+    work_budget: FrameBudget,
+    pending_uploads: SectionUploadQueue,
     ui: crate::ui::State,
     config: WindowConfig,
     scene: Option<Scene>,
@@ -232,6 +240,8 @@ impl WindowApp {
             .map(|name| ContentKey::parse(name).expect("static material key"))
             .collect();
         Self {
+            work_budget: FrameBudget::new(FRAME_LIMITS, 16_666),
+            pending_uploads: SectionUploadQueue::default(),
             ui: {
                 let mut state = crate::ui::State::default();
                 state.set_mode(config.ui_mode);
@@ -426,7 +436,7 @@ impl WindowApp {
             let Some(scene) = self.scene.as_mut() else {
                 return;
             };
-            if let Err(error) = scene.stream_around(center, STREAM_BUDGET) {
+            if let Err(error) = scene.stream_around(center, self.work_budget.limits().generation) {
                 self.failure = Some(format!("streaming failed: {error}"));
                 event_loop.exit();
                 return;
@@ -585,7 +595,7 @@ impl WindowApp {
             .scene
             .as_mut()
             .expect("camera implies scene")
-            .refresh_visuals(STREAM_BUDGET)
+            .refresh_visuals(self.work_budget.limits().meshing)
         {
             Ok(rebuilt) => rebuilt,
             Err(error) => {
@@ -595,13 +605,29 @@ impl WindowApp {
             }
         };
         self.rebuilds += rebuilt.len();
-        if !rebuilt.is_empty() || !self.uploaded {
+        self.pending_uploads.extend(rebuilt);
+        let scene = self.scene.as_ref().expect("camera implies scene");
+        self.pending_uploads
+            .retain(|p| scene.sections().contains(&p));
+        let uploads = match self
+            .pending_uploads
+            .select(center, self.work_budget.limits(), |p| {
+                scene.section_geometry_bytes(p)
+            }) {
+            Ok(uploads) => uploads,
+            Err(error) => {
+                self.failure = Some(error.to_owned());
+                event_loop.exit();
+                return;
+            }
+        };
+        if !uploads.is_empty() || !self.uploaded {
             let scene = self.scene.as_ref().expect("camera implies scene");
             if let Some(gpu) = self.gpu.as_mut() {
                 // Re-upload only the changed sections; untouched terrain keeps
                 // its buffers, so an edit costs one small upload, not the
                 // whole scene.
-                for pos in &rebuilt {
+                for pos in &uploads {
                     if let Some((vertices, indices)) = scene.section_geometry(*pos) {
                         let bytes = Scene::vertex_bytes(&vertices);
                         gpu.context.upload_section(*pos, &bytes, &indices);
@@ -618,7 +644,7 @@ impl WindowApp {
                 );
             }
             self.uploaded = true;
-            self.uploads += rebuilt.len();
+            self.uploads += uploads.len();
         }
         // Unloaded sections must stop drawing even when nothing rebuilt this
         // frame; retention is cheap and the entity slot survives it.
@@ -728,6 +754,8 @@ impl WindowApp {
         queue.present(frame);
 
         let frame_us = frame_started.elapsed().as_micros();
+        self.work_budget
+            .observe(frame_us.min(u128::from(u64::MAX)) as u64);
         self.frame_total_us += frame_us;
         self.frame_max_us = self.frame_max_us.max(frame_us);
         self.frame_count += 1;
@@ -1018,6 +1046,7 @@ impl WindowApp {
         self.pending_palette = None;
         self.center = None;
         self.uploaded = false;
+        self.pending_uploads.clear();
         self.rebuild_network = true;
     }
     fn rebuild_network_scene(&mut self) -> Result<(), String> {

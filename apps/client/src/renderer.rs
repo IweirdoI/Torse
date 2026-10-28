@@ -81,21 +81,23 @@ struct VertexOut {
 };
 
 fn sample_surface(surface: Surface, uv: vec2<f32>) -> vec4<f32> {
+    let local = fract(uv);
     let texel = 0.5 / vec2<f32>(textureDimensions(atlas, 0));
     let minimum = surface.rect.xy + texel;
     let maximum = surface.rect.xy + surface.rect.zw - texel;
-    let first_uv = clamp(surface.rect.xy + uv * surface.rect.zw, minimum, maximum);
+    let first_uv = clamp(surface.rect.xy + local * surface.rect.zw, minimum, maximum);
     var first: vec4<f32>;
     if (surface.frame.y > 0.5) {
         first = textureSampleLevel(atlas, atlas_sampler, first_uv, 0.0);
     } else {
-        first = textureSample(atlas, atlas_sampler, first_uv);
+        first = textureSampleGrad(atlas, atlas_sampler, first_uv,
+            dpdx(uv) * surface.rect.zw, dpdy(uv) * surface.rect.zw);
     }
     if (surface.frame.x <= 0.0) {
         return first;
     }
     let second_uv = clamp(
-        surface.next_rect.xy + uv * surface.next_rect.zw,
+        surface.next_rect.xy + local * surface.next_rect.zw,
         surface.next_rect.xy + texel,
         surface.next_rect.xy + surface.next_rect.zw - texel,
     );

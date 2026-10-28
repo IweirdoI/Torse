@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use torse_content::{Face, Shape, compile, m0_fixture_pack};
-use torse_render::{MeshData, MeshSample, RenderBlock, RenderBox, build_mesh};
+use torse_render::{MeshData, MeshSample, RenderBlock, RenderBox, build_mesh_optimized};
 use torse_sim::WorldAuthority;
 use torse_sim::action::{ActionOrigin, ActionRequest, ActionService, ActionTarget, ActorContext};
 use torse_sim::replica::{ReplicaChanges, ReplicaEntity, ReplicaSnapshot};
@@ -957,8 +957,15 @@ impl Scene {
     ///
     /// Returns the rebuilt sections, so callers re-upload only what changed.
     pub fn refresh_meshes(&mut self) -> Vec<SectionPos> {
+        self.refresh_meshes_bounded(usize::MAX)
+    }
+
+    fn refresh_meshes_bounded(&mut self, budget: usize) -> Vec<SectionPos> {
         let mut rebuilt = Vec::new();
         'sections: for pos in self.sections.clone() {
+            if rebuilt.len() >= budget {
+                break;
+            }
             let unchanged = self
                 .meshes
                 .get(&pos)
@@ -977,7 +984,7 @@ impl Scene {
             ) else {
                 break;
             };
-            let mesh = build_mesh(self.side, pos, |query| {
+            let mesh = build_mesh_optimized(self.side, pos, |query| {
                 sample(
                     self.authority.store(),
                     self.authority.registry(),
@@ -1106,7 +1113,7 @@ impl Scene {
 
     pub fn refresh_visuals(&mut self, budget: usize) -> Result<Vec<SectionPos>, String> {
         let Some(mut background) = self.background.take() else {
-            return Ok(self.refresh_meshes());
+            return Ok(self.refresh_meshes_bounded(budget));
         };
         let result = background.refresh(self, budget);
         self.background = Some(background);
@@ -1146,6 +1153,12 @@ impl Scene {
             );
         }
         (vertices, indices)
+    }
+
+    /// Interleaved vertices and indices of one cached section, world space.
+    pub fn section_geometry_bytes(&self, pos: SectionPos) -> Option<usize> {
+        let (_, mesh) = self.meshes.get(&pos)?;
+        Some(mesh.positions.len() * size_of::<Vertex>() + mesh.indices.len() * size_of::<u32>())
     }
 
     /// Interleaved vertices and indices of one cached section, world space.
@@ -1500,6 +1513,17 @@ mod tests {
         assert!(!indices.is_empty());
         assert!(faces > 0);
         assert_eq!(indices.len() % 3, 0);
+    }
+
+    #[test]
+    fn serial_visual_admission_honors_zero_and_one_section_budgets() {
+        let mut scene = Scene::new(1).unwrap();
+        assert!(scene.refresh_visuals(0).unwrap().is_empty());
+        assert_eq!(scene.mesh_count(), 0);
+        assert_eq!(scene.refresh_visuals(1).unwrap().len(), 1);
+        assert_eq!(scene.mesh_count(), 1);
+        assert_eq!(scene.refresh_visuals(1).unwrap().len(), 1);
+        assert_eq!(scene.mesh_count(), 2);
     }
 
     #[test]

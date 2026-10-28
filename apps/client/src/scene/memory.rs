@@ -19,7 +19,7 @@ pub(super) fn mesh_work_bytes(side: u32) -> u64 {
     (side as u64)
         .pow(3)
         .saturating_mul(6 * 268 * 3)
-        .saturating_add(16384)
+        .saturating_add(32768 + 16384)
 }
 impl Scene {
     pub fn startup_world_reservation(pool: &MemoryPool, radius: i64) -> Result<MemoryLease, Fault> {

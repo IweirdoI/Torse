@@ -1,7 +1,7 @@
 //! Owned generation/mesh inputs. Only the scene thread installs their results.
 use std::collections::BTreeMap;
 
-use torse_render::{Face, MeshBuildError, MeshJob, build_mesh_bounded};
+use torse_render::{Face, MeshBuildError, MeshJob, build_mesh_optimized_bounded};
 use torse_runtime::{
     Executor, ExecutorConfig, Job, JobBudget, JobError, JobOutput, Priority, ReserveError,
 };
@@ -361,7 +361,7 @@ impl Background {
             let face_bytes = 268;
             let task_budget = JobBudget {
                 input_bytes: (side + 2).pow(3) * size_of::<MeshSample>() + size_of::<MeshInput>(),
-                output_bytes: size_of::<MeshData>() + max_faces * face_bytes * 2 + 8192,
+                output_bytes: size_of::<MeshData>() + max_faces * face_bytes * 2 + 32768 + 8192,
             };
             let Some(lease) = self.reserve(task_budget)? else {
                 break;
@@ -369,7 +369,7 @@ impl Background {
             // Reservation precedes the only owned input copy.
             let input = MeshInput::capture(scene, pos)?;
             let job = lease.submit(Priority::Visible, move |cancel| {
-                let mesh = build_mesh_bounded(
+                let mesh = build_mesh_optimized_bounded(
                     input.side,
                     pos,
                     |p| input.sample(p),

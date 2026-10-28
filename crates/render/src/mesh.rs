@@ -23,6 +23,8 @@
 
 use std::collections::BTreeMap;
 
+mod cubes;
+
 use torse_types::{
     BlockPos, EvictionRank, Fault, MemoryChargeId, MemoryClass, MemoryLedger, MemoryResident,
     Revision, SectionPos,
@@ -333,7 +335,17 @@ pub fn build_mesh(
     section: SectionPos,
     sample: impl Fn(BlockPos) -> MeshSample,
 ) -> MeshData {
-    build_mesh_inner(side, section, sample, || false, None)
+    build_mesh_inner(side, section, sample, || false, None, false)
+        .expect("uncancelled unrestricted meshing succeeds")
+}
+
+/// Synchronous counterpart of the bounded occupancy/run mesher.
+pub fn build_mesh_optimized(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+) -> MeshData {
+    build_mesh_inner(side, section, sample, || false, None, true)
         .expect("uncancelled unrestricted meshing succeeds")
 }
 
@@ -356,7 +368,24 @@ pub fn build_mesh_bounded(
     if max_faces > u32::MAX as usize / 4 || max_faces > usize::MAX / 6 {
         return Err(MeshBuildError::OutputLimit);
     }
-    build_mesh_inner(side, section, sample, cancelled, Some(max_faces))
+    build_mesh_inner(side, section, sample, cancelled, Some(max_faces), false)
+}
+
+/// Merge coplanar opaque cube runs with identical materials and tints.
+/// Missing borders, shaped blocks and overlays retain ordinary face semantics.
+/// At most 32 KiB of occupancy scratch is used in addition to bounded output.
+/// UVs repeat per cell; consumers must support tiled local face coordinates.
+pub fn build_mesh_optimized_bounded(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+    cancelled: impl Fn() -> bool,
+    max_faces: usize,
+) -> Result<MeshData, MeshBuildError> {
+    if max_faces > u32::MAX as usize / 4 || max_faces > usize::MAX / 6 {
+        return Err(MeshBuildError::OutputLimit);
+    }
+    build_mesh_inner(side, section, sample, cancelled, Some(max_faces), true)
 }
 
 fn build_mesh_inner(
@@ -365,6 +394,7 @@ fn build_mesh_inner(
     sample: impl Fn(BlockPos) -> MeshSample,
     cancelled: impl Fn() -> bool,
     max_faces: Option<usize>,
+    optimized: bool,
 ) -> Result<MeshData, MeshBuildError> {
     if cancelled() {
         return Err(MeshBuildError::Cancelled);
@@ -409,7 +439,10 @@ fn build_mesh_inner(
             .map_err(|_| MeshBuildError::OutputLimit)?;
     }
 
-    for y in 0..side {
+    let optimized = optimized && side <= 64;
+    let all_cubes =
+        optimized && cubes::emit(&mut mesh, side, origin, &sample, &cancelled, max_faces)?;
+    for y in 0..if all_cubes { 0 } else { side } {
         if cancelled() {
             return Err(MeshBuildError::Cancelled);
         }
@@ -424,6 +457,9 @@ fn build_mesh_inner(
                     MeshSample::Ready(block) => block,
                     MeshSample::NotLoaded | MeshSample::OutOfBounds => continue,
                 };
+                if optimized && cubes::eligible(block) {
+                    continue;
+                }
                 if block.cross {
                     if max_faces.is_some_and(|limit| mesh.face_count() + 2 > limit) {
                         return Err(MeshBuildError::OutputLimit);
@@ -534,6 +570,7 @@ fn section_within(face: Face, bounds: RenderBox, neighbor: RenderBox) -> bool {
         && bounds.max[second] <= neighbor.max[second]
 }
 
+#[derive(Clone, Copy, PartialEq)]
 struct FaceAppearance {
     material: u16,
     overlay: Option<u16>,

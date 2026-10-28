@@ -31,6 +31,7 @@ use torse_render::{FrameBudget, FrameLimits, SectionUploadQueue};
 use torse_sim::PresentationClock;
 use torse_types::{BlockPos, ContentKey, SectionPos};
 use torse_world::Position;
+mod items;
 mod settings;
 
 /// How far the pick ray reaches, in blocks.
@@ -359,6 +360,7 @@ impl WindowApp {
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
         // The HUD needs the pack labels before the GPU borrow starts.
+        self.sync_inventory();
         let names = self.hotbar_names();
         let frame_started = Instant::now();
         self.frame_pacer
@@ -423,6 +425,10 @@ impl WindowApp {
                                 names: names.clone(),
                                 sensitivity: self.look_sensitivity,
                                 debug_lines: &self.debug_lines,
+                                inventory: self
+                                    .scene
+                                    .as_ref()
+                                    .map_or_else(Vec::new, Scene::inventory_slots),
                             },
                         );
                         gpu.ui.draw(&mut encoder, &view);
@@ -546,7 +552,7 @@ impl WindowApp {
                 &self.materials[self.material],
             ) {
                 let material = &self.materials[self.material];
-                let call = crate::net::edit_call(place, material, target, half);
+                let call = self.edit_call(place, material, target, half);
                 if let Some(Ok(seq)) = self.net.as_mut().map(|net| net.request(call)) {
                     self.requests_sent += 1;
                     self.last_result = format!("seq {} sent", seq.0);
@@ -579,7 +585,7 @@ impl WindowApp {
                 // session has no edit grants, so the admission reply carries
                 // the rejection; the mirror never forks.
                 let material = &self.materials[self.material];
-                let call = crate::net::edit_call(place, material, target, half);
+                let call = self.edit_call(place, material, target, half);
                 match self.net.as_mut().map(|net| net.request(call)) {
                     Some(Ok(seq)) => self.last_result = format!("seq {} sent", seq.0),
                     Some(Err(error)) => self.last_result = format!("send failed: {error}"),
@@ -587,7 +593,9 @@ impl WindowApp {
                 }
             } else {
                 let material = &self.materials[self.material];
+                let call = self.edit_call(place, material, target, half);
                 let result = match self.scene.as_mut() {
+                    Some(scene) if scene.item_owner().is_some() => scene.apply_item_call(call),
                     Some(scene) => scene.apply_edit(place, material, target, half),
                     None => return,
                 };
@@ -815,6 +823,10 @@ impl WindowApp {
                 names: names.to_vec(),
                 sensitivity: self.look_sensitivity,
                 debug_lines: &self.debug_lines,
+                inventory: self
+                    .scene
+                    .as_ref()
+                    .map_or_else(Vec::new, Scene::inventory_slots),
             },
         );
         gpu.ui.draw(&mut encoder, &view);
@@ -1226,13 +1238,24 @@ impl WindowApp {
     }
     /// Capture or release the mouse.
     ///
-    /// Captured means hidden and re-centred after every motion event: the
-    /// deltas drive the camera directly, and any modal needs the real cursor
-    /// back. winit's own grab is deliberately not used on Windows because
-    /// both of its modes clip the cursor to a one-pixel rect there, which
-    /// freezes the reported positions and with them the camera.
     /// Hotbar labels for a pack scene; an empty list keeps the packaged icons.
     fn hotbar_names(&self) -> Vec<String> {
+        if let Some(scene) = self
+            .scene
+            .as_ref()
+            .filter(|scene| scene.item_owner().is_some())
+        {
+            return scene
+                .inventory_slots()
+                .iter()
+                .take(9)
+                .map(|stack| {
+                    stack
+                        .as_ref()
+                        .map_or_else(String::new, |stack| stack.item.path().to_owned())
+                })
+                .collect();
+        }
         if !self.pack {
             return Vec::new();
         }
@@ -1360,6 +1383,10 @@ impl WindowApp {
             return;
         }
         match action {
+            crate::ui::Action::Slot(slot) => {
+                self.inventory_slot_clicked(slot);
+                return;
+            }
             crate::ui::Action::ToggleFrameLimit => {
                 self.ui.settings.frame_limit.enabled = !self.ui.settings.frame_limit.enabled;
                 self.frame_pacer.reset();
@@ -1678,6 +1705,13 @@ impl ApplicationHandler for WindowApp {
             window,
         });
         self.scene = scene;
+        if let Some(scene) = self.scene.as_mut().filter(|scene| !scene.is_network())
+            && let Err(error) = scene.enable_items(None)
+        {
+            self.failure = Some(error);
+            event_loop.exit();
+            return;
+        }
         if let Some(notice) = self.scene.as_ref().and_then(Scene::startup_notice) {
             self.last_result = notice.to_owned();
         }
@@ -1740,6 +1774,17 @@ impl ApplicationHandler for WindowApp {
                     if !event.repeat && self.rebind_key(code) {
                         return;
                     }
+                    if code == self.ui.settings.bindings.inventory && !event.repeat {
+                        let mode = if self.ui.mode == crate::ui::Mode::Inventory {
+                            crate::ui::Mode::Game
+                        } else {
+                            crate::ui::Mode::Inventory
+                        };
+                        self.set_ui_mode(mode);
+                        self.input.reset();
+                        self.set_grab(!self.ui.modal());
+                        return;
+                    }
                     if !self.ui.modal() && !event.repeat {
                         if code == self.ui.settings.bindings.debug {
                             self.toggle_debug();
@@ -1781,6 +1826,12 @@ impl ApplicationHandler for WindowApp {
                         KeyCode::Digit1 => self.material = 0,
                         KeyCode::Digit2 => self.material = 1,
                         KeyCode::Digit3 => self.material = 2,
+                        KeyCode::Digit4 if self.materials.len() > 3 => self.material = 3,
+                        KeyCode::Digit5 if self.materials.len() > 4 => self.material = 4,
+                        KeyCode::Digit6 if self.materials.len() > 5 => self.material = 5,
+                        KeyCode::Digit7 if self.materials.len() > 6 => self.material = 6,
+                        KeyCode::Digit8 if self.materials.len() > 7 => self.material = 7,
+                        KeyCode::Digit9 if self.materials.len() > 8 => self.material = 8,
                         _ => {}
                     }
                 }

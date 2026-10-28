@@ -9,6 +9,7 @@ use gpu::Overlay;
 use std::collections::BTreeMap;
 use style::{MUTED, SEPARATOR, TEXT, TITLE_TEXT};
 use torse_ui::{Part, Theme};
+mod inventory;
 mod settings;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -18,6 +19,7 @@ pub enum Mode {
     Pause,
     MachinePreview,
     Settings,
+    Inventory,
 }
 impl Mode {
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -26,7 +28,8 @@ impl Mode {
             "pause" => Ok(Self::Pause),
             "machine" => Ok(Self::MachinePreview),
             "settings" => Ok(Self::Settings),
-            _ => Err("UI preview must be hud, pause or machine".into()),
+            "inventory" => Ok(Self::Inventory),
+            _ => Err("UI preview must be hud, pause, machine, settings or inventory".into()),
         }
     }
 }
@@ -46,6 +49,7 @@ pub enum Action {
     Value(OptionId, u16),
     Rebind(Binding),
     ResetSettings,
+    Slot(usize),
 }
 
 #[derive(Default)]
@@ -55,6 +59,7 @@ pub struct State {
     pub settings: Settings,
     pub tab: Tab,
     pub rebinding: Option<Binding>,
+    pub inventory_source: Option<usize>,
     capture: torse_ui::Pointer<Action>,
 }
 impl State {
@@ -65,6 +70,7 @@ impl State {
         self.mode = mode;
         self.capture.cancel();
         self.rebinding = None;
+        self.inventory_source = None;
     }
     fn event(event: Option<torse_ui::Event<Action>>) -> Option<Action> {
         match event? {
@@ -106,7 +112,9 @@ impl Layout {
         }
     }
     fn panel(&self, mode: Mode) -> Rect {
-        let (w, h) = if mode == Mode::Settings {
+        let (w, h) = if mode == Mode::Inventory {
+            (324, 226)
+        } else if mode == Mode::Settings {
             (400, 248)
         } else if mode == Mode::Pause {
             (284, 238)
@@ -125,7 +133,7 @@ impl Layout {
     fn buttons(&self, mode: Mode, tab: Tab) -> Vec<(Action, Rect, &'static str)> {
         let p = self.panel(mode);
         match mode {
-            Mode::Game | Mode::MachinePreview => Vec::new(),
+            Mode::Game | Mode::MachinePreview | Mode::Inventory => Vec::new(),
             Mode::Settings => self.settings_buttons(tab),
             Mode::Pause => vec![
                 (
@@ -212,6 +220,12 @@ impl Layout {
                     }),
             );
         }
+        if mode == Mode::Inventory {
+            controls.extend((0..36).map(|slot| torse_ui::Control::Button {
+                key: Action::Slot(slot),
+                rect: self.inventory_slot(slot),
+            }));
+        }
         controls
     }
     fn hit(&self, mode: Mode, cursor: [f64; 2], tab: Tab) -> Option<Action> {
@@ -224,6 +238,11 @@ impl Layout {
         ];
         if self.close(mode).contains(p) {
             return Some(Action::Resume);
+        }
+        if mode == Mode::Inventory {
+            return (0..36)
+                .find(|slot| self.inventory_slot(*slot).contains(p))
+                .map(Action::Slot);
         }
         self.buttons(mode, tab)
             .into_iter()
@@ -277,6 +296,8 @@ struct View {
     tab: Tab,
     rebinding: Option<Binding>,
     debug_lines: Vec<String>,
+    inventory: Vec<Option<torse_inventory::ItemStack>>,
+    inventory_source: Option<usize>,
 }
 
 pub struct Layer {
@@ -298,6 +319,7 @@ pub struct Hud<'a> {
     /// Captured-look sensitivity, shown and tuned in the pause menu.
     pub sensitivity: f64,
     pub debug_lines: &'a [String],
+    pub inventory: Vec<Option<torse_inventory::ItemStack>>,
 }
 impl Layer {
     pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) -> Result<(), String> {
@@ -351,14 +373,29 @@ impl Layer {
         hud: Hud<'_>,
     ) {
         let layout = Layout::new(size);
+        let names = if hud.inventory.is_empty() {
+            hud.names.into_iter().take(3).collect()
+        } else {
+            hud.inventory
+                .iter()
+                .take(9)
+                .map(|stack| {
+                    stack
+                        .as_ref()
+                        .map_or_else(String::new, |stack| self.item_name(stack))
+                })
+                .collect()
+        };
         let view = View {
             size,
             mode: state.mode,
-            material: hud.material.min(2),
+            material: hud
+                .material
+                .min(if hud.inventory.is_empty() { 2 } else { 8 }),
             network: hud.network,
             ready: hud.ready,
             result: hud.result.chars().take(120).collect(),
-            names: hud.names.into_iter().take(3).collect(),
+            names,
             sensitivity: (hud.sensitivity * 100.0).round() as u16,
             hover: layout.hit(state.mode, state.cursor, state.tab),
             pressed: state.capture.active(),
@@ -367,6 +404,8 @@ impl Layer {
             settings: state.settings.clone(),
             tab: state.tab,
             rebinding: state.rebinding,
+            inventory: hud.inventory,
+            inventory_source: state.inventory_source,
             debug_lines: if state.settings.debug {
                 hud.debug_lines.to_vec()
             } else {
@@ -454,7 +493,9 @@ impl Layer {
         c.fill(Rect::new(0, 0, l.width, l.height), [8, 9, 11, 130]);
         let p = l.panel(v.mode);
         self.theme.paint(c, Part::Window, p);
-        let title = if v.mode == Mode::Settings {
+        let title = if v.mode == Mode::Inventory {
+            "inventory_title"
+        } else if v.mode == Mode::Settings {
             "menu_settings"
         } else if v.mode == Mode::Pause {
             "menu_title"
@@ -478,7 +519,9 @@ impl Layer {
             l.close(v.mode),
         );
         style::hline(c, p.x, p.y + 21, p.w, SEPARATOR);
-        if v.mode == Mode::Settings {
+        if v.mode == Mode::Inventory {
+            self.paint_inventory(c, l, v);
+        } else if v.mode == Mode::Settings {
             self.paint_settings(c, l, v);
         } else if v.mode == Mode::Pause {
             self.paint_pause(c, l, v, p);
@@ -543,14 +586,21 @@ impl Layer {
     }
     /// HUD is shared by all modes: hotbar, status chip, result toast, help.
     fn paint_hud(&mut self, c: &mut Canvas, l: &Layout, v: &View, w: i32, h: i32) {
-        let slot_x = w / 2 - 38;
+        let count = if v.inventory.is_empty() { 3 } else { 9 };
+        let slot_x = w / 2 - (count * 26 - 2) / 2;
         let slot_y = h - 36;
         let packaged = v.names.is_empty();
-        for i in 0..3 {
+        for i in 0..count as usize {
             let x = slot_x + i as i32 * 26;
             self.theme
                 .slot(c, Rect::new(x, slot_y, 24, 24), i == v.material);
-            if packaged {
+            if !v.inventory.is_empty() {
+                self.paint_item(
+                    c,
+                    Rect::new(x, slot_y, 24, 24),
+                    v.inventory.get(i).and_then(Option::as_ref),
+                );
+            } else if packaged {
                 c.sprite(&self.skin.icons[i], Rect::new(x + 4, slot_y + 4, 16, 16), 0);
             }
             self.text.draw(
@@ -576,7 +626,7 @@ impl Layer {
                     );
                 }
                 None => {
-                    let selected = ["item_stone", "item_glass", "item_plant"][v.material];
+                    let selected = ["item_stone", "item_glass", "item_plant"][v.material.min(2)];
                     let width = self.text.measure(self.labels[selected], 12);
                     self.shadow_label(
                         c,

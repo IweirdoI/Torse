@@ -100,6 +100,7 @@ pub struct Scene {
     principal: ContentKey,
     edit_counter: u64,
     walker: Option<torse_sim::player::WalkerState>,
+    items: Option<items::Stock>,
     generator: Option<HillTerrain>,
     /// Data-driven terrain used when the scene comes from a content pack.
     layered: Option<Arc<crate::game::LayeredTerrain>>,
@@ -127,6 +128,7 @@ pub struct Scene {
     startup_notice: Option<String>,
     lighting: Option<lighting::Lighting>,
 }
+mod items;
 mod lighting;
 mod memory;
 
@@ -136,6 +138,7 @@ fn content_pack() -> torse_content::ContentPack {
     let mut pack = m0_fixture_pack();
     block_actions::register_content(&mut pack);
     torse_inventory::register_content(&mut pack);
+    torse_items::register_content(&mut pack);
     pack
 }
 
@@ -146,7 +149,7 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
     let registry =
         BlockStateRegistry::build(&content).map_err(|error| format!("registry failed: {error}"))?;
     let schemas = ComponentSchemas::build(&content);
-    let catalog = torse_inventory::ItemCatalog::new([(key("base:stone"), 64)])
+    let catalog = torse_items::fixture_catalog(&registry)
         .map_err(|error| format!("item rules: {error:?}"))?;
     let compatibility = catalog.bind_compatibility(Compatibility {
         authority_schema: 4,
@@ -254,6 +257,7 @@ impl Scene {
             principal: key("client:player"),
             edit_counter: 0,
             walker: None,
+            items: None,
             generator: Some(generator),
             layered: None,
             side,
@@ -307,6 +311,7 @@ impl Scene {
             principal: key("client:player"),
             edit_counter: 0,
             walker: None,
+            items: None,
             generator: None,
             layered: None,
             side: snapshot.side,
@@ -1099,15 +1104,18 @@ impl Scene {
         let mut pack = game.content.clone();
         block_actions::register_content(&mut pack);
         torse_inventory::register_content(&mut pack);
+        torse_items::register_content(&mut pack);
         let content = compile(pack).map_err(|errors| format!("content failed: {errors:?}"))?;
         let registry = BlockStateRegistry::build(&content)
             .map_err(|error| format!("registry failed: {error}"))?;
         let schemas = ComponentSchemas::build(&content);
-        let compatibility = Compatibility {
-            authority_schema: 4,
-            rules_digest: content.authority_digest,
-            content_digest: content.presentation_digest,
-        };
+        let compatibility = torse_items::block_catalog(&registry)
+            .map_err(|error| format!("item rules: {error:?}"))?
+            .bind_compatibility(Compatibility {
+                authority_schema: 4,
+                rules_digest: content.authority_digest,
+                content_digest: content.presentation_digest,
+            });
         let (palette, state_materials) = material_tables(&registry, &game.texture)?;
         let side = 16;
         let bounds = WorldBounds::new(0, 64).map_err(|error| error.to_string())?;
@@ -1127,6 +1135,7 @@ impl Scene {
             principal: key("client:player"),
             edit_counter: 0,
             walker: None,
+            items: None,
             generator: None,
             layered: Some(Arc::new(terrain)),
             side,
@@ -1202,6 +1211,14 @@ impl Scene {
                     .components
                     .component(&torse_world::block_instance_schema())
                     .is_some()
+                || (entity
+                    .components
+                    .component(&torse_inventory::schema())
+                    .is_some()
+                    && matches!(
+                        torse_world::EntityCollider::of(entity),
+                        Ok(Some(torse_world::EntityCollider::Disabled))
+                    ))
             {
                 continue;
             }

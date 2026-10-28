@@ -1,4 +1,4 @@
-hud_help=1-3 Select   E Panel preview   Esc Menu
+hud_help=1-9 Select   Tab Inventory   E Panel preview   Esc Menu
 hud_local=Local world
 hud_online=Connected
 hud_connecting=Connecting
@@ -49,4 +49,8 @@ bind_walk=Toggle walk
 bind_screenshot=Screenshot
 bind_debug=Debug overlay
 bind_inventory=Inventory
+inventory_title=Inventory
+inventory_help=Click a source slot, then a destination to swap
+inventory_unavailable=Inventory access is unavailable in this session
+inventory_hotbar=Top row: hotbar. Tab closes; 1-9 select a slot.
 bind_hint=Click then press a key; Esc cancels. Menu and digits are reserved.

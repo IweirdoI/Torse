@@ -1280,6 +1280,7 @@ impl Renderer {
             &state,
             crate::ui::Hud {
                 debug_lines: &[],
+                inventory: vec![],
                 material: 0,
                 network: false,
                 ready: true,

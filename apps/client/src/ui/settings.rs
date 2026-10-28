@@ -51,11 +51,7 @@ impl Layout {
             }
             Tab::Controls => {
                 let column = p.w.saturating_sub(28) / 2;
-                for (index, binding) in crate::settings::BINDINGS
-                    .into_iter()
-                    .filter(|binding| *binding != Binding::Inventory)
-                    .enumerate()
-                {
+                for (index, binding) in crate::settings::BINDINGS.into_iter().enumerate() {
                     let label = match binding {
                         Binding::Forward => "bind_forward",
                         Binding::Back => "bind_back",

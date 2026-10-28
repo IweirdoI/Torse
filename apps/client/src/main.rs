@@ -29,7 +29,8 @@ use window::{WindowConfig, run_window};
 const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
                     [--place KEY:X,Y,Z]...\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
-                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--fps-limit 30..1000] [--ui-preview hud|pause|machine]\n\
+                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--fps-limit 30..1000]\n\
+                        [--ui-preview hud|pause|machine|settings|inventory] [--settings-tab debug|gameplay|graphics|controls]\n\
                         [--connect ADDRESS] [--walk] [--section X,Y,Z]...\n\
                         [--tls-ca PEM --tls-cert PEM --tls-key PEM --server-name DNS]\n\
        both modes accept [--memory-mib N; default 512] [--gpu-memory-mib N; default 64] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
@@ -171,7 +172,7 @@ fn main() -> ExitCode {
             "--ui-preview" => match value().as_deref().map(ui::Mode::parse) {
                 Some(Ok(mode)) => ui_preview = Some(mode),
                 _ => {
-                    eprintln!("--ui-preview requires hud, pause or machine");
+                    eprintln!("--ui-preview requires hud, pause, machine, settings or inventory");
                     return ExitCode::FAILURE;
                 }
             },

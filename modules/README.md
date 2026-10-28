@@ -3,6 +3,7 @@
 | 目录 | 职责 |
 |---|---|
 | [inventory](inventory/src/lib.rs) | 物品堆叠、容量、端口与受控转移 |
+| [items](items/README.md) | 物品目录、放置消耗、破坏回收及背包交互 |
 | [crafting](crafting/src/lib.rs) | 配方描述与原子加工结算 |
 | [energy](energy/src/lib.rs) | 能量单位、存储、端口与结算 |
 | [ui](ui/README.md) | 可换肤即时模式控件、输入捕获、字体与绘制 |

@@ -970,6 +970,13 @@ impl Scene {
             let Some(_revision) = job.terrain.section_revision else {
                 continue;
             };
+            let Ok(scratch) = self.reserve_memory(
+                torse_types::MemoryClass::Mesh,
+                torse_render::occupancy_scratch_bytes(self.side),
+                torse_types::EvictionRank::Pinned,
+            ) else {
+                break;
+            };
             let Ok(work) = self.reserve_memory(
                 torse_types::MemoryClass::Executor,
                 memory::mesh_work_bytes(self.side),
@@ -987,6 +994,7 @@ impl Scene {
                     query,
                 )
             });
+            drop(scratch);
             let lease = match work {
                 Some(mut work) => loop {
                     match work.split(

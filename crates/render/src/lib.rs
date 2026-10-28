@@ -17,7 +17,7 @@ mod gpu_probe;
 pub use mesh::{
     CachedMesh, Face, InsertOutcome, MeshBuildError, MeshCache, MeshData, MeshJob, MeshSample,
     ModelMeshError, ModelQuad, RenderBlock, RenderBox, append_model, build_mesh,
-    build_mesh_accounted, build_mesh_bounded,
+    build_mesh_accounted, build_mesh_bounded, occupancy_scratch_bytes,
 };
 
 #[cfg(feature = "gpu")]

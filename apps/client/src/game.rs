@@ -21,9 +21,9 @@ use torse_assets::texture::{
     TintSource,
 };
 use torse_content::{
-    AlphaMode, BlockDefinition, CollisionProfile, ContentPack, Face, FaceMaterials, FaceOverlay,
-    FaceOverlays, InteractionProfile, LightTransport, OcclusionProfile, RenderProfile,
-    SelectionProfile, Shape, SourceRef, Sourced, StateSchema,
+    AlphaMode, BlockDefinition, BoxBounds, CollisionProfile, ContentPack, Face, FaceMaterials,
+    FaceOverlay, FaceOverlays, InteractionProfile, LightTransport, OcclusionProfile, RenderModel,
+    RenderProfile, SelectionProfile, Shape, SourceRef, Sourced, StateSchema,
 };
 use torse_types::{BlockPos, ContentKey, LocalPos, SectionPos};
 use torse_world::{BlockStateId, BlockStateRegistry, Section, SectionError, WorldBounds};
@@ -43,6 +43,8 @@ pub struct GamePack {
     pub biomes: BTreeMap<String, BiomeColours>,
     /// Biome used when the table or the region lookup has no better answer.
     pub default_biome: String,
+    /// Limitations that must be shown when this preview pack is opened.
+    pub startup_notice: Option<String>,
 }
 
 /// Colour set of one biome, in sRGB bytes.
@@ -158,6 +160,10 @@ impl GamePack {
         let source = format!("{}/atlas.toml", descriptor.pack.namespace);
         let texture = texture_pack(&descriptor, atlas)?;
         let content = content_pack(&descriptor, &source)?;
+        let startup_notice = model_preview_notice(&descriptor);
+        if let Some(notice) = &startup_notice {
+            eprintln!("warning: {}: {notice}", index.display());
+        }
         Ok(Self {
             content,
             texture,
@@ -165,6 +171,7 @@ impl GamePack {
             world,
             biomes: descriptor.biomes,
             default_biome: descriptor.pack.biome,
+            startup_notice,
         })
     }
 
@@ -348,9 +355,17 @@ const fn one() -> u32 {
     1
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct Bounds {
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
 #[derive(Debug, Deserialize)]
 struct BlockSpec {
     shape: String,
+    #[serde(default)]
+    bounds: Option<Bounds>,
     #[serde(default = "opaque")]
     alpha: String,
     #[serde(default)]
@@ -394,16 +409,7 @@ fn texture_pack(descriptor: &Descriptor, atlas: Atlas) -> Result<TexturePack, St
         // The index records a reference colour next to the source that produces
         // the real one. Keeping both would multiply the tint twice.
         let tint = if tint_source.is_some() { None } else { tint };
-        let mipmap_strategy = match entry.mipmap_strategy.as_deref() {
-            Some("dark_cutout") => MipmapStrategy::DarkCutout,
-            Some("mean") | Some("average") | None => MipmapStrategy::Average,
-            Some(other) => {
-                return Err(format!(
-                    "{}: unsupported mipmap strategy `{other}`",
-                    entry.key
-                ));
-            }
-        };
+        let mipmap_strategy = parse_mipmap_strategy(&entry.key, entry.mipmap_strategy.as_deref())?;
         let frames = entry.frames.max(1);
         let animation = (frames > 1).then(|| MaterialAnimation {
             frame_count: frames,
@@ -436,7 +442,8 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
     let mut blocks = Vec::with_capacity(descriptor.blocks.len());
     for (name, spec) in &descriptor.blocks {
         let id = format!("{namespace}:{name}");
-        let shape = parse_shape(&spec.shape).map_err(|error| format!("{id}: {error}"))?;
+        let shape =
+            parse_shape(&spec.shape, spec.bounds).map_err(|error| format!("{id}: {error}"))?;
         let alpha = parse_alpha(&spec.alpha).map_err(|error| format!("{id}: {error}"))?;
         let overlay_alpha = match &spec.overlay_alpha {
             Some(value) => parse_alpha(value).map_err(|error| format!("{id}: {error}"))?,
@@ -472,6 +479,13 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
             }
         }
         let solid = shape == Shape::FullCube && alpha == AlphaMode::Opaque;
+        // Models are visual only. An index that names one without quads still
+        // has to load; collision and selection stay unset rather than copying
+        // the visual shape into those profiles.
+        let selection = match &shape {
+            Shape::Model(_) => None,
+            other => Some(other.clone()),
+        };
         blocks.push(Sourced::new(
             SourceRef::new(source, 1),
             BlockDefinition {
@@ -488,7 +502,7 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
                 collision_profile: CollisionProfile {
                     shape: collision_shape(&shape),
                 },
-                selection_profile: SelectionProfile { shape: Some(shape) },
+                selection_profile: SelectionProfile { shape: selection },
                 occlusion_profile: OcclusionProfile {
                     face_mask: if solid { 0b11_1111 } else { 0 },
                 },
@@ -525,13 +539,63 @@ fn content_pack(descriptor: &Descriptor, source: &str) -> Result<ContentPack, St
     })
 }
 
-fn parse_shape(value: &str) -> Result<Shape, String> {
+fn parse_shape(value: &str, bounds: Option<Bounds>) -> Result<Shape, String> {
+    if value != "box" && bounds.is_some() {
+        return Err("only box geometry accepts bounds".to_owned());
+    }
     match value {
         "full_cube" => Ok(Shape::FullCube),
         "lower_slab" => Ok(Shape::LowerSlab),
         "cross" => Ok(Shape::Cross),
         "panel" => Ok(Shape::Panel),
+        // Preset geometry is not in the index. Record an empty visual model
+        // so the block still loads; callers must not reuse it for physics.
+        "model" => Ok(Shape::Model(Arc::new(RenderModel::default()))),
+        "box" => {
+            let bounds = bounds.ok_or_else(|| "box geometry needs bounds".to_owned())?;
+            if !(0..3).all(|axis| {
+                let (minimum, maximum) = (bounds.min[axis], bounds.max[axis]);
+                minimum.is_finite()
+                    && maximum.is_finite()
+                    && minimum >= 0.0
+                    && minimum < maximum
+                    && maximum <= 1.0
+            }) {
+                return Err("invalid cell-local box bounds".to_owned());
+            }
+            Ok(Shape::Box(BoxBounds {
+                min: bounds.min,
+                max: bounds.max,
+            }))
+        }
         other => Err(format!("unsupported shape `{other}`")),
+    }
+}
+
+/// The atlas index contains no model quads. Accepting its names is only a
+/// metadata preview; callers must carry this notice to the visible client.
+fn model_preview_notice(descriptor: &Descriptor) -> Option<String> {
+    let count = descriptor
+        .blocks
+        .values()
+        .filter(|block| block.shape == "model")
+        .count();
+    (count != 0).then(|| format!(
+        "Preview warning: {count} model block(s) are invisible (no geometry, collision or selection)"
+    ))
+}
+
+/// Map one index name onto the kernel mipmap strategy.
+///
+/// `cutout` and `strict_cutout` both request coverage-preserving mips. This
+/// loader has one coverage strategy, so either name selects it. An omitted
+/// name averages texels, the same as `mean` and `average`.
+fn parse_mipmap_strategy(key: &str, value: Option<&str>) -> Result<MipmapStrategy, String> {
+    match value {
+        Some("dark_cutout") => Ok(MipmapStrategy::DarkCutout),
+        Some("cutout") | Some("strict_cutout") => Ok(MipmapStrategy::CutoutCoverage),
+        Some("mean") | Some("average") | None => Ok(MipmapStrategy::Average),
+        Some(other) => Err(format!("{key}: unsupported mipmap strategy `{other}`")),
     }
 }
 
@@ -914,4 +978,295 @@ fn column_noise(seed: u64, x: i64, z: i64, cell: i64) -> u64 {
     let bottom = corner(x0, z0 + 1) * (1.0 - sx) + corner(x0 + 1, z0 + 1) * sx;
     let value = top * (1.0 - sz) + bottom * sz;
     value.round().clamp(0.0, 255.0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_names_map_and_unknown_names_do_not() {
+        assert_eq!(
+            parse_mipmap_strategy("base:material/flower", Some("strict_cutout")).unwrap(),
+            MipmapStrategy::CutoutCoverage
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/flower", Some("cutout")).unwrap(),
+            MipmapStrategy::CutoutCoverage
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/stone", Some("mean")).unwrap(),
+            MipmapStrategy::Average
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/stone", Some("average")).unwrap(),
+            MipmapStrategy::Average
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/stone", None).unwrap(),
+            MipmapStrategy::Average
+        );
+        assert_eq!(
+            parse_mipmap_strategy("base:material/leaves", Some("dark_cutout")).unwrap(),
+            MipmapStrategy::DarkCutout
+        );
+        let error = parse_mipmap_strategy("base:material/flower", Some("blurry")).unwrap_err();
+        assert_eq!(
+            error,
+            "base:material/flower: unsupported mipmap strategy `blurry`"
+        );
+    }
+
+    #[test]
+    fn strict_cutout_material_is_kept_and_a_later_unknown_name_rejects_the_pack() {
+        let atlas = Atlas::decode(&solid_png(16, 16)).expect("png decodes");
+        let mut descriptor = empty_descriptor();
+        descriptor.material.push(material(
+            "base:material/flower",
+            Some("strict_cutout"),
+            2,
+            2,
+        ));
+        descriptor
+            .material
+            .push(material("base:material/stone", Some("mean"), 8, 2));
+        let pack = texture_pack(&descriptor, atlas.clone()).expect("known names build a pack");
+        assert!(
+            pack.surface(&key("base:material/flower").unwrap())
+                .is_some()
+        );
+        assert!(pack.surface(&key("base:material/stone").unwrap()).is_some());
+
+        descriptor
+            .material
+            .push(material("base:material/bad", Some("blurry"), 2, 8));
+        let error = texture_pack(&descriptor, atlas).unwrap_err();
+        assert_eq!(
+            error,
+            "base:material/bad: unsupported mipmap strategy `blurry`"
+        );
+    }
+
+    fn empty_descriptor() -> Descriptor {
+        Descriptor {
+            pack: PackInfo {
+                namespace: "base".to_owned(),
+                biome: "plains".to_owned(),
+            },
+            atlas: AtlasInfo {
+                width: 16,
+                height: 16,
+                mip_levels: 1,
+                padding: 1,
+                missing: [2, 14, 1, 1],
+                white: [8, 14, 1, 1],
+            },
+            material: Vec::new(),
+            blocks: BTreeMap::new(),
+            biomes: BTreeMap::new(),
+        }
+    }
+
+    fn material(key: &str, strategy: Option<&str>, x: u32, y: u32) -> MaterialSpec {
+        MaterialSpec {
+            key: key.to_owned(),
+            texture: String::new(),
+            x,
+            y,
+            width: 4,
+            height: 4,
+            frames: 1,
+            frametime: 1,
+            interpolate: false,
+            tint: None,
+            tint_source: None,
+            mipmap_strategy: strategy.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn model_shape_stays_visual_and_a_later_unknown_shape_rejects_the_pack() {
+        let shape = parse_shape("model", None).expect("model is a shape");
+        assert!(matches!(shape, Shape::Model(ref model) if model.quads.is_empty()));
+        assert!(collision_shape(&shape).is_none());
+
+        let mut descriptor = empty_descriptor();
+        descriptor.blocks.insert(
+            "stone".to_owned(),
+            block_spec("full_cube", "opaque", "base:material/stone"),
+        );
+        descriptor.blocks.insert(
+            "log".to_owned(),
+            block_spec("model", "opaque", "base:material/log"),
+        );
+        let pack = content_pack(&descriptor, "base/atlas.toml").expect("known shapes build");
+        let stone = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:stone")
+            .expect("stone");
+        assert_eq!(stone.value.render_profile.shape, Shape::FullCube);
+        assert_eq!(stone.value.selection_profile.shape, Some(Shape::FullCube));
+        let log = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:log")
+            .expect("log");
+        assert!(matches!(log.value.render_profile.shape, Shape::Model(_)));
+        assert!(log.value.collision_profile.shape.is_none());
+        assert!(log.value.selection_profile.shape.is_none());
+        torse_content::compile(pack).expect("empty visual model compiles");
+
+        descriptor.blocks.insert(
+            "zz_bad".to_owned(),
+            block_spec("mesh", "opaque", "base:material/stone"),
+        );
+        let error = content_pack(&descriptor, "base/atlas.toml").unwrap_err();
+        assert_eq!(error, "base:zz_bad: unsupported shape `mesh`");
+    }
+
+    #[test]
+    fn model_preview_reports_missing_geometry_and_ordinary_shapes_are_quiet() {
+        let mut descriptor = empty_descriptor();
+        descriptor.blocks.insert(
+            "stone".into(),
+            block_spec("full_cube", "opaque", "base:material/stone"),
+        );
+        assert!(model_preview_notice(&descriptor).is_none());
+        descriptor.blocks.insert(
+            "log".into(),
+            block_spec("model", "opaque", "base:material/log"),
+        );
+        descriptor.blocks.insert(
+            "plant".into(),
+            block_spec("model", "mask", "base:material/plant"),
+        );
+        let notice = model_preview_notice(&descriptor).expect("model warning");
+        assert!(notice.contains("2 model block(s)"));
+        for limitation in ["invisible", "geometry", "collision", "selection"] {
+            assert!(notice.contains(limitation));
+        }
+    }
+
+    #[test]
+    fn box_shape_keeps_its_bounds_and_rejects_a_partial_declaration() {
+        let bounds = Bounds {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 0.0625, 1.0],
+        };
+        let shape = parse_shape("box", Some(bounds)).expect("box");
+        assert_eq!(
+            shape,
+            Shape::Box(BoxBounds {
+                min: bounds.min,
+                max: bounds.max,
+            })
+        );
+
+        for invalid in [
+            Bounds {
+                min: [f32::NAN, 0.0, 0.0],
+                max: [1.0; 3],
+            },
+            Bounds {
+                min: [0.0; 3],
+                max: [f32::INFINITY, 1.0, 1.0],
+            },
+            Bounds {
+                min: [-0.1, 0.0, 0.0],
+                max: [1.0; 3],
+            },
+            Bounds {
+                min: [0.0; 3],
+                max: [1.1, 1.0, 1.0],
+            },
+            Bounds {
+                min: [0.0; 3],
+                max: [0.0, 1.0, 1.0],
+            },
+        ] {
+            assert!(parse_shape("box", Some(invalid)).is_err());
+        }
+        assert_eq!(
+            parse_shape("box", None).unwrap_err(),
+            "box geometry needs bounds"
+        );
+        assert_eq!(
+            parse_shape("full_cube", Some(bounds)).unwrap_err(),
+            "only box geometry accepts bounds"
+        );
+        assert_eq!(
+            parse_shape(
+                "box",
+                Some(Bounds {
+                    min: [0.0, 0.5, 0.0],
+                    max: [1.0, 0.25, 1.0],
+                })
+            )
+            .unwrap_err(),
+            "invalid cell-local box bounds"
+        );
+
+        let mut descriptor = empty_descriptor();
+        let mut carpet = block_spec("box", "opaque", "base:material/wool");
+        carpet.bounds = Some(bounds);
+        descriptor.blocks.insert("carpet".to_owned(), carpet);
+        descriptor.blocks.insert(
+            "stone".to_owned(),
+            block_spec("full_cube", "opaque", "base:material/stone"),
+        );
+        let pack = content_pack(&descriptor, "base/atlas.toml").expect("box builds");
+        let carpet = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:carpet")
+            .expect("carpet");
+        assert_eq!(carpet.value.render_profile.shape, shape);
+        assert_eq!(carpet.value.selection_profile.shape, Some(shape));
+        assert!(carpet.value.collision_profile.shape.is_none());
+        let stone = pack
+            .blocks
+            .iter()
+            .find(|block| block.value.id.to_string() == "base:stone")
+            .expect("stone");
+        assert_eq!(stone.value.render_profile.shape, Shape::FullCube);
+        assert_eq!(
+            stone.value.collision_profile.shape.as_ref(),
+            Some(&Shape::FullCube)
+        );
+
+        descriptor.blocks.insert(
+            "open".to_owned(),
+            block_spec("box", "opaque", "base:material/wool"),
+        );
+        assert_eq!(
+            content_pack(&descriptor, "base/atlas.toml").unwrap_err(),
+            "base:open: box geometry needs bounds"
+        );
+    }
+
+    fn block_spec(shape: &str, alpha: &str, material: &str) -> BlockSpec {
+        BlockSpec {
+            shape: shape.to_owned(),
+            bounds: None,
+            alpha: alpha.to_owned(),
+            overlay_alpha: None,
+            faces: FaceSpec {
+                all: Some(material.to_owned()),
+                ..FaceSpec::default()
+            },
+        }
+    }
+
+    fn solid_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        let pixels = vec![255u8; (width * height * 4) as usize];
+        writer.write_image_data(&pixels).expect("png pixels");
+        drop(writer);
+        bytes
+    }
 }

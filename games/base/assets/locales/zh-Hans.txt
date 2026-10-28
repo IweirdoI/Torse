@@ -20,3 +20,4 @@ empty=空
 sens_down=<
 sens_up=>
 menu_sensitivity=鼠标灵敏度
+menu_frame_limit=限制帧率

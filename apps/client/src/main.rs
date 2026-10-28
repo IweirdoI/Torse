@@ -6,6 +6,7 @@
 //! rendering.
 
 mod camera;
+mod frame_pacing;
 mod game;
 mod input;
 mod net;
@@ -27,7 +28,7 @@ use window::{WindowConfig, run_window};
 const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N] [--radius N] [--view overview|player]\n\
                     [--place KEY:X,Y,Z]...\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
-                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]\n\
+                        [--screenshot <png>] [--autoplay] [--sensitivity F] [--fps-limit 30..1000] [--ui-preview hud|pause|machine]\n\
                         [--connect ADDRESS] [--walk] [--section X,Y,Z]...\n\
                         [--tls-ca PEM --tls-cert PEM --tls-key PEM --server-name DNS]\n\
        both modes accept [--memory-mib N; default 512] [--gpu-memory-mib N; default 64] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
     let mut walk = false;
     let mut connect: Option<String> = None;
     let mut sensitivity = 1.0f64;
+    let mut fps_limit = None;
     let mut probe_outside = false;
     let mut ui_preview = None;
     let mut places: Vec<(String, [i64; 3])> = Vec::new();
@@ -132,6 +134,13 @@ fn main() -> ExitCode {
                 }
             },
             "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            "--fps-limit" => match value().and_then(|v| v.parse::<u16>().ok()) {
+                Some(fps @ 30..=1000) => fps_limit = Some(fps),
+                _ => {
+                    eprintln!("--fps-limit requires 30..=1000");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--probe-outside" => probe_outside = true,
             "--place" => match value().as_deref().map(parse_place) {
                 Some(Ok(place)) => places.push(place),
@@ -206,6 +215,7 @@ fn main() -> ExitCode {
             connect,
             probe_outside,
             sensitivity: sensitivity.clamp(0.2, 5.0),
+            fps_limit,
             ui_mode: ui_preview.unwrap_or_default(),
             content: content.clone(),
         };

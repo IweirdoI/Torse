@@ -82,6 +82,7 @@ pub struct WindowConfig {
     /// Captured-look sensitivity multiplier; scroll steps multiply it in
     /// walk mode.
     pub sensitivity: f64,
+    pub fps_limit: Option<u16>,
     /// Send one edit request far outside the approved scope, for acceptance
     /// evidence that the server rejects out-of-scope targets.
     pub probe_outside: bool,
@@ -171,6 +172,7 @@ struct WindowApp {
     pending_uploads: SectionUploadQueue,
     ui: crate::ui::State,
     config: WindowConfig,
+    frame_pacer: crate::frame_pacing::FramePacer,
     scene: Option<Scene>,
     camera: Option<FlyCamera>,
     input: InputState,
@@ -248,9 +250,13 @@ impl WindowApp {
             ui: {
                 let mut state = crate::ui::State::default();
                 state.set_mode(config.ui_mode);
+                if let Some(fps) = config.fps_limit {
+                    state.frame_limit = crate::frame_pacing::FrameLimit { enabled: true, fps };
+                }
                 state
             },
             config,
+            frame_pacer: crate::frame_pacing::FramePacer::default(),
             scene: None,
             camera: None,
             input: InputState::new(),
@@ -342,6 +348,7 @@ impl WindowApp {
         // The HUD needs the pack labels before the GPU borrow starts.
         let names = self.hotbar_names();
         let frame_started = Instant::now();
+        self.frame_pacer.started(frame_started, self.ui.frame_limit);
         if !self.poll_network(event_loop) {
             return;
         }
@@ -1288,6 +1295,30 @@ impl WindowApp {
         }
     }
 
+    fn ui_action(&mut self, action: crate::ui::Action, event_loop: &ActiveEventLoop) {
+        match action {
+            crate::ui::Action::ToggleFrameLimit => {
+                self.ui.frame_limit.enabled = !self.ui.frame_limit.enabled;
+                self.frame_pacer.reset();
+            }
+            crate::ui::Action::FrameRate(fps) => {
+                self.ui.frame_limit.fps = fps;
+                self.frame_pacer.reset();
+            }
+            crate::ui::Action::Quit => self.finish(event_loop),
+            crate::ui::Action::Resume => self.set_ui_mode(crate::ui::Mode::Game),
+            crate::ui::Action::Preview => self.set_ui_mode(crate::ui::Mode::MachinePreview),
+            crate::ui::Action::SensDown => {
+                self.look_sensitivity = (self.look_sensitivity - 0.1).clamp(0.2, 5.0);
+                self.last_result = format!("sens {:.2}", self.look_sensitivity);
+            }
+            crate::ui::Action::SensUp => {
+                self.look_sensitivity = (self.look_sensitivity + 0.1).clamp(0.2, 5.0);
+                self.last_result = format!("sens {:.2}", self.look_sensitivity);
+            }
+        }
+    }
+
     fn finish(&mut self, event_loop: &ActiveEventLoop) {
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
             let (vertices, faces) = scene.geometry_counts();
@@ -1417,6 +1448,15 @@ impl ApplicationHandler for WindowApp {
                     return;
                 }
             };
+        let present = if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Immediate)
+        {
+            config.present_mode = wgpu::PresentMode::Immediate;
+            wgpu::PresentMode::Immediate
+        } else {
+            present
+        };
         surface.configure(&session.device, &config);
         let depth = create_depth(&session.device, config.width, config.height);
         let depth_view = depth.create_view(&TextureViewDescriptor::default());
@@ -1668,25 +1708,7 @@ impl ApplicationHandler for WindowApp {
                             .map_or([960, 540], |g| [g.config.width, g.config.height]);
                         if let Some(action) = self.ui.pointer(state == ElementState::Pressed, size)
                         {
-                            match action {
-                                crate::ui::Action::Quit => self.finish(event_loop),
-                                crate::ui::Action::Resume => {
-                                    self.set_ui_mode(crate::ui::Mode::Game)
-                                }
-                                crate::ui::Action::Preview => {
-                                    self.set_ui_mode(crate::ui::Mode::MachinePreview)
-                                }
-                                crate::ui::Action::SensDown => {
-                                    self.look_sensitivity =
-                                        (self.look_sensitivity - 0.1).clamp(0.2, 5.0);
-                                    self.last_result = format!("sens {:.2}", self.look_sensitivity);
-                                }
-                                crate::ui::Action::SensUp => {
-                                    self.look_sensitivity =
-                                        (self.look_sensitivity + 0.1).clamp(0.2, 5.0);
-                                    self.last_result = format!("sens {:.2}", self.look_sensitivity);
-                                }
-                            }
+                            self.ui_action(action, event_loop);
                             self.input.reset();
                             self.set_grab(!self.ui.modal());
                         }
@@ -1701,7 +1723,13 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.ui.cursor = [position.x, position.y];
+                let size = self
+                    .gpu
+                    .as_ref()
+                    .map_or([960, 540], |gpu| [gpu.config.width, gpu.config.height]);
+                if let Some(action) = self.ui.motion([position.x, position.y], size) {
+                    self.ui_action(action, event_loop);
+                }
                 if !self.grabbed && !self.ui.modal() {
                     self.input.cursor(position);
                 }
@@ -1726,6 +1754,7 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::Focused(false) => {
                 self.focused = false;
+                self.ui.set_mode(self.ui.mode);
                 self.input.reset();
                 self.set_grab(false);
             }
@@ -1736,7 +1765,10 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if self.gpu.is_some() && self.camera.is_some() {
+                if self.gpu.is_some()
+                    && self.camera.is_some()
+                    && self.frame_pacer.ready(Instant::now())
+                {
                     self.frame(event_loop);
                 }
             }
@@ -1760,7 +1792,17 @@ impl ApplicationHandler for WindowApp {
             return;
         }
         if let Some(gpu) = self.gpu.as_ref() {
-            gpu.window.request_redraw();
+            let now = Instant::now();
+            if self.ui.frame_limit.enabled {
+                let deadline = self.frame_pacer.deadline(now);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                if now >= deadline {
+                    gpu.window.request_redraw();
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::Poll);
+                gpu.window.request_redraw();
+            }
         }
     }
 }
@@ -2095,6 +2137,7 @@ mod tests {
             walk: false,
             connect: None,
             sensitivity: 1.0,
+            fps_limit: None,
             probe_outside: false,
             ui_mode: crate::ui::Mode::Game,
             content: None,

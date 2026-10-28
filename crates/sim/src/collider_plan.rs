@@ -3,10 +3,10 @@
 use torse_types::{EntityId, RejectCode, TransactionId};
 use torse_world::{ComponentEdit, EntityCollider};
 
+use crate::OrderingKey;
 use crate::action::{ActionTarget, ActorContext};
 use crate::authority::WorldAuthority;
 use crate::transaction::Transaction;
-use crate::OrderingKey;
 
 pub(crate) fn plan(
     world: &WorldAuthority,
@@ -44,6 +44,10 @@ pub(crate) fn plan(
     if current != expected {
         return Err(RejectCode::Conflict);
     }
+    // `EntityCollider::Box` is publicly constructible, so reject an invalid
+    // request here instead of returning a plan that preparation must later
+    // discard for schema validation.
+    EntityCollider::from_fields(&requested.fields()).map_err(|_| RejectCode::InvalidData)?;
     let mut tx = Transaction::new(transaction, torse_world::collider_owner(), ordering);
     if let Some(half) = requested.half() {
         for (pos, query) in

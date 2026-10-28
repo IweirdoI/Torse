@@ -169,13 +169,7 @@ fn enabling_inside_terrain_is_rejected_and_open_air_is_planned() {
     let granted = grant(id, true);
     let blocked = granted.view(&world);
     assert_eq!(
-        blocked.plan_collider_transition(
-            id,
-            disabled,
-            body,
-            TransactionId(1),
-            ordering()
-        ),
+        blocked.plan_collider_transition(id, disabled, body, TransactionId(1), ordering()),
         Err(RejectCode::Conflict)
     );
     world
@@ -214,5 +208,23 @@ fn enabling_inside_terrain_is_rejected_and_open_air_is_planned() {
             ordering()
         ),
         Err(RejectCode::NotLoaded)
+    );
+}
+
+#[test]
+fn planning_rejects_an_invalid_collider_before_returning_a_transaction() {
+    let mut world = world();
+    load(&mut world);
+    let disabled = EntityCollider::Disabled;
+    let id = spawn(&mut world, disabled);
+    assert_eq!(
+        grant(id, true).view(&world).plan_collider_transition(
+            id,
+            disabled,
+            EntityCollider::Box { half: [0, 1, 1] },
+            TransactionId(4),
+            ordering(),
+        ),
+        Err(RejectCode::InvalidData)
     );
 }

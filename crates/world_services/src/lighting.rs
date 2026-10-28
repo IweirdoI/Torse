@@ -1,8 +1,9 @@
-//! Bounded monochromatic emitted light. All values are disposable derived data.
+//! Bounded monochromatic emitted light and skylight, as disposable derived data.
 //!
 //! Levels are 0..=15. Every edge loses at least one level, so a 15-cell halo
 //! contains every source that can affect the requested section. Missing input
 //! is opaque and makes the result incomplete; it is never interpreted as air.
+//! Skylight additionally observes bounded columns up to the world ceiling.
 use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use torse_types::{Binding, BlockPos, Digest, Fault, Revision, SectionPos};
@@ -88,6 +89,10 @@ pub struct LightSection {
     complete: bool,
 }
 impl LightSection {
+    /// Borrow resolved cells in the store's linear order after validating this observation.
+    pub fn levels(&self) -> &[u8] {
+        &self.levels
+    }
     pub fn target(&self) -> SectionPos {
         self.target
     }
@@ -120,6 +125,8 @@ pub struct LightJob {
     seeded: usize,
     complete: bool,
     failed: bool,
+    sky: bool,
+    sky_columns: Vec<u8>,
 }
 impl LightJob {
     pub fn prepare(
@@ -128,6 +135,29 @@ impl LightJob {
         registry: &BlockStateRegistry,
         target: SectionPos,
         limits: LightLimits,
+    ) -> Result<Self, Fault> {
+        Self::prepare_kind(binding, store, registry, target, limits, false)
+    }
+
+    /// Skylight seeds vertical columns from the world ceiling. Missing cells
+    /// block the column. Lateral propagation still loses at least one level.
+    pub fn prepare_sky(
+        binding: Binding,
+        store: &SectionStore,
+        registry: &BlockStateRegistry,
+        target: SectionPos,
+        limits: LightLimits,
+    ) -> Result<Self, Fault> {
+        Self::prepare_kind(binding, store, registry, target, limits, true)
+    }
+
+    fn prepare_kind(
+        binding: Binding,
+        store: &SectionStore,
+        registry: &BlockStateRegistry,
+        target: SectionPos,
+        limits: LightLimits,
+        sky: bool,
     ) -> Result<Self, Fault> {
         if !readable(store, target) {
             return Err(Fault::invalid_data("lighting target is not loaded"));
@@ -148,31 +178,62 @@ impl LightJob {
             .checked_add(side + 14, side + 14, side + 14)
             .map_err(invalid)?;
         let bounds = store.bounds();
-        let origin = BlockPos::new(min.x, min.y.max(bounds.min_y), min.z);
-        let last = BlockPos::new(max.x, max.y.min(bounds.max_y - 1), max.z);
+        let origin = BlockPos::new(
+            min.x,
+            if sky {
+                bounds.min_y
+            } else {
+                min.y.max(bounds.min_y)
+            },
+            min.z,
+        );
+        let last = BlockPos::new(
+            max.x,
+            if sky {
+                bounds.max_y - 1
+            } else {
+                max.y.min(bounds.max_y - 1)
+            },
+            max.z,
+        );
         if origin.y > last.y {
             return Err(Fault::invalid_data(
                 "lighting target is outside world bounds",
             ));
         }
+        let extent = |last: i64, first: i64| -> Result<usize, Fault> {
+            usize::try_from(i128::from(last) - i128::from(first) + 1)
+                .map_err(|_| Fault::resource_limit("lighting extent overflow"))
+        };
         let dims = [
-            (last.x - origin.x + 1) as usize,
-            (last.y - origin.y + 1) as usize,
-            (last.z - origin.z + 1) as usize,
+            extent(last.x, origin.x)?,
+            extent(last.y, origin.y)?,
+            extent(last.z, origin.z)?,
         ];
-        let cells = dims.iter().product::<usize>();
+        let cells = dims
+            .iter()
+            .try_fold(1usize, |n, dim| n.checked_mul(*dim))
+            .filter(|n| *n <= limits.cells)
+            .ok_or_else(|| Fault::resource_limit("lighting cell limit exceeded"))?;
         let first_section = origin.to_section(store.side()).map_err(invalid)?.0;
         let last_section = last.to_section(store.side()).map_err(invalid)?.0;
-        let deps = ((last_section.x - first_section.x + 1)
-            * (last_section.y - first_section.y + 1)
-            * (last_section.z - first_section.z + 1)) as usize;
+        let deps = [
+            extent(last_section.x, first_section.x)?,
+            extent(last_section.y, first_section.y)?,
+            extent(last_section.z, first_section.z)?,
+        ]
+        .iter()
+        .try_fold(1usize, |n, dim| n.checked_mul(*dim))
+        .filter(|n| *n <= limits.dependencies)
+        .ok_or_else(|| Fault::resource_limit("lighting dependency limit exceeded"))?;
         let frontier = limits.frontier.min(cells * 2);
         let bytes = size_of::<Self>()
             + cells * 2
             + frontier * size_of::<(u8, u32)>()
             + deps * size_of::<Dependency>()
             + (store.side() as usize).pow(3)
-            + size_of::<LightSection>();
+            + size_of::<LightSection>()
+            + if sky { dims[0] * dims[2] } else { 0 };
         if cells > limits.cells || deps > limits.dependencies || bytes as u64 > limits.bytes {
             return Err(Fault::resource_limit(
                 "lighting region exceeds its preparation budget",
@@ -209,6 +270,12 @@ impl LightJob {
             seeded: 0,
             complete: true,
             failed: false,
+            sky,
+            sky_columns: if sky {
+                vec![15; dims[0] * dims[2]]
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -239,12 +306,22 @@ impl LightJob {
     ) -> Result<bool, Fault> {
         for _ in 0..work {
             if self.seeded < self.levels.len() {
-                let index = self.seeded;
+                let index = if self.sky {
+                    let layer = self.dims[0] * self.dims[2];
+                    (self.dims[1] - 1 - self.seeded / layer) * layer + self.seeded % layer
+                } else {
+                    self.seeded
+                };
                 let pos = self.position(index);
+                let column = index % (self.dims[0] * self.dims[2]);
+                let mut direct_absorption = 15;
                 match store.query(pos) {
                     TerrainQuery::NotLoaded => self.complete = false,
                     TerrainQuery::OutOfBounds => {}
-                    TerrainQuery::Ready(state) if state.is_empty() => self.absorption[index] = 1,
+                    TerrainQuery::Ready(state) if state.is_empty() => {
+                        self.absorption[index] = 1;
+                        direct_absorption = 0;
+                    }
                     TerrainQuery::Ready(state) => {
                         let definition = registry
                             .definition(state)
@@ -254,10 +331,21 @@ impl LightJob {
                             .clamp(1.0, 15.0)
                             as u8;
                         let level = (definition.light_transport.emission * 15.0).round() as u8;
-                        self.levels[index] = level;
-                        if level > 0 {
+                        direct_absorption =
+                            (definition.light_transport.absorption * 15.0).ceil() as u8;
+                        self.levels[index] = if self.sky { 0 } else { level };
+                        if level > 0 && !self.sky {
                             self.push(level, index)?;
                         }
+                    }
+                }
+                if self.sky {
+                    self.sky_columns[column] =
+                        self.sky_columns[column].saturating_sub(direct_absorption);
+                    let level = self.sky_columns[column];
+                    self.levels[index] = level;
+                    if level > 0 {
+                        self.push(level, index)?;
                     }
                 }
                 self.seeded += 1;
@@ -380,6 +468,17 @@ pub struct LightCache {
     identity: u64,
 }
 impl LightCache {
+    /// Validate once before a bulk mesh-input capture, then borrow the resolved cells.
+    pub fn section(
+        &self,
+        binding: Binding,
+        store: &SectionStore,
+        registry: &BlockStateRegistry,
+        target: SectionPos,
+    ) -> Option<&LightSection> {
+        let (_, data) = self.entries.get(&target)?;
+        (binding == self.binding && data.validate(binding, store, registry)).then_some(data)
+    }
     pub fn new(binding: Binding, max_sections: usize, max_bytes: usize) -> Result<Self, Fault> {
         if max_sections == 0 || max_sections > 32768 || max_bytes == 0 {
             return Err(Fault::invalid_data("invalid light cache limits"));

@@ -12,6 +12,65 @@ fn config(workers: usize, jobs: usize) -> ExecutorConfig {
 }
 
 #[test]
+fn occupancy_scratch_respects_the_shared_mesh_limit_before_admission() {
+    use torse_types::{MemoryBudget, MemoryClass, MemoryPool};
+    let memory = MemoryPool::new(
+        MemoryBudget::new(128 * 1024 * 1024).with_class_limit(MemoryClass::Mesh, 0),
+    );
+    let mut scene = Scene::new_background(0).unwrap();
+    scene.attach_memory(memory.clone()).unwrap();
+    let revision = scene.authority.store().revision(SectionPos::ZERO);
+    assert!(scene.refresh_visuals(1).unwrap().is_empty());
+    let background = scene.background.as_ref().unwrap();
+    assert_eq!(background.stats.admitted, 0);
+    assert_eq!(background.pool.usage().jobs, 0);
+    assert!(background.stats.backpressure > 0);
+    assert_eq!(memory.usage().peak[MemoryClass::Mesh.index()], 0);
+    assert_eq!(scene.authority.store().revision(SectionPos::ZERO), revision);
+    drop(scene);
+    assert_eq!(memory.usage().total, 0);
+}
+
+#[test]
+fn queued_mesh_cancellation_releases_its_shared_occupancy_scratch() {
+    use torse_types::{MemoryBudget, MemoryClass, MemoryPool};
+    let memory = MemoryPool::new(MemoryBudget::new(128 * 1024 * 1024));
+    let mut scene = Scene::new(0).unwrap();
+    scene.enable_background(config(1, 2)).unwrap();
+    scene.attach_memory(memory.clone()).unwrap();
+    let (started, observed) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let mut blocker = scene
+        .background
+        .as_ref()
+        .unwrap()
+        .pool
+        .try_reserve(JobBudget {
+            input_bytes: 1,
+            output_bytes: 1,
+        })
+        .unwrap()
+        .submit(Priority::Visible, move |_| {
+            started.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            Err(JobError::Cancelled)
+        });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    scene.refresh_visuals(1).unwrap();
+    assert_eq!(
+        memory.usage().current[MemoryClass::Mesh.index()],
+        torse_render::occupancy_scratch_bytes(scene.side)
+    );
+    scene.stream_around(SectionPos::new(10, 0, 0), 0).unwrap();
+    assert_eq!(memory.usage().current[MemoryClass::Mesh.index()], 0);
+    release.send(()).unwrap();
+    wait(|| blocker.try_take().is_some());
+    drop(blocker);
+    drop(scene);
+    assert_eq!(memory.usage().total, 0);
+}
+
+#[test]
 fn shared_task_pressure_preserves_intent_and_releases_completed_and_cancelled_work() {
     use torse_types::{EvictionRank, MemoryBudget, MemoryClass, MemoryPool};
     let pool = MemoryPool::new(MemoryBudget::new(128 * 1024 * 1024));

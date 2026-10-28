@@ -6,7 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+mod frame_budget;
 mod mesh;
+pub use frame_budget::{FrameBudget, FrameLimits, SectionUploadQueue};
 
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -17,7 +19,8 @@ mod gpu_probe;
 pub use mesh::{
     CachedMesh, Face, InsertOutcome, MeshBuildError, MeshCache, MeshData, MeshJob, MeshSample,
     ModelMeshError, ModelQuad, RenderBlock, RenderBox, append_model, build_mesh,
-    build_mesh_bounded,
+    build_mesh_accounted, build_mesh_bounded, build_mesh_optimized, build_mesh_optimized_bounded,
+    build_mesh_reference, occupancy_scratch_bytes,
 };
 
 #[cfg(feature = "gpu")]

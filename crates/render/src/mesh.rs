@@ -14,6 +14,11 @@
 //!   cross-section fits inside the neighbor's same-material opposite face is
 //!   dropped, and equal sections drop both sides. This is the explicit
 //!   contact rule that removes coincident panes between glass neighbours.
+//! - A full cube that occludes every face is marked in a per-row bitset. A face
+//!   between two such cubes is omitted without sampling the neighbour again.
+//!   Slabs, crossed shapes, partial occlusion, and missing samples stay on the
+//!   per-face path. Budgeted callers reserve the temporary bitset in the shared
+//!   mesh class and release it when construction ends.
 //! - A mesh computed from older data must never replace a newer one. [`MeshJob`]
 //!   records the section revision and the six neighbor revisions, and
 //!   [`MeshCache::insert`] rejects results whose stamp no longer matches.
@@ -22,6 +27,8 @@
 //! job, which keeps a mesh valid as long as its own section does not change.
 
 use std::collections::BTreeMap;
+
+mod cubes;
 
 use torse_types::{
     BlockPos, EvictionRank, Fault, MemoryChargeId, MemoryClass, MemoryLedger, MemoryResident,
@@ -180,6 +187,9 @@ pub struct RenderBlock {
     pub face_tints: Option<[[f32; 3]; 6]>,
     /// Linear tint per overlay face; `None` uses white.
     pub face_overlay_tints: Option<[[f32; 3]; 6]>,
+    /// Resolved per-corner brightness in face-quad order, 0..=255.
+    /// None retains the consumer's directional shading policy.
+    pub face_shades: Option<[[u8; 4]; 6]>,
 }
 
 impl RenderBlock {
@@ -193,6 +203,7 @@ impl RenderBlock {
         face_overlays: None,
         face_tints: None,
         face_overlay_tints: None,
+        face_shades: None,
     };
 
     /// Full cube using one material on every face.
@@ -206,6 +217,7 @@ impl RenderBlock {
             face_overlays: None,
             face_tints: None,
             face_overlay_tints: None,
+            face_shades: None,
         }
     }
 
@@ -273,7 +285,7 @@ pub struct MeshData {
     pub tints: Vec<[f32; 3]>,
     /// Overlay vertex tint per emitted vertex.
     pub overlay_tints: Vec<[f32; 3]>,
-    /// Directional face shading policy per vertex: one enables it, zero disables it.
+    /// Negative selects directional shading; 0..=1 is resolved vertex brightness.
     pub shades: Vec<f32>,
 }
 
@@ -324,26 +336,92 @@ impl MeshData {
 
 /// Build a section mesh.
 ///
-/// `sample` returns authoritative data for block coordinates. It is called for
-/// every cell and for each face's neighbor, so an implementation backed by a
-/// hash map lookup is acceptable for M1 but should be replaced by a batched
-/// section read before profiling.
+/// Sides must be in `1..=64`, matching authoritative section storage. Invalid
+/// sides or unrepresentable block extents return an empty mesh without sampling.
+/// Use a bounded entry point to distinguish invalid input from an empty section.
+/// `sample` must describe one immutable view throughout the build. Full-cube
+/// occupancy is sampled first; visible cells and slow-path neighbours may be
+/// sampled again. Callers with a shared budget must reserve
+/// [`occupancy_scratch_bytes`] before starting and hold it until return.
 pub fn build_mesh(
     side: u32,
     section: SectionPos,
     sample: impl Fn(BlockPos) -> MeshSample,
 ) -> MeshData {
-    build_mesh_inner(side, section, sample, || false, None)
-        .expect("uncancelled unrestricted meshing succeeds")
+    build_mesh_inner(side, section, sample, || false, None, None, MeshMode::Faces).unwrap_or_else(
+        |_| MeshData {
+            section,
+            ..MeshData::default()
+        },
+    )
+}
+
+/// Unoptimized semantic reference, useful for geometry and CPU comparisons.
+pub fn build_mesh_reference(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+) -> MeshData {
+    build_mesh_inner(
+        side,
+        section,
+        sample,
+        || false,
+        None,
+        None,
+        MeshMode::Reference,
+    )
+    .unwrap_or_else(|_| MeshData {
+        section,
+        ..MeshData::default()
+    })
+}
+
+/// Synchronous counterpart of the bounded occupancy/run mesher.
+pub fn build_mesh_optimized(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+) -> MeshData {
+    build_mesh_inner(side, section, sample, || false, None, None, MeshMode::Runs).unwrap_or_else(
+        |_| MeshData {
+            section,
+            ..MeshData::default()
+        },
+    )
+}
+
+/// Mesh one section and charge the occupancy table to `ledger` until it returns.
+pub fn build_mesh_accounted(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+    ledger: &mut MemoryLedger,
+) -> Result<MeshData, MeshBuildError> {
+    build_mesh_inner(
+        side,
+        section,
+        sample,
+        || false,
+        None,
+        Some(ledger),
+        MeshMode::Faces,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MeshBuildError {
     Cancelled,
     OutputLimit,
+    /// The occupancy table did not fit in the mesh-class budget.
+    Memory,
+    /// Side is outside `1..=64`, or the section's block extent overflows i64.
+    InvalidInput,
 }
 
 /// Bound face output before allocation and check cancellation at each y slice.
+/// The working reservation must also cover [`occupancy_scratch_bytes`]; shared
+/// budget adapters hold a mesh-class scratch lease for the queued/running job.
 /// Input is owned by the caller; output allocation is at most twice the stated
 /// face payload, allowing final compaction while the original buffers exist.
 pub fn build_mesh_bounded(
@@ -356,7 +434,59 @@ pub fn build_mesh_bounded(
     if max_faces > u32::MAX as usize / 4 || max_faces > usize::MAX / 6 {
         return Err(MeshBuildError::OutputLimit);
     }
-    build_mesh_inner(side, section, sample, cancelled, Some(max_faces))
+    build_mesh_inner(
+        side,
+        section,
+        sample,
+        cancelled,
+        Some(max_faces),
+        None,
+        MeshMode::Faces,
+    )
+}
+
+/// Merge coplanar opaque cube runs with identical materials and tints.
+/// Missing borders, shaped blocks and overlays retain ordinary face semantics.
+/// Reserve occupancy_scratch_bytes in addition to bounded output.
+/// UVs repeat per cell; consumers must support tiled local face coordinates.
+pub fn build_mesh_optimized_bounded(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+    cancelled: impl Fn() -> bool,
+    max_faces: usize,
+) -> Result<MeshData, MeshBuildError> {
+    if max_faces > u32::MAX as usize / 4 || max_faces > usize::MAX / 6 {
+        return Err(MeshBuildError::OutputLimit);
+    }
+    build_mesh_inner(
+        side,
+        section,
+        sample,
+        cancelled,
+        Some(max_faces),
+        None,
+        MeshMode::Runs,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MeshMode {
+    Reference,
+    Faces,
+    Runs,
+}
+
+fn checked_origin(side: u32, section: SectionPos) -> Option<[i64; 3]> {
+    if !(1..=64).contains(&side) {
+        return None;
+    }
+    let mut origin = [0; 3];
+    for (out, coordinate) in origin.iter_mut().zip([section.x, section.y, section.z]) {
+        *out = coordinate.checked_mul(i64::from(side))?;
+        out.checked_add(i64::from(side) - 1)?;
+    }
+    Some(origin)
 }
 
 fn build_mesh_inner(
@@ -365,18 +495,28 @@ fn build_mesh_inner(
     sample: impl Fn(BlockPos) -> MeshSample,
     cancelled: impl Fn() -> bool,
     max_faces: Option<usize>,
+    ledger: Option<&mut MemoryLedger>,
+    mode: MeshMode,
 ) -> Result<MeshData, MeshBuildError> {
     if cancelled() {
         return Err(MeshBuildError::Cancelled);
     }
-    let origin = [
-        section.x.saturating_mul(i64::from(side)),
-        section.y.saturating_mul(i64::from(side)),
-        section.z.saturating_mul(i64::from(side)),
-    ];
+    let origin = checked_origin(side, section).ok_or(MeshBuildError::InvalidInput)?;
     let mut mesh = MeshData {
         section,
         ..MeshData::default()
+    };
+
+    let use_occupancy = mode != MeshMode::Reference;
+    let _occupancy_charge = if use_occupancy {
+        charge_occupancy(side, ledger)?
+    } else {
+        None
+    };
+    let occupancy = if use_occupancy {
+        RowOccupancy::build(side, &origin, &sample, &cancelled)?
+    } else {
+        RowOccupancy::Absent
     };
 
     if let Some(faces) = max_faces {
@@ -409,12 +549,22 @@ fn build_mesh_inner(
             .map_err(|_| MeshBuildError::OutputLimit)?;
     }
 
+    let optimized = mode == MeshMode::Runs && side <= 64;
+    if optimized {
+        cubes::emit(
+            &mut mesh, &occupancy, side, origin, &sample, &cancelled, max_faces,
+        )?;
+    }
     for y in 0..side {
         if cancelled() {
             return Err(MeshBuildError::Cancelled);
         }
         for z in 0..side {
-            for x in 0..side {
+            if !occupancy.has_visuals(y, z) {
+                continue;
+            }
+            let coverage = occupancy.covered_faces(y, z);
+            for x in RowCells::new(side, coverage.as_ref()) {
                 let pos = BlockPos::new(
                     origin[0] + i64::from(x),
                     origin[1] + i64::from(y),
@@ -424,6 +574,9 @@ fn build_mesh_inner(
                     MeshSample::Ready(block) => block,
                     MeshSample::NotLoaded | MeshSample::OutOfBounds => continue,
                 };
+                if optimized && cubes::eligible(block) {
+                    continue;
+                }
                 if block.cross {
                     if max_faces.is_some_and(|limit| mesh.face_count() + 2 > limit) {
                         return Err(MeshBuildError::OutputLimit);
@@ -435,7 +588,11 @@ fn build_mesh_inner(
                     continue;
                 };
                 for face in Face::ALL {
-                    if face_culled(face, &block, &sample, pos) {
+                    if coverage
+                        .as_ref()
+                        .is_some_and(|masks| masks[face.index() as usize] & (1u64 << x) != 0)
+                        || face_culled(face, &block, &sample, pos)
+                    {
                         continue;
                     }
                     if max_faces.is_some_and(|limit| mesh.face_count() >= limit) {
@@ -464,6 +621,237 @@ fn build_mesh_inner(
         mesh.shades.shrink_to_fit();
     }
     Ok(mesh)
+}
+
+/// Temporary row-table and nonempty-row flag payload, excluding stack metadata.
+///
+/// Budgeted callers reserve these bytes in their shared mesh class before
+/// copying mesh input or starting work, and keep the lease until work ends.
+/// Invalid sides outside `1..=64` require no scratch allocation.
+pub fn occupancy_scratch_bytes(side: u32) -> u64 {
+    if side == 0 || side > 64 {
+        return 0;
+    }
+    let word = if side <= 32 { 4 } else { 8 };
+    let rows = u64::from(side) * u64::from(side);
+    rows * word + rows.div_ceil(64) * 8
+}
+
+struct OccupancyCharge<'a> {
+    ledger: &'a mut MemoryLedger,
+    id: MemoryChargeId,
+}
+
+impl Drop for OccupancyCharge<'_> {
+    fn drop(&mut self) {
+        let _ = self.ledger.release(self.id);
+    }
+}
+
+fn charge_occupancy<'a>(
+    side: u32,
+    ledger: Option<&'a mut MemoryLedger>,
+) -> Result<Option<OccupancyCharge<'a>>, MeshBuildError> {
+    let bytes = occupancy_scratch_bytes(side);
+    let Some(ledger) = ledger else {
+        return Ok(None);
+    };
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let id = ledger
+        .charge(MemoryResident {
+            class: MemoryClass::Mesh,
+            bytes,
+            rank: EvictionRank::Mesh { distance_sq: 0 },
+        })
+        .map_err(|_| MeshBuildError::Memory)?;
+    Ok(Some(OccupancyCharge { ledger, id }))
+}
+
+/// One bit per cell in an x-row. Side 32 uses `u32`; side 64 uses `u64`.
+enum RowOccupancy {
+    Bits32 {
+        side: u32,
+        rows: Vec<u32>,
+        visual_rows: Vec<u64>,
+    },
+    Bits64 {
+        side: u32,
+        rows: Vec<u64>,
+        visual_rows: Vec<u64>,
+    },
+    Absent,
+}
+
+impl RowOccupancy {
+    fn build(
+        side: u32,
+        origin: &[i64; 3],
+        sample: &impl Fn(BlockPos) -> MeshSample,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, MeshBuildError> {
+        if side == 0 || side > 64 {
+            return Ok(Self::Absent);
+        }
+        let count = (side * side) as usize;
+        let mut visual_rows = vec![0u64; count.div_ceil(64)];
+        if side <= 32 {
+            let mut rows = vec![0u32; count];
+            fill_rows(side, origin, sample, cancelled, |x, y, z, full| {
+                let row = (y * side + z) as usize;
+                visual_rows[row / 64] |= 1u64 << (row % 64);
+                if full {
+                    rows[row] |= 1u32 << x;
+                }
+            })?;
+            Ok(Self::Bits32 {
+                side,
+                rows,
+                visual_rows,
+            })
+        } else {
+            let mut rows = vec![0u64; count];
+            fill_rows(side, origin, sample, cancelled, |x, y, z, full| {
+                let row = (y * side + z) as usize;
+                visual_rows[row / 64] |= 1u64 << (row % 64);
+                if full {
+                    rows[row] |= 1u64 << x;
+                }
+            })?;
+            Ok(Self::Bits64 {
+                side,
+                rows,
+                visual_rows,
+            })
+        }
+    }
+
+    fn has_visuals(&self, y: u32, z: u32) -> bool {
+        match self {
+            Self::Bits32 {
+                side, visual_rows, ..
+            }
+            | Self::Bits64 {
+                side, visual_rows, ..
+            } => {
+                let row = (y * side + z) as usize;
+                visual_rows[row / 64] & (1u64 << (row % 64)) != 0
+            }
+            Self::Absent => true,
+        }
+    }
+
+    fn row(&self, y: i64, z: i64) -> u64 {
+        let Some(side) = self.side() else {
+            return 0;
+        };
+        if y < 0 || z < 0 || y >= i64::from(side) || z >= i64::from(side) {
+            return 0;
+        }
+        let index = (y as u32 * side + z as u32) as usize;
+        match self {
+            Self::Bits32 { rows, .. } => u64::from(rows[index]),
+            Self::Bits64 { rows, .. } => rows[index],
+            Self::Absent => 0,
+        }
+    }
+
+    /// Six row-wide coverage masks. No halo bit is assumed loaded or opaque.
+    fn covered_faces(&self, y: u32, z: u32) -> Option<[u64; 6]> {
+        self.side()?;
+        let (y, z) = (i64::from(y), i64::from(z));
+        let row = self.row(y, z);
+        Some([
+            row & (row << 1),
+            row & (row >> 1),
+            row & self.row(y - 1, z),
+            row & self.row(y + 1, z),
+            row & self.row(y, z - 1),
+            row & self.row(y, z + 1),
+        ])
+    }
+
+    fn side(&self) -> Option<u32> {
+        match self {
+            Self::Bits32 { side, .. } | Self::Bits64 { side, .. } => Some(*side),
+            Self::Absent => None,
+        }
+    }
+}
+
+enum RowCells {
+    Bits(u64),
+    Slow(std::ops::Range<u32>),
+}
+
+impl RowCells {
+    fn new(side: u32, coverage: Option<&[u64; 6]>) -> Self {
+        let Some(coverage) = coverage else {
+            return Self::Slow(0..side);
+        };
+        let mask = if side == 64 {
+            u64::MAX
+        } else {
+            (1u64 << side) - 1
+        };
+        let buried = coverage.iter().fold(mask, |bits, covered| bits & covered);
+        Self::Bits(mask & !buried)
+    }
+}
+
+impl Iterator for RowCells {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Bits(bits) if *bits == 0 => None,
+            Self::Bits(bits) => {
+                let x = bits.trailing_zeros();
+                *bits &= *bits - 1;
+                Some(x)
+            }
+            Self::Slow(range) => range.next(),
+        }
+    }
+}
+
+fn fill_rows(
+    side: u32,
+    origin: &[i64; 3],
+    sample: &impl Fn(BlockPos) -> MeshSample,
+    cancelled: &impl Fn() -> bool,
+    mut mark: impl FnMut(u32, u32, u32, bool),
+) -> Result<(), MeshBuildError> {
+    for y in 0..side {
+        if cancelled() {
+            return Err(MeshBuildError::Cancelled);
+        }
+        for z in 0..side {
+            for x in 0..side {
+                let pos = BlockPos::new(
+                    origin[0] + i64::from(x),
+                    origin[1] + i64::from(y),
+                    origin[2] + i64::from(z),
+                );
+                if let MeshSample::Ready(block) = sample(pos)
+                    && (block.cross || block.bounds.is_some())
+                {
+                    mark(x, y, z, fast_cube(MeshSample::Ready(block)));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fast_cube(sample: MeshSample) -> bool {
+    let MeshSample::Ready(block) = sample else {
+        return false;
+    };
+    !block.cross
+        && block.bounds == Some(RenderBox::FULL_CUBE)
+        && block.occlusion & 0b0011_1111 == 0b0011_1111
 }
 
 fn face_culled(
@@ -534,11 +922,13 @@ fn section_within(face: Face, bounds: RenderBox, neighbor: RenderBox) -> bool {
         && bounds.max[second] <= neighbor.max[second]
 }
 
+#[derive(Clone, Copy, PartialEq)]
 struct FaceAppearance {
     material: u16,
     overlay: Option<u16>,
     tint: [f32; 3],
     overlay_tint: [f32; 3],
+    shades: [f32; 4],
 }
 
 impl FaceAppearance {
@@ -548,6 +938,9 @@ impl FaceAppearance {
             overlay: block.overlay_for(face),
             tint: block.tint_for(face),
             overlay_tint: block.overlay_tint_for(face),
+            shades: block.face_shades.map_or([-1.0; 4], |faces| {
+                faces[face.index() as usize].map(|v| f32::from(v) / 255.0)
+            }),
         }
     }
 }
@@ -584,7 +977,7 @@ fn emit_face(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
-    mesh.shades.extend([-1.0; 4]);
+    mesh.shades.extend(appearance.shades);
 }
 
 fn emit_cross(mesh: &mut MeshData, block: &RenderBlock, cell: [f32; 3]) {
@@ -635,7 +1028,7 @@ fn emit_quad(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     mesh.materials.push(appearance.material);
     mesh.overlays.push(appearance.overlay.unwrap_or(u16::MAX));
-    mesh.shades.extend([-1.0; 4]);
+    mesh.shades.extend(appearance.shades);
 }
 
 /// Resolved visual surface ready for a mesh; no content registry access is needed.
@@ -727,6 +1120,7 @@ pub fn append_model(
                     overlay: quad.overlay,
                     tint: quad.tint,
                     overlay_tint: quad.overlay_tint,
+                    shades: [-1.0; 4],
                 },
             );
             let begin = mesh.shades.len() - 4;
@@ -1093,9 +1487,380 @@ fn axis_sq(delta: i128) -> u128 {
 mod tests {
     use std::cell::Cell;
 
-    use torse_types::MemoryBudget;
+    use torse_types::{MemoryBudget, MemoryLedger};
 
     use super::*;
+
+    #[test]
+    fn invalid_extents_never_sample_or_charge_scratch() {
+        let sample = |_| -> MeshSample { panic!("invalid section must not sample") };
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(0));
+        for (side, section) in [
+            (0, SectionPos::ZERO),
+            (65, SectionPos::ZERO),
+            (u32::MAX, SectionPos::ZERO),
+            (2, SectionPos::new(i64::MAX, 0, 0)),
+            (2, SectionPos::new(0, i64::MIN, 0)),
+            (3, SectionPos::new(0, 0, i64::MAX / 3)),
+        ] {
+            for mode in [MeshMode::Reference, MeshMode::Faces, MeshMode::Runs] {
+                assert_eq!(
+                    build_mesh_inner(
+                        side,
+                        section,
+                        sample,
+                        || false,
+                        Some(usize::MAX / 16),
+                        Some(&mut ledger),
+                        mode
+                    ),
+                    Err(MeshBuildError::InvalidInput)
+                );
+            }
+            assert_eq!(ledger.total_usage(), 0);
+            for mesh in [
+                build_mesh(side, section, sample),
+                build_mesh_reference(side, section, sample),
+                build_mesh_optimized(side, section, sample),
+            ] {
+                assert!(mesh.is_empty());
+                assert_eq!(mesh.section, section);
+            }
+            assert_eq!(
+                build_mesh_bounded(side, section, sample, || false, 4),
+                Err(MeshBuildError::InvalidInput)
+            );
+            assert_eq!(
+                build_mesh_optimized_bounded(side, section, sample, || false, 4),
+                Err(MeshBuildError::InvalidInput)
+            );
+            assert_eq!(
+                build_mesh_accounted(side, section, sample, &mut ledger),
+                Err(MeshBuildError::InvalidInput)
+            );
+            assert_eq!(
+                build_mesh_bounded(side, section, sample, || true, 4),
+                Err(MeshBuildError::Cancelled)
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_legal_and_negative_sections_keep_geometry() {
+        for side in [1_u32, 2, 3, 64] {
+            let width = i64::from(side);
+            for coordinate in [i64::MIN / width, (i64::MAX - (width - 1)) / width, -2] {
+                let section = SectionPos::new(coordinate, coordinate, coordinate);
+                let origin = checked_origin(side, section).unwrap();
+                let sample = |pos: BlockPos| {
+                    if [pos.x, pos.y, pos.z] == origin {
+                        MeshSample::Ready(RenderBlock::uniform(1))
+                    } else {
+                        MeshSample::NotLoaded
+                    }
+                };
+                let expected = build_mesh_reference(side, section, sample);
+                assert_eq!(expected.face_count(), 6);
+                assert_eq!(build_mesh(side, section, sample), expected);
+                assert_eq!(
+                    build_mesh_bounded(side, section, sample, || false, 6).unwrap(),
+                    expected
+                );
+                let runs =
+                    build_mesh_optimized_bounded(side, section, sample, || false, 6).unwrap();
+                assert_eq!(runs.face_count(), 6);
+                assert_eq!(runs.section, section);
+                assert!(
+                    runs.positions
+                        .iter()
+                        .all(|p| p.iter().all(|n| (0.0..=1.0).contains(n)))
+                );
+            }
+        }
+    }
+
+    fn reference(
+        side: u32,
+        section: SectionPos,
+        sample: impl Fn(BlockPos) -> MeshSample,
+    ) -> MeshData {
+        build_mesh_inner(
+            side,
+            section,
+            sample,
+            || false,
+            None,
+            None,
+            MeshMode::Reference,
+        )
+        .unwrap()
+    }
+
+    fn solid_sample(side: u32, pos: BlockPos) -> MeshSample {
+        let range = 0..i64::from(side);
+        if range.contains(&pos.x) && range.contains(&pos.y) && range.contains(&pos.z) {
+            MeshSample::Ready(RenderBlock::uniform(1))
+        } else {
+            MeshSample::NotLoaded
+        }
+    }
+
+    #[test]
+    fn row_shifts_skip_the_interior_and_preserve_word_endpoints() {
+        for side in [32, 64] {
+            let occupancy =
+                RowOccupancy::build(side, &[0; 3], &|pos| solid_sample(side, pos), &|| false)
+                    .unwrap();
+            let coverage = occupancy.covered_faces(1, 1).unwrap();
+            assert_eq!(
+                RowCells::new(side, Some(&coverage)).collect::<Vec<_>>(),
+                [0, side - 1]
+            );
+            let boundary = occupancy.covered_faces(0, 1).unwrap();
+            assert_eq!(RowCells::new(side, Some(&boundary)).count(), side as usize);
+        }
+        assert_eq!(
+            RowCells::new(65, None).collect::<Vec<_>>(),
+            (0..65).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn empty_rows_are_not_sampled_again_after_the_prepass() {
+        let samples = Cell::new(0);
+        let mesh = build_mesh(32, SectionPos::ZERO, |_| {
+            samples.set(samples.get() + 1);
+            MeshSample::Ready(RenderBlock::EMPTY)
+        });
+        assert!(mesh.is_empty());
+        assert_eq!(samples.get(), 32usize.pow(3));
+    }
+
+    #[test]
+    fn dense_rows_match_the_reference_including_64_bit_boundaries() {
+        for side in [1, 3, 32, 33, 64] {
+            let optimized = build_mesh(side, SectionPos::ZERO, |pos| solid_sample(side, pos));
+            let expected = reference(side, SectionPos::ZERO, |pos| solid_sample(side, pos));
+            assert_eq!(optimized, expected, "side={side}");
+            assert_eq!(optimized.face_count(), 6 * side as usize * side as usize);
+        }
+    }
+
+    #[test]
+    fn mixed_shapes_tints_materials_and_missing_halos_match_the_reference() {
+        let sample = |pos: BlockPos| {
+            let tag = (pos.x * 13 + pos.y * 7 + pos.z * 17).rem_euclid(11);
+            let mut block = RenderBlock::uniform((tag % 3) as u16);
+            block.face_materials = Some([1, 2, 1, 3, 2, 1]);
+            block.face_overlays = Some([Some(4), None, None, Some(5), None, None]);
+            block.face_tints = Some([[0.5, 0.25, 0.75]; 6]);
+            block.face_overlay_tints = Some([[0.75, 0.5, 0.25]; 6]);
+            match tag {
+                0 => return MeshSample::NotLoaded,
+                1 => return MeshSample::OutOfBounds,
+                2 => return MeshSample::Ready(RenderBlock::EMPTY),
+                3 => {
+                    block.bounds = Some(RenderBox {
+                        min: [0.0; 3],
+                        max: [1.0, 0.5, 1.0],
+                    });
+                    block.occlusion = Face::NegY.bit();
+                }
+                4 => {
+                    block.cross = true;
+                    block.occlusion = 0;
+                }
+                5 => block.occlusion = 0,
+                6 => block.occlusion = Face::PosX.bit(),
+                _ => {}
+            }
+            MeshSample::Ready(block)
+        };
+        for side in [1, 3, 8, 16] {
+            for section in [SectionPos::ZERO, SectionPos::new(-1, 1, -2)] {
+                assert_eq!(
+                    build_mesh(side, section, sample),
+                    reference(side, section, sample)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU microbenchmark; run explicitly in release mode with --nocapture"]
+    fn row_occupancy_cpu_comparison() {
+        use std::time::Instant;
+        for dense in [true, false] {
+            let side = 32;
+            let sample = |pos| {
+                let pos = std::hint::black_box(pos);
+                std::hint::black_box(if dense {
+                    solid_sample(side, pos)
+                } else {
+                    MeshSample::Ready(RenderBlock::EMPTY)
+                })
+            };
+            let optimized_calls = Cell::new(0usize);
+            let optimized = build_mesh(side, SectionPos::ZERO, |pos| {
+                optimized_calls.set(optimized_calls.get() + 1);
+                sample(pos)
+            });
+            let reference_calls = Cell::new(0usize);
+            assert_eq!(
+                optimized,
+                reference(side, SectionPos::ZERO, |pos| {
+                    reference_calls.set(reference_calls.get() + 1);
+                    sample(pos)
+                })
+            );
+            let rounds = 20;
+            let start = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(reference(side, SectionPos::ZERO, sample));
+            }
+            let reference_us = start.elapsed().as_micros();
+            let start = Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(build_mesh(side, SectionPos::ZERO, sample));
+            }
+            let optimized_us = start.elapsed().as_micros();
+            println!(
+                "dense={dense} side={side} rounds={rounds} reference_us={reference_us} optimized_us={optimized_us} reference_samples={} optimized_samples={}",
+                reference_calls.get(),
+                optimized_calls.get()
+            );
+        }
+    }
+
+    #[test]
+    fn full_cube_rows_drop_buried_faces_and_keep_partial_cells() {
+        let solid = |pos: BlockPos| {
+            if (0..2).contains(&pos.x) && (0..2).contains(&pos.y) && (0..2).contains(&pos.z) {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mesh = build_mesh(2, SectionPos::ZERO, solid);
+        assert_eq!(mesh.face_count(), 24);
+
+        let mut open = RenderBlock::uniform(1);
+        open.occlusion = 0;
+        let mut other = RenderBlock::uniform(2);
+        other.occlusion = 0;
+        let exposed = |pos: BlockPos| match (pos.x, pos.y, pos.z) {
+            (0, 0, 0) => MeshSample::Ready(open),
+            (1, 0, 0) => MeshSample::Ready(other),
+            _ => MeshSample::Ready(RenderBlock::EMPTY),
+        };
+        assert_eq!(build_mesh(2, SectionPos::ZERO, exposed).face_count(), 12);
+
+        let mut slab = RenderBlock::uniform(3);
+        slab.bounds = Some(RenderBox {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 0.5, 1.0],
+        });
+        slab.occlusion = 0;
+        let mixed = |pos: BlockPos| match (pos.x, pos.y, pos.z) {
+            (0, 0, 0) => MeshSample::Ready(RenderBlock::uniform(1)),
+            (1, 0, 0) => MeshSample::Ready(slab),
+            _ => MeshSample::Ready(RenderBlock::EMPTY),
+        };
+        let mixed_mesh = build_mesh(2, SectionPos::ZERO, mixed);
+        assert_eq!(mixed_mesh.face_count(), 11);
+    }
+
+    #[test]
+    fn buried_full_cube_is_sampled_only_while_building_the_mask() {
+        let hits = Cell::new(0u32);
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::new(1, 1, 1) {
+                hits.set(hits.get() + 1);
+            }
+            if (0..3).contains(&pos.x) && (0..3).contains(&pos.y) && (0..3).contains(&pos.z) {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mesh = build_mesh(3, SectionPos::ZERO, sample);
+        assert_eq!(mesh.face_count(), 54);
+        assert_eq!(hits.get(), 1);
+    }
+
+    #[test]
+    fn wide_rows_keep_the_bit_past_a_32_bit_word() {
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::new(32, 0, 0) {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        assert_eq!(build_mesh(33, SectionPos::ZERO, sample).face_count(), 6);
+    }
+
+    #[test]
+    fn failed_accounted_build_releases_the_occupancy_charge() {
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::ZERO {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(10_000));
+        assert_eq!(
+            super::build_mesh_inner(
+                4,
+                SectionPos::ZERO,
+                sample,
+                || true,
+                Some(6),
+                Some(&mut ledger),
+                MeshMode::Faces
+            ),
+            Err(MeshBuildError::Cancelled)
+        );
+        assert_eq!(ledger.total_usage(), 0);
+        assert_eq!(
+            super::build_mesh_inner(
+                4,
+                SectionPos::ZERO,
+                sample,
+                || false,
+                Some(0),
+                Some(&mut ledger),
+                MeshMode::Faces
+            ),
+            Err(MeshBuildError::OutputLimit)
+        );
+        assert_eq!(ledger.total_usage(), 0);
+    }
+
+    #[test]
+    fn occupancy_table_is_charged_then_released() {
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::ZERO {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mut empty = MemoryLedger::new(MemoryBudget::new(0));
+        assert_eq!(
+            build_mesh_accounted(4, SectionPos::ZERO, sample, &mut empty).unwrap_err(),
+            MeshBuildError::Memory
+        );
+        assert_eq!(empty.total_usage(), 0);
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(10_000));
+        let mesh = build_mesh_accounted(4, SectionPos::ZERO, sample, &mut ledger).unwrap();
+        assert_eq!(ledger.total_usage(), 0);
+        assert_eq!(mesh.face_count(), 6);
+        assert_eq!(occupancy_scratch_bytes(32), 32 * 32 * 4 + 128);
+        assert_eq!(occupancy_scratch_bytes(64), 64 * 64 * 8 + 512);
+        assert_eq!(occupancy_scratch_bytes(65), 0);
+    }
 
     #[test]
     fn bounded_meshing_matches_reference_and_discards_partial_cancelled_or_oversized_output() {

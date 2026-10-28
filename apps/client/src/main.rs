@@ -30,7 +30,7 @@ const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N
                         [--screenshot <png>] [--autoplay] [--sensitivity F] [--ui-preview hud|pause|machine]\n\
                         [--connect ADDRESS] [--walk] [--section X,Y,Z]...\n\
                         [--tls-ca PEM --tls-cert PEM --tls-key PEM --server-name DNS]\n\
-       both modes accept [--memory-mib N; default 512] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
+       both modes accept [--memory-mib N; default 512] [--gpu-memory-mib N; default 64] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
        atlas.png, world.toml) instead of the built-in fixture content";
 
 fn main() -> ExitCode {
@@ -53,6 +53,7 @@ fn main() -> ExitCode {
     let mut places: Vec<(String, [i64; 3])> = Vec::new();
     let mut content: Option<String> = None;
     let mut memory_mib = 512u64;
+    let mut geometry_mib = 64u64;
     let (mut tls_ca, mut tls_cert, mut tls_key, mut server_name) = (None, None, None, None);
     let mut sections = Vec::new();
     let mut index = 0;
@@ -123,6 +124,13 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--gpu-memory-mib" => match value().and_then(|value| value.parse::<u64>().ok()) {
+                Some(value @ 1..=4096) => geometry_mib = value,
+                _ => {
+                    eprintln!("--gpu-memory-mib requires 1..=4096");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             "--probe-outside" => probe_outside = true,
             "--place" => match value().as_deref().map(parse_place) {
@@ -187,6 +195,7 @@ fn main() -> ExitCode {
             sections: (!sections.is_empty()).then_some(sections),
             tls,
             memory_mib,
+            geometry_mib,
             radius: if radius_set { radius } else { 4 },
             width,
             height,
@@ -205,6 +214,15 @@ fn main() -> ExitCode {
                 println!(
                     "memory_current_bytes={} memory_peak_bytes={} memory_class_peak_bytes={:?}",
                     summary.memory.total, summary.memory.total_peak, summary.memory.peak
+                );
+                println!(
+                    "gpu_geometry_bytes={} gpu_geometry_limit={} gpu_sections={} gpu_evictions={} visible_sections={} culled_sections={}",
+                    summary.geometry.bytes,
+                    summary.geometry.limit,
+                    summary.geometry.sections,
+                    summary.geometry.evictions,
+                    summary.draws.visible_sections,
+                    summary.draws.culled_sections
                 );
                 println!(
                     "adapter={} backend={} present={} format={} frames={} streams={} rebuilds={} \
@@ -273,6 +291,7 @@ fn main() -> ExitCode {
             &places,
             content.as_deref(),
             memory_mib,
+            geometry_mib,
         ) {
             Ok(summary) => {
                 println!("{summary}");
@@ -304,6 +323,7 @@ fn run(
     places: &[(String, [i64; 3])],
     content: Option<&str>,
     memory_mib: u64,
+    geometry_mib: u64,
 ) -> Result<String, String> {
     let start = Instant::now();
     let pool =
@@ -332,6 +352,17 @@ fn run(
             .apply_edit(true, &key, torse_types::BlockPos::new(*x, *y, *z), 0)
             .map_err(|error| format!("--place `{material}`: {error}"))?;
     }
+    scene.enable_lighting()?;
+    let mut resolved = false;
+    for _ in 0..4096 {
+        if scene.refresh_lighting(16_384)? {
+            resolved = true;
+            break;
+        }
+    }
+    if !resolved {
+        return Err("lighting did not fit the capture budget".into());
+    }
     let _frame = scene
         .reserve_frame_memory(u64::from(width) * u64::from(height) * 16 + 64 * 1024 * 1024)
         .map_err(|error| error.to_string())?;
@@ -350,8 +381,12 @@ fn run(
     let vertex_bytes = Scene::vertex_bytes(&vertices);
 
     let mut renderer = Renderer::new(width, height)?;
+    renderer.set_geometry_limit(geometry_mib * 1024 * 1024);
+    renderer.attach_memory(pool.clone());
     renderer.set_palette(scene.palette());
-    renderer.upload_section(torse_types::SectionPos::ZERO, &vertex_bytes, &indices);
+    if !renderer.upload_section(torse_types::SectionPos::ZERO, &vertex_bytes, &indices) {
+        return Err("terrain geometry or upload metadata exceeds memory budget".into());
+    }
 
     let (eye, target) = match view {
         "player" => {
@@ -361,18 +396,22 @@ fn run(
         _ => ([40.0, 18.0, 40.0], [0.0, 6.0, 0.0]),
     };
     let camera = Camera::new(eye, target);
-    renderer.render(
+    if !renderer.render(
         camera.view_projection(width as f32 / height as f32),
         camera.eye,
-    );
+    ) {
+        return Err("transparent sorting exceeds memory budget".into());
+    }
     if let Some(mode) = ui_preview {
         renderer.render_ui(mode)?;
     }
     renderer.save_png(path)?;
 
     let elapsed = start.elapsed();
+    let gpu = renderer.geometry_usage();
+    let draws = renderer.draw_stats();
     Ok(format!(
-        "sections={} meshes={} entities={} seq={} vertices={} indices={} faces={} eye=({:.1},{:.1},{:.1}) elapsed_ms={}",
+        "sections={} meshes={} entities={} seq={} vertices={} indices={} faces={} eye=({:.1},{:.1},{:.1}) elapsed_ms={} gpu_geometry_bytes={} gpu_geometry_limit={} visible_sections={} culled_sections={}",
         scene.sections().len(),
         scene.mesh_count(),
         scene.authority().entities().len(),
@@ -383,7 +422,11 @@ fn run(
         eye[0],
         eye[1],
         eye[2],
-        elapsed.as_millis()
+        elapsed.as_millis(),
+        gpu.bytes,
+        gpu.limit,
+        draws.visible_sections,
+        draws.culled_sections
     ))
 }
 

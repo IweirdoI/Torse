@@ -25,14 +25,24 @@ use crate::camera::{FlyCamera, MoveInput};
 use crate::input::InputState;
 use crate::pick::PickOutcome;
 use crate::renderer::GpuContext;
-use crate::scene::{Pace, Scene, TASK_CAP, split_uploads};
+use crate::scene::Scene;
 use crate::texture::Palette;
+use torse_render::{FrameBudget, FrameLimits, SectionUploadQueue};
 use torse_sim::PresentationClock;
 use torse_types::{BlockPos, ContentKey, SectionPos};
 use torse_world::Position;
 
 /// How far the pick ray reaches, in blocks.
 const PICK_RANGE: f32 = 64.0;
+/// Sections generated per frame while streaming; spreading the work keeps
+/// the frame time bounded at the cost of populating a window over a few
+/// frames.
+const FRAME_LIMITS: FrameLimits = FrameLimits {
+    generation: 4,
+    meshing: 4,
+    uploads: 4,
+    upload_bytes: 8 * 1024 * 1024,
+};
 /// Fixed logic step in seconds. A presentation frame may run several of these
 /// and must not stretch one step to match the frame.
 const LOGIC_STEP_SECONDS: f64 = 1.0 / 20.0;
@@ -52,6 +62,8 @@ pub struct WindowConfig {
     pub tls: Option<crate::net::TlsClient>,
     /// Shared CPU memory reservation ceiling in MiB.
     pub memory_mib: u64,
+    /// Independent logical resident geometry payload ceiling in MiB.
+    pub geometry_mib: u64,
     /// Section loading radius around the camera.
     pub radius: i64,
     /// Initial window size in logical pixels.
@@ -82,6 +94,8 @@ pub struct WindowConfig {
 /// Measurements reported when the window closes.
 #[derive(Clone, Debug, Default)]
 pub struct WindowSummary {
+    pub geometry: crate::renderer::GeometryUsage,
+    pub draws: crate::renderer::DrawStats,
     /// Logical shared reservation usage; excludes native allocator and GPU memory.
     pub memory: torse_types::MemoryUsage,
     /// Adapter name reported by the backend.
@@ -137,11 +151,11 @@ pub struct WindowSummary {
     pub stream_frame_us: u64,
     /// Mean frame time containing mesh rebuilds.
     pub rebuild_frame_us: u64,
-    /// Mean main-thread time admitting and installing generation and meshes.
+    /// Mean main-thread streaming and mesh admission time.
     pub cpu_us: u64,
-    /// Mean time spent creating geometry buffers.
+    /// Mean terrain-buffer upload time.
     pub upload_us: u64,
-    /// Mean time spent encoding and presenting a frame.
+    /// Mean render encoding and presentation time.
     pub present_us: u64,
     pub cpu: crate::scene::BackgroundStats,
 }
@@ -159,6 +173,8 @@ struct Gpu {
 }
 
 struct WindowApp {
+    work_budget: FrameBudget,
+    pending_uploads: SectionUploadQueue,
     ui: crate::ui::State,
     config: WindowConfig,
     scene: Option<Scene>,
@@ -171,6 +187,7 @@ struct WindowApp {
     pack: bool,
     center: Option<SectionPos>,
     uploaded: bool,
+    entity_sequence: Option<u64>,
     frames: u32,
     streams: usize,
     rebuilds: usize,
@@ -214,8 +231,6 @@ struct WindowApp {
     rebuilds_mark: usize,
     rebuild_total_us: u128,
     rebuild_count: u32,
-    pace: Pace,
-    pending_uploads: Vec<SectionPos>,
     cpu_total_us: u128,
     cpu_samples: u32,
     upload_total_us: u128,
@@ -250,6 +265,8 @@ impl WindowApp {
             .map(|name| ContentKey::parse(name).expect("static material key"))
             .collect();
         Self {
+            work_budget: FrameBudget::new(FRAME_LIMITS, 16_666),
+            pending_uploads: SectionUploadQueue::default(),
             ui: {
                 let mut state = crate::ui::State::default();
                 state.set_mode(config.ui_mode);
@@ -265,6 +282,7 @@ impl WindowApp {
             pack: false,
             center: None,
             uploaded: false,
+            entity_sequence: None,
             frames: 0,
             streams: 0,
             rebuilds: 0,
@@ -306,8 +324,6 @@ impl WindowApp {
             rebuilds_mark: 0,
             rebuild_total_us: 0,
             rebuild_count: 0,
-            pace: Pace::new(),
-            pending_uploads: Vec::new(),
             cpu_total_us: 0,
             cpu_samples: 0,
             upload_total_us: 0,
@@ -445,16 +461,16 @@ impl WindowApp {
             .as_ref()
             .expect("camera implies scene")
             .center_section(self.camera.as_ref().expect("camera").eye);
-        // Local scenes stream on the presentation frame. The pace keeps a
-        // crossing from filling one frame, and it shrinks when that work
-        // runs long. Network scenes keep the subscribed sections.
+        // Local scenes stream continuously with a per-frame generation
+        // budget: a crossing no longer stalls one frame with a whole ring of
+        // fresh sections. Network scenes keep the subscribed sections.
         let mut cpu_us = 0u128;
         if self.scene.as_ref().is_some_and(|scene| !scene.is_network()) {
             let Some(scene) = self.scene.as_mut() else {
                 return;
             };
             let started = Instant::now();
-            if let Err(error) = scene.stream_around(center, self.pace.generate) {
+            if let Err(error) = scene.stream_around(center, self.work_budget.limits().generation) {
                 self.failure = Some(format!("streaming failed: {error}"));
                 event_loop.exit();
                 return;
@@ -615,7 +631,7 @@ impl WindowApp {
             .scene
             .as_mut()
             .expect("camera implies scene")
-            .refresh_visuals(self.pace.mesh)
+            .refresh_visuals(self.work_budget.limits().meshing)
         {
             Ok(rebuilt) => rebuilt,
             Err(error) => {
@@ -626,13 +642,95 @@ impl WindowApp {
         };
         cpu_us += mesh_started.elapsed().as_micros();
         self.rebuilds += rebuilt.len();
-        for pos in rebuilt {
-            if !self.pending_uploads.contains(&pos) {
-                self.pending_uploads.push(pos);
+        self.pending_uploads.extend(rebuilt);
+        let scene = self.scene.as_ref().expect("camera implies scene");
+        if let Some(gpu) = self.gpu.as_mut() {
+            let camera = self.camera.as_ref().expect("active scene camera");
+            let aspect = gpu.config.width as f32 / gpu.config.height.max(1) as f32;
+            gpu.context
+                .write_camera(camera.view_projection(aspect), camera.eye);
+            gpu.context.set_section_focus(center);
+            gpu.context.retain_sections(scene.sections());
+            let side = scene.authority().store().side();
+            self.pending_uploads
+                .extend(scene.sections().iter().copied().filter(|pos| {
+                    !gpu.context.has_section(*pos)
+                        && scene.section_geometry_bytes(*pos).is_some_and(|bytes| {
+                            bytes > 0 && gpu.context.should_upload(*pos, side, bytes)
+                        })
+                }));
+            if !gpu.context.has_section(crate::renderer::ENTITY_SLOT)
+                && !scene.authority().entities().is_empty()
+            {
+                self.entity_sequence = None;
             }
         }
-        let upload_us = self.upload_pending();
-        self.note_work(cpu_us, upload_us);
+        self.pending_uploads
+            .retain(|p| scene.sections().contains(&p));
+        let upload_started = Instant::now();
+        let uploads = match self.pending_uploads.select_where(
+            center,
+            self.work_budget.limits(),
+            |p| {
+                self.gpu.as_ref().is_some_and(|gpu| {
+                    scene.section_geometry_bytes(p).is_none_or(|bytes| {
+                        gpu.context
+                            .should_upload(p, scene.authority().store().side(), bytes)
+                    })
+                })
+            },
+            |p| scene.section_geometry_bytes(p),
+        ) {
+            Ok(uploads) => uploads,
+            Err(error) => {
+                self.failure = Some(error.to_owned());
+                event_loop.exit();
+                return;
+            }
+        };
+        let sequence = self
+            .scene
+            .as_ref()
+            .expect("camera implies scene")
+            .authority()
+            .seq()
+            .0;
+        if !uploads.is_empty() || !self.uploaded || self.entity_sequence != Some(sequence) {
+            let scene = self.scene.as_ref().expect("camera implies scene");
+            if let Some(gpu) = self.gpu.as_mut() {
+                // Re-upload only the changed sections; untouched terrain keeps
+                // its buffers, so an edit costs one small upload, not the
+                // whole scene.
+                for pos in &uploads {
+                    if let Some((vertices, indices)) = scene.section_geometry(*pos) {
+                        let bytes = Scene::vertex_bytes(&vertices);
+                        if !gpu.context.upload_section(*pos, &bytes, &indices) {
+                            self.pending_uploads.extend([*pos]);
+                        } else {
+                            self.uploads += 1;
+                        }
+                    }
+                }
+                // Entity bodies change without mesh rebuilds; refresh them
+                // alongside any terrain upload.
+                if self.entity_sequence != Some(sequence) {
+                    let (entity_vertices, entity_indices) = scene.entity_geometry();
+                    let entity_bytes = Scene::vertex_bytes(&entity_vertices);
+                    if gpu.context.upload_section(
+                        crate::renderer::ENTITY_SLOT,
+                        &entity_bytes,
+                        &entity_indices,
+                    ) {
+                        self.entity_sequence = Some(sequence);
+                    }
+                }
+            }
+            self.uploaded = true;
+        }
+        self.cpu_total_us += cpu_us;
+        self.cpu_samples += 1;
+        self.upload_total_us += upload_started.elapsed().as_micros();
+        self.upload_samples += 1;
         // Unloaded sections must stop drawing even when nothing rebuilt this
         // frame; retention is cheap and the entity slot survives it.
         if let Some(gpu) = self.gpu.as_mut()
@@ -656,82 +754,6 @@ impl WindowApp {
         }
 
         self.draw(event_loop, &names, frame_started);
-    }
-
-    /// Upload a prefix of the pending meshes. The rest stay queued in order.
-    ///
-    /// Returns the microseconds spent creating GPU buffers. Entity boxes ride
-    /// along with the first terrain upload of a frame and do not consume the
-    /// section budget.
-    fn upload_pending(&mut self) -> u128 {
-        let started = Instant::now();
-        let budget = self.pace.upload_bytes;
-        let already_uploaded = self.uploaded;
-        let queued = std::mem::take(&mut self.pending_uploads);
-        let (pending, deferred) = {
-            let Some(scene) = self.scene.as_ref() else {
-                self.pending_uploads = queued;
-                return 0;
-            };
-            let mut pending = Vec::new();
-            let mut sizes = Vec::new();
-            for pos in queued {
-                if scene.sections().contains(&pos)
-                    && let Some(bytes) = scene.section_upload_bytes(pos)
-                {
-                    pending.push(pos);
-                    sizes.push(bytes);
-                }
-            }
-            let count = split_uploads(&sizes, budget, TASK_CAP);
-            let deferred = pending.split_off(count);
-            (pending, deferred)
-        };
-        self.pending_uploads = deferred;
-        if self.gpu.is_none() {
-            let mut restored = pending;
-            restored.append(&mut self.pending_uploads);
-            self.pending_uploads = restored;
-            return 0;
-        }
-        let uploaded = {
-            let scene = self.scene.as_ref().expect("upload follows a scene");
-            let gpu = self.gpu.as_mut().expect("gpu checked");
-            let mut uploaded = 0usize;
-            for pos in &pending {
-                if let Some((vertices, indices)) = scene.section_geometry(*pos) {
-                    let bytes = Scene::vertex_bytes(&vertices);
-                    gpu.context.upload_section(*pos, &bytes, &indices);
-                    uploaded += 1;
-                }
-            }
-            if uploaded > 0 || !already_uploaded {
-                let (entity_vertices, entity_indices) = scene.entity_geometry();
-                let entity_bytes = Scene::vertex_bytes(&entity_vertices);
-                gpu.context.upload_section(
-                    crate::renderer::ENTITY_SLOT,
-                    &entity_bytes,
-                    &entity_indices,
-                );
-            }
-            uploaded
-        };
-        self.uploads += uploaded;
-        if uploaded > 0 || !already_uploaded {
-            self.uploaded = true;
-        }
-        started.elapsed().as_micros()
-    }
-
-    fn note_work(&mut self, cpu_us: u128, upload_us: u128) {
-        self.cpu_total_us += cpu_us;
-        self.cpu_samples += 1;
-        self.upload_total_us += upload_us;
-        self.upload_samples += 1;
-        self.pace.observe(
-            u64::try_from(cpu_us).unwrap_or(u64::MAX),
-            u64::try_from(upload_us).unwrap_or(u64::MAX),
-        );
     }
 
     /// Present one frame. This does not pump logic steps.
@@ -779,8 +801,13 @@ impl WindowApp {
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("client window frame"),
         });
-        gpu.context
-            .encode_draw(&mut encoder, &view, &gpu.depth_view);
+        if !gpu
+            .context
+            .encode_draw(&mut encoder, &view, &gpu.depth_view)
+        {
+            gpu.window.request_redraw();
+            return;
+        }
         gpu.ui.prepare(
             device,
             queue,
@@ -816,10 +843,13 @@ impl WindowApp {
             }
         }
         queue.present(frame);
+
         self.present_total_us += present_started.elapsed().as_micros();
         self.present_samples += 1;
 
         let frame_us = frame_started.elapsed().as_micros();
+        self.work_budget
+            .observe(frame_us.min(u128::from(u64::MAX)) as u64);
         self.frame_total_us += frame_us;
         self.frame_max_us = self.frame_max_us.max(frame_us);
         self.frame_count += 1;
@@ -1110,6 +1140,8 @@ impl WindowApp {
         self.pending_palette = None;
         self.center = None;
         self.uploaded = false;
+        self.entity_sequence = None;
+        self.pending_uploads.clear();
         self.rebuild_network = true;
     }
     fn rebuild_network_scene(&mut self) -> Result<(), String> {
@@ -1123,6 +1155,7 @@ impl WindowApp {
             Err(error) => return Err(error.to_string()),
         };
         scene.enable_background(crate::scene::background_config())?;
+        scene.enable_lighting()?;
         if let Some(connection) = self.net.as_mut() {
             connection
                 .refresh_player(scene.authority())
@@ -1282,6 +1315,8 @@ impl WindowApp {
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
             let (vertices, faces) = scene.geometry_counts();
             self.summary = Some(WindowSummary {
+                geometry: gpu.context.geometry_usage(),
+                draws: gpu.context.draw_stats(),
                 memory: self.memory.usage(),
                 cpu: scene.background_stats(),
                 adapter: self.adapter.clone(),
@@ -1411,7 +1446,9 @@ impl ApplicationHandler for WindowApp {
         surface.configure(&session.device, &config);
         let depth = create_depth(&session.device, config.width, config.height);
         let depth_view = depth.create_view(&TextureViewDescriptor::default());
-        let context = GpuContext::new(session.device, session.queue, config.format);
+        let mut context = GpuContext::new(session.device, session.queue, config.format);
+        context.set_geometry_limit(self.config.geometry_mib * 1024 * 1024);
+        context.attach_memory(self.memory.clone());
         eprintln!("{}", torse_render::startup_line(&info, Some(present)));
 
         let scene = if self.config.connect.is_some() {
@@ -1442,6 +1479,11 @@ impl ApplicationHandler for WindowApp {
                         scene.attach_memory_prepared(self.memory.clone(), world_memory)
                     {
                         self.failure = Some(error.to_string());
+                        event_loop.exit();
+                        return;
+                    }
+                    if let Err(error) = scene.enable_lighting() {
+                        self.failure = Some(error);
                         event_loop.exit();
                         return;
                     }
@@ -1961,6 +2003,7 @@ mod tests {
             sections: None,
             tls: None,
             memory_mib: 512,
+            geometry_mib: 64,
             radius: 1,
             width: 960,
             height: 540,

@@ -381,6 +381,9 @@ impl BehaviorRuntime {
                 .set_fuel(budget.fuel)
                 .map_err(|error| format!("fuel setup failed: {error}"))?;
             store.data_mut().begin_invocation();
+            store
+                .data_mut()
+                .bind_package(&package.manifest.principal())?;
             let bindings =
                 ModBehavior::instantiate(&mut store, &component, &linker).map_err(|error| {
                     format!("instantiation for {} failed: {error}", package.manifest.id)
@@ -428,6 +431,7 @@ impl BehaviorRuntime {
             .set_fuel(fuel)
             .map_err(|error| format!("fuel reset failed: {error}"))?;
         self.host_mut().begin_invocation();
+        self.host_mut().bind_package(package)?;
         let Some(invocation) = self.host_mut().prepare_invocation(tick, &event, package) else {
             self.host_mut().on_failure(tick, &event, package);
             return Ok(DispatchOutcome::Rejected {
@@ -512,6 +516,7 @@ impl BehaviorRuntime {
                 .set_fuel(self.budget.fuel)
                 .map_err(|error| format!("fuel reset failed: {error}"))?;
             store.data_mut().begin_invocation();
+            store.data_mut().bind_package(principal)?;
             let bindings = ModBehavior::instantiate(&mut store, component, &linker)
                 .map_err(|error| format!("rebuild for {principal} failed: {error}"))?;
             if store.data().budget_exceeded() {

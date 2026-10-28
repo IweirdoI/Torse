@@ -7,6 +7,9 @@
 
 use core::fmt;
 
+mod asset;
+pub use asset::{AssetGuid, valid_asset_path};
+
 mod identity;
 mod lifecycle;
 mod memory;

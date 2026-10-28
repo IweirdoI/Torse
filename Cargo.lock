@@ -3039,6 +3039,8 @@ name = "torse-assets"
 version = "0.1.0"
 dependencies = [
  "png",
+ "sha2",
+ "torse-content",
  "torse-types",
 ]
 
@@ -3084,7 +3086,6 @@ version = "0.1.0"
 dependencies = [
  "sha2",
  "torse-actions",
- "torse-assets",
  "torse-types",
 ]
 

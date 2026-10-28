@@ -92,6 +92,70 @@ fn level(
 }
 const TARGET: SectionPos = SectionPos::new(0, 0, 0);
 
+fn sky(store: &SectionStore, registry: &BlockStateRegistry) -> LightSection {
+    let mut job = LightJob::prepare_sky(binding(), store, registry, TARGET, limits()).unwrap();
+    for _ in 0..1000 {
+        if job.poll(binding(), store, registry, 4096).unwrap() {
+            return job.finish(binding(), store, registry).unwrap();
+        }
+    }
+    panic!("skylight failed to finish");
+}
+
+#[test]
+fn skylight_roof_opening_and_upper_section_changes_are_observed() {
+    let registry = registry(1.0);
+    let mut store = SectionStore::new(16, WorldBounds::new(0, 32).unwrap()).unwrap();
+    for z in -2..=2 {
+        for x in -2..=2 {
+            for y in 0..2 {
+                load(&mut store, SectionPos::new(x, y, z), BlockStateId::EMPTY);
+            }
+        }
+    }
+    let stone = state(&registry, "base:stone");
+    for z in -16..32 {
+        for x in -16..32 {
+            store.edit(BlockPos::new(x, 24, z), stone).unwrap();
+        }
+    }
+    let mut cache = LightCache::new(binding(), 1, 1_000_000).unwrap();
+    let stamp = cache
+        .publish(sky(&store, &registry), &store, &registry)
+        .unwrap();
+    assert_eq!(level(&cache, &store, &registry, 8, 8, 8), 0);
+    store
+        .edit(BlockPos::new(8, 24, 8), BlockStateId::EMPTY)
+        .unwrap();
+    assert!(!cache.validate_stamp(stamp, binding(), &store, &registry));
+    cache
+        .publish(sky(&store, &registry), &store, &registry)
+        .unwrap();
+    assert_eq!(level(&cache, &store, &registry, 8, 8, 8), 15);
+    assert_eq!(level(&cache, &store, &registry, 9, 8, 8), 14);
+}
+
+#[test]
+fn missing_sky_columns_are_dark_incomplete_and_extreme_height_is_bounded() {
+    let registry = registry(1.0);
+    let mut store = SectionStore::new(16, WorldBounds::new(0, 32).unwrap()).unwrap();
+    load(&mut store, TARGET, BlockStateId::EMPTY);
+    let mut cache = LightCache::new(binding(), 1, 1_000_000).unwrap();
+    cache
+        .publish(sky(&store, &registry), &store, &registry)
+        .unwrap();
+    assert_eq!(
+        cache.sample(binding(), &store, &registry, BlockPos::new(8, 8, 8)),
+        LightQuery::Ready {
+            level: 0,
+            complete: false
+        }
+    );
+    let mut huge = SectionStore::new(16, WorldBounds::new(i64::MIN, i64::MAX).unwrap()).unwrap();
+    load(&mut huge, TARGET, BlockStateId::EMPTY);
+    assert!(LightJob::prepare_sky(binding(), &huge, &registry, TARGET, limits()).is_err());
+}
+
 #[test]
 fn emitted_light_crosses_positive_and_negative_section_boundaries() {
     let registry = registry(1.0);

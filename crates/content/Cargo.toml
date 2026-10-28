@@ -8,5 +8,4 @@ license.workspace = true
 [dependencies]
 sha2 = "0.10"
 torse-actions = { path = "../actions" }
-torse-assets = { path = "../assets" }
 torse-types = { path = "../types" }

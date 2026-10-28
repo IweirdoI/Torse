@@ -22,8 +22,8 @@ use torse_mod_host::component::{
     CallBudget, EntityId, InvokeEvent, WakeupTarget, encode_component, engine_with, instantiate,
     invoke, machine_invocation, run_native, run_roundtrip,
 };
-use wasmtime::Engine;
 use wasmtime::component::Component;
+use wasmtime::{Engine, Trap};
 
 fn workspace_root() -> PathBuf {
     let mut dir = env::current_dir().expect("current directory readable");
@@ -67,12 +67,6 @@ fn build_guest(features: &[&str]) -> Vec<u8> {
     std::fs::read(guest_artifact_path()).expect("guest wasm artifact readable")
 }
 
-fn error_chain_contains(error: &wasmtime::Error, needle: &str) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains(needle))
-}
-
 fn wakeup_event() -> InvokeEvent {
     InvokeEvent::Wakeup(WakeupTarget {
         entity: EntityId { low: 1, high: 0 },
@@ -109,33 +103,43 @@ fn epoch_kills_runaway_guest_and_leaves_state_unchanged() {
     let engine = engine_with(true).expect("engine with epoch");
     let component = component_from(&engine, &core);
 
-    let (bindings, mut store) =
-        instantiate(&engine, &component, CallBudget::prototype()).expect("instance");
-    store.set_epoch_deadline(1);
+    // This test isolates epoch interruption. Finite instruction fuel can
+    // expire before a delayed ticker runs; fuel exhaustion has its own test.
+    let budget = CallBudget {
+        fuel: u64::MAX,
+        ..CallBudget::prototype()
+    };
+    // Also exercise a ticker that cannot run promptly on a busy CI worker.
+    for ticker_delay in [Duration::ZERO, Duration::from_millis(250)] {
+        let (bindings, mut store) = instantiate(&engine, &component, budget).expect("instance");
+        store.set_epoch_deadline(1);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let ticker_engine = engine.clone();
-    let ticker_stop = Arc::clone(&stop);
-    let ticker = thread::spawn(move || {
-        while !ticker_stop.load(Ordering::Relaxed) {
-            ticker_engine.increment_epoch();
-            thread::sleep(Duration::from_millis(1));
-        }
-    });
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker_engine = engine.clone();
+        let ticker_stop = Arc::clone(&stop);
+        let ticker = thread::spawn(move || {
+            thread::sleep(ticker_delay);
+            while !ticker_stop.load(Ordering::Relaxed) {
+                ticker_engine.increment_epoch();
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
 
-    let invocation = machine_invocation(&store, 1, wakeup_event());
-    let result = invoke(&bindings).call_handle_event(&mut store, &invocation);
-    stop.store(true, Ordering::Relaxed);
-    ticker.join().expect("ticker joins");
+        let invocation = machine_invocation(&store, 1, wakeup_event());
+        let result = invoke(&bindings).call_handle_event(&mut store, &invocation);
+        stop.store(true, Ordering::Relaxed);
+        ticker.join().expect("ticker joins");
 
-    let error = result.expect_err("spin guest must be interrupted");
-    assert!(
-        error_chain_contains(&error, "interrupt"),
-        "unexpected trap: {error:#}"
-    );
-    let host = store.data();
-    assert_eq!(host.committed_count, 0, "failed call must not commit");
-    assert!(host.wakeups.is_empty());
+        let error = result.expect_err("spin guest must be interrupted");
+        assert_eq!(
+            error.downcast_ref::<Trap>(),
+            Some(&Trap::Interrupt),
+            "unexpected trap with ticker delay {ticker_delay:?}: {error:#}"
+        );
+        let host = store.data();
+        assert_eq!(host.committed_count, 0, "failed call must not commit");
+        assert!(host.wakeups.is_empty());
+    }
 }
 
 #[test]
@@ -152,8 +156,9 @@ fn fuel_kills_runaway_guest() {
     let invocation = machine_invocation(&store, 1, wakeup_event());
     let result = invoke(&bindings).call_handle_event(&mut store, &invocation);
     let error = result.expect_err("spin guest must exhaust fuel");
-    assert!(
-        error_chain_contains(&error, "fuel"),
+    assert_eq!(
+        error.downcast_ref::<Trap>(),
+        Some(&Trap::OutOfFuel),
         "unexpected trap: {error:#}"
     );
 }

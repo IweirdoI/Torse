@@ -11,6 +11,7 @@
 //! belongs in a kernel crate once the pack format is agreed.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +122,39 @@ pub struct PlantsSpec {
     pub density: u64,
 }
 
+fn read_pack_file(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    if length > limit as u64 {
+        return Err(format!(
+            "{}: source exceeds byte limit {limit}",
+            path.display()
+        ));
+    }
+    let bound = u64::try_from(limit)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .ok_or("pack source bound overflow")?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(bound)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    // The stream may grow after metadata was read; the bounded reader admits
+    // at most one sentinel byte beyond the declared limit.
+    if bytes.len() > limit {
+        return Err(format!(
+            "{}: source exceeds byte limit {limit}",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_pack_text(path: &Path) -> Result<String, String> {
+    String::from_utf8(read_pack_file(path, 1024 * 1024)?)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
 impl GamePack {
     /// Read one pack directory: `atlas.toml`, `atlas.png` and `world.toml`.
     ///
@@ -136,16 +170,16 @@ impl GamePack {
                 directory.display()
             ));
         }
-        let text = std::fs::read_to_string(&index)
-            .map_err(|error| format!("{}: {error}", index.display()))?;
+        let text = read_pack_text(&index)?;
         let descriptor: Descriptor =
             toml::from_str(&text).map_err(|error| format!("{}: {error}", index.display()))?;
-        let bytes =
-            std::fs::read(&image).map_err(|error| format!("{}: {error}", image.display()))?;
+        let bytes = read_pack_file(
+            &image,
+            torse_assets::texture::DecodeLimits::default().max_source_bytes,
+        )?;
         let atlas =
             Atlas::decode(&bytes).map_err(|error| format!("{}: {error}", image.display()))?;
-        let world_text = std::fs::read_to_string(&world)
-            .map_err(|error| format!("{}: {error}", world.display()))?;
+        let world_text = read_pack_text(&world)?;
         let world: WorldFile =
             toml::from_str(&world_text).map_err(|error| format!("{}: {error}", world.display()))?;
 
@@ -983,6 +1017,32 @@ fn column_noise(seed: u64, x: i64, z: i64, cell: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_sources_are_bounded_before_reading() {
+        let directory =
+            std::env::temp_dir().join(format!("torse-pack-source-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("source");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(read_pack_file(&path, 3).unwrap(), b"abc");
+        assert!(
+            read_pack_file(&path, 2)
+                .unwrap_err()
+                .contains("source exceeds")
+        );
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            read_pack_text(&path)
+                .unwrap_err()
+                .contains("source exceeds")
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+    }
 
     #[test]
     fn coverage_names_map_and_unknown_names_do_not() {

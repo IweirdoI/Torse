@@ -1,0 +1,7 @@
+date=2026-10-28
+os=Windows x86_64
+profile=dev
+build_jobs=1
+source=base cook manifest and existing repository PNGs
+measurement=logical shared memory reservations; not RSS
+workspace_tests=855 passed; 0 failed; 0 ignored

@@ -361,6 +361,23 @@ impl Palette {
             memory: None,
         }
     }
+
+    #[cfg(feature = "gpu-tests")]
+    pub fn pixels_for_tests(surfaces: Vec<Surface>, pixel: [u8; 4]) -> Self {
+        let (assets, mips) = resident_mips(vec![MipLevel {
+            width: 1,
+            height: 1,
+            pixels: pixel.to_vec(),
+        }])
+        .unwrap();
+        Self {
+            slots: Arc::new(BTreeMap::new()),
+            surfaces: Arc::new(surfaces),
+            assets,
+            mips,
+            memory: None,
+        }
+    }
 }
 
 #[cfg(test)]

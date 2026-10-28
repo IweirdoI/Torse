@@ -1,0 +1,7 @@
+date=2026-10-28
+os=Windows x86_64
+cpu_measurement=release; 100 repetitions; 16-cell solid cube
+gpu_validation=dev; NVIDIA GeForce RTX 4060 Laptop GPU; Vulkan; Mailbox
+window=120 requested frames; radius 1; autoplay
+build_jobs=1
+timing_scope=single machine; CPU wall time; not GPU timestamps

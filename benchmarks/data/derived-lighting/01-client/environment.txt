@@ -1,0 +1,9 @@
+date=2026-10-28
+os=Windows x86_64
+profile=dev
+adapter=NVIDIA GeForce RTX 4060 Laptop GPU
+backend=Vulkan
+present=Mailbox for window; none for offscreen
+build_jobs=1
+window=240 requested frames; radius 1; autoplay
+memory_measurement=logical shared reservations; not RSS or GPU memory

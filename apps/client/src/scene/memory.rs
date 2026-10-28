@@ -19,9 +19,21 @@ pub(super) fn mesh_work_bytes(side: u32) -> u64 {
     (side as u64)
         .pow(3)
         .saturating_mul(6 * 268 * 3)
-        .saturating_add(16384)
+        .saturating_add(32768 + 16384)
 }
 impl Scene {
+    pub(super) fn resize_visual_control(&mut self) -> Result<(), Fault> {
+        if let Some(memory) = &mut self.memory {
+            let wanted = ((self.radius * 2 + 1).pow(2) * self.layers) as u64;
+            memory._control.resize(
+                wanted
+                    .saturating_mul(256)
+                    .saturating_add(self.state_materials.len() as u64 * 4096)
+                    .saturating_add(4096),
+            )?;
+        }
+        Ok(())
+    }
     pub fn startup_world_reservation(pool: &MemoryPool, radius: i64) -> Result<MemoryLease, Fault> {
         if !(0..=16).contains(&radius) {
             return Err(Fault::invalid_data("scene radius must be 0..=16"));
@@ -258,6 +270,21 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_occupancy_denial_precedes_work_and_preserves_the_world() {
+        let pool = MemoryPool::new(
+            MemoryBudget::new(128 * 1024 * 1024).with_class_limit(MemoryClass::Mesh, 0),
+        );
+        let mut scene = Scene::new(0).unwrap();
+        scene.attach_memory(pool.clone()).unwrap();
+        let revision = scene.authority.store().revision(SectionPos::ZERO);
+        assert!(scene.refresh_meshes().is_empty());
+        assert_eq!(scene.authority.store().revision(SectionPos::ZERO), revision);
+        assert_eq!(pool.usage().peak[MemoryClass::Executor.index()], 0);
+        assert_eq!(pool.usage().peak[MemoryClass::Mesh.index()], 0);
+        drop(scene);
+        assert_eq!(pool.usage().total, 0);
+    }
     use torse_types::MemoryBudget;
     #[test]
     fn pressure_evicts_meshes_keeps_world_and_releases_scene_and_palette() {

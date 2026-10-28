@@ -19,6 +19,7 @@ cargo run -p torse-tools --features experiments -- wasm-probe
 
 ```sh
 cargo run -p torse-tools --locked -- cook-base games/base/assets .work/base.tcook
+cargo run -p torse-tools --locked -- run-cooked .work/base.tcook games/base/assets
 ```
 
 输入清单、格式和当前客户端接入范围见[运行时表说明](../crates/content/COOKED.md)。

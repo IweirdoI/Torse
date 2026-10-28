@@ -7,4 +7,6 @@ license.workspace = true
 
 [dependencies]
 png = "0.17"
+sha2 = "=0.10.9"
+torse-content = { path = "../content" }
 torse-types = { path = "../types" }

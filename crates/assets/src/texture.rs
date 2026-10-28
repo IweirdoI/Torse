@@ -25,12 +25,62 @@ pub struct Atlas {
     pixels: Vec<u8>,
 }
 
+/// Bounds checked before parsing chunks or allocating decoded pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeLimits {
+    pub max_source_bytes: usize,
+    pub max_rgba_bytes: usize,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: 8 * 1024 * 1024,
+            max_rgba_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 impl Atlas {
     /// Decode a PNG atlas into tight RGBA8 rows.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let mut decoder = png::Decoder::new(Cursor::new(bytes));
+        Self::decode_with_limits(bytes, DecodeLimits::default())
+    }
+
+    /// Decode with caller-supplied source and RGBA bounds. Decoder scratch is
+    /// limited to twice the RGBA size plus 64 KiB. Text and ICC data are unused.
+    pub fn decode_with_limits(bytes: &[u8], limits: DecodeLimits) -> Result<Self, String> {
+        if bytes.len() > limits.max_source_bytes {
+            return Err("PNG source exceeds byte limit".into());
+        }
+        if bytes.len() < 33
+            || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
+            || bytes[8..12] != 13_u32.to_be_bytes()
+            || &bytes[12..16] != b"IHDR"
+        {
+            return Err("invalid PNG header".into());
+        }
+        let width = u32::from_be_bytes(bytes[16..20].try_into().expect("header length"));
+        let height = u32::from_be_bytes(bytes[20..24].try_into().expect("header length"));
+        let rgba = usize::try_from(width)
+            .ok()
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|n| n.checked_mul(4))
+            .filter(|n| width > 0 && height > 0 && *n <= limits.max_rgba_bytes)
+            .ok_or("decoded image exceeds byte limit")?;
+        let auxiliary = rgba
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(65_536))
+            .ok_or("PNG scratch bound overflow")?;
+        let mut decoder =
+            png::Decoder::new_with_limits(Cursor::new(bytes), png::Limits { bytes: auxiliary });
+        decoder.set_ignore_text_chunk(true);
+        decoder.set_ignore_iccp_chunk(true);
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
+        if reader.output_buffer_size() > rgba {
+            return Err("PNG output exceeds RGBA bound".into());
+        }
         let mut data = vec![0; reader.output_buffer_size()];
         let info = reader
             .next_frame(&mut data)
@@ -39,7 +89,7 @@ impl Atlas {
             return Err("texture atlas must not be empty".to_string());
         }
         let channels = info.color_type.samples();
-        let mut pixels = Vec::with_capacity((info.width * info.height * 4) as usize);
+        let mut pixels = Vec::with_capacity(rgba);
         for pixel in data[..info.buffer_size()].chunks_exact(channels) {
             pixels.extend_from_slice(&match info.color_type {
                 png::ColorType::Rgba => [pixel[0], pixel[1], pixel[2], pixel[3]],
@@ -48,6 +98,9 @@ impl Atlas {
                 png::ColorType::GrayscaleAlpha => [pixel[0], pixel[0], pixel[0], pixel[1]],
                 png::ColorType::Indexed => return Err("unexpanded atlas palette".to_string()),
             });
+        }
+        if info.width != width || info.height != height || pixels.len() != rgba {
+            return Err("PNG frame dimensions differ from header".into());
         }
         Ok(Self {
             width: info.width,
@@ -757,6 +810,80 @@ fn halve(previous: &MipLevel) -> MipLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn png_preflight_rejects_large_dimensions_before_parsing() {
+        // A header is sufficient to reject the request before CRC parsing or
+        // decoder allocation. No large image or output buffer is constructed.
+        for (width, height) in [(16384_u32, 16384_u32), (u32::MAX, u32::MAX), (0, 1)] {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(&13_u32.to_be_bytes());
+            bytes.extend_from_slice(b"IHDR");
+            bytes.extend_from_slice(&width.to_be_bytes());
+            bytes.extend_from_slice(&height.to_be_bytes());
+            bytes.resize(33, 0);
+            assert!(
+                Atlas::decode(&bytes)
+                    .unwrap_err()
+                    .contains("decoded image exceeds")
+            );
+        }
+        assert!(Atlas::decode(b"invalid").unwrap_err().contains("header"));
+    }
+
+    #[test]
+    fn png_colour_conversion_and_exact_limits() {
+        for (colour, input, expected) in [
+            (png::ColorType::Rgba, vec![1, 2, 3, 4], [1, 2, 3, 4]),
+            (png::ColorType::Rgb, vec![1, 2, 3], [1, 2, 3, 255]),
+            (png::ColorType::Grayscale, vec![7], [7, 7, 7, 255]),
+            (png::ColorType::GrayscaleAlpha, vec![7, 8], [7, 7, 7, 8]),
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+                encoder.set_color(colour);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&input)
+                    .unwrap();
+            }
+            let limits = DecodeLimits {
+                max_source_bytes: bytes.len(),
+                max_rgba_bytes: 4,
+            };
+            assert_eq!(
+                Atlas::decode_with_limits(&bytes, limits).unwrap().pixels(),
+                expected
+            );
+            assert!(
+                Atlas::decode_with_limits(
+                    &bytes,
+                    DecodeLimits {
+                        max_rgba_bytes: 3,
+                        ..limits
+                    }
+                )
+                .unwrap_err()
+                .contains("decoded image exceeds")
+            );
+            assert!(
+                Atlas::decode_with_limits(
+                    &bytes,
+                    DecodeLimits {
+                        max_source_bytes: bytes.len() - 1,
+                        ..limits
+                    }
+                )
+                .unwrap_err()
+                .contains("source exceeds")
+            );
+            bytes.truncate(bytes.len() / 2);
+            assert!(Atlas::decode(&bytes).is_err());
+        }
+    }
 
     fn key(value: &str) -> ContentKey {
         ContentKey::parse(value).expect("test key")

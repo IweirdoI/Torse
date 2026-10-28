@@ -14,6 +14,10 @@
 //!   cross-section fits inside the neighbor's same-material opposite face is
 //!   dropped, and equal sections drop both sides. This is the explicit
 //!   contact rule that removes coincident panes between glass neighbours.
+//! - A full cube that occludes every face is marked in a per-row bitset. A face
+//!   between two such cubes is omitted without sampling the neighbour again.
+//!   Slabs, crossed shapes, partial occlusion, and missing samples stay on the
+//!   per-face path. The bitset is a mesh-class charge released before return.
 //! - A mesh computed from older data must never replace a newer one. [`MeshJob`]
 //!   records the section revision and the six neighbor revisions, and
 //!   [`MeshCache::insert`] rejects results whose stamp no longer matches.
@@ -24,8 +28,8 @@
 use std::collections::BTreeMap;
 
 use torse_types::{
-    BlockPos, EvictionRank, Fault, MemoryChargeId, MemoryClass, MemoryLedger, MemoryResident,
-    Revision, SectionPos,
+    BlockPos, EvictionRank, Fault, MemoryBudget, MemoryChargeId, MemoryClass, MemoryLedger,
+    MemoryResident, Revision, SectionPos,
 };
 
 /// The six cell faces in occlusion-mask order: `-x, +x, -y, +y, -z, +z`.
@@ -333,14 +337,27 @@ pub fn build_mesh(
     section: SectionPos,
     sample: impl Fn(BlockPos) -> MeshSample,
 ) -> MeshData {
-    build_mesh_inner(side, section, sample, || false, None)
-        .expect("uncancelled unrestricted meshing succeeds")
+    let mut scratch = scratch_ledger(side);
+    build_mesh_accounted(side, section, sample, &mut scratch)
+        .expect("occupancy scratch fits in its own budget")
+}
+
+/// Mesh one section and charge the occupancy table to `ledger` until it returns.
+pub fn build_mesh_accounted(
+    side: u32,
+    section: SectionPos,
+    sample: impl Fn(BlockPos) -> MeshSample,
+    ledger: &mut MemoryLedger,
+) -> Result<MeshData, MeshBuildError> {
+    build_mesh_inner(side, section, sample, || false, None, Some(ledger))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MeshBuildError {
     Cancelled,
     OutputLimit,
+    /// The occupancy table did not fit in the mesh-class budget.
+    Memory,
 }
 
 /// Bound face output before allocation and check cancellation at each y slice.
@@ -356,7 +373,15 @@ pub fn build_mesh_bounded(
     if max_faces > u32::MAX as usize / 4 || max_faces > usize::MAX / 6 {
         return Err(MeshBuildError::OutputLimit);
     }
-    build_mesh_inner(side, section, sample, cancelled, Some(max_faces))
+    let mut scratch = scratch_ledger(side);
+    build_mesh_inner(
+        side,
+        section,
+        sample,
+        cancelled,
+        Some(max_faces),
+        Some(&mut scratch),
+    )
 }
 
 fn build_mesh_inner(
@@ -365,6 +390,7 @@ fn build_mesh_inner(
     sample: impl Fn(BlockPos) -> MeshSample,
     cancelled: impl Fn() -> bool,
     max_faces: Option<usize>,
+    ledger: Option<&mut MemoryLedger>,
 ) -> Result<MeshData, MeshBuildError> {
     if cancelled() {
         return Err(MeshBuildError::Cancelled);
@@ -409,12 +435,18 @@ fn build_mesh_inner(
             .map_err(|_| MeshBuildError::OutputLimit)?;
     }
 
+    let _occupancy_charge = charge_occupancy(side, ledger)?;
+    let occupancy = RowOccupancy::build(side, &origin, &sample, &cancelled)?;
+
     for y in 0..side {
         if cancelled() {
             return Err(MeshBuildError::Cancelled);
         }
         for z in 0..side {
             for x in 0..side {
+                if occupancy.buried(x, y, z) {
+                    continue;
+                }
                 let pos = BlockPos::new(
                     origin[0] + i64::from(x),
                     origin[1] + i64::from(y),
@@ -435,7 +467,7 @@ fn build_mesh_inner(
                     continue;
                 };
                 for face in Face::ALL {
-                    if face_culled(face, &block, &sample, pos) {
+                    if occupancy.covers(x, y, z, face) || face_culled(face, &block, &sample, pos) {
                         continue;
                     }
                     if max_faces.is_some_and(|limit| mesh.face_count() >= limit) {
@@ -464,6 +496,164 @@ fn build_mesh_inner(
         mesh.shades.shrink_to_fit();
     }
     Ok(mesh)
+}
+
+fn scratch_ledger(side: u32) -> MemoryLedger {
+    MemoryLedger::new(MemoryBudget::new(occupancy_bytes(side).max(1)))
+}
+
+fn occupancy_bytes(side: u32) -> u64 {
+    if side == 0 || side > 64 {
+        return 0;
+    }
+    let word = if side <= 32 { 4 } else { 8 };
+    u64::from(side) * u64::from(side) * word
+}
+
+struct OccupancyCharge<'a> {
+    ledger: &'a mut MemoryLedger,
+    id: MemoryChargeId,
+}
+
+impl Drop for OccupancyCharge<'_> {
+    fn drop(&mut self) {
+        let _ = self.ledger.release(self.id);
+    }
+}
+
+fn charge_occupancy<'a>(
+    side: u32,
+    ledger: Option<&'a mut MemoryLedger>,
+) -> Result<Option<OccupancyCharge<'a>>, MeshBuildError> {
+    let bytes = occupancy_bytes(side);
+    let Some(ledger) = ledger else {
+        return Ok(None);
+    };
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let id = ledger
+        .charge(MemoryResident {
+            class: MemoryClass::Mesh,
+            bytes,
+            rank: EvictionRank::Mesh { distance_sq: 0 },
+        })
+        .map_err(|_| MeshBuildError::Memory)?;
+    Ok(Some(OccupancyCharge { ledger, id }))
+}
+
+/// One bit per cell in an x-row. Side 32 uses `u32`; side 64 uses `u64`.
+enum RowOccupancy {
+    Bits32 { side: u32, rows: Vec<u32> },
+    Bits64 { side: u32, rows: Vec<u64> },
+    Absent,
+}
+
+impl RowOccupancy {
+    fn build(
+        side: u32,
+        origin: &[i64; 3],
+        sample: &impl Fn(BlockPos) -> MeshSample,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Self, MeshBuildError> {
+        if side == 0 || side > 64 {
+            return Ok(Self::Absent);
+        }
+        let count = (side * side) as usize;
+        if side <= 32 {
+            let mut rows = vec![0u32; count];
+            fill_rows(side, origin, sample, cancelled, |x, y, z| {
+                rows[(y * side + z) as usize] |= 1u32 << x;
+            })?;
+            Ok(Self::Bits32 { side, rows })
+        } else {
+            let mut rows = vec![0u64; count];
+            fill_rows(side, origin, sample, cancelled, |x, y, z| {
+                rows[(y * side + z) as usize] |= 1u64 << x;
+            })?;
+            Ok(Self::Bits64 { side, rows })
+        }
+    }
+
+    fn fast(&self, x: u32, y: u32, z: u32) -> bool {
+        let Some(side) = self.side() else {
+            return false;
+        };
+        if x >= side || y >= side || z >= side {
+            return false;
+        }
+        let index = (y * side + z) as usize;
+        match self {
+            Self::Bits32 { rows, .. } => rows[index] & (1u32 << x) != 0,
+            Self::Bits64 { rows, .. } => rows[index] & (1u64 << x) != 0,
+            Self::Absent => false,
+        }
+    }
+
+    fn covers(&self, x: u32, y: u32, z: u32, face: Face) -> bool {
+        if !self.fast(x, y, z) {
+            return false;
+        }
+        let (dx, dy, dz) = face.offset();
+        let nx = i64::from(x) + dx;
+        let ny = i64::from(y) + dy;
+        let nz = i64::from(z) + dz;
+        let Some(side) = self.side() else {
+            return false;
+        };
+        let side = i64::from(side);
+        if nx < 0 || ny < 0 || nz < 0 || nx >= side || ny >= side || nz >= side {
+            return false;
+        }
+        self.fast(nx as u32, ny as u32, nz as u32)
+    }
+
+    fn buried(&self, x: u32, y: u32, z: u32) -> bool {
+        self.fast(x, y, z) && Face::ALL.into_iter().all(|face| self.covers(x, y, z, face))
+    }
+
+    fn side(&self) -> Option<u32> {
+        match self {
+            Self::Bits32 { side, .. } | Self::Bits64 { side, .. } => Some(*side),
+            Self::Absent => None,
+        }
+    }
+}
+
+fn fill_rows(
+    side: u32,
+    origin: &[i64; 3],
+    sample: &impl Fn(BlockPos) -> MeshSample,
+    cancelled: &impl Fn() -> bool,
+    mut mark: impl FnMut(u32, u32, u32),
+) -> Result<(), MeshBuildError> {
+    for y in 0..side {
+        if cancelled() {
+            return Err(MeshBuildError::Cancelled);
+        }
+        for z in 0..side {
+            for x in 0..side {
+                let pos = BlockPos::new(
+                    origin[0] + i64::from(x),
+                    origin[1] + i64::from(y),
+                    origin[2] + i64::from(z),
+                );
+                if fast_cube(sample(pos)) {
+                    mark(x, y, z);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fast_cube(sample: MeshSample) -> bool {
+    let MeshSample::Ready(block) = sample else {
+        return false;
+    };
+    !block.cross
+        && block.bounds == Some(RenderBox::FULL_CUBE)
+        && block.occlusion & 0b0011_1111 == 0b0011_1111
 }
 
 fn face_culled(
@@ -1093,9 +1283,137 @@ fn axis_sq(delta: i128) -> u128 {
 mod tests {
     use std::cell::Cell;
 
-    use torse_types::MemoryBudget;
+    use torse_types::{MemoryBudget, MemoryLedger};
 
     use super::*;
+
+    #[test]
+    fn full_cube_rows_drop_buried_faces_and_keep_partial_cells() {
+        let solid = |pos: BlockPos| {
+            if (0..2).contains(&pos.x) && (0..2).contains(&pos.y) && (0..2).contains(&pos.z) {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mesh = build_mesh(2, SectionPos::ZERO, solid);
+        assert_eq!(mesh.face_count(), 24);
+
+        let mut open = RenderBlock::uniform(1);
+        open.occlusion = 0;
+        let mut other = RenderBlock::uniform(2);
+        other.occlusion = 0;
+        let exposed = |pos: BlockPos| match (pos.x, pos.y, pos.z) {
+            (0, 0, 0) => MeshSample::Ready(open),
+            (1, 0, 0) => MeshSample::Ready(other),
+            _ => MeshSample::Ready(RenderBlock::EMPTY),
+        };
+        assert_eq!(build_mesh(2, SectionPos::ZERO, exposed).face_count(), 12);
+
+        let mut slab = RenderBlock::uniform(3);
+        slab.bounds = Some(RenderBox {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 0.5, 1.0],
+        });
+        slab.occlusion = 0;
+        let mixed = |pos: BlockPos| match (pos.x, pos.y, pos.z) {
+            (0, 0, 0) => MeshSample::Ready(RenderBlock::uniform(1)),
+            (1, 0, 0) => MeshSample::Ready(slab),
+            _ => MeshSample::Ready(RenderBlock::EMPTY),
+        };
+        let mixed_mesh = build_mesh(2, SectionPos::ZERO, mixed);
+        assert_eq!(mixed_mesh.face_count(), 11);
+    }
+
+    #[test]
+    fn buried_full_cube_is_sampled_only_while_building_the_mask() {
+        let hits = Cell::new(0u32);
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::new(1, 1, 1) {
+                hits.set(hits.get() + 1);
+            }
+            if (0..3).contains(&pos.x) && (0..3).contains(&pos.y) && (0..3).contains(&pos.z) {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mesh = build_mesh(3, SectionPos::ZERO, sample);
+        assert_eq!(mesh.face_count(), 54);
+        assert_eq!(hits.get(), 1);
+    }
+
+    #[test]
+    fn wide_rows_keep_the_bit_past_a_32_bit_word() {
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::new(32, 0, 0) {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        assert_eq!(build_mesh(33, SectionPos::ZERO, sample).face_count(), 6);
+    }
+
+    #[test]
+    fn failed_accounted_build_releases_the_occupancy_charge() {
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::ZERO {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(10_000));
+        assert_eq!(
+            super::build_mesh_inner(
+                4,
+                SectionPos::ZERO,
+                sample,
+                || true,
+                Some(6),
+                Some(&mut ledger)
+            ),
+            Err(MeshBuildError::Cancelled)
+        );
+        assert_eq!(ledger.total_usage(), 0);
+        assert_eq!(
+            super::build_mesh_inner(
+                4,
+                SectionPos::ZERO,
+                sample,
+                || false,
+                Some(0),
+                Some(&mut ledger)
+            ),
+            Err(MeshBuildError::OutputLimit)
+        );
+        assert_eq!(ledger.total_usage(), 0);
+    }
+
+    #[test]
+    fn occupancy_table_is_charged_then_released() {
+        let sample = |pos: BlockPos| {
+            if pos == BlockPos::ZERO {
+                MeshSample::Ready(RenderBlock::uniform(1))
+            } else {
+                MeshSample::Ready(RenderBlock::EMPTY)
+            }
+        };
+        let mut empty = MemoryLedger::new(MemoryBudget::new(0));
+        assert_eq!(
+            build_mesh_accounted(4, SectionPos::ZERO, sample, &mut empty).unwrap_err(),
+            MeshBuildError::Memory
+        );
+        assert_eq!(empty.total_usage(), 0);
+        let mut ledger = MemoryLedger::new(MemoryBudget::new(10_000));
+        let mesh = build_mesh_accounted(4, SectionPos::ZERO, sample, &mut ledger).unwrap();
+        assert_eq!(ledger.total_usage(), 0);
+        assert_eq!(mesh.face_count(), 6);
+        assert_eq!(super::occupancy_bytes(32), 32 * 32 * 4);
+        assert_eq!(super::occupancy_bytes(64), 64 * 64 * 8);
+        assert_eq!(super::occupancy_bytes(65), 0);
+    }
 
     #[test]
     fn bounded_meshing_matches_reference_and_discards_partial_cancelled_or_oversized_output() {

@@ -34,7 +34,7 @@ pub(super) struct MeshStamp {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VisualStamp {
-    lighting: [[u64; 2]; 27],
+    lighting: [[u64; 2]; 7],
     neighbors: [Option<(Revision, u64)>; 27],
 }
 
@@ -74,16 +74,12 @@ impl MeshStamp {
             loads,
             visual: scene.lighting.as_ref().map(|lighting| VisualStamp {
                 lighting: std::array::from_fn(|index| {
-                    let Some(neighbor) = pos
-                        .x
-                        .checked_add((index % 3) as i64 - 1)
-                        .zip(pos.y.checked_add((index / 9) as i64 - 1))
-                        .zip(pos.z.checked_add(((index / 3) % 3) as i64 - 1))
-                        .map(|((x, y), z)| SectionPos::new(x, y, z))
-                    else {
-                        return [0; 2];
+                    let neighbor = if index == 0 {
+                        Some(pos)
+                    } else {
+                        Face::ALL[index - 1].neighbor_section(pos)
                     };
-                    lighting.stamp(scene, neighbor)
+                    neighbor.map_or([0; 2], |p| lighting.stamp(p))
                 }),
                 neighbors: std::array::from_fn(|index| {
                     let neighbor = SectionPos::new(

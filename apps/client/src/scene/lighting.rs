@@ -1,9 +1,10 @@
 //! Incremental derived lighting. The scene thread alone validates and publishes.
 use super::*;
 use torse_types::{Binding, EvictionRank, MemoryClass, MemoryLease, MemoryPool};
-use torse_world_services::lighting::{LightCache, LightJob, LightLimits, LightSection, LightStamp};
+use torse_world_services::lighting::{LightJob, LightLimits, LightSection};
 
 const WORK_BYTES: u64 = 16 * 1024 * 1024;
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const LIMITS: LightLimits = LightLimits {
     cells: 1_000_000,
     dependencies: 1024,
@@ -19,14 +20,18 @@ struct Pending {
     _memory: Option<MemoryLease>,
 }
 struct Cached {
-    stamp: LightStamp,
+    // Presentation keeps the previous complete image while a replacement is
+    // calculated. This is never used by authoritative lighting queries.
+    data: LightSection,
+    current: bool,
+    load: Option<u64>,
     _memory: Option<MemoryLease>,
     generation: u64,
 }
 pub(super) struct Lighting {
     binding: Binding,
-    caches: [LightCache; 2],
     entries: [BTreeMap<SectionPos, Cached>; 2],
+    cache_bytes: [usize; 2],
     pending: Option<Pending>,
     memory: Option<MemoryPool>,
     pub generation: u64,
@@ -35,11 +40,8 @@ impl Lighting {
     pub fn new(binding: Binding, memory: Option<MemoryPool>) -> Result<Self, String> {
         Ok(Self {
             binding,
-            caches: [
-                LightCache::new(binding, 32768, 64 * 1024 * 1024).map_err(|e| e.to_string())?,
-                LightCache::new(binding, 32768, 64 * 1024 * 1024).map_err(|e| e.to_string())?,
-            ],
             entries: [BTreeMap::new(), BTreeMap::new()],
+            cache_bytes: [0; 2],
             pending: None,
             memory,
             generation: 0,
@@ -56,23 +58,24 @@ impl Lighting {
         let store = scene.authority.store();
         let registry = scene.authority.registry();
         for kind in 0..2 {
-            let invalid: Vec<_> = self.entries[kind]
+            let removed: Vec<_> = self.entries[kind]
                 .iter()
                 .filter_map(|(pos, entry)| {
                     (!scene.sections.contains(pos)
-                        || !self.caches[kind].validate_stamp(
-                            entry.stamp,
-                            self.binding,
-                            store,
-                            registry,
-                        ))
+                        || entry.load != scene.load_generations.get(pos).copied())
                     .then_some(*pos)
                 })
                 .collect();
-            for pos in invalid {
+            for pos in removed {
                 self.advance_generation()?;
-                self.entries[kind].remove(&pos);
-                self.caches[kind].remove(pos);
+                if let Some(old) = self.entries[kind].remove(&pos) {
+                    self.cache_bytes[kind] -= old.data.allocated_bytes() + 256;
+                }
+            }
+            // Validate each dependency set once per update, rather than once
+            // for every neighboring mesh stamp captured in the frame.
+            for entry in self.entries[kind].values_mut() {
+                entry.current = entry.data.validate(self.binding, store, registry);
             }
         }
         if let Some(pending) = self.pending.as_mut() {
@@ -104,6 +107,14 @@ impl Lighting {
                 self.pending = None;
                 return Ok(());
             }
+            let previous_bytes = self.entries[pending.kind]
+                .get(&pending.target)
+                .map_or(0, |old| old.data.allocated_bytes() + 256);
+            let bytes =
+                self.cache_bytes[pending.kind] - previous_bytes + result.allocated_bytes() + 256;
+            if bytes > CACHE_BYTES {
+                return Ok(());
+            }
             let lease = match self
                 .memory
                 .as_ref()
@@ -119,21 +130,33 @@ impl Lighting {
                 Ok(lease) => lease,
                 Err(_) => return Ok(()),
             };
-            self.advance_generation()?;
+            let changed = self.entries[pending.kind].get(&pending.target).map_or_else(
+                || {
+                    result
+                        .levels()
+                        .iter()
+                        .any(|v| *v != if pending.kind == 1 { 15 } else { 0 })
+                },
+                |old| old.data.levels() != result.levels(),
+            );
+            let generation = if changed {
+                self.advance_generation()?;
+                self.generation
+            } else {
+                self.entries[pending.kind]
+                    .get(&pending.target)
+                    .map_or(0, |old| old.generation)
+            };
             let pending = self.pending.take().expect("light publication");
-            let stamp = self.caches[pending.kind]
-                .publish(
-                    pending.result.expect("resolved light result"),
-                    store,
-                    registry,
-                )
-                .map_err(|e| e.to_string())?;
+            self.cache_bytes[pending.kind] = bytes;
             self.entries[pending.kind].insert(
                 pending.target,
                 Cached {
-                    stamp,
+                    data: pending.result.expect("resolved light result"),
+                    current: true,
+                    load: scene.load_generations.get(&pending.target).copied(),
                     _memory: lease,
-                    generation: self.generation,
+                    generation,
                 },
             );
             return Ok(());
@@ -148,7 +171,10 @@ impl Lighting {
                 continue;
             }
             for kind in 0..2 {
-                if self.entries[kind].contains_key(target) {
+                if self.entries[kind]
+                    .get(target)
+                    .is_some_and(|entry| entry.current)
+                {
                     continue;
                 }
                 let lease = match self
@@ -187,61 +213,47 @@ impl Lighting {
         self.pending.is_none()
             && scene.sections.iter().all(|pos| {
                 scene.authority.store().revision(*pos).is_some()
-                    && self.entries.iter().all(|entries| entries.contains_key(pos))
+                    && self
+                        .entries
+                        .iter()
+                        .all(|entries| entries.get(pos).is_some_and(|entry| entry.current))
             })
     }
     pub fn view<'a>(&'a self, scene: &Scene) -> View<'a> {
-        let mut grids: [BTreeMap<SectionPos, &'a [u8]>; 2] = [BTreeMap::new(), BTreeMap::new()];
-        for (kind, grid) in grids.iter_mut().enumerate() {
-            for pos in self.entries[kind].keys() {
-                if let Some(data) = self.caches[kind].section(
-                    self.binding,
-                    scene.authority.store(),
-                    scene.authority.registry(),
-                    *pos,
-                ) {
-                    grid.insert(*pos, data.levels());
-                }
-            }
-        }
         View {
-            grids,
+            grids: [&self.entries[0], &self.entries[1]],
             side: scene.side,
             bounds: scene.authority.store().bounds(),
         }
     }
-    pub fn stamp(&self, scene: &Scene, target: SectionPos) -> [u64; 2] {
+    pub fn stamp(&self, target: SectionPos) -> [u64; 2] {
         std::array::from_fn(|kind| {
             self.entries[kind]
                 .get(&target)
-                .filter(|entry| {
-                    self.caches[kind].validate_stamp(
-                        entry.stamp,
-                        self.binding,
-                        scene.authority.store(),
-                        scene.authority.registry(),
-                    )
-                })
                 .map_or(0, |entry| entry.generation)
         })
     }
 }
 pub(super) struct View<'a> {
-    grids: [BTreeMap<SectionPos, &'a [u8]>; 2],
+    grids: [&'a BTreeMap<SectionPos, Cached>; 2],
     side: u32,
     bounds: WorldBounds,
 }
 impl View<'_> {
-    fn light(&self, kind: usize, pos: BlockPos) -> u8 {
-        if kind == 1 && pos.y >= self.bounds.max_y {
-            return 15;
+    fn light(&self, kind: usize, pos: BlockPos) -> Option<u8> {
+        if !self.bounds.contains_y(pos.y) {
+            return Some(if kind == 1 && pos.y >= self.bounds.max_y {
+                15
+            } else {
+                0
+            });
         }
         let Ok((section, local)) = pos.to_section(self.side) else {
-            return 0;
+            return None;
         };
         self.grids[kind]
             .get(&section)
-            .map_or(0, |grid| grid[torse_world::linear_index(self.side, local)])
+            .map(|entry| entry.data.levels()[torse_world::linear_index(self.side, local)])
     }
     pub fn shade(&self, scene: &Scene, pos: BlockPos, block: &mut RenderBlock) {
         let mut faces = [[255; 4]; 6];
@@ -264,8 +276,14 @@ impl View<'_> {
             {
                 continue;
             }
-            let emission = self.light(0, pos).max(self.light(0, outside));
-            let sky = self.light(1, outside);
+            let emission = self
+                .light(0, pos)
+                .unwrap_or(0)
+                .max(self.light(0, outside).unwrap_or(0));
+            // Uncomputed presentation uses the original directional shading.
+            // A real, resolved zero still represents darkness. Missing terrain
+            // remains opaque to the light solver and to collision queries.
+            let sky = self.light(1, outside).unwrap_or(15);
             let directional = match face {
                 torse_render::Face::PosY => 1.0,
                 torse_render::Face::NegY => 0.5,
@@ -560,5 +578,85 @@ mod tests {
         scene.sections.push(SectionPos::new(8, 0, 0));
         resolve(&mut scene);
         assert_eq!(before, MeshStamp::capture(&scene, SectionPos::ZERO));
+    }
+
+    #[test]
+    fn invalidation_keeps_presented_brightness_until_replacement_is_ready() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let wall = BlockPos::new(8, 8, 8);
+        scene.authority.store_mut().edit(wall, stone).unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        let before = block(&scene, wall).face_shades.unwrap();
+        let generation = scene.lighting.as_ref().unwrap().stamp(SectionPos::ZERO);
+        // Invalidate the observation without changing the wall's local AO.
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(1, 1, 1), stone)
+            .unwrap();
+        assert!(!scene.refresh_lighting(1).unwrap());
+        assert!(!scene.lighting.as_ref().unwrap().entries[1][&SectionPos::ZERO].current);
+        assert_eq!(block(&scene, wall).face_shades.unwrap(), before);
+        assert_eq!(
+            scene.lighting.as_ref().unwrap().stamp(SectionPos::ZERO),
+            generation
+        );
+        resolve(&mut scene);
+        assert_eq!(block(&scene, wall).face_shades.unwrap(), before);
+    }
+
+    #[test]
+    fn identical_relit_pixels_do_not_invalidate_meshes() {
+        let mut scene = scene();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        let generation = scene.lighting.as_ref().unwrap().generation;
+        let revision = scene.authority.store().revision(SectionPos::ZERO).unwrap();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(1, 1, 1), stone)
+            .unwrap();
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(1, 1, 1), BlockStateId::EMPTY)
+            .unwrap();
+        assert_ne!(
+            scene.authority.store().revision(SectionPos::ZERO).unwrap(),
+            revision
+        );
+        resolve(&mut scene);
+        assert_eq!(scene.lighting.as_ref().unwrap().generation, generation);
+    }
+
+    #[test]
+    fn uncomputed_light_uses_directional_presentation_instead_of_black() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let wall = BlockPos::new(8, 8, 8);
+        scene.authority.store_mut().edit(wall, stone).unwrap();
+        scene.enable_lighting().unwrap();
+        let view = scene.lighting.as_ref().unwrap().view(&scene);
+        assert_eq!(view.light(1, BlockPos::new(8, -1, 8)), Some(0));
+        assert_eq!(view.light(1, BlockPos::new(8, 16, 8)), Some(15));
+        let top =
+            block(&scene, wall).face_shades.unwrap()[torse_render::Face::PosY.index() as usize];
+        assert!(top.iter().all(|v| *v == 255));
     }
 }

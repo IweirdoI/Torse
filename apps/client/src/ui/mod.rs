@@ -273,6 +273,9 @@ impl Layer {
             },
         };
 
+        if self.last.as_ref() == Some(&view) {
+            return;
+        }
         let mut canvas = Canvas::new(layout.width, layout.height, layout.scale);
         self.paint(&mut canvas, &layout, &view);
         // The canvas already matches the surface one to one; the shader

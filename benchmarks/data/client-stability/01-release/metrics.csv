@@ -1,0 +1,5 @@
+scenario,frames,elapsed_ms,mean_frame_us,max_frame_us,rebuilds,uploads,actions_ok,walk_ticks,gpu_geometry_bytes,memory_peak_bytes
+before,1801,8464,4399,18249,3232,3023,0,0,9351232,166389917
+after,1801,4606,2456,26661,442,347,0,0,3945976,166050317
+after_edits,2401,7312,2986,15042,2655,2394,101,0,8919368,166539217
+after_walk,2401,7502,3037,15772,700,581,0,149,6138448,166871601

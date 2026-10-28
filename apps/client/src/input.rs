@@ -141,8 +141,10 @@ impl InputState {
     /// Accumulates the same way as drag look so the shared `take_input`
     /// sign stays correct: mouse right turns right and mouse up looks up.
     pub fn mouse_look(&mut self, dx: f64, dy: f64) {
-        self.look_delta.x += dx;
-        self.look_delta.y += dy;
+        if dx.is_finite() && dy.is_finite() {
+            self.look_delta.x += dx;
+            self.look_delta.y += dy;
+        }
     }
 
     /// Queue a click that fired while the cursor was captured; there is no

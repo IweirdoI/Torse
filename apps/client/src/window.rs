@@ -17,9 +17,9 @@ use wgpu::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera::{FlyCamera, MoveInput};
 use crate::input::InputState;
@@ -194,9 +194,7 @@ struct WindowApp {
     session: Option<u128>,
     grabbed: bool,
     focused: bool,
-    last_cursor: Option<(f64, f64)>,
     look_sensitivity: f64,
-    recentring: bool,
     probe_sent: bool,
     batches: u32,
     requests_sent: u32,
@@ -275,9 +273,7 @@ impl WindowApp {
             session: None,
             grabbed: false,
             focused: true,
-            last_cursor: None,
             look_sensitivity: 1.0,
-            recentring: false,
             probe_sent: false,
             batches: 0,
             requests_sent: 0,
@@ -1183,26 +1179,26 @@ impl WindowApp {
         // Never capture while the window is unfocused; the next focus event
         // or the per-frame check re-arms capture.
         let grab = grab && self.focused;
-        self.grabbed = grab;
         if let Some(gpu) = self.gpu.as_ref() {
-            gpu.window.set_cursor_visible(!grab);
-            if grab {
-                let center = winit::dpi::Position::Physical(winit::dpi::PhysicalPosition::new(
-                    gpu.config.width as i32 / 2,
-                    gpu.config.height as i32 / 2,
-                ));
-                let _ = gpu.window.set_cursor_position(center);
-                // Deltas are measured from this baseline until real motion
-                // or the drift allowance moves the cursor. The first event
-                // after the programmatic jump is synthetic and skipped.
-                self.last_cursor = Some((
-                    f64::from(gpu.config.width / 2),
-                    f64::from(gpu.config.height / 2),
-                ));
-                self.recentring = true;
+            self.grabbed = if grab {
+                gpu.window
+                    .set_cursor_grab(CursorGrabMode::Locked)
+                    .or_else(|_| gpu.window.set_cursor_grab(CursorGrabMode::Confined))
+                    .is_ok()
             } else {
-                self.last_cursor = None;
-            }
+                let _ = gpu.window.set_cursor_grab(CursorGrabMode::None);
+                false
+            };
+            gpu.window.set_cursor_visible(!self.grabbed);
+        }
+    }
+
+    fn captured_motion(&mut self, delta: (f64, f64)) {
+        if self.grabbed && self.focused && !self.ui.modal() {
+            self.input.mouse_look(
+                delta.0 * self.look_sensitivity,
+                delta.1 * self.look_sensitivity,
+            );
         }
     }
 
@@ -1685,46 +1681,7 @@ impl ApplicationHandler for WindowApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.cursor = [position.x, position.y];
-                if self.grabbed && self.focused && !self.ui.modal() {
-                    if let Some(gpu) = self.gpu.as_ref() {
-                        let center = (
-                            f64::from(gpu.config.width / 2),
-                            f64::from(gpu.config.height / 2),
-                        );
-                        // Deltas come from the previous delivered position:
-                        // per-event re-centring would feed rounding jitter
-                        // into the camera every event.
-                        let (last_x, last_y) = self.last_cursor.unwrap_or(center);
-                        // The OS cursor lands a pixel off after re-centring;
-                        // that synthetic jump must not reach the camera.
-                        let recentred = self.recentring;
-                        self.recentring = false;
-                        let dx = position.x - last_x;
-                        let dy = position.y - last_y;
-                        if !recentred && dx.abs() + dy.abs() > 0.5 {
-                            self.input
-                                .mouse_look(dx * self.look_sensitivity, dy * self.look_sensitivity);
-                        }
-                        // Recentre only on real drift; the hidden cursor may
-                        // wander a little without anyone noticing. The next
-                        // CursorMoved after a recentre is the synthetic jump,
-                        // so it is skipped above.
-                        if (position.x - center.0).abs() > 24.0
-                            || (position.y - center.1).abs() > 24.0
-                        {
-                            let point =
-                                winit::dpi::Position::Physical(winit::dpi::PhysicalPosition::new(
-                                    gpu.config.width as i32 / 2,
-                                    gpu.config.height as i32 / 2,
-                                ));
-                            let _ = gpu.window.set_cursor_position(point);
-                            self.last_cursor = Some(center);
-                            self.recentring = true;
-                        } else {
-                            self.last_cursor = Some((position.x, position.y));
-                        }
-                    }
-                } else if !self.ui.modal() {
+                if !self.grabbed && !self.ui.modal() {
                     self.input.cursor(position);
                 }
             }
@@ -1763,6 +1720,17 @@ impl ApplicationHandler for WindowApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            self.captured_motion(delta);
         }
     }
 
@@ -1984,6 +1952,40 @@ mod tests {
             forward: 1.0,
             ..MoveInput::default()
         }
+    }
+
+    #[test]
+    fn captured_raw_motion_accumulates_small_and_large_steps_without_warps() {
+        let mut app = app();
+        app.grabbed = true;
+        app.focused = true;
+        app.look_sensitivity = 2.0;
+        for _ in 0..100 {
+            app.captured_motion((0.1, -0.1));
+        }
+        app.captured_motion((100.0, -50.0));
+        app.captured_motion((f64::NAN, 0.0));
+        let motion = app.input.take_input(12.0).0;
+        assert!((motion.yaw_delta + 1.1).abs() < 1e-6);
+        assert!((motion.pitch_delta - 0.6).abs() < 1e-6);
+        assert_eq!(app.input.take_input(12.0).0.yaw_delta, 0.0);
+    }
+
+    #[test]
+    fn captured_raw_motion_respects_focus_capture_and_modal_state() {
+        let mut app = app();
+        app.grabbed = true;
+        app.focused = false;
+        app.captured_motion((10.0, 10.0));
+        app.focused = true;
+        app.ui.mode = crate::ui::Mode::Pause;
+        app.captured_motion((10.0, 10.0));
+        app.ui.mode = crate::ui::Mode::Game;
+        app.grabbed = false;
+        app.captured_motion((10.0, 10.0));
+        let motion = app.input.take_input(12.0).0;
+        assert_eq!(motion.yaw_delta, 0.0);
+        assert_eq!(motion.pitch_delta, 0.0);
     }
 
     #[test]

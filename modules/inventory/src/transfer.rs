@@ -55,6 +55,47 @@ pub struct Transfer {
     pub count: u32,
 }
 
+/// Sequential private drafts for a bounded batch, including shared endpoints.
+/// Final components and conservation publish together through one owner transaction.
+pub fn plan_transfers(
+    view: &ActionView<'_>,
+    catalog: &ItemCatalog,
+    transfers: &[Transfer],
+    transaction: TransactionId,
+    ordering: OrderingKey,
+) -> Result<Transaction, RejectCode> {
+    let mut expected = std::collections::BTreeMap::new();
+    if transfers.is_empty() || transfers.len() > crate::MAX_OPERATIONS {
+        return Err(RejectCode::QuotaExceeded);
+    }
+    if !view.actor().permits(&key("inventory:permission/transfer")) {
+        return Err(RejectCode::PermissionDenied);
+    }
+    for transfer in transfers {
+        for entity in [transfer.source, transfer.destination] {
+            if !view.actor().allows(ActionTarget::Entity(entity)) {
+                return Err(RejectCode::PermissionDenied);
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) = expected.entry(entity) {
+                entry.insert(view.component(entity, &schema())?.clone());
+            }
+        }
+    }
+    crate::plan_inventory(
+        view,
+        catalog,
+        &transfers
+            .iter()
+            .copied()
+            .map(crate::InventoryOperation::Transfer)
+            .collect::<Vec<_>>(),
+        &expected,
+        transaction,
+        ordering,
+    )
+    .map(|plan| plan.into_parts().0)
+}
+
 impl ActionHandler for PortHandler {
     fn plan(
         &self,

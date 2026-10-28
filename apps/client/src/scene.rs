@@ -140,11 +140,13 @@ fn compile_content() -> Result<(BlockStateRegistry, ComponentSchemas, Compatibil
     let registry =
         BlockStateRegistry::build(&content).map_err(|error| format!("registry failed: {error}"))?;
     let schemas = ComponentSchemas::build(&content);
-    let compatibility = Compatibility {
+    let catalog = torse_inventory::ItemCatalog::new([(key("base:stone"), 64)])
+        .map_err(|error| format!("item rules: {error:?}"))?;
+    let compatibility = catalog.bind_compatibility(Compatibility {
         authority_schema: 4,
         rules_digest: content.authority_digest,
         content_digest: content.presentation_digest,
-    };
+    });
     Ok((registry, schemas, compatibility))
 }
 

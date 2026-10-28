@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+sha2 = "=0.10.9"
 torse-actions = { path = "../../crates/actions" }
 torse-content = { path = "../../crates/content" }
 torse-sim = { path = "../../crates/sim" }

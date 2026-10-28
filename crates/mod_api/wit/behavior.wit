@@ -1,4 +1,4 @@
-package torse:behavior@0.2.0-draft;
+package torse:behavior@0.3.0-draft;
 
 interface types {
     record vec3i {
@@ -17,9 +17,26 @@ interface types {
         high: u64,
     }
 
-    // Bounded to flat field tables of atoms. Nested structures are not
-    // expressible on this boundary yet; see the mod-platform design log
-    // before extending.
+    // Trees use postorder indices. Every non-root node has one parent;
+    // children precede their parent, and the root is the last node.
+    record node-field {
+        key: string,
+        value: u32,
+    }
+    variant value-node {
+        %bool(bool),
+        %u32(u32),
+        %i64(s64),
+        content(u32),
+        entity(entity-id),
+        text(string),
+        %list(list<u32>),
+        %record(list<node-field>),
+    }
+    record value-tree {
+        nodes: list<value-node>,
+    }
+
     variant atom {
         %bool(bool),
         %u32(u32),
@@ -27,6 +44,7 @@ interface types {
         content(u32),
         entity(entity-id),
         text(string),
+        tree(value-tree),
     }
 
     record field {
@@ -50,8 +68,7 @@ interface types {
         budget-exceeded,
         not-authorized,
         invalid-cursor,
-        // The requested representation cannot cross this boundary yet, for
-        // example a nested component value; see the design log before use.
+        // The requested representation contains an unknown symbol or shape.
         unsupported,
     }
 }
@@ -146,11 +163,29 @@ interface invoke {
         key: string,
     }
 
+    variant action-target {
+        block(vec3i),
+        entity(entity-id),
+    }
+    record interaction {
+        caller: string,
+        action: string,
+        api-version: u32,
+        target: action-target,
+        parameters: list<field>,
+    }
+
+    record entity-spawn {
+        pos: vec3i,
+        components: list<owned-state>,
+    }
+
     variant event {
         init,
         wakeup(wakeup-target),
         block-placed,
         block-broken(cell),
+        interaction(interaction),
     }
 
     record invocation {
@@ -194,6 +229,8 @@ interface invoke {
         component-edits: list<component-edit>,
         transfers: list<transfer-request>,
         wakeups: list<wakeup-request>,
+        spawns: list<entity-spawn>,
+        despawns: list<entity-id>,
     }
 
     handle-event: func(invocation: invocation) -> option<plan>;

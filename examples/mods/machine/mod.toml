@@ -1,6 +1,6 @@
 id = "machine"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 side = "server"
 permissions = ["inventory:permission/transfer", "inventory:permission/read"]
 

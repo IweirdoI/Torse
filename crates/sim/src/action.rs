@@ -163,6 +163,36 @@ impl ActorContext {
     pub fn permits(&self, permission: &ContentKey) -> bool {
         self.permissions.contains(permission)
     }
+    /// Restrict a module grant to a caller without delegating the caller's
+    /// identity or adding permissions. Exact cells covered by the other side's
+    /// section grant remain usable; entity access always requires both grants.
+    pub fn intersect(&self, caller: &Self, side: u32) -> Self {
+        let mut restricted = Self::new(self.principal.clone());
+        restricted.permissions = self
+            .permissions
+            .intersection(&caller.permissions)
+            .cloned()
+            .collect();
+        restricted.sections = self
+            .sections
+            .intersection(&caller.sections)
+            .copied()
+            .collect();
+        for target in self.targets.iter().chain(&caller.targets) {
+            let allowed = match *target {
+                TargetKey::Block(pos) => {
+                    self.allows_block(pos, side) && caller.allows_block(pos, side)
+                }
+                TargetKey::Entity(id) => {
+                    self.allows(ActionTarget::Entity(id)) && caller.allows(ActionTarget::Entity(id))
+                }
+            };
+            if allowed {
+                restricted.targets.insert(*target);
+            }
+        }
+        restricted
+    }
     /// Open the same restricted view for a scheduled native operation.
     pub fn view<'a>(&'a self, world: &'a WorldAuthority) -> ActionView<'a> {
         ActionView {

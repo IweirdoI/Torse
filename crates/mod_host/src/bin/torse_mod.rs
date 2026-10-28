@@ -16,7 +16,7 @@ use torse_mod_host::scenario::{self, GrantPolicy, Scenario};
 
 const TEMPLATE_MANIFEST: &str = r#"id = "{id}"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 side = "server"
 permissions = []
 
@@ -140,6 +140,8 @@ impl Guest for Component {
             }
         }
         Some(Plan {
+            spawns: Vec::new(),
+            despawns: Vec::new(),
             edits: Vec::new(),
             component_edits: vec![ComponentEdit {
                 entity: machine,
@@ -149,7 +151,7 @@ impl Guest for Component {
             }],
             transfers: Vec::new(),
             wakeups: vec![WakeupRequest {
-                entity: EntityId { low: 0, high: 0 },
+                entity: machine,
                 tick: tick + 1,
                 key: WORK_KEY.to_string(),
             }],

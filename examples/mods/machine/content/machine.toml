@@ -20,6 +20,11 @@ id = "machine:field/output"
 type = "entity"
 required = true
 
+[[component.field]]
+id = "machine:field/history"
+type = "list"
+required = false
+
 [[state]]
 id = "machine:state/machine"
 version = 1

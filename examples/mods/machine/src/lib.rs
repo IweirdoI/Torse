@@ -4,7 +4,8 @@
 //! commits completely or not at all.
 
 use bindings::exports::torse::behavior::invoke::{
-    ComponentEdit, Guest, Invocation, Plan, TransferRequest, WakeupRequest,
+    ComponentEdit, EntitySpawn, Event, Guest, Invocation, OwnedState, Plan, TransferRequest,
+    WakeupRequest,
 };
 use bindings::torse::behavior::types::{Atom, EntityId, Field};
 use torse_mod_sdk::Rng;
@@ -72,6 +73,9 @@ impl Guest for Component {
         {
             let tick = invocation.tick;
             let self_ref = invocation.self_.as_ref()?;
+            if let Event::Interaction(request) = &invocation.event {
+                return interaction(&invocation, request);
+            }
             let machine = self_ref.entity;
             let previous = owned_fields(&invocation);
             let progress = field_u32(&previous, PROGRESS_FIELD)?;
@@ -86,16 +90,7 @@ impl Guest for Component {
             let _work = rng.next_u64() ^ u64::from(progress);
 
             let (next_progress, transfers) = if progress + 1 >= RECIPES_PER_STEP {
-                (
-                    0,
-                    vec![TransferRequest {
-                        source: input,
-                        source_slot: 0,
-                        destination: output,
-                        destination_slot: 0,
-                        count: 1,
-                    }],
-                )
+                (0, batch(input, output, 1))
             } else {
                 (progress + 1, Vec::new())
             };
@@ -125,6 +120,8 @@ impl Guest for Component {
             }
 
             Some(Plan {
+                spawns: Vec::new(),
+                despawns: Vec::new(),
                 edits: Vec::new(),
                 component_edits,
                 transfers,
@@ -140,6 +137,84 @@ impl Guest for Component {
             })
         }
     }
+}
+
+fn batch(input: EntityId, output: EntityId, count: u32) -> Vec<TransferRequest> {
+    vec![
+        TransferRequest {
+            source: input,
+            source_slot: 0,
+            destination: output,
+            destination_slot: 1,
+            count,
+        },
+        TransferRequest {
+            source: output,
+            source_slot: 1,
+            destination: output,
+            destination_slot: 0,
+            count,
+        },
+    ]
+}
+
+fn interaction(
+    invocation: &Invocation,
+    request: &bindings::exports::torse::behavior::invoke::Interaction,
+) -> Option<Plan> {
+    let object = invocation.self_.as_ref()?;
+    let schema = bindings::torse::behavior::query::resolve_symbol(SCHEMA_KEY)?;
+    let fields = owned_fields(invocation);
+    let mut plan = Plan {
+        edits: Vec::new(),
+        component_edits: Vec::new(),
+        transfers: Vec::new(),
+        wakeups: Vec::new(),
+        spawns: Vec::new(),
+        despawns: Vec::new(),
+    };
+    match request.action.as_str() {
+        "machine:action/transfer" => {
+            let count = field_u32(&request.parameters, "machine:field/count")?;
+            plan.transfers = batch(
+                field_entity(&fields, INPUT_FIELD)?,
+                field_entity(&fields, OUTPUT_FIELD)?,
+                count,
+            );
+        }
+        "machine:action/set" => {
+            let history = request
+                .parameters
+                .iter()
+                .find(|f| f.key == "machine:field/history")?
+                .clone();
+            let mut next = fields.clone();
+            next.retain(|f| f.key != history.key);
+            next.push(history);
+            plan.component_edits.push(ComponentEdit {
+                entity: object.entity,
+                schema,
+                previous: Some(fields),
+                fields: Some(next),
+            });
+        }
+        "machine:action/spawn" => {
+            let mut pos = object.pos;
+            pos.x = pos.x.checked_add(1)?;
+            plan.spawns.push(EntitySpawn {
+                pos,
+                components: vec![OwnedState {
+                    schema,
+                    fields: Some(fields),
+                }],
+            });
+        }
+        "machine:action/despawn" => {
+            plan.despawns.push(object.entity);
+        }
+        _ => return None,
+    }
+    Some(plan)
 }
 
 #[cfg(feature = "budget-probe")]

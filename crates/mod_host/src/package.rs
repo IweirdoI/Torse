@@ -22,7 +22,7 @@ use torse_types::{ContentKey, ReplicationDeclaration};
 use torse_world::{BlockStateRegistry, ComponentSchemas};
 
 /// The behavior API version this host implements; manifests must match.
-pub const SUPPORTED_API: (u32, u32) = (0, 2);
+pub const SUPPORTED_API: (u32, u32) = (0, 3);
 
 /// A semantic version restricted to `major.minor.patch`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1449,7 +1449,7 @@ mod tests {
 
     fn manifest_text(id: &str, version: &str) -> String {
         format!(
-            "id = \"{id}\"\nversion = \"{version}\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n"
+            "id = \"{id}\"\nversion = \"{version}\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n"
         )
     }
 

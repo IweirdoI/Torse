@@ -56,7 +56,7 @@ fn clone_package(id: &str) -> PathBuf {
         .join(format!("{id}-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(dir.join("content")).expect("clone content dir");
     let manifest = format!(
-        "id = \"{id}\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = [\"inventory:permission/transfer\", \"inventory:permission/read\"]\n\n[server]\nentry = \"logic.wasm\"\n\n[build]\ncrate = \"torse-mod-machine\"\nworkspace = \"{}\"\n",
+        "id = \"{id}\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = [\"inventory:permission/transfer\", \"inventory:permission/read\"]\n\n[server]\nentry = \"logic.wasm\"\n\n[build]\ncrate = \"torse-mod-machine\"\nworkspace = \"{}\"\n",
         workspace_root()
             .display()
             .to_string()

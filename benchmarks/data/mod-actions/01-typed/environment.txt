@@ -1,0 +1,8 @@
+date=2026-10-28
+platform=Windows x86_64-pc-windows-msvc
+rustc=1.93.1 (01f6ddf75 2026-02-11)
+cargo=1.93.1 (083ac5135 2025-12-15)
+profile=dev and test, limited debuginfo; wasm release
+cargo_build_jobs=1
+guest_target=wasm32-unknown-unknown
+scope=functional acceptance, no throughput claim

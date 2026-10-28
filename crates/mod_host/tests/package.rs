@@ -41,7 +41,7 @@ fn temp_package(name: &str, manifest: &str, content: Option<String>) -> PathBuf 
 }
 
 const VALID_MANIFEST: &str =
-    "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n";
+    "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n";
 
 const VALID_CONTENT: &str = r#"
 [[component]]
@@ -159,12 +159,12 @@ id = "dep:schema/state"
 "#;
     let leaf = temp_package(
         "dep-leaf",
-        "id = \"dep\"\nversion = \"0.2.3\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n",
+        "id = \"dep\"\nversion = \"0.2.3\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n",
         Some(dep_content.to_string()),
     );
     let root_ok = temp_package(
         "dep-root",
-        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n\n[dependencies]\ndep = \"0.2\"\n",
+        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n\n[dependencies]\ndep = \"0.2\"\n",
         Some(VALID_CONTENT.to_string()),
     );
     let set = resolve(&[root_ok.clone(), leaf.clone()], &base).expect("resolution succeeds");
@@ -174,7 +174,7 @@ id = "dep:schema/state"
 
     let root_wrong = temp_package(
         "dep-wrong",
-        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n\n[dependencies]\ndep = \"0.3\"\n",
+        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n\n[dependencies]\ndep = \"0.3\"\n",
         Some(VALID_CONTENT.to_string()),
     );
     let errors = resolve(&[root_wrong.clone(), leaf.clone()], &base).unwrap_err();
@@ -187,7 +187,7 @@ id = "dep:schema/state"
 
     let root_missing = temp_package(
         "dep-missing",
-        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n\n[dependencies]\ndep = \"0.2\"\n",
+        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n\n[dependencies]\ndep = \"0.2\"\n",
         Some(VALID_CONTENT.to_string()),
     );
     let errors = resolve(std::slice::from_ref(&root_missing), &base).unwrap_err();
@@ -200,12 +200,12 @@ id = "dep:schema/state"
 
     let cyclic_a = temp_package(
         "cyc-a",
-        "id = \"appa\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n\n[dependencies]\nappb = \"0.1\"\n",
+        "id = \"appa\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n\n[dependencies]\nappb = \"0.1\"\n",
         Some(VALID_CONTENT.replace("probe", "appa")),
     );
     let cyclic_b = temp_package(
         "cyc-b",
-        "id = \"appb\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n\n[dependencies]\nappa = \"0.1\"\n",
+        "id = \"appb\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n\n[dependencies]\nappa = \"0.1\"\n",
         Some(VALID_CONTENT.replace("probe", "appb")),
     );
     let errors = resolve(&[cyclic_a.clone(), cyclic_b.clone()], &base).unwrap_err();
@@ -218,7 +218,7 @@ id = "dep:schema/state"
     // remaining duplicate case is two content files inside one package.
     let duplicated = temp_package(
         "duplicate",
-        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.2\"\nside = \"server\"\npermissions = []\n",
+        "id = \"probe\"\nversion = \"0.1.0\"\napi = \"0.3\"\nside = \"server\"\npermissions = []\n",
         Some(VALID_CONTENT.to_string()),
     );
     std::fs::write(duplicated.join("content").join("again.toml"), VALID_CONTENT)

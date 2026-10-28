@@ -154,6 +154,26 @@ impl ModRule {
         transaction_id: TransactionId,
         outcome: Result<GuestOutcome, String>,
     ) -> WorkPlan {
+        // A host-scheduled object may have been created after package assembly.
+        // Ownership of one declared component grants this invocation its own
+        // target; unrelated entities and external callers receive no grant.
+        let mut actor = self.actor.clone();
+        if world
+            .entities()
+            .handle_of(entity)
+            .and_then(|h| world.entities().get(h))
+            .is_some_and(|object| {
+                self.owned_schemas.iter().any(|schema| {
+                    object.components.component(schema).is_some()
+                        && world
+                            .schemas()
+                            .get(schema)
+                            .is_some_and(|s| s.owner_module == self.package)
+                })
+            })
+        {
+            actor = actor.target(ActionTarget::Entity(entity));
+        }
         match outcome {
             Err(_setup) => {
                 // Structural dispatch failures are terminal for this event;
@@ -190,6 +210,7 @@ impl ModRule {
                     world,
                     &self.symbols,
                     &self.package,
+                    &actor,
                     &plan,
                     stable,
                     transaction_id,
@@ -204,18 +225,22 @@ impl ModRule {
                             local_sequence: local,
                         };
                         let mut members: Vec<_> = parts.machine.into_iter().collect();
-                        if let Some(transfer) = &parts.transfer {
-                            let request = Transfer {
-                                source: transfer.source,
-                                source_slot: transfer.source_slot as usize,
-                                destination: transfer.destination,
-                                destination_slot: transfer.destination_slot as usize,
-                                count: transfer.count,
-                            };
-                            match plan_transfer(
-                                &self.actor.view(world),
+                        if !parts.transfers.is_empty() {
+                            let requests: Vec<_> = parts
+                                .transfers
+                                .iter()
+                                .map(|transfer| Transfer {
+                                    source: transfer.source,
+                                    source_slot: transfer.source_slot as usize,
+                                    destination: transfer.destination,
+                                    destination_slot: transfer.destination_slot as usize,
+                                    count: transfer.count,
+                                })
+                                .collect();
+                            match torse_inventory::plan_transfers(
+                                &actor.view(world),
                                 &self.catalog,
-                                request,
+                                &requests,
                                 transaction_id,
                                 ordering,
                             ) {
@@ -718,11 +743,11 @@ pub fn mod_world_with_layout(
 
     let catalog = ItemCatalog::new([(bootstrap::key("base:stone"), 64)])
         .map_err(|e| Fault::invalid_data(format!("{e:?}")))?;
-    let compatibility = Compatibility {
+    let compatibility = catalog.bind_compatibility(Compatibility {
         authority_schema: 4,
         rules_digest: set.content.authority_digest,
         content_digest: set.content.presentation_digest,
-    };
+    });
     let (schemas, compatibility) = torse_world::ComponentSchemas::assemble(
         &set.content,
         torse_world::ComponentConfiguration::default(),

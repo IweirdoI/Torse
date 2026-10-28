@@ -154,7 +154,12 @@ impl FixtureHost {
 
     /// Applies a returned plan to the fixture, standing in for the authority's
     /// prepare/publish cycle at prototype fidelity.
-    pub fn apply_plan(&mut self, plan: &Plan) {
+    pub fn apply_plan(&mut self, plan: &Plan) -> Result<(), String> {
+        // The prototype fixture has no inventory or entity authority. Refuse
+        // unsupported plans before applying any of their other members.
+        if !plan.transfers.is_empty() || !plan.spawns.is_empty() || !plan.despawns.is_empty() {
+            return Err("fixture has no inventory or entity authority".into());
+        }
         for edit in &plan.edits {
             let pos = (edit.pos.x, edit.pos.y, edit.pos.z);
             match &edit.new {
@@ -181,6 +186,7 @@ impl FixtureHost {
             self.wakeups
                 .push((wakeup.tick, wakeup.entity.low, wakeup.key.clone()));
         }
+        Ok(())
     }
 
     fn cell_at(&self, pos: (i64, i64, i64)) -> Cell {
@@ -449,7 +455,7 @@ pub fn run_roundtrip(
                 .input(plan_size(&plan))
                 .map_err(|_| "host input budget exceeded".to_string())?;
             plans_returned += 1;
-            host.apply_plan(&plan);
+            host.apply_plan(&plan)?;
         }
     }
     let total = start.elapsed();

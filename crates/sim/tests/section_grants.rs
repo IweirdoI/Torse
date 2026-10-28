@@ -20,6 +20,33 @@ fn key(value: &str) -> ContentKey {
     ContentKey::parse(value).expect("key")
 }
 
+#[test]
+fn module_and_caller_intersection_keeps_exact_cells_without_widening_entities() {
+    let cell = BlockPos::new(1, 2, 3);
+    let module = ActorContext::new(key("test:module"))
+        .section(SectionPos::ZERO)
+        .permission(key("world:permission/edit"))
+        .permission(key("world:permission/spawn"))
+        .target(ActionTarget::Entity(EntityId(7)));
+    let caller = ActorContext::new(key("test:user"))
+        .target(ActionTarget::Block(cell))
+        .permission(key("world:permission/edit"))
+        .target(ActionTarget::Entity(EntityId(7)))
+        .target(ActionTarget::Entity(EntityId(8)));
+    for restricted in [module.intersect(&caller, 16), caller.intersect(&module, 16)] {
+        assert!(restricted.allows_block(cell, 16));
+        assert!(!restricted.allows_block(BlockPos::new(2, 2, 3), 16));
+        assert!(restricted.allows(ActionTarget::Entity(EntityId(7))));
+        assert!(!restricted.allows(ActionTarget::Entity(EntityId(8))));
+        assert!(restricted.permits(&key("world:permission/edit")));
+        assert!(!restricted.permits(&key("world:permission/spawn")));
+    }
+    assert_eq!(
+        module.intersect(&caller, 16).principal(),
+        module.principal()
+    );
+}
+
 fn setup() -> (WorldAuthority, ActionService) {
     let mut pack = m0_fixture_pack();
     block_actions::register_content(&mut pack);

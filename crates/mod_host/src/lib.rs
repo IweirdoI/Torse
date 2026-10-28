@@ -6,6 +6,9 @@
 mod budget;
 
 #[cfg(feature = "authority")]
+mod values;
+
+#[cfg(feature = "authority")]
 pub mod authority;
 
 #[cfg(feature = "package")]

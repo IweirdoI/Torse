@@ -197,6 +197,17 @@ macro_rules! boundary_sizes {
                     .saturating_add(field.key.len() as u64)
                     .saturating_add(match &field.value {
                         Atom::Text(text) => text.len() as u64,
+                        Atom::Tree(tree) => tree.nodes.iter().fold(0_u64, |size, node| {
+                            use torse::behavior::types::ValueNode;
+                            size.saturating_add(64).saturating_add(match node {
+                                ValueNode::Text(text) => text.len() as u64,
+                                ValueNode::List(ids) => (ids.len() as u64).saturating_mul(4),
+                                ValueNode::Record(fields) => fields.iter().fold(0_u64, |n, f| {
+                                    n.saturating_add(32).saturating_add(f.key.len() as u64)
+                                }),
+                                _ => 0,
+                            })
+                        }),
                         _ => 0,
                     })
             })
@@ -224,6 +235,15 @@ macro_rules! boundary_sizes {
                     .saturating_add(edit.fields.as_deref().map(fields_size).unwrap_or(0));
             }
             bytes = bytes.saturating_add((plan.transfers.len() as u64).saturating_mul(64));
+            bytes = bytes.saturating_add((plan.despawns.len() as u64).saturating_mul(16));
+            for spawn in &plan.spawns {
+                bytes = bytes.saturating_add(48);
+                for component in &spawn.components {
+                    bytes = bytes
+                        .saturating_add(32)
+                        .saturating_add(component.fields.as_deref().map(fields_size).unwrap_or(0));
+                }
+            }
             for wakeup in &plan.wakeups {
                 bytes = bytes
                     .saturating_add(48)
@@ -237,6 +257,12 @@ macro_rules! boundary_sizes {
             match &invocation.event {
                 Event::Wakeup(target) => bytes = bytes.saturating_add(target.key.len() as u64),
                 Event::BlockBroken(cell) => bytes = bytes.saturating_add(cell_size(cell)),
+                Event::Interaction(request) => {
+                    bytes = bytes
+                        .saturating_add(request.caller.len() as u64)
+                        .saturating_add(request.action.len() as u64)
+                        .saturating_add(fields_size(&request.parameters))
+                }
                 _ => {}
             }
             if let Some(object) = &invocation.self_ {
@@ -255,17 +281,10 @@ pub(crate) use boundary_sizes;
 
 #[cfg(feature = "authority")]
 pub(crate) fn flat_source_size(fields: &torse_world::ComponentFields) -> Option<u64> {
-    if fields.values().any(|value| {
-        matches!(
-            value,
-            torse_world::ComponentValue::List(_) | torse_world::ComponentValue::Record(_)
-        )
-    }) {
-        return None;
-    }
     torse_world::component_size(fields)
         .ok()?
-        .checked_add((fields.len() as u64).checked_mul(128)?)
+        .checked_mul(16)?
+        .checked_add(128)
 }
 
 #[cfg(test)]

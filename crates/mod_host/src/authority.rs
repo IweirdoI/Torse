@@ -27,11 +27,11 @@ use torse_content::{
     PersistencePolicy, compile, m0_fixture_pack,
 };
 use torse_inventory::{
-    Inventory, ItemCatalog, ItemStack, Transfer, plan_transfer,
+    Inventory, ItemCatalog, ItemStack, Transfer, plan_transfers,
     register_content as register_inventory,
 };
 use torse_sim::action::{ActionTarget, ActorContext, register_action_module};
-use torse_sim::{OrderingKey, Phase, Transaction, WorldAuthority, block_actions};
+use torse_sim::{OrderingKey, Phase, Transaction, TransactionGroup, WorldAuthority, block_actions};
 use torse_types::{
     BlockPos, CommitSeq, Compatibility, ContentKey, EntityId, SectionPos, TransactionId, WorldId,
 };
@@ -52,6 +52,7 @@ use crate::budget::{GuestLimits, HostBudget};
 use crate::component::{CallBudget, Meters};
 
 crate::budget::boundary_sizes!();
+crate::values::boundary_values!();
 
 /// Consecutive plan rejections or traps before the handler is deactivated.
 const FAILURE_THRESHOLD: u32 = 8;
@@ -355,53 +356,11 @@ impl AuthorityHost {
         if crate::budget::flat_source_size(fields)? > self.budget.limits.max_output_bytes {
             return None;
         }
-        let mut flat = Vec::with_capacity(fields.len());
-        for (field_key, value) in fields {
-            let atom = self.value_to_atom(value)?;
-            flat.push(Field {
-                key: field_key.to_string(),
-                value: atom,
-            });
-        }
-        Some(flat)
-    }
-
-    fn value_to_atom(&self, value: &ComponentValue) -> Option<Atom> {
-        match value {
-            ComponentValue::Bool(value) => Some(Atom::Bool(*value)),
-            ComponentValue::U32(value) => Some(Atom::U32(*value)),
-            ComponentValue::I64(value) => Some(Atom::I64(*value)),
-            ComponentValue::Content(content) => Some(Atom::Content(self.symbol_of(content)?)),
-            ComponentValue::Entity(entity) => {
-                Some(Atom::Entity(WitEntityId::from_entity_id(*entity)))
-            }
-            ComponentValue::Text(text) => Some(Atom::Text(text.clone())),
-            // Nested values cannot cross the flat-atom boundary yet.
-            ComponentValue::List(_) | ComponentValue::Record(_) => None,
-        }
-    }
-
-    fn atom_to_value(&self, atom: &Atom) -> Result<ComponentValue, String> {
-        match atom {
-            Atom::Bool(value) => Ok(ComponentValue::Bool(*value)),
-            Atom::U32(value) => Ok(ComponentValue::U32(*value)),
-            Atom::I64(value) => Ok(ComponentValue::I64(*value)),
-            Atom::Content(symbol) => Ok(ComponentValue::Content(
-                self.key_of(*symbol).ok_or("unknown content symbol")?,
-            )),
-            Atom::Entity(entity) => Ok(ComponentValue::Entity(entity.to_entity_id())),
-            Atom::Text(text) => Ok(ComponentValue::Text(text.clone())),
-        }
+        encode_fields(fields, |key| self.symbol_of(key))
     }
 
     fn flat_to_fields(&self, flat: &[Field]) -> Result<ComponentFields, String> {
-        let mut fields = ComponentFields::new();
-        for field in flat {
-            let field_key = ContentKey::parse(&field.key).map_err(|e| format!("field key: {e}"))?;
-            let value = self.atom_to_value(&field.value)?;
-            fields.insert(field_key, value);
-        }
-        Ok(fields)
+        decode_fields(flat, |symbol| self.key_of(symbol))
     }
 
     fn cell_to_state(&self, cell: &Cell) -> Result<BlockStateId, String> {
@@ -519,47 +478,124 @@ impl AuthorityHost {
             });
         }
 
+        let actor = &self.packages.get(package).ok_or("unknown package")?.actor;
+        if plan.spawns.len().saturating_add(plan.despawns.len()) > 256
+            || (!plan.spawns.is_empty() && !actor.permits(&torse_sim::action::spawn_permission()))
+            || (!plan.despawns.is_empty()
+                && !actor.permits(&torse_sim::action::despawn_permission()))
+        {
+            return Ok(DispatchOutcome::Rejected {
+                reason: "lifecycle permission or count rejected".into(),
+            });
+        }
+        for spawn in &plan.spawns {
+            let pos = BlockPos::new(spawn.pos.x, spawn.pos.y, spawn.pos.z);
+            if !actor.allows_block(pos, self.authority.store().side()) {
+                return Ok(DispatchOutcome::Rejected {
+                    reason: "spawn scope denied".into(),
+                });
+            }
+            let mut components = BTreeMap::new();
+            for component in &spawn.components {
+                let schema = self
+                    .key_of(component.schema)
+                    .ok_or("unknown spawn schema")?;
+                if self
+                    .authority
+                    .schemas()
+                    .get(&schema)
+                    .is_none_or(|s| s.owner_module != *package)
+                {
+                    return Ok(DispatchOutcome::Rejected {
+                        reason: "foreign spawn schema".into(),
+                    });
+                }
+                let fields = self
+                    .flat_to_fields(component.fields.as_deref().ok_or("missing spawn fields")?)?;
+                if components.insert(schema, fields).is_some() {
+                    return Ok(DispatchOutcome::Rejected {
+                        reason: "duplicate spawn schema".into(),
+                    });
+                }
+            }
+            machine_tx.spawn_entity(
+                Position::new(pos.x as f64, pos.y as f64, pos.z as f64),
+                components,
+            );
+            has_machine_work = true;
+        }
+        for entity in &plan.despawns {
+            let view = actor.view(&self.authority);
+            let (handle, previous) = match view.entity(entity.to_entity_id()) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(DispatchOutcome::Rejected {
+                        reason: "despawn target denied".into(),
+                    });
+                }
+            };
+            machine_tx.despawn_entity(handle, previous);
+            has_machine_work = true;
+        }
+        for edit in &plan.component_edits {
+            if !actor.allows(ActionTarget::Entity(edit.entity.to_entity_id())) {
+                return Ok(DispatchOutcome::Rejected {
+                    reason: "component target denied".into(),
+                });
+            }
+        }
+        for edit in &plan.edits {
+            if !actor.permits(&key("world:permission/edit"))
+                || !actor.allows_block(
+                    BlockPos::new(edit.pos.x, edit.pos.y, edit.pos.z),
+                    self.authority.store().side(),
+                )
+            {
+                return Ok(DispatchOutcome::Rejected {
+                    reason: "block edit denied".into(),
+                });
+            }
+        }
+        for wakeup in &plan.wakeups {
+            if !actor.allows(ActionTarget::Entity(wakeup.entity.to_entity_id())) {
+                return Ok(DispatchOutcome::Rejected {
+                    reason: "wakeup target denied".into(),
+                });
+            }
+        }
+
         if has_machine_work {
             transactions.push(machine_tx);
         }
 
-        match plan.transfers.as_slice() {
-            [] => {}
-            [only] => {
-                let source = only.source.to_entity_id();
-                let transfer = Transfer {
-                    source,
+        if !plan.transfers.is_empty() {
+            let transfers: Vec<_> = plan
+                .transfers
+                .iter()
+                .map(|only| Transfer {
+                    source: only.source.to_entity_id(),
                     source_slot: only.source_slot as usize,
                     destination: only.destination.to_entity_id(),
                     destination_slot: only.destination_slot as usize,
                     count: only.count,
-                };
-                let transaction_id = self.next_transaction_id();
-                let ordering = self.ordering(source.0 as u64);
-                let authority = &self.authority;
-                let catalog = &self.catalog;
-                let actor = &self
-                    .packages
-                    .get(package)
-                    .expect("dispatching package is registered")
-                    .actor;
-                let view = actor.view(authority);
-                let transfer_tx =
-                    match plan_transfer(&view, catalog, transfer, transaction_id, ordering) {
-                        Ok(transaction) => transaction,
-                        Err(code) => {
-                            return Ok(DispatchOutcome::Rejected {
-                                reason: format!("transfer rejected: {code:?}"),
-                            });
-                        }
-                    };
-                transactions.push(transfer_tx);
-            }
-            _ => {
-                return Ok(DispatchOutcome::Rejected {
-                    reason: "at most one transfer per plan until batched inventory primitives"
-                        .to_string(),
-                });
+                })
+                .collect();
+            let transaction_id = self.next_transaction_id();
+            let ordering = self.ordering(0);
+            let actor = &self.packages.get(package).ok_or("unknown package")?.actor;
+            match plan_transfers(
+                &actor.view(&self.authority),
+                &self.catalog,
+                &transfers,
+                transaction_id,
+                ordering,
+            ) {
+                Ok(tx) => transactions.push(tx),
+                Err(code) => {
+                    return Ok(DispatchOutcome::Rejected {
+                        reason: format!("transfer rejected: {code:?}"),
+                    });
+                }
             }
         }
 
@@ -590,29 +626,21 @@ impl AuthorityHost {
             }
         }
 
-        // Prepare and publish sequentially: `prepare` records the current
-        // commit position, so a prepared change cannot be held across another
-        // publish. Disjoint targets make a later prepare rejection impossible
-        // for staleness reasons; if one still occurs the world is in an
-        // invariant fault state and the error propagates.
-        for (index, transaction) in transactions.iter().enumerate() {
-            let prepared = match self.authority.prepare(transaction) {
-                Ok(change) => change,
-                Err(error) if index == 0 => {
-                    return Ok(DispatchOutcome::Rejected {
-                        reason: format!("prepare rejected: {error:?}"),
-                    });
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "invariant fault: later transaction rejected after earlier publish: {error:?}"
-                    ));
-                }
-            };
-            self.authority
-                .publish(prepared)
-                .map_err(|fault| format!("invariant fault while publishing: {fault:?}"))?;
-        }
+        let id = self.next_transaction_id();
+        let ordering = transactions[0].ordering;
+        let group = TransactionGroup::new(id, ordering, transactions)
+            .map_err(|e| format!("group: {e:?}"))?;
+        let prepared = match self.authority.prepare_group(&group) {
+            Ok(change) => change,
+            Err(error) => {
+                return Ok(DispatchOutcome::Rejected {
+                    reason: format!("prepare rejected: {error:?}"),
+                });
+            }
+        };
+        self.authority
+            .publish(prepared)
+            .map_err(|e| format!("publish fault: {e:?}"))?;
         self.consecutive_failures.insert(package.clone(), 0);
         for wakeup in &plan.wakeups {
             let entity = wakeup.entity.to_entity_id();
@@ -990,6 +1018,11 @@ impl ModInstance {
 
     /// Dispatches one event and applies the returned plan.
     pub fn dispatch(&mut self, tick: u64, event: Event) -> Result<DispatchOutcome, String> {
+        if matches!(event, Event::Interaction(_)) {
+            return Ok(DispatchOutcome::Rejected {
+                reason: "interactions require a scoped durable route".into(),
+            });
+        }
         let package = self.package.clone();
         if self.host().is_deactivated(&package) {
             return Ok(DispatchOutcome::Deactivated);
@@ -1080,6 +1113,11 @@ pub fn machine_scenario(config: &ScenarioConfig) -> Result<MachineWorld, String>
         owner_module: package.clone(),
         fields: vec![
             ComponentField {
+                id: key("machine:field/history"),
+                field_type: ComponentFieldType::List { max_items: 64 },
+                required: false,
+            },
+            ComponentField {
                 id: key("machine:field/progress"),
                 field_type: ComponentFieldType::Unsigned32,
                 required: true,
@@ -1123,11 +1161,11 @@ pub fn machine_scenario(config: &ScenarioConfig) -> Result<MachineWorld, String>
         schemas.clone(),
         16,
         WorldBounds::new(0, 32).map_err(|e| format!("{e:?}"))?,
-        Compatibility {
+        catalog.bind_compatibility(Compatibility {
             authority_schema: 3,
             rules_digest: content.authority_digest,
             content_digest: content.presentation_digest,
-        },
+        }),
     )
     .map_err(|error| format!("authority assembly failed: {error:?}"))?;
 
@@ -1304,6 +1342,8 @@ mod budget_tests {
             Err(QueryError::BudgetExceeded)
         ));
         let plan = Plan {
+            spawns: Vec::new(),
+            despawns: Vec::new(),
             edits: Vec::new(),
             component_edits: Vec::new(),
             transfers: Vec::new(),

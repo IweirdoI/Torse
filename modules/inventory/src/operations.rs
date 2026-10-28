@@ -12,6 +12,7 @@ pub const MAX_OPERATIONS: usize = 64;
 /// its own trusted permission; transfer alone never grants item creation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InventoryOperation {
+    Transfer(crate::Transfer),
     Insert {
         target: EntityId,
         slot: usize,
@@ -73,6 +74,11 @@ pub fn plan_inventory(
     let mut targets = BTreeSet::new();
     for operation in operations {
         let permission = match operation {
+            InventoryOperation::Transfer(transfer) => {
+                targets.insert(transfer.source);
+                targets.insert(transfer.destination);
+                "transfer"
+            }
             InventoryOperation::Insert { target, .. } => {
                 targets.insert(*target);
                 "insert"
@@ -120,6 +126,64 @@ pub fn plan_inventory(
     let mut extracted = Vec::new();
     for operation in operations {
         match operation {
+            InventoryOperation::Transfer(transfer) => {
+                let crate::Transfer {
+                    source,
+                    source_slot,
+                    destination,
+                    destination_slot,
+                    count,
+                } = *transfer;
+                if count == 0 || (source == destination && source_slot == destination_slot) {
+                    return Err(RejectCode::InvalidData);
+                }
+                let stack = drafts[&source]
+                    .1
+                    .slots()
+                    .get(source_slot)
+                    .ok_or(RejectCode::InvalidData)?
+                    .as_ref()
+                    .ok_or(RejectCode::Conflict)?
+                    .clone();
+                if stack.count < count {
+                    return Err(RejectCode::Conflict);
+                }
+                let existing = drafts[&destination]
+                    .1
+                    .slots()
+                    .get(destination_slot)
+                    .ok_or(RejectCode::InvalidData)?;
+                let old = match existing {
+                    None => 0,
+                    Some(other) if other.item == stack.item => other.count,
+                    Some(_) => return Err(RejectCode::Conflict),
+                };
+                let limit = catalog.limit(&stack.item)?;
+                let new = old
+                    .checked_add(count)
+                    .filter(|total| *total <= limit)
+                    .ok_or(RejectCode::Conflict)?;
+                drafts.get_mut(&source).expect("observed source").1.set(
+                    source_slot,
+                    (stack.count > count).then(|| ItemStack {
+                        item: stack.item.clone(),
+                        count: stack.count - count,
+                    }),
+                    catalog,
+                )?;
+                drafts
+                    .get_mut(&destination)
+                    .expect("observed destination")
+                    .1
+                    .set(
+                        destination_slot,
+                        Some(ItemStack {
+                            item: stack.item,
+                            count: new,
+                        }),
+                        catalog,
+                    )?;
+            }
             InventoryOperation::Insert {
                 target,
                 slot,

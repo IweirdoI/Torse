@@ -12,12 +12,12 @@ mod operations;
 mod transfer;
 
 use std::collections::BTreeMap;
-use torse_types::{ContentKey, RejectCode};
+use torse_types::{Compatibility, ContentKey, Digest, RejectCode};
 use torse_world::{ComponentFields, ComponentValue};
 
 pub use content::{descriptors, owner, register_content, schema};
 pub use operations::{InventoryOperation, InventoryPlan, MAX_OPERATIONS, plan_inventory};
-pub use transfer::{Transfer, handlers, plan_transfer};
+pub use transfer::{Transfer, handlers, plan_transfer, plan_transfers};
 
 /// Bounded slot count of the first native container implementation.
 pub const MAX_SLOTS: usize = 64;
@@ -33,6 +33,31 @@ pub struct ItemCatalog {
 }
 
 impl ItemCatalog {
+    /// Canonical identity of item membership and stack limits, independent of input order.
+    pub fn rules_digest(&self) -> Digest {
+        use sha2::{Digest as _, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"torse:inventory/item-rules/v1\0");
+        digest.update((self.limits.len() as u64).to_le_bytes());
+        for (item, limit) in &self.limits {
+            let key = item.to_string();
+            digest.update((key.len() as u64).to_le_bytes());
+            digest.update(key.as_bytes());
+            digest.update(limit.to_le_bytes());
+        }
+        Digest(digest.finalize().into())
+    }
+    /// Apply once before freezing schemas and building authority or recovery.
+    /// Presentation identity is unaffected; unbound legacy rule identities differ.
+    pub fn bind_compatibility(&self, mut base: Compatibility) -> Compatibility {
+        use sha2::{Digest as _, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"torse:inventory/compatibility/v1\0");
+        digest.update(base.rules_digest.0);
+        digest.update(self.rules_digest().0);
+        base.rules_digest = Digest(digest.finalize().into());
+        base
+    }
     /// Reject duplicate items and zero stack capacities.
     pub fn new(items: impl IntoIterator<Item = (ContentKey, u32)>) -> Result<Self, RejectCode> {
         let mut limits = BTreeMap::new();

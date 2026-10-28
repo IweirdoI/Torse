@@ -179,20 +179,27 @@ pub fn spawn_players(
     Ok(ids)
 }
 pub fn world() -> Result<(WorldAuthority, ActionService), Fault> {
+    world_with_catalog(
+        torse_inventory::ItemCatalog::new([(key("base:stone"), 64)])
+            .map_err(|e| Fault::invalid_data(format!("catalog: {e:?}")))?,
+    )
+}
+/// Freeze the exact item rules used by native handlers into recovery and admission.
+pub fn world_with_catalog(
+    catalog: torse_inventory::ItemCatalog,
+) -> Result<(WorldAuthority, ActionService), Fault> {
     let mut pack = m0_fixture_pack();
     block_actions::register_content(&mut pack);
     torse_inventory::register_content(&mut pack);
     let content = compile(pack).map_err(|e| Fault::invalid_data(format!("demo content: {e:?}")))?;
-    let compatibility = Compatibility {
+    let compatibility = catalog.bind_compatibility(Compatibility {
         authority_schema: 4,
         rules_digest: content.authority_digest,
         content_digest: content.presentation_digest,
-    };
+    });
     let (schemas, compatibility) =
         ComponentSchemas::assemble(&content, ComponentConfiguration::default(), compatibility)
             .map_err(|error| Fault::invalid_data(error.to_string()))?;
-    let catalog = torse_inventory::ItemCatalog::new([(key("base:stone"), 64)])
-        .map_err(|e| Fault::invalid_data(format!("catalog: {e:?}")))?;
     let mut handlers = block_actions::handlers();
     handlers.extend(torse_inventory::handlers(catalog.clone()));
     let mut actions = block_actions::descriptors();

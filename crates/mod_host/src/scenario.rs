@@ -585,11 +585,11 @@ pub fn run_scenario(
         scenario.side,
         WorldBounds::new(scenario.bounds.0, scenario.bounds.1)
             .map_err(|error| format!("bounds: {error:?}"))?,
-        Compatibility {
+        catalog.bind_compatibility(Compatibility {
             authority_schema: 3,
             rules_digest: set.content.authority_digest,
             content_digest: set.content.presentation_digest,
-        },
+        }),
     )
     .map_err(|error| format!("authority: {error:?}"))?;
 

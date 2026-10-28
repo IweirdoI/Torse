@@ -19,9 +19,12 @@ use torse::behavior::query::{
 use torse::behavior::schedule::WakeupSlot;
 use torse::behavior::types::{Atom, Bbox, BlockRef, Cell, EntityId, Field, Vec3i};
 use torse_sim::WorldAuthority;
+use torse_sim::action::{
+    ActionRequest, ActionTarget as NativeTarget, ActorContext, despawn_permission, spawn_permission,
+};
 use torse_sim::{OrderingKey, Phase, Transaction};
 use torse_types::{BlockPos, ContentKey, EntityId as EngineEntityId, TransactionId};
-use torse_world::{BlockStateId, ComponentEdit, ComponentFields, ComponentValue, TerrainQuery};
+use torse_world::{BlockStateId, ComponentEdit, ComponentFields, Position, TerrainQuery};
 use wasmtime::Engine;
 use wasmtime::Store;
 use wasmtime::component::{Component, bindgen};
@@ -35,10 +38,11 @@ bindgen!({
 });
 
 use exports::torse::behavior::invoke::{
-    Event, Invocation, ObjectRef, OwnedState, Plan, WakeupTarget,
+    ActionTarget, Event, Interaction, Invocation, ObjectRef, OwnedState, Plan, WakeupTarget,
 };
 
 crate::budget::boundary_sizes!();
+crate::values::boundary_values!();
 
 /// Session-wide stable symbol table shared by all dispatches.
 #[derive(Clone, Debug, Default)]
@@ -119,6 +123,7 @@ pub struct BlockNotification {
 enum DispatchTarget<'a> {
     Wakeup(EngineEntityId, &'a str),
     Block(&'a BlockNotification),
+    Interaction(&'a ActionRequest, &'a ActorContext),
 }
 
 /// A compiled behavior executor creating fresh instances over bounded snapshots.
@@ -181,26 +186,7 @@ fn snapshot_fields(
     budget
         .output(crate::budget::flat_source_size(fields)?)
         .ok()?;
-    let mut flat = Vec::with_capacity(fields.len());
-    for (field_key, value) in fields {
-        let atom = match value {
-            ComponentValue::Bool(value) => Atom::Bool(*value),
-            ComponentValue::U32(value) => Atom::U32(*value),
-            ComponentValue::I64(value) => Atom::I64(*value),
-            ComponentValue::Content(content) => {
-                Atom::Content(symbols.symbol_of(&content.to_string())?)
-            }
-            ComponentValue::Entity(entity) => Atom::Entity(wit_entity(*entity)),
-            ComponentValue::Text(text) => Atom::Text(text.clone()),
-            // Nested values do not cross the flat-atom boundary.
-            ComponentValue::List(_) | ComponentValue::Record(_) => return None,
-        };
-        flat.push(Field {
-            key: field_key.to_string(),
-            value: atom,
-        });
-    }
-    Some(flat)
+    encode_fields(fields, |key| symbols.symbol_of(&key.to_string()))
 }
 
 impl DurableGuest {
@@ -296,6 +282,7 @@ impl DurableGuest {
             tick,
             DispatchTarget::Wakeup(entity, key),
             owned_schemas,
+            None,
         )
     }
 
@@ -313,7 +300,109 @@ impl DurableGuest {
             tick,
             DispatchTarget::Block(notification),
             owned_schemas,
+            None,
         )
+    }
+
+    /// Dispatch a host-routed action with caller identity supplied by the host.
+    /// Both the module grant and caller must authorize every resulting effect.
+    /// The route is trusted configuration, never supplied by the guest or wire.
+    pub fn plan_interaction(
+        &mut self,
+        world: &WorldAuthority,
+        tick: u64,
+        route: &InteractionRoute,
+        caller: &ActorContext,
+        request: &ActionRequest,
+    ) -> Result<InteractionPlan, String> {
+        if request.action != route.action
+            || request.api_version != route.api_version
+            || request.ordering.phase != Phase::Interaction
+            || !caller.permits(&route.permission)
+            || !route.grant.permits(&route.permission)
+            || route.owned_schemas.iter().any(|schema| {
+                world
+                    .schemas()
+                    .get(schema)
+                    .is_none_or(|s| s.owner_module != *route.grant.principal())
+            })
+        {
+            return Err("interaction route or permission rejected".into());
+        }
+        let actor = route.grant.intersect(caller, world.store().side());
+        let allowed = match request.target {
+            NativeTarget::Entity(id) => actor.allows(NativeTarget::Entity(id)),
+            NativeTarget::Block(pos) => actor.allows_block(pos, world.store().side()),
+        };
+        if !allowed {
+            return Err("interaction target rejected".into());
+        }
+        let outcome = self.dispatch_target(
+            world,
+            tick,
+            DispatchTarget::Interaction(request, caller),
+            &route.owned_schemas,
+            Some(&actor),
+        )?;
+        let GuestOutcome::Plan(plan) = outcome else {
+            return Err("interaction produced no valid plan".into());
+        };
+        let symbols = Arc::clone(&self.store.data().symbols);
+        let mut parts = convert_plan(
+            world,
+            &symbols,
+            route.grant.principal(),
+            &actor,
+            &plan,
+            request.ordering.stable_task_key,
+            request.transaction,
+            request.ordering.local_sequence,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(tx) = &mut parts.machine {
+            tx.ordering = request.ordering;
+        }
+        let mut members: Vec<_> = parts.machine.into_iter().collect();
+        if !parts.transfers.is_empty() {
+            let transfers: Vec<_> = parts
+                .transfers
+                .iter()
+                .map(|t| torse_inventory::Transfer {
+                    source: t.source,
+                    source_slot: t.source_slot as usize,
+                    destination: t.destination,
+                    destination_slot: t.destination_slot as usize,
+                    count: t.count,
+                })
+                .collect();
+            members.push(
+                torse_inventory::plan_transfers(
+                    &actor.view(world),
+                    &route.catalog,
+                    &transfers,
+                    request.transaction,
+                    request.ordering,
+                )
+                .map_err(|e| format!("inventory: {e:?}"))?,
+            );
+        }
+        let transaction = if members.is_empty() {
+            None
+        } else {
+            Some(
+                torse_sim::TransactionGroup::new(request.transaction, request.ordering, members)
+                    .map_err(|e| format!("interaction group: {e:?}"))?,
+            )
+        };
+        if let Some(group) = &transaction {
+            world
+                .prepare_group(group)
+                .map_err(|e| format!("interaction rejected: {e:?}"))?;
+        }
+        Ok(InteractionPlan {
+            transaction,
+            wakeups: parts.wakeups,
+        })
     }
 
     fn dispatch_target(
@@ -322,6 +411,7 @@ impl DurableGuest {
         tick: u64,
         target: DispatchTarget<'_>,
         owned_schemas: &[ContentKey],
+        actor: Option<&ActorContext>,
     ) -> Result<GuestOutcome, String> {
         self.rebuild()?;
         self.store.data_mut().budget.reset();
@@ -345,6 +435,62 @@ impl DurableGuest {
                     Event::Wakeup(WakeupTarget {
                         entity: wit_entity(entity),
                         key: key.to_string(),
+                    }),
+                    0,
+                )
+            }
+            DispatchTarget::Interaction(request, caller) => {
+                let (entity, pos, target) = match request.target {
+                    NativeTarget::Entity(id) => {
+                        let handle = world
+                            .entities()
+                            .handle_of(id)
+                            .ok_or("missing interaction target")?;
+                        let pos = world
+                            .entities()
+                            .get(handle)
+                            .ok_or("missing entity")?
+                            .position;
+                        (
+                            id,
+                            BlockPos::new(
+                                pos.x.floor() as i64,
+                                pos.y.floor() as i64,
+                                pos.z.floor() as i64,
+                            ),
+                            ActionTarget::Entity(wit_entity(id)),
+                        )
+                    }
+                    NativeTarget::Block(pos) => (
+                        EngineEntityId(0),
+                        pos,
+                        ActionTarget::Block(Vec3i {
+                            x: pos.x,
+                            y: pos.y,
+                            z: pos.z,
+                        }),
+                    ),
+                };
+                let bytes = crate::budget::flat_source_size(&request.parameters)
+                    .ok_or("invalid action parameters")?;
+                self.store
+                    .data_mut()
+                    .budget
+                    .output(bytes)
+                    .map_err(|_| "action parameter budget exceeded")?;
+                let parameters = encode_fields(&request.parameters, |key| {
+                    symbols.symbol_of(&key.to_string())
+                })
+                .ok_or("unrepresentable action parameters")?;
+                (
+                    entity,
+                    (pos.x, pos.y, pos.z),
+                    Event::Interaction(Interaction {
+                        caller: caller.principal().to_string(),
+                        action: request.action.to_string(),
+                        api_version: request.api_version,
+                        target,
+                        parameters,
                     }),
                     0,
                 )
@@ -382,7 +528,11 @@ impl DurableGuest {
                         .budget
                         .work(1)
                         .map_err(|_| "snapshot work budget exceeded".to_string())?;
-                    let cell = snapshot_cell(world, &symbols, BlockPos::new(x, y, z));
+                    let pos = BlockPos::new(x, y, z);
+                    if actor.is_some_and(|a| !a.allows_block(pos, world.store().side())) {
+                        continue;
+                    }
+                    let cell = snapshot_cell(world, &symbols, pos);
                     self.store
                         .data_mut()
                         .budget
@@ -409,7 +559,9 @@ impl DurableGuest {
             let x = position.x.floor() as i64;
             let y = position.y.floor() as i64;
             let z = position.z.floor() as i64;
-            if !in_box(x, y, z) {
+            if !in_box(x, y, z)
+                || actor.is_some_and(|a| !a.allows(NativeTarget::Entity(candidate.id)))
+            {
                 continue;
             }
             self.store
@@ -438,7 +590,7 @@ impl DurableGuest {
             }
         }
 
-        // Build the invocation: self carries the owned flat state.
+        // Build the invocation: self carries the owned, bounded state.
         let owned = owned_schemas
             .iter()
             .filter_map(|schema| {
@@ -706,10 +858,27 @@ pub struct TransferSpec {
     pub count: u32,
 }
 
+/// Trusted route binding a typed guest action to an explicitly granted module.
+pub struct InteractionRoute {
+    pub action: ContentKey,
+    pub api_version: u32,
+    pub permission: ContentKey,
+    pub grant: ActorContext,
+    pub owned_schemas: Vec<ContentKey>,
+    pub catalog: torse_inventory::ItemCatalog,
+}
+
+/// Unpublished, fully checked action effects. The host journals the group and
+/// wakeups together before acknowledging the action; planning never commits.
+pub struct InteractionPlan {
+    pub transaction: Option<torse_sim::TransactionGroup>,
+    pub wakeups: Vec<(u64, EngineEntityId, String)>,
+}
+
 /// Decomposed guest plan.
 pub struct PlanParts {
     pub machine: Option<Transaction>,
-    pub transfer: Option<TransferSpec>,
+    pub transfers: Vec<TransferSpec>,
     pub wakeups: Vec<(u64, EngineEntityId, String)>,
 }
 
@@ -734,36 +903,18 @@ impl std::fmt::Display for ConvertError {
             Self::UnknownSymbol(symbol) => write!(f, "unknown content symbol {symbol}"),
             Self::UnknownSchema(symbol) => write!(f, "unknown schema symbol {symbol}"),
             Self::UnknownEntity(entity) => write!(f, "entity {entity:?} does not exist"),
-            Self::TooManyTransfers => write!(f, "at most one transfer per plan"),
+            Self::TooManyTransfers => write!(f, "at most 64 transfers per plan"),
             Self::MissingExpected(pos) => write!(f, "no readable state at {pos:?}"),
             Self::BadField(detail) => write!(f, "bad field: {detail}"),
         }
     }
 }
 
-fn atom_to_value(symbols: &SymbolTable, atom: &Atom) -> Result<ComponentValue, ConvertError> {
-    match atom {
-        Atom::Bool(value) => Ok(ComponentValue::Bool(*value)),
-        Atom::U32(value) => Ok(ComponentValue::U32(*value)),
-        Atom::I64(value) => Ok(ComponentValue::I64(*value)),
-        Atom::Text(text) => Ok(ComponentValue::Text(text.clone())),
-        Atom::Content(symbol) => symbols
-            .key_of(*symbol)
-            .map(ComponentValue::Content)
-            .ok_or(ConvertError::UnknownSymbol(*symbol)),
-        Atom::Entity(entity) => Ok(ComponentValue::Entity(engine_entity(entity))),
-    }
-}
-
-fn flat_to_fields(symbols: &SymbolTable, flat: &[Field]) -> Result<ComponentFields, ConvertError> {
-    let mut fields = ComponentFields::new();
-    for field in flat {
-        let key = ContentKey::parse(&field.key)
-            .map_err(|error| ConvertError::BadField(format!("{}: {error}", field.key)))?;
-        let value = atom_to_value(symbols, &field.value)?;
-        fields.insert(key, value);
-    }
-    Ok(fields)
+fn flat_to_fields(
+    symbols: &SymbolTable,
+    fields: &[Field],
+) -> Result<ComponentFields, ConvertError> {
+    decode_fields(fields, |id| symbols.key_of(id)).map_err(ConvertError::BadField)
 }
 
 fn cell_to_state(
@@ -789,13 +940,18 @@ fn cell_to_state(
 /// Converts a guest plan into single-source parts against the live world.
 ///
 /// Block edits and this package's component edits become one transaction
-/// sourced from `package`; a single transfer is returned separately so the
+/// sourced from `package`; transfers are returned separately so the
 /// caller can obtain an inventory member for the same group. This mirrors the authority
 /// bridge's ownership rules without committing anything.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit host authorization and arbitration context"
+)]
 pub fn convert_plan(
     world: &WorldAuthority,
     symbols: &SymbolTable,
     package: &ContentKey,
+    actor: &ActorContext,
     plan: &Plan,
     stable_task_key: u64,
     id: TransactionId,
@@ -807,12 +963,22 @@ pub fn convert_plan(
         stable_task_key,
         local_sequence: local,
     };
+    if actor.principal() != package {
+        return Err(ConvertError::BadField("module principal mismatch".into()));
+    }
     let mut transaction = Transaction::new(id, package.clone(), ordering);
     let mut has_work = false;
 
     for edit in &plan.edits {
         has_work = true;
         let pos = BlockPos::new(edit.pos.x, edit.pos.y, edit.pos.z);
+        if !actor.permits(&ContentKey::parse("world:permission/edit").expect("static"))
+            || !actor.allows_block(pos, world.store().side())
+        {
+            return Err(ConvertError::BadField(
+                "block edit permission denied".into(),
+            ));
+        }
         let expected = match &edit.expected {
             Some(cell) => cell_to_state(world, symbols, cell)?,
             None => match world.store().query(pos) {
@@ -836,6 +1002,9 @@ pub fn convert_plan(
             None => return Err(ConvertError::UnknownSchema(edit.schema)),
         }
         let entity = engine_entity(&edit.entity);
+        if !actor.allows(NativeTarget::Entity(entity)) {
+            return Err(ConvertError::BadField("component target denied".into()));
+        }
         if world.entities().handle_of(entity).is_none() {
             return Err(ConvertError::UnknownEntity(entity));
         }
@@ -855,17 +1024,78 @@ pub fn convert_plan(
         });
     }
 
-    let transfer = match plan.transfers.as_slice() {
-        [] => None,
-        [only] => Some(TransferSpec {
+    if plan.spawns.len().saturating_add(plan.despawns.len()) > 256 {
+        return Err(ConvertError::BadField(
+            "lifecycle count limit exceeded".into(),
+        ));
+    }
+    if (!plan.spawns.is_empty() && !actor.permits(&spawn_permission()))
+        || (!plan.despawns.is_empty() && !actor.permits(&despawn_permission()))
+    {
+        return Err(ConvertError::BadField("lifecycle permission denied".into()));
+    }
+    for spawn in &plan.spawns {
+        let pos = BlockPos::new(spawn.pos.x, spawn.pos.y, spawn.pos.z);
+        if !actor.allows_block(pos, world.store().side()) {
+            return Err(ConvertError::BadField("spawn scope denied".into()));
+        }
+        let mut components = BTreeMap::new();
+        for component in &spawn.components {
+            let schema = symbols
+                .key_of(component.schema)
+                .ok_or(ConvertError::UnknownSchema(component.schema))?;
+            if world
+                .schemas()
+                .get(&schema)
+                .is_none_or(|s| s.owner_module != *package)
+            {
+                return Err(ConvertError::ForeignSchema(schema));
+            }
+            let fields = flat_to_fields(
+                symbols,
+                component
+                    .fields
+                    .as_deref()
+                    .ok_or_else(|| ConvertError::BadField("missing spawn fields".into()))?,
+            )?;
+            if components.insert(schema, fields).is_some() {
+                return Err(ConvertError::BadField("duplicate spawn component".into()));
+            }
+        }
+        transaction.spawn_entity(
+            Position::new(pos.x as f64, pos.y as f64, pos.z as f64),
+            components,
+        );
+        has_work = true;
+    }
+    for entity in &plan.despawns {
+        let entity = engine_entity(entity);
+        let view = actor.view(world);
+        let (handle, previous) = view
+            .entity(entity)
+            .map_err(|e| ConvertError::BadField(format!("despawn target: {e:?}")))?;
+        transaction.despawn_entity(handle, previous);
+        has_work = true;
+    }
+    for wakeup in &plan.wakeups {
+        if !actor.allows(NativeTarget::Entity(engine_entity(&wakeup.entity))) {
+            return Err(ConvertError::BadField("wakeup target denied".into()));
+        }
+    }
+    if plan.transfers.len() > torse_inventory::MAX_OPERATIONS {
+        return Err(ConvertError::TooManyTransfers);
+    }
+    let transfers = plan
+        .transfers
+        .iter()
+        .map(|only| TransferSpec {
             source: engine_entity(&only.source),
             source_slot: only.source_slot,
             destination: engine_entity(&only.destination),
             destination_slot: only.destination_slot,
             count: only.count,
-        }),
-        _ => return Err(ConvertError::TooManyTransfers),
-    };
+        })
+        .collect();
 
     let wakeups = plan
         .wakeups
@@ -881,7 +1111,7 @@ pub fn convert_plan(
 
     Ok(PlanParts {
         machine: has_work.then_some(transaction),
-        transfer,
+        transfers,
         wakeups,
     })
 }

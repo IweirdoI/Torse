@@ -128,6 +128,8 @@ impl Guest for Component {
             }
 
             Some(Plan {
+                spawns: Vec::new(),
+                despawns: Vec::new(),
                 edits,
                 component_edits: vec![ComponentEdit {
                     entity: EntityId { low: 1, high: 0 },

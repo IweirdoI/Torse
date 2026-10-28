@@ -723,6 +723,14 @@ impl CommitCoordinator {
             edits.extend(member_edits);
             entity_moves.extend(resolved.moves);
             movement_reads.extend(resolved.reads);
+            take_relocations(
+                store,
+                entities,
+                registry,
+                &member.relocations,
+                &mut entity_moves,
+                &mut movement_reads,
+            )?;
             movement_handles.extend(member.movements.iter().map(|request| {
                 (
                     request.handle,
@@ -861,6 +869,14 @@ impl CommitCoordinator {
         .map_err(PrepareError::Rejected)?;
         prepared.entity_moves = resolved.moves;
         prepared.movement_reads = resolved.reads;
+        take_relocations(
+            store,
+            entities,
+            registry,
+            &transaction.relocations,
+            &mut prepared.entity_moves,
+            &mut prepared.movement_reads,
+        )?;
         prepared.movement_handles = transaction
             .movements
             .iter()
@@ -904,7 +920,8 @@ impl CommitCoordinator {
             && transaction.movements.is_empty()
             && transaction.components.is_empty()
             && transaction.spawns.is_empty()
-            && transaction.despawns.is_empty())
+            && transaction.despawns.is_empty()
+            && transaction.relocations.is_empty())
             || has_duplicate_targets(transaction)
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
@@ -1198,6 +1215,7 @@ impl CommitCoordinator {
             || !transaction.components.is_empty()
             || !transaction.spawns.is_empty()
             || !transaction.despawns.is_empty()
+            || !transaction.relocations.is_empty()
         {
             return Err(PrepareError::Rejected(RejectCode::InvalidData));
         }
@@ -1313,6 +1331,28 @@ fn rejected<T>(transaction: TransactionId, code: RejectCode) -> TransactionResul
         transaction,
         outcome: TransactionOutcome::Rejected(code),
     }
+}
+
+fn take_relocations(
+    store: &SectionStore,
+    entities: &EntityStore,
+    registry: &BlockStateRegistry,
+    relocations: &[crate::transaction::Relocation],
+    moves: &mut Vec<torse_world::EntityMove>,
+    reads: &mut Vec<(torse_types::BlockPos, TerrainQuery)>,
+) -> Result<(), PrepareError> {
+    let resolved = crate::relocation::resolve(store, entities, registry, relocations)
+        .map_err(PrepareError::Rejected)?;
+    if resolved
+        .moves
+        .iter()
+        .any(|relocation| moves.iter().any(|movement| movement.id == relocation.id))
+    {
+        return Err(PrepareError::Rejected(RejectCode::Conflict));
+    }
+    moves.extend(resolved.moves);
+    reads.extend(resolved.reads);
+    Ok(())
 }
 
 fn has_duplicate_targets(transaction: &Transaction) -> bool {

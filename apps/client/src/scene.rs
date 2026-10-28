@@ -639,10 +639,33 @@ impl Scene {
     /// directly through the entity store the same way the server bootstrap
     /// installs its fixtures; movement still goes through transactions.
     /// Server projections reject local walking until server movement exists.
-    pub fn spawn_walker(&mut self, at: Position) -> Result<(), String> {
+    pub fn spawn_walker(&mut self, at: Position) -> Result<Position, String> {
         if self.is_network() {
             return Err("network mirrors cannot settle local movement".to_owned());
         }
+        if self.walker.is_some() {
+            return Err("walk mode already has an entity".to_owned());
+        }
+        // Correct a near-floor fly viewpoint without creating a buried body.
+        // Unknown terrain is never searched through or treated as empty.
+        let mut safe = None;
+        for step in 0..=8 {
+            let candidate = at.translated([0.0, f64::from(step) * 0.25, 0.0]);
+            match torse_sim::movement::observe_body(
+                self.authority.store(),
+                self.authority.registry(),
+                candidate,
+                torse_sim::player::WALKER_HALF,
+            ) {
+                Ok(_) => {
+                    safe = Some(candidate);
+                    break;
+                }
+                Err(torse_types::RejectCode::Conflict) => continue,
+                Err(error) => return Err(format!("walk entry rejected: {error:?}")),
+            }
+        }
+        let at = safe.ok_or("walk entry has no clear body position within two blocks")?;
         let growth = self
             .reserve_memory(
                 torse_types::MemoryClass::World,
@@ -661,6 +684,18 @@ impl Scene {
         self.walker = Some(torse_sim::player::WalkerState::new(handle));
         self.reconcile_world_memory(growth)
             .map_err(|error| error.to_string())?;
+        Ok(at)
+    }
+
+    /// Release a camera binding; local walk bodies belong to this mode only.
+    pub fn stop_walker(&mut self) -> Result<(), String> {
+        if let Some(walker) = self.walker.take()
+            && !self.is_network()
+        {
+            self.authority.entities_mut().despawn(walker.handle);
+            self.reconcile_world_memory(None)
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -2296,6 +2331,41 @@ mod tests {
         assert!(final_position.z < 8.0, "moved to {final_position:?}");
         assert!(grounded);
         assert!(final_position.y > 0.0 && final_position.y < 16.0);
+    }
+
+    #[test]
+    fn rejected_and_duplicate_walk_entry_leave_entity_counts_unchanged() {
+        let mut scene = Scene::new(0).unwrap();
+        for position in [
+            Position::new(30.5, 12.0, 8.5),
+            Position::new(8.5, 1.0, 8.5),
+            Position::new(f64::NAN, 12.0, 8.5),
+        ] {
+            assert!(scene.spawn_walker(position).is_err());
+            assert_eq!(scene.authority().entities().len(), 0);
+            assert!(scene.walker.is_none());
+        }
+        scene.spawn_walker(Position::new(8.5, 13.0, 8.5)).unwrap();
+        let handle = scene.walker.unwrap().handle;
+        assert!(scene.spawn_walker(Position::new(8.5, 14.0, 8.5)).is_err());
+        assert_eq!(scene.authority().entities().len(), 1);
+        scene.stop_walker().unwrap();
+        scene.stop_walker().unwrap();
+        assert!(scene.authority().entities().get(handle).is_none());
+        scene.spawn_walker(Position::new(8.5, 13.0, 8.5)).unwrap();
+        assert_ne!(scene.walker.unwrap().handle, handle);
+    }
+
+    #[test]
+    fn leaving_network_walk_only_clears_the_camera_binding() {
+        let mut scene = Scene::from_snapshot(&replica_snapshot()).unwrap();
+        let meta = torse_sim::streaming::page_meta(scene.authority());
+        let before = scene.authority().capture_snapshot(meta).unwrap();
+        scene.view_player(EntityId(9));
+        assert!(scene.walker.is_some());
+        scene.stop_walker().unwrap();
+        assert!(scene.walker.is_none());
+        assert_eq!(scene.authority().capture_snapshot(meta).unwrap(), before);
     }
 
     #[test]

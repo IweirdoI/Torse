@@ -1222,11 +1222,8 @@ impl WindowApp {
 
     /// Switch to walk mode by spawning the player entity under the camera.
     ///
-    /// `Scene::eye` sits 1.4 blocks above the surface cell's top, and the
-    /// walker's centre must stand 0.9 above that top for the collider to
-    /// clear the ground, hence the 0.5 drop. Movement preparation rejects any
-    /// entity that already overlaps terrain, so a low spawn point freezes the
-    /// walker until it is toggled again from higher up.
+    /// Preserve eye height when clear. The scene can raise a near-floor
+    /// candidate within a bounded search before creating any entity.
     fn enter_walk(&mut self, eye: [f32; 3]) {
         if let Some((connection, scene)) = self.net.as_ref().zip(self.scene.as_mut()) {
             if let Some(position) = connection.player_position(scene.authority()) {
@@ -1247,18 +1244,19 @@ impl WindowApp {
         }
         let under = Position::new(
             f64::from(eye[0]),
-            f64::from(eye[1]) - 0.5,
+            f64::from(eye[1]) - WALKER_EYE_OFFSET,
             f64::from(eye[2]),
         );
-        match self.scene.as_mut() {
-            Some(scene) => {
-                if let Err(reason) = scene.spawn_walker(under) {
+        let under = match self.scene.as_mut() {
+            Some(scene) => match scene.spawn_walker(under) {
+                Ok(position) => position,
+                Err(reason) => {
                     self.last_result = reason;
                     return;
                 }
-            }
+            },
             None => return,
-        }
+        };
         self.walk = true;
         self.config.walk = false;
         // Seed the interpolation endpoints with the spawn position so the
@@ -1271,9 +1269,14 @@ impl WindowApp {
         self.reset_presentation_pose(start);
     }
 
-    /// F5 flips between fly and walk; the walker entity stays in the world.
+    /// F5 flips modes; only the server retains a body while flying.
     fn toggle_walk(&mut self) {
         if self.walk {
+            if let Some(scene) = self.scene.as_mut()
+                && let Err(error) = scene.stop_walker()
+            {
+                self.last_result = error;
+            }
             self.walk = false;
             if let Some(eye) = self.camera.as_ref().map(|camera| camera.eye) {
                 self.reset_presentation_pose(eye);
@@ -1648,7 +1651,7 @@ impl ApplicationHandler for WindowApp {
                         KeyCode::Digit1 => self.material = 0,
                         KeyCode::Digit2 => self.material = 1,
                         KeyCode::Digit3 => self.material = 2,
-                        KeyCode::F5 => self.toggle_walk(),
+                        KeyCode::F5 if !event.repeat => self.toggle_walk(),
                         _ => {}
                     }
                 }
@@ -2261,6 +2264,45 @@ mod tests {
             assert_eq!(app.present_next, eye);
             assert_eq!(app.presentation_alpha(), 0.0);
         }
+    }
+
+    #[test]
+    fn local_mode_changes_release_bodies_and_keep_clear_viewpoints_stable() {
+        let mut app = app();
+        let mut scene = Scene::new(0).unwrap();
+        scene.enable_lighting().unwrap();
+        app.scene = Some(scene);
+        for _ in 0..12 {
+            let eye = [8.5, 66.7, 8.5];
+            app.reset_presentation_pose(eye);
+            app.toggle_walk();
+            assert!(app.walk);
+            assert_eq!(app.scene.as_ref().unwrap().authority().entities().len(), 1);
+            assert_eq!(app.present_next, eye);
+            app.pump_logic(0.05, MoveInput::default()).unwrap();
+            assert!(app.scene.as_ref().unwrap().walker_position().unwrap().y < 66.0);
+            app.toggle_walk();
+            assert!(!app.walk);
+            let scene = app.scene.as_ref().unwrap();
+            assert_eq!(scene.authority().entities().len(), 0);
+            assert!(scene.walker_position().is_none());
+            assert!(scene.entity_geometry().0.is_empty());
+        }
+        app.reset_presentation_pose([8.5, 14.7, 8.5]);
+        app.toggle_walk();
+        app.toggle_walk();
+        // The abandoned body must no longer veto placement at its old cell.
+        app.scene
+            .as_mut()
+            .unwrap()
+            .apply_edit(true, &key("base:stone"), BlockPos::new(8, 14, 8), 0)
+            .unwrap();
+        app.toggle_walk();
+        assert!(app.walk);
+        assert!(
+            app.present_next[1] > 15.5,
+            "near-floor entry raises the body clear"
+        );
     }
 
     #[test]

@@ -265,7 +265,19 @@ impl View<'_> {
                 1 => (0, 2),
                 _ => (0, 1),
             };
-            let (dx, dy, dz) = face.offset();
+            // Sample just outside the actual face plane. An inset slab face
+            // opens into air in its own cell, not into the opaque cell below
+            // or above it. Keep the offset local to avoid large-coordinate
+            // rounding when locating the sample cell.
+            let bounds = block.bounds.unwrap_or(RenderBox::FULL_CUBE);
+            let plane = if normal[axis] < 0.0 {
+                bounds.min[axis]
+            } else {
+                bounds.max[axis]
+            };
+            let mut offset = [0; 3];
+            offset[axis] = (f64::from(plane) + f64::from(normal[axis]) * 1e-4).floor() as i64;
+            let [dx, dy, dz] = offset;
             let Ok(outside) = pos.checked_add(dx, dy, dz) else {
                 continue;
             };
@@ -658,5 +670,47 @@ mod tests {
         let top =
             block(&scene, wall).face_shades.unwrap()[torse_render::Face::PosY.index() as usize];
         assert!(top.iter().all(|v| *v == 255));
+    }
+
+    #[test]
+    fn inset_slab_faces_sample_the_air_gap_in_their_own_cell() {
+        for (half, face, neighbor_y) in [
+            (0, torse_render::Face::PosY, 9),
+            (1, torse_render::Face::NegY, 7),
+        ] {
+            let mut scene = scene();
+            let stone = scene
+                .authority
+                .registry()
+                .default_state(&key("base:stone"))
+                .unwrap();
+            let slab = scene
+                .authority
+                .registry()
+                .state_of(&key("base:glass_slab"), &[half])
+                .unwrap();
+            // Cover both sides of the section boundary with the same case.
+            for x in [15, 16] {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, 8, 8), slab)
+                    .unwrap();
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, neighbor_y, 8), stone)
+                    .unwrap();
+            }
+            scene.enable_lighting().unwrap();
+            resolve(&mut scene);
+            for x in [15, 16] {
+                let shades = block(&scene, BlockPos::new(x, 8, 8)).face_shades.unwrap();
+                assert!(
+                    shades[face.index() as usize].iter().all(|v| *v > 80),
+                    "half={half}: {shades:?}"
+                );
+            }
+        }
     }
 }

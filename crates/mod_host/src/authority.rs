@@ -112,6 +112,7 @@ pub struct AuthorityHost {
     symbols: BTreeMap<String, u32>,
     symbol_keys: Vec<String>,
     packages: BTreeMap<ContentKey, PackageGrant>,
+    active_package: Option<ContentKey>,
     // Wakeup entries remember the package that scheduled them so dispatch
     // returns to the right instance.
     wakeups: Vec<(u64, EntityId, String, ContentKey)>,
@@ -158,6 +159,7 @@ impl AuthorityHost {
             symbols,
             symbol_keys,
             packages: BTreeMap::new(),
+            active_package: None,
             wakeups: Vec::new(),
             meters: Meters::default(),
             read_positions: BTreeSet::new(),
@@ -215,6 +217,35 @@ impl AuthorityHost {
         self.budget.reset();
     }
 
+    /// Select a registered identity before initialization or dispatch. Only the
+    /// trusted runtime can select it; it is absent from the guest interface.
+    pub(crate) fn bind_package(&mut self, package: &ContentKey) -> Result<(), String> {
+        self.active_package = None;
+        if !self.packages.contains_key(package) {
+            return Err(format!("no grant for package {package}"));
+        }
+        self.active_package = Some(package.clone());
+        Ok(())
+    }
+
+    fn active_grant(&self) -> Option<&PackageGrant> {
+        self.packages.get(self.active_package.as_ref()?)
+    }
+
+    fn allows_entity(&self, entity: EntityId) -> bool {
+        self.active_grant()
+            .is_some_and(|grant| grant.actor.allows(ActionTarget::Entity(entity)))
+    }
+
+    fn allows_component(&self, entity: EntityId, schema: &ContentKey) -> bool {
+        self.active_grant().is_some_and(|grant| {
+            grant.actor.allows(ActionTarget::Entity(entity))
+                && (grant.owned_schemas.contains(schema)
+                    || (*schema == torse_inventory::schema()
+                        && grant.actor.permits(&key("inventory:permission/read"))))
+        })
+    }
+
     pub(crate) fn configure_budget(&mut self, budget: CallBudget) {
         self.budget = HostBudget::new(budget);
         self.guest_limits = GuestLimits::new(budget);
@@ -242,7 +273,13 @@ impl AuthorityHost {
         package: &ContentKey,
     ) -> Option<Invocation> {
         // Reserve owned state before cloning it into the boundary value.
+        if self.active_package.as_ref() != Some(package) {
+            return None;
+        }
         if let Event::Wakeup(target) = event {
+            if !self.allows_entity(target.entity.to_entity_id()) {
+                return None;
+            }
             self.budget.output(target.key.len() as u64).ok()?;
             if let Some(handle) = self
                 .authority
@@ -307,6 +344,10 @@ impl AuthorityHost {
         package: &ContentKey,
     ) -> Option<ObjectRef> {
         let entity = wit_entity.to_entity_id();
+        let grant = self.packages.get(package)?;
+        if !grant.actor.allows(ActionTarget::Entity(entity)) {
+            return None;
+        }
         let handle = self.authority.entities().handle_of(entity)?;
         let stored = self.authority.entities().get(handle)?;
         let position = stored.position;
@@ -315,11 +356,16 @@ impl AuthorityHost {
             y: position.y.floor() as i64,
             z: position.z.floor() as i64,
         };
-        let block = match self
-            .authority
-            .store()
-            .query(BlockPos::new(pos.x, pos.y, pos.z))
+        let block_pos = BlockPos::new(pos.x, pos.y, pos.z);
+        let terrain = if grant
+            .actor
+            .allows_block(block_pos, self.authority.store().side())
         {
+            self.authority.store().query(block_pos)
+        } else {
+            TerrainQuery::NotLoaded
+        };
+        let block = match terrain {
             TerrainQuery::Ready(state) => self
                 .authority
                 .registry()
@@ -717,8 +763,16 @@ impl torse::behavior::query::Host for AuthorityHost {
             for z in region.min.z..region.max.z {
                 for x in region.min.x..region.max.x {
                     let pos = BlockPos::new(x, y, z);
-                    self.read_positions.insert(pos);
-                    let cell = match self.authority.store().query(pos) {
+                    let allowed = self.active_grant().is_some_and(|grant| {
+                        grant.actor.allows_block(pos, self.authority.store().side())
+                    });
+                    let terrain = if allowed {
+                        self.read_positions.insert(pos);
+                        self.authority.store().query(pos)
+                    } else {
+                        TerrainQuery::NotLoaded
+                    };
+                    let cell = match terrain {
                         TerrainQuery::Ready(BlockStateId::EMPTY) => Cell::Empty,
                         TerrainQuery::Ready(state) => {
                             let definition = self
@@ -783,6 +837,9 @@ impl torse::behavior::query::Host for AuthorityHost {
             .work(self.authority.entities().allocated_slots() as u64)
             .map_err(|_| QueryError::BudgetExceeded)?;
         for (_, entity) in self.authority.entities().iter() {
+            if !self.allows_entity(entity.id) {
+                continue;
+            }
             let position = entity.position;
             let x = position.x.floor() as i64;
             let y = position.y.floor() as i64;
@@ -833,11 +890,15 @@ impl torse::behavior::query::Host for AuthorityHost {
                 .ok_or(QueryError::InvalidCursor)?; // unknown symbol
             let entity = target.entity.to_entity_id();
             let fields = self
-                .authority
-                .entities()
-                .handle_of(entity)
-                .and_then(|handle| self.authority.entities().get(handle))
-                .and_then(|entity| entity.components.component(&schema));
+                .allows_component(entity, &schema)
+                .then(|| {
+                    self.authority
+                        .entities()
+                        .handle_of(entity)
+                        .and_then(|handle| self.authority.entities().get(handle))
+                        .and_then(|entity| entity.components.component(&schema))
+                })
+                .flatten();
             if let Some(fields) = fields {
                 self.budget
                     .work(fields.len() as u64)
@@ -862,6 +923,13 @@ impl torse::behavior::query::Host for AuthorityHost {
         self.budget.enter(16 + port.len() as u64).ok()?;
         self.budget.work(torse_inventory::MAX_SLOTS as u64).ok()?;
         let entity = entity.to_entity_id();
+        if !self.allows_entity(entity)
+            || !self
+                .active_grant()
+                .is_some_and(|grant| grant.actor.permits(&key("inventory:permission/read")))
+        {
+            return None;
+        }
         let fields = self
             .authority
             .entities()
@@ -916,7 +984,10 @@ impl torse::behavior::schedule::Host for AuthorityHost {
             return Vec::new();
         }
         let mut slots = Vec::new();
-        for (tick, entity, key, _) in &self.wakeups {
+        for (tick, entity, key, package) in &self.wakeups {
+            if self.active_package.as_ref() != Some(package) || !self.allows_entity(*entity) {
+                continue;
+            }
             if key_prefix
                 .as_ref()
                 .is_some_and(|prefix| !key.starts_with(prefix))
@@ -953,9 +1024,10 @@ impl ModInstance {
         package: ContentKey,
         engine: &Engine,
         component: Component,
-        host: AuthorityHost,
+        mut host: AuthorityHost,
         budget: CallBudget,
     ) -> Result<Self, String> {
+        host.bind_package(&package)?;
         let (bindings, store) = Self::build(engine, &component, host, budget)?;
         Ok(Self {
             package,
@@ -993,7 +1065,8 @@ impl ModInstance {
     /// guest state restarts from the last committed components.
     pub fn rebuild(&mut self) -> Result<(), String> {
         let old = self.store.take().expect("store present while rebuilding");
-        let host = old.into_data();
+        let mut host = old.into_data();
+        host.bind_package(&self.package)?;
         let (bindings, store) = Self::build(&self.engine, &self.component, host, self.budget)?;
         self.bindings = bindings;
         self.store = Some(store);
@@ -1034,6 +1107,7 @@ impl ModInstance {
                 .set_fuel(fuel)
                 .map_err(|error| format!("fuel reset failed: {error}"))?;
             store.data_mut().begin_invocation();
+            store.data_mut().bind_package(&package)?;
         }
         let Some(invocation) = self.host_mut().prepare_invocation(tick, &event, &package) else {
             self.host_mut().on_failure(tick, &event, &package);
@@ -1279,14 +1353,16 @@ mod budget_tests {
     use torse::behavior::query::Host;
 
     fn host() -> AuthorityHost {
-        machine_scenario(&ScenarioConfig {
+        let mut host = machine_scenario(&ScenarioConfig {
             package: "machine:module",
             schema: "machine:schema/state",
             stock_input: true,
             granted_permissions: &["inventory:permission/transfer", "inventory:permission/read"],
         })
         .unwrap()
-        .host
+        .host;
+        host.bind_package(&key("machine:module")).unwrap();
+        host
     }
 
     fn region(min: [i64; 3], max: [i64; 3]) -> Bbox {
@@ -1302,6 +1378,126 @@ mod budget_tests {
                 z: max[2],
             },
         }
+    }
+
+    #[test]
+    fn imports_filter_targets_schemas_and_package_wakeups() {
+        use torse::behavior::schedule::Host as _;
+
+        let mut host = host();
+        let all = || region([i64::MIN; 3], [i64::MAX; 3]);
+        let machine = host.authority.entities().iter().next().unwrap().1.id;
+        let schema = host.symbol_of(&key("machine:schema/state")).unwrap();
+        let inventory = host.symbol_of(&torse_inventory::schema()).unwrap();
+        let input = host.authority.entities().iter().nth(1).unwrap().1.id;
+        let stranger = host
+            .authority_mut()
+            .entities_mut()
+            .spawn(Position::new(2.0, 2.0, 2.0))
+            .unwrap();
+        let stranger = host.authority.entities().get(stranger).unwrap().id;
+        let package = key("machine:module");
+        let other = key("other:module");
+        host.seed_wakeup(1, machine, "own", package.clone());
+        host.seed_wakeup(2, machine, "foreign", other.clone());
+        host.seed_wakeup(3, stranger, "denied", package.clone());
+        let page = host.query_entities(all(), None, 16).unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert!(!page.items.iter().any(|e| e.id.to_entity_id() == stranger));
+        let first = host.query_entities(all(), None, 2).unwrap();
+        let last = host.query_entities(all(), first.next, 2).unwrap();
+        assert_eq!(last.items.len(), 1);
+        assert!(last.next.is_none());
+        let target = |entity, schema| ComponentTarget {
+            entity: WitEntityId::from_entity_id(entity),
+            schema,
+        };
+        assert!(
+            host.read_components(vec![target(machine, schema)]).unwrap()[0]
+                .fields
+                .is_some()
+        );
+        assert!(
+            host.read_components(vec![target(input, inventory)])
+                .unwrap()[0]
+                .fields
+                .is_some()
+        );
+        assert!(
+            host.probe_item_port(WitEntityId::from_entity_id(input), "main".into())
+                .is_some()
+        );
+        assert_eq!(host.pending_wakeups(None).len(), 1);
+        assert_eq!(host.pending_wakeups(None)[0].key, "own");
+        assert!(matches!(
+            host.query_blocks(region([0; 3], [1; 3])).unwrap()[0].cell,
+            Cell::NotLoaded
+        ));
+        assert!(host.read_positions.is_empty());
+
+        host.register_package(
+            other.clone(),
+            ActorContext::new(other.clone())
+                .target(ActionTarget::Entity(machine))
+                .target(ActionTarget::Entity(input)),
+            Vec::new(),
+        );
+        host.bind_package(&other).unwrap();
+        host.begin_invocation();
+        assert!(
+            host.read_components(vec![target(machine, schema), target(input, inventory)])
+                .unwrap()
+                .iter()
+                .all(|s| s.fields.is_none())
+        );
+        assert!(
+            host.probe_item_port(WitEntityId::from_entity_id(input), "main".into())
+                .is_none()
+        );
+        assert_eq!(host.pending_wakeups(None)[0].key, "foreign");
+        assert!(
+            host.build_object_ref(&WitEntityId::from_entity_id(stranger), &other)
+                .is_none()
+        );
+        let denied = Event::Wakeup(WakeupTarget {
+            entity: WitEntityId::from_entity_id(stranger),
+            key: "denied".into(),
+        });
+        assert!(host.prepare_invocation(0, &denied, &other).is_none());
+
+        assert!(host.bind_package(&key("unknown:module")).is_err());
+        host.begin_invocation();
+        assert!(
+            host.query_entities(all(), None, 16)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(host.pending_wakeups(None).is_empty());
+        assert!(
+            host.read_components(vec![target(machine, schema)]).unwrap()[0]
+                .fields
+                .is_none()
+        );
+
+        // A later trusted binding may grant terrain without granting entities.
+        host.register_package(
+            other.clone(),
+            ActorContext::new(other.clone()).section(SectionPos::ZERO),
+            Vec::new(),
+        );
+        host.bind_package(&other).unwrap();
+        assert!(matches!(
+            host.query_blocks(region([0; 3], [1; 3])).unwrap()[0].cell,
+            Cell::Empty
+        ));
+        assert_eq!(host.read_positions.len(), 1);
+        assert!(
+            host.query_entities(all(), None, 16)
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     #[test]

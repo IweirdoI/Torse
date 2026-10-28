@@ -18,6 +18,16 @@ games/base/assets/cook.toml分配稳定图片GUID，并列出源路径和语言�
 
 PNG字节保留在外部。图片行包含GUID、源文件SHA-256、内容键别名和相对PNG路径。替换PNG保留GUID，但改变呈现兼容身份。表中不包含解码像素、网格或视觉模型几何；加载器仍需资源目录和PNG文件。当前客户端继续嵌入源文件，默认改读运行时表属于后续接入。
 
+无窗口示例宿主已接入运行时表：
+
+```sh
+cargo run -p torse-tools --locked -- run-cooked .work/base.tcook games/base/assets
+```
+
+入口通过CookedResources读取状态、材质及语言行，仅打开清单中的PNG，不再读取作者TOML或语言文件。宿主将状态与覆盖材质逐行核对原生注册表，并检查完整编译器摘要。输出包含驻留和峰值计账；释放后remaining_bytes必须为0。可用`--memory-mib N`设置共享预算，默认32MiB。
+
+通用加载器接受有界图片读取回调，先核对源SHA-256和尺寸，再解码为RGBA并装入AssetCatalog。资源及临时编解码分属共享MemoryPool的Resource和Codec类别。初次加载任意图片失败时，整个未发布对象连同收费一起释放；重装失败保留既有资源。具体句柄与依赖约定见[资源说明](../assets/README.md)。
+
 状态行只是遮挡、碰撞和材质投影，不能完整替代CompiledContent或BlockStateRegistry。动作定义、发光等信息仍在编译器与注册表中。完整的编译器权威和呈现摘要分别进入对应的运行时表摘要，相关行为变化仍会影响兼容身份。
 
 ## 格式版本2

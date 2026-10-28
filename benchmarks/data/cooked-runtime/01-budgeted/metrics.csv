@@ -1,0 +1,3 @@
+scenario,cooked_bytes,states,materials,images,locales,source_reads,rgba_bytes,resident_bytes,peak_bytes,remaining_bytes,result
+default_32_mib,2387,8,3,4,2,4,14592,33125,16809319,0,accepted
+low_1_mib,2387,,,,,,,,,,codec_reservation_denied

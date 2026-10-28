@@ -96,16 +96,27 @@ fn build(source: &Path) -> Result<Vec<u8>, String> {
         });
     }
     // Use the same base-domain registrations as the client's fixture scene.
-    let mut pack = torse_content::m0_fixture_pack();
-    torse_sim::block_actions::register_content(&mut pack);
-    torse_inventory::register_content(&mut pack);
-    let content =
-        torse_content::compile(pack).map_err(|errors| format!("content failed: {errors:?}"))?;
+    let content = base_content()?;
     let tables = cook(&content, &images, &locales).map_err(|error| error.to_string())?;
     write_cooked(&tables).map_err(|error| error.to_string())
 }
 
 fn read_source(root: &Path, relative: &str) -> Result<Vec<u8>, String> {
+    read_source_limit(root, relative, SOURCE_LIMIT)
+}
+
+pub(crate) fn base_content() -> Result<torse_content::CompiledContent, String> {
+    let mut pack = torse_content::m0_fixture_pack();
+    torse_sim::block_actions::register_content(&mut pack);
+    torse_inventory::register_content(&mut pack);
+    torse_content::compile(pack).map_err(|errors| format!("content failed: {errors:?}"))
+}
+
+pub(crate) fn read_source_limit(
+    root: &Path,
+    relative: &str,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
     if relative.is_empty()
         || relative.contains(['\\', ':'])
         || relative
@@ -124,10 +135,10 @@ fn read_source(root: &Path, relative: &str) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     fs::File::open(path)
         .map_err(|error| error.to_string())?
-        .take(SOURCE_LIMIT + 1)
+        .take(limit.checked_add(1).ok_or("source limit overflow")?)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > SOURCE_LIMIT {
+    if bytes.len() as u64 > limit {
         return Err("author file exceeds its byte limit".into());
     }
     Ok(bytes)

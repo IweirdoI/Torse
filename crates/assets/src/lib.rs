@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod cooked;
 pub mod texture;
 
 pub use catalog::{AssetAlias, AssetCatalog, AssetError, AssetGuid, AssetHandle};

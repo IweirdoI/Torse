@@ -12,6 +12,7 @@ use torse_modules::resolve_modules;
 use torse_types::Digest;
 
 mod commit_scenario;
+mod cooked_runtime;
 mod cooked_tables;
 mod exchange_scenario;
 mod movement_scenario;
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
     match command.as_str() {
         "content-fixture" => content_fixture(),
         "cook-base" => cooked_tables::command(std::env::args().skip(2)),
+        "run-cooked" => cooked_runtime::command(std::env::args().skip(2)),
         "m1-scenario" => m1_scenario(),
         "commit-scenario" => commit_scenario(),
         "tick-scenario" => tick_scenario(),
@@ -37,7 +39,7 @@ fn main() -> ExitCode {
         "gpu-probe" => gpu_probe(),
         "help" | "--help" | "-h" => {
             println!(
-                "usage: torse-tools <content-fixture|cook-base|m1-scenario|commit-scenario|tick-scenario|\
+                "usage: torse-tools <content-fixture|cook-base|run-cooked|m1-scenario|commit-scenario|tick-scenario|\
                  exchange-scenario|recovery-scenario|movement-scenario|persistence-scenario|\
                  ecs-probe|wasm-probe|gpu-probe>\n\
                  experimental probes require their matching cargo feature"

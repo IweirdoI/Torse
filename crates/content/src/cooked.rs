@@ -10,8 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest as ShaDigest, Sha256};
-use torse_assets::{AssetAlias, AssetGuid};
-use torse_types::{ContentKey, Digest};
+use torse_types::{AssetGuid, ContentKey, Digest, valid_asset_path};
 
 use crate::compiler::{CompiledContent, MAX_FINITE_STATES};
 use crate::descriptor::{AlphaMode, BoxBounds, Face, Shape, StateProfile};
@@ -346,7 +345,7 @@ fn check_digests(tables: &CookedTables) -> Result<(), CookError> {
     Ok(())
 }
 
-fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<(), CookError> {
+fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<usize, CookError> {
     let invalid = |message: &str| CookError::Invalid(message.into());
     if tables.states.len() > usize::from(u16::MAX) || tables.materials.len() > usize::from(u16::MAX)
     {
@@ -465,7 +464,9 @@ fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<(), Cook
         if !keys.insert(&image.key) || !paths.insert(&image.path) {
             return Err(CookError::DuplicateImage);
         }
-        AssetAlias::path(&image.path).map_err(|error| invalid(&error.to_string()))?;
+        if !valid_asset_path(&image.path) {
+            return Err(invalid("invalid image path alias"));
+        }
         if !image.path.ends_with(".png") {
             return Err(invalid("only PNG image identities are supported"));
         }
@@ -514,7 +515,17 @@ fn validate_tables(tables: &CookedTables, limits: CookLimits) -> Result<(), Cook
     if encoded > limits.max_file_bytes {
         return Err(CookError::Limit);
     }
-    Ok(())
+    Ok(budget.owned)
+}
+
+impl CookedTables {
+    /// Conservative retained table storage, using the reader's own accounting.
+    /// This validates canonical rows and checks their digests before reporting.
+    pub fn accounted_bytes(&self) -> Result<usize, CookError> {
+        let bytes = validate_tables(self, CookLimits::default())?;
+        check_digests(self)?;
+        Ok(bytes)
+    }
 }
 
 fn check_string(

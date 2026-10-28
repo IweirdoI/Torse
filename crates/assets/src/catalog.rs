@@ -14,13 +14,7 @@ use torse_types::{
     MemoryLedger, MemoryPool, MemoryResident,
 };
 
-/// Assigned 128-bit asset identity.
-///
-/// This is not a [`ContentKey`] and not an entity id. Callers choose the
-/// value. It is not derived from the file bytes, so a later cook step can
-/// keep the same guid when the source image changes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct AssetGuid(pub u128);
+pub use torse_types::AssetGuid;
 
 /// Handle for one resident CPU copy.
 ///
@@ -66,25 +60,11 @@ impl AssetAlias {
     /// Empty paths, absolute paths, backslashes, and `..` segments are
     /// rejected so an alias cannot name a location outside the pack.
     pub fn path(value: &str) -> Result<Self, AssetError> {
-        if value.is_empty()
-            || value.len() > 128
-            || value.starts_with('/')
-            || value.ends_with('/')
-            || value.contains('\\')
-            || value.contains("//")
-            || value
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
-            || !value.bytes().all(is_path_byte)
-        {
+        if !torse_types::valid_asset_path(value) {
             return Err(AssetError::BadPath);
         }
         Ok(Self::Path(value.to_owned()))
     }
-}
-
-fn is_path_byte(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.' | b'/')
 }
 
 /// Why a load or unload did not change the catalog.

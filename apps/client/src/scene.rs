@@ -526,14 +526,10 @@ impl Scene {
                 if state.is_empty() {
                     return Some(None);
                 }
-                let Some(definition) = self.authority.registry().definition(state) else {
-                    return Some(None);
-                };
                 Some(
-                    definition
-                        .selection_profile
-                        .shape
-                        .as_ref()
+                    self.authority
+                        .registry()
+                        .selection_shape_ref(state)
                         .and_then(shape_box),
                 )
             }
@@ -616,23 +612,23 @@ impl Scene {
         )
     }
 
-    /// Whether placing an identical block into `pos` completes its contents.
-    ///
-    /// A lower slab with a completion target fills its empty upper half; the
-    /// action service makes the final call, this only steers the aim.
-    pub fn completes_at(&self, pos: BlockPos) -> bool {
-        match self.authority.store().query(pos) {
-            TerrainQuery::Ready(state) => {
-                self.authority
-                    .registry()
-                    .definition(state)
-                    .is_some_and(|definition| {
-                        definition.render_profile.shape == Shape::LowerSlab
-                            && definition.interaction_profile.completes_to.is_some()
-                    })
-            }
-            TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds => false,
-        }
+    /// Resolve the same content-driven placement for local and network edits.
+    pub fn placement_at(
+        &self,
+        hit: &PickHit,
+        held: &ContentKey,
+    ) -> Option<block_actions::placement::PlacementIntent> {
+        let current = self.authority.store().query(hit.block).ready()?;
+        block_actions::placement::resolve(
+            self.authority.registry(),
+            held,
+            current,
+            block_actions::placement::PlacementHit {
+                block: hit.block,
+                face: hit.face,
+                local_height: hit.entry[1] - hit.block.y as f32,
+            },
+        )
     }
 
     /// Spawn the walk-mode player entity at a world position.
@@ -1826,14 +1822,12 @@ mod tests {
         scene
             .apply_edit(true, &slab, target, 0)
             .expect("first slab");
-        assert!(scene.completes_at(target));
 
         // Placing the same slab into the occupied cell merges the pair into
         // one full glass block, exactly what the top-face aim sends.
         scene
             .apply_edit(true, &slab, target, 0)
             .expect("second slab merges");
-        assert!(!scene.completes_at(target));
         let state = scene
             .authority()
             .store()

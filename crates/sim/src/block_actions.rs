@@ -1,5 +1,7 @@
 //! Optional native place/break actions, shared by every input adapter.
 
+pub mod placement;
+
 use torse_actions::{
     ActionDescriptor, ActionKind, ActionPhase, CommandBinding, HandlerBinding, PermissionRule,
 };

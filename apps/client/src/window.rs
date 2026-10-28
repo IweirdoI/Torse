@@ -463,10 +463,14 @@ impl WindowApp {
             };
             scene.pick(camera.eye, camera.forward(), PICK_RANGE)
         };
-        let mut intent = self
-            .input
-            .take_click()
-            .and_then(|button| action_for(&aim, button));
+        let mut intent = self.input.take_click().and_then(|button| {
+            action_for(
+                self.scene.as_ref(),
+                &aim,
+                button,
+                &self.materials[self.material],
+            )
+        });
         // The walk demo is about walking; firing place or break at the aim
         // while walking would block the walker's own path.
         let network = self.scene.as_ref().is_some_and(Scene::is_network);
@@ -509,9 +513,13 @@ impl WindowApp {
                 };
                 scene.pick(camera.eye, camera.forward(), PICK_RANGE)
             };
-            if let Some((place, target)) = action_for(&aim, MouseButton::Left) {
+            if let Some((place, target, half)) = action_for(
+                self.scene.as_ref(),
+                &aim,
+                MouseButton::Left,
+                &self.materials[self.material],
+            ) {
                 let material = &self.materials[self.material];
-                let half = place_half(&aim);
                 let call = crate::net::edit_call(place, material, target, half);
                 if let Some(Ok(seq)) = self.net.as_mut().map(|net| net.request(call)) {
                     self.requests_sent += 1;
@@ -531,24 +539,20 @@ impl WindowApp {
             } else {
                 MouseButton::Right
             };
-            intent = action_for(&aim, button);
+            intent = action_for(
+                self.scene.as_ref(),
+                &aim,
+                button,
+                &self.materials[self.material],
+            );
             self.autoplay_break = !self.autoplay_break;
         }
-        // Aiming at the exposed top of a half block places into the same
-        // cell, where the action service merges the two halves into one
-        // full block.
-        if let Some((true, target)) = intent.as_mut()
-            && let Some(merged) = merged_target(self.scene.as_ref(), &aim)
-        {
-            *target = merged;
-        }
-        if let Some((place, target)) = intent {
+        if let Some((place, target, half)) = intent {
             if self.scene.as_ref().is_some_and(Scene::is_network) {
                 // Edits go to the server, not the local mirror. The guest
                 // session has no edit grants, so the admission reply carries
                 // the rejection; the mirror never forks.
                 let material = &self.materials[self.material];
-                let half = place_half(&aim);
                 let call = crate::net::edit_call(place, material, target, half);
                 match self.net.as_mut().map(|net| net.request(call)) {
                     Some(Ok(seq)) => self.last_result = format!("seq {} sent", seq.0),
@@ -557,7 +561,6 @@ impl WindowApp {
                 }
             } else {
                 let material = &self.materials[self.material];
-                let half = place_half(&aim);
                 let result = match self.scene.as_mut() {
                     Some(scene) => scene.apply_edit(place, material, target, half),
                     None => return,
@@ -1764,62 +1767,24 @@ const fn demo_scope() -> [SectionPos; 2] {
     [SectionPos::new(0, 0, 0), SectionPos::new(1, 0, 0)]
 }
 
-/// Translate one aim and mouse button into a place or break intent.
-///
-/// Left breaks the hit cell; right places the selected material against the
-/// entered face. A hit inside a solid cell carries no face, so placement is
-/// dropped rather than guessed.
-/// The half a placement produces, decided by the aimed face: a click on a
-/// ceiling underside places the upper half, a click on a floor top the lower
-/// half, and a side click follows the aim point's height within the targeted
-/// cell.
-fn place_half(aim: &PickOutcome) -> u32 {
-    let PickOutcome::Hit(hit) = aim else {
-        return 0;
-    };
-    match hit.face {
-        [0, -1, 0] => 1,
-        [0, 1, 0] => 0,
-        _ => {
-            let fraction = hit.entry[1] - hit.block.y as f32;
-            u32::from(fraction > 0.5)
-        }
-    }
-}
-
-fn action_for(outcome: &PickOutcome, button: MouseButton) -> Option<(bool, BlockPos)> {
+/// Translate one hit into the same intent for local and network actions.
+fn action_for(
+    scene: Option<&Scene>,
+    outcome: &PickOutcome,
+    button: MouseButton,
+    material: &ContentKey,
+) -> Option<(bool, BlockPos, u32)> {
     let PickOutcome::Hit(hit) = outcome else {
         return None;
     };
     match button {
-        MouseButton::Left => Some((false, hit.block)),
+        MouseButton::Left => Some((false, hit.block, 0)),
         MouseButton::Right => {
-            let (face_x, face_y, face_z) = (hit.face[0], hit.face[1], hit.face[2]);
-            if (face_x, face_y, face_z) == (0, 0, 0) {
-                return None;
-            }
-            Some((
-                true,
-                BlockPos::new(
-                    hit.block.x + i64::from(face_x),
-                    hit.block.y + i64::from(face_y),
-                    hit.block.z + i64::from(face_z),
-                ),
-            ))
+            let placement = scene?.placement_at(hit, material)?;
+            Some((true, placement.target, placement.half))
         }
         _ => None,
     }
-}
-
-/// Placement aimed at the exposed top of a completable half block targets
-/// the same cell instead of the cell above; the action service decides
-/// whether the pair merges into one full block.
-fn merged_target(scene: Option<&Scene>, outcome: &PickOutcome) -> Option<BlockPos> {
-    let PickOutcome::Hit(hit) = outcome else {
-        return None;
-    };
-    (hit.face == [0, 1, 0] && scene.is_some_and(|scene| scene.completes_at(hit.block)))
-        .then_some(hit.block)
 }
 
 fn create_depth(device: &Device, width: u32, height: u32) -> Texture {
@@ -1937,6 +1902,127 @@ pub fn run_window(config: WindowConfig) -> Result<WindowSummary, String> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn key(text: &str) -> ContentKey {
+        ContentKey::parse(text).unwrap()
+    }
+
+    #[test]
+    fn slab_clicks_resolve_and_commit_the_same_local_and_network_arguments() {
+        let slab = key("base:glass_slab");
+        let pos = BlockPos::new(8, 14, 8);
+        for (state_half, origin, direction, held, target, half) in [
+            (0, [8.5, 15.9, 8.5], [0.0, -1.0, 0.0], &slab, pos, 1),
+            (1, [8.5, 13.8, 8.5], [0.0, 1.0, 0.0], &slab, pos, 0),
+            (
+                0,
+                [8.5, 13.8, 8.5],
+                [0.0, 1.0, 0.0],
+                &slab,
+                BlockPos::new(8, 13, 8),
+                1,
+            ),
+            (
+                1,
+                [8.5, 15.9, 8.5],
+                [0.0, -1.0, 0.0],
+                &slab,
+                BlockPos::new(8, 15, 8),
+                0,
+            ),
+            (
+                0,
+                [6.5, 14.25, 8.5],
+                [1.0, 0.0, 0.0],
+                &slab,
+                BlockPos::new(7, 14, 8),
+                0,
+            ),
+            (
+                1,
+                [6.5, 14.75, 8.5],
+                [1.0, 0.0, 0.0],
+                &slab,
+                BlockPos::new(7, 14, 8),
+                1,
+            ),
+            (
+                0,
+                [8.5, 15.9, 8.5],
+                [0.0, -1.0, 0.0],
+                &key("base:stone"),
+                BlockPos::new(8, 15, 8),
+                0,
+            ),
+            (
+                1,
+                [8.5, 13.8, 8.5],
+                [0.0, 1.0, 0.0],
+                &key("base:stone"),
+                BlockPos::new(8, 13, 8),
+                1,
+            ),
+        ] {
+            let mut scene = Scene::new(0).unwrap();
+            scene.apply_edit(true, &slab, pos, state_half).unwrap();
+            let aim = scene.pick(origin, direction, PICK_RANGE);
+            let PickOutcome::Hit(hit) = aim else {
+                panic!(
+                    "slab not hit: half={state_half}, origin={origin:?}, direction={direction:?}, outcome={aim:?}"
+                );
+            };
+            assert_eq!(hit.block, pos);
+            let intent = action_for(Some(&scene), &aim, MouseButton::Right, held).unwrap();
+            assert_eq!(intent, (true, target, half));
+            let call = crate::net::edit_call(intent.0, held, intent.1, intent.2);
+            assert_eq!(call.target, torse_sim::action::ActionTarget::Block(target));
+            assert_eq!(
+                call.parameters.get(&key("world:field/half")),
+                Some(&torse_world::ComponentValue::U32(half))
+            );
+            assert_eq!(
+                call.parameters.get(&key("world:field/block")),
+                Some(&torse_world::ComponentValue::Content(held.clone()))
+            );
+            scene
+                .apply_edit(intent.0, held, intent.1, intent.2)
+                .unwrap();
+            let state = scene.authority().store().query(target).ready().unwrap();
+            let registry = scene.authority().registry();
+            let expected = if target == pos {
+                &key("base:glass")
+            } else {
+                held
+            };
+            assert_eq!(registry.definition_key(state), Some(expected));
+            if target != pos && held == &slab {
+                assert_eq!(registry.state_values(state), Some([half as u16].as_slice()));
+            }
+        }
+    }
+
+    #[test]
+    fn side_placement_completes_an_adjacent_matching_slab() {
+        let mut scene = Scene::new(0).unwrap();
+        let stone = key("base:stone");
+        let slab = key("base:glass_slab");
+        let wall = BlockPos::new(8, 14, 8);
+        let target = BlockPos::new(7, 14, 8);
+        scene.apply_edit(true, &stone, wall, 0).unwrap();
+        scene.apply_edit(true, &slab, target, 0).unwrap();
+        let aim = scene.pick([6.5, 14.75, 8.5], [1.0, 0.0, 0.0], PICK_RANGE);
+        let intent = action_for(Some(&scene), &aim, MouseButton::Right, &slab).unwrap();
+        assert_eq!(intent, (true, target, 1));
+        scene
+            .apply_edit(intent.0, &slab, intent.1, intent.2)
+            .unwrap();
+        let state = scene.authority().store().query(target).ready().unwrap();
+        assert_eq!(
+            scene.authority().registry().definition_key(state),
+            Some(&key("base:glass"))
+        );
+        assert!(action_for(Some(&scene), &PickOutcome::Miss, MouseButton::Right, &slab).is_none());
+    }
 
     fn app() -> WindowApp {
         let mut app = WindowApp::new(WindowConfig {

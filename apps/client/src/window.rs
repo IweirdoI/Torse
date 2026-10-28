@@ -25,7 +25,7 @@ use crate::camera::{FlyCamera, MoveInput};
 use crate::input::InputState;
 use crate::pick::PickOutcome;
 use crate::renderer::GpuContext;
-use crate::scene::Scene;
+use crate::scene::{Pace, Scene, TASK_CAP, split_uploads};
 use crate::texture::Palette;
 use torse_sim::PresentationClock;
 use torse_types::{BlockPos, ContentKey, SectionPos};
@@ -33,10 +33,6 @@ use torse_world::Position;
 
 /// How far the pick ray reaches, in blocks.
 const PICK_RANGE: f32 = 64.0;
-/// Sections generated per frame while streaming; spreading the work keeps
-/// the frame time bounded at the cost of populating a window over a few
-/// frames.
-const STREAM_BUDGET: usize = 4;
 /// Fixed logic step in seconds. A presentation frame may run several of these
 /// and must not stretch one step to match the frame.
 const LOGIC_STEP_SECONDS: f64 = 1.0 / 20.0;
@@ -141,6 +137,12 @@ pub struct WindowSummary {
     pub stream_frame_us: u64,
     /// Mean frame time containing mesh rebuilds.
     pub rebuild_frame_us: u64,
+    /// Mean main-thread time admitting and installing generation and meshes.
+    pub cpu_us: u64,
+    /// Mean time spent creating geometry buffers.
+    pub upload_us: u64,
+    /// Mean time spent encoding and presenting a frame.
+    pub present_us: u64,
     pub cpu: crate::scene::BackgroundStats,
 }
 
@@ -212,6 +214,14 @@ struct WindowApp {
     rebuilds_mark: usize,
     rebuild_total_us: u128,
     rebuild_count: u32,
+    pace: Pace,
+    pending_uploads: Vec<SectionPos>,
+    cpu_total_us: u128,
+    cpu_samples: u32,
+    upload_total_us: u128,
+    upload_samples: u32,
+    present_total_us: u128,
+    present_samples: u32,
     pending_shot: Option<String>,
     /// Palette waiting for the next frame to be uploaded, set when a scene is
     /// installed before the GPU context exists or from a network baseline.
@@ -220,6 +230,14 @@ struct WindowApp {
     failure: Option<String>,
     rebuild_network: bool,
     memory: torse_types::MemoryPool,
+}
+
+fn mean_us(total: u128, samples: u32) -> u64 {
+    if samples == 0 {
+        0
+    } else {
+        u64::try_from(total / u128::from(samples)).unwrap_or(0)
+    }
 }
 
 impl WindowApp {
@@ -288,6 +306,14 @@ impl WindowApp {
             rebuilds_mark: 0,
             rebuild_total_us: 0,
             rebuild_count: 0,
+            pace: Pace::new(),
+            pending_uploads: Vec::new(),
+            cpu_total_us: 0,
+            cpu_samples: 0,
+            upload_total_us: 0,
+            upload_samples: 0,
+            present_total_us: 0,
+            present_samples: 0,
             pending_shot: None,
             pending_palette: None,
             summary: None,
@@ -419,18 +445,21 @@ impl WindowApp {
             .as_ref()
             .expect("camera implies scene")
             .center_section(self.camera.as_ref().expect("camera").eye);
-        // Local scenes stream continuously with a per-frame generation
-        // budget: a crossing no longer stalls one frame with a whole ring of
-        // fresh sections. Network scenes keep the subscribed sections.
+        // Local scenes stream on the presentation frame. The pace keeps a
+        // crossing from filling one frame, and it shrinks when that work
+        // runs long. Network scenes keep the subscribed sections.
+        let mut cpu_us = 0u128;
         if self.scene.as_ref().is_some_and(|scene| !scene.is_network()) {
             let Some(scene) = self.scene.as_mut() else {
                 return;
             };
-            if let Err(error) = scene.stream_around(center, STREAM_BUDGET) {
+            let started = Instant::now();
+            if let Err(error) = scene.stream_around(center, self.pace.generate) {
                 self.failure = Some(format!("streaming failed: {error}"));
                 event_loop.exit();
                 return;
             }
+            cpu_us += started.elapsed().as_micros();
             if self.center != Some(center) {
                 self.center = Some(center);
                 self.streams += 1;
@@ -581,11 +610,12 @@ impl WindowApp {
             gpu.context.write_lines(&outline);
         }
 
+        let mesh_started = Instant::now();
         let rebuilt = match self
             .scene
             .as_mut()
             .expect("camera implies scene")
-            .refresh_visuals(STREAM_BUDGET)
+            .refresh_visuals(self.pace.mesh)
         {
             Ok(rebuilt) => rebuilt,
             Err(error) => {
@@ -594,32 +624,15 @@ impl WindowApp {
                 return;
             }
         };
+        cpu_us += mesh_started.elapsed().as_micros();
         self.rebuilds += rebuilt.len();
-        if !rebuilt.is_empty() || !self.uploaded {
-            let scene = self.scene.as_ref().expect("camera implies scene");
-            if let Some(gpu) = self.gpu.as_mut() {
-                // Re-upload only the changed sections; untouched terrain keeps
-                // its buffers, so an edit costs one small upload, not the
-                // whole scene.
-                for pos in &rebuilt {
-                    if let Some((vertices, indices)) = scene.section_geometry(*pos) {
-                        let bytes = Scene::vertex_bytes(&vertices);
-                        gpu.context.upload_section(*pos, &bytes, &indices);
-                    }
-                }
-                // Entity bodies change without mesh rebuilds; refresh them
-                // alongside any terrain upload.
-                let (entity_vertices, entity_indices) = scene.entity_geometry();
-                let entity_bytes = Scene::vertex_bytes(&entity_vertices);
-                gpu.context.upload_section(
-                    crate::renderer::ENTITY_SLOT,
-                    &entity_bytes,
-                    &entity_indices,
-                );
+        for pos in rebuilt {
+            if !self.pending_uploads.contains(&pos) {
+                self.pending_uploads.push(pos);
             }
-            self.uploaded = true;
-            self.uploads += rebuilt.len();
         }
+        let upload_us = self.upload_pending();
+        self.note_work(cpu_us, upload_us);
         // Unloaded sections must stop drawing even when nothing rebuilt this
         // frame; retention is cheap and the entity slot survives it.
         if let Some(gpu) = self.gpu.as_mut()
@@ -645,8 +658,85 @@ impl WindowApp {
         self.draw(event_loop, &names, frame_started);
     }
 
+    /// Upload a prefix of the pending meshes. The rest stay queued in order.
+    ///
+    /// Returns the microseconds spent creating GPU buffers. Entity boxes ride
+    /// along with the first terrain upload of a frame and do not consume the
+    /// section budget.
+    fn upload_pending(&mut self) -> u128 {
+        let started = Instant::now();
+        let budget = self.pace.upload_bytes;
+        let already_uploaded = self.uploaded;
+        let queued = std::mem::take(&mut self.pending_uploads);
+        let (pending, deferred) = {
+            let Some(scene) = self.scene.as_ref() else {
+                self.pending_uploads = queued;
+                return 0;
+            };
+            let mut pending = Vec::new();
+            let mut sizes = Vec::new();
+            for pos in queued {
+                if scene.sections().contains(&pos)
+                    && let Some(bytes) = scene.section_upload_bytes(pos)
+                {
+                    pending.push(pos);
+                    sizes.push(bytes);
+                }
+            }
+            let count = split_uploads(&sizes, budget, TASK_CAP);
+            let deferred = pending.split_off(count);
+            (pending, deferred)
+        };
+        self.pending_uploads = deferred;
+        if self.gpu.is_none() {
+            let mut restored = pending;
+            restored.append(&mut self.pending_uploads);
+            self.pending_uploads = restored;
+            return 0;
+        }
+        let uploaded = {
+            let scene = self.scene.as_ref().expect("upload follows a scene");
+            let gpu = self.gpu.as_mut().expect("gpu checked");
+            let mut uploaded = 0usize;
+            for pos in &pending {
+                if let Some((vertices, indices)) = scene.section_geometry(*pos) {
+                    let bytes = Scene::vertex_bytes(&vertices);
+                    gpu.context.upload_section(*pos, &bytes, &indices);
+                    uploaded += 1;
+                }
+            }
+            if uploaded > 0 || !already_uploaded {
+                let (entity_vertices, entity_indices) = scene.entity_geometry();
+                let entity_bytes = Scene::vertex_bytes(&entity_vertices);
+                gpu.context.upload_section(
+                    crate::renderer::ENTITY_SLOT,
+                    &entity_bytes,
+                    &entity_indices,
+                );
+            }
+            uploaded
+        };
+        self.uploads += uploaded;
+        if uploaded > 0 || !already_uploaded {
+            self.uploaded = true;
+        }
+        started.elapsed().as_micros()
+    }
+
+    fn note_work(&mut self, cpu_us: u128, upload_us: u128) {
+        self.cpu_total_us += cpu_us;
+        self.cpu_samples += 1;
+        self.upload_total_us += upload_us;
+        self.upload_samples += 1;
+        self.pace.observe(
+            u64::try_from(cpu_us).unwrap_or(u64::MAX),
+            u64::try_from(upload_us).unwrap_or(u64::MAX),
+        );
+    }
+
     /// Present one frame. This does not pump logic steps.
     fn draw(&mut self, event_loop: &ActiveEventLoop, names: &[String], frame_started: Instant) {
+        let present_started = Instant::now();
         let frame = match self.gpu.as_mut() {
             Some(gpu) => match gpu.surface.get_current_texture() {
                 CurrentSurfaceTexture::Success(frame)
@@ -726,6 +816,8 @@ impl WindowApp {
             }
         }
         queue.present(frame);
+        self.present_total_us += present_started.elapsed().as_micros();
+        self.present_samples += 1;
 
         let frame_us = frame_started.elapsed().as_micros();
         self.frame_total_us += frame_us;
@@ -1242,6 +1334,9 @@ impl WindowApp {
                     u64::try_from(self.rebuild_total_us / u128::from(self.rebuild_count))
                         .unwrap_or(0)
                 },
+                cpu_us: mean_us(self.cpu_total_us, self.cpu_samples),
+                upload_us: mean_us(self.upload_total_us, self.upload_samples),
+                present_us: mean_us(self.present_total_us, self.present_samples),
             });
         }
         event_loop.exit();

@@ -29,8 +29,10 @@ use crate::pick::{PickHit, PickOutcome, cast_ray};
 use crate::texture::{Palette, TexturePack};
 
 mod background;
+mod pace;
 pub use background::BackgroundStats;
 use background::{Background, MeshStamp};
+pub(crate) use pace::{Pace, TASK_CAP, split_uploads};
 
 pub fn background_config() -> torse_runtime::ExecutorConfig {
     background::default_config()
@@ -957,8 +959,15 @@ impl Scene {
     ///
     /// Returns the rebuilt sections, so callers re-upload only what changed.
     pub fn refresh_meshes(&mut self) -> Vec<SectionPos> {
+        self.refresh_meshes_bounded(usize::MAX)
+    }
+
+    fn refresh_meshes_bounded(&mut self, budget: usize) -> Vec<SectionPos> {
         let mut rebuilt = Vec::new();
         'sections: for pos in self.sections.clone() {
+            if rebuilt.len() >= budget {
+                break;
+            }
             let unchanged = self
                 .meshes
                 .get(&pos)
@@ -1106,7 +1115,7 @@ impl Scene {
 
     pub fn refresh_visuals(&mut self, budget: usize) -> Result<Vec<SectionPos>, String> {
         let Some(mut background) = self.background.take() else {
-            return Ok(self.refresh_meshes());
+            return Ok(self.refresh_meshes_bounded(budget));
         };
         let result = background.refresh(self, budget);
         self.background = Some(background);
@@ -1146,6 +1155,17 @@ impl Scene {
             );
         }
         (vertices, indices)
+    }
+
+    /// Vertex and index bytes one cached section would upload.
+    pub fn section_upload_bytes(&self, pos: SectionPos) -> Option<usize> {
+        let (_, mesh) = self.meshes.get(&pos)?;
+        Some(
+            mesh.positions
+                .len()
+                .saturating_mul(Vertex::STRIDE)
+                .saturating_add(mesh.indices.len().saturating_mul(size_of::<u32>())),
+        )
     }
 
     /// Interleaved vertices and indices of one cached section, world space.
@@ -1467,6 +1487,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use torse_types::EntityId;
 
+    #[test]
+    fn foreground_visuals_honor_the_frame_budget_and_eventually_match_full_refresh() {
+        let mut scene = Scene::new(1).unwrap();
+        assert!(scene.background.is_none());
+        assert!(scene.refresh_visuals(0).unwrap().is_empty());
+        assert_eq!(scene.mesh_count(), 0);
+        let sections = scene.sections.len();
+        for expected in 1..=sections {
+            assert_eq!(scene.refresh_visuals(1).unwrap().len(), 1);
+            assert_eq!(scene.mesh_count(), expected);
+        }
+        assert!(scene.refresh_visuals(1).unwrap().is_empty());
+        let incremental = scene.geometry();
+        scene.meshes.clear();
+        assert_eq!(scene.refresh_meshes().len(), sections);
+        assert_eq!(scene.geometry(), incremental);
+    }
     struct RegionTint(AtomicU64);
 
     impl torse_assets::texture::PositionTintProvider for RegionTint {

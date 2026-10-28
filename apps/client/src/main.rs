@@ -210,7 +210,8 @@ fn main() -> ExitCode {
                     "adapter={} backend={} present={} format={} frames={} streams={} rebuilds={} \
                      uploads={} screenshots={} actions_ok={} actions_rejected={} walk_ticks={} \
                      walker=({:.1},{:.1},{:.1}) session={} batches={} requests_sent={} requests_rejected={} baseline_sections={} \
-                     sections={} meshes={} vertices={} faces={} elapsed_ms={} \n                     mean_frame_us={} max_frame_us={} stream_frame_us={} rebuild_frame_us={}",
+                     sections={} meshes={} vertices={} faces={} elapsed_ms={} \n                     mean_frame_us={} max_frame_us={} stream_frame_us={} rebuild_frame_us={} \
+                     cpu_us={} upload_us={} present_us={}",
                     summary.adapter,
                     summary.backend,
                     summary.present,
@@ -240,6 +241,9 @@ fn main() -> ExitCode {
                     summary.max_frame_us,
                     summary.stream_frame_us,
                     summary.rebuild_frame_us,
+                    summary.cpu_us,
+                    summary.upload_us,
+                    summary.present_us,
                 );
                 println!(
                     "cpu_admitted={} cpu_cancelled={} cpu_stale={} cpu_backpressure={} cpu_peak_jobs={} cpu_peak_input_bytes={} cpu_peak_output_bytes={}",

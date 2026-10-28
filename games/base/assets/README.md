@@ -10,3 +10,5 @@
 locale资源采用每行key=value，zh-Hans与en的键对应；用户界面文案不写入Rust源码。地形图集由脚本生成，修改脚本后重新运行并提交产物。
 
 客户端编译时嵌入PNG与文案，修改素材后需要重新编译。字体由运行环境提供，不复制或分发操作系统字体。可用TORSE_UI_FONT指定字体文件；系统字体不含中文字形时选择英文文案。
+
+`cook.toml`记录离线生成使用的稳定图片GUID、别名、PNG路径和语言文件。运行`cargo run -p torse-tools --locked -- cook-base games/base/assets .work/base.tcook`可生成运行时表，PNG像素仍由资源目录提供。客户端默认读取运行时表的接入尚未完成，格式与限制见[运行时表说明](../../../crates/content/COOKED.md)。

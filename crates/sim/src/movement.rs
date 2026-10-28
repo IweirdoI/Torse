@@ -379,6 +379,41 @@ fn trace_loaded(
     Err(RejectCode::QuotaExceeded)
 }
 
+/// Whether an enabled body at `position` is clear of terrain.
+///
+/// `Ok` lists the cells that were observed. Overlap is [`RejectCode::Conflict`].
+/// A missing or out-of-range cell is [`RejectCode::NotLoaded`].
+pub(crate) fn observe_body(
+    store: &SectionStore,
+    registry: &BlockStateRegistry,
+    position: Position,
+    half: [f64; 3],
+) -> Result<Vec<(BlockPos, TerrainQuery)>, RejectCode> {
+    let center = bounded_center([position.x, position.y, position.z], half)
+        .ok_or(RejectCode::InvalidData)?;
+    let view = CollisionView {
+        store,
+        registry,
+        overlay: BTreeMap::new(),
+        reads: RefCell::new(BTreeMap::new()),
+        unknown: RefCell::new(false),
+    };
+    let blocked = collides(&view, &Aabb::from_center(center, half));
+    let unknown = *view.unknown.borrow();
+    let reads: Vec<_> = view.reads.into_inner().into_iter().collect();
+    if unknown
+        || reads
+            .iter()
+            .any(|(_, query)| matches!(query, TerrainQuery::NotLoaded | TerrainQuery::OutOfBounds))
+    {
+        return Err(RejectCode::NotLoaded);
+    }
+    if blocked {
+        return Err(RejectCode::Conflict);
+    }
+    Ok(reads)
+}
+
 /// Validate resized bodies at their resolved final positions, including terrain writes.
 pub(crate) fn validate_bodies(
     store: &SectionStore,

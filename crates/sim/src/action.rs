@@ -299,6 +299,31 @@ impl ActionView<'_> {
         }
         Ok(self.world.store().query(pos))
     }
+    /// Plan an unpublished body transition authored by the physics module.
+    ///
+    /// `expected` must match the entity's current collider. Enabling or resizing
+    /// a body that overlaps terrain is rejected here; this call does not move
+    /// the entity. A pose change is a separate transaction the caller composes.
+    /// Permission and the entity grant must both already be on this restricted
+    /// view. Inventory, visibility, and the caller's name are not consulted.
+    pub fn plan_collider_transition(
+        &self,
+        entity: EntityId,
+        expected: torse_world::EntityCollider,
+        requested: torse_world::EntityCollider,
+        transaction: TransactionId,
+        ordering: OrderingKey,
+    ) -> Result<Transaction, RejectCode> {
+        crate::collider_plan::plan(
+            self.world,
+            self.actor,
+            entity,
+            expected,
+            requested,
+            transaction,
+            ordering,
+        )
+    }
     pub fn component(
         &self,
         id: EntityId,

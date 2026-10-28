@@ -429,7 +429,7 @@ pub fn build_mesh_bounded(
     )
 }
 
-/// Merge coplanar opaque cube runs with identical materials and tints.
+/// Merge coplanar opaque cube faces into rectangles with identical materials and tints.
 /// Missing borders, shaped blocks and overlays retain ordinary face semantics.
 /// Reserve occupancy_scratch_bytes in addition to bounded output.
 /// UVs repeat per cell; consumers must support tiled local face coordinates.

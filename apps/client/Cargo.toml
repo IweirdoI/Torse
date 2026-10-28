@@ -27,4 +27,4 @@ torse-types = { path = "../../crates/types" }
 torse-world = { path = "../../crates/world" }
 torse-world-services = { path = "../../crates/world_services" }
 wgpu = { version = "=30.0.1", default-features = false, features = ["dx12", "metal", "vulkan", "wgsl", "std"] }
-winit = "=0.30.12"
+winit = { version = "=0.30.12", features = ["serde"] }

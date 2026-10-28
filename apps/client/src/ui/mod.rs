@@ -3,11 +3,13 @@
 //! authoritative mutation.
 use torse_ui::{canvas, gpu, style};
 
+use crate::settings::{Binding, OptionId, Settings, Tab};
 use canvas::{Canvas, Rect, Sprite, Text};
 use gpu::Overlay;
 use std::collections::BTreeMap;
 use style::{MUTED, SEPARATOR, TEXT, TITLE_TEXT};
 use torse_ui::{Part, Theme};
+mod settings;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -15,6 +17,7 @@ pub enum Mode {
     Game,
     Pause,
     MachinePreview,
+    Settings,
 }
 impl Mode {
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -22,6 +25,7 @@ impl Mode {
             "hud" => Ok(Self::Game),
             "pause" => Ok(Self::Pause),
             "machine" => Ok(Self::MachinePreview),
+            "settings" => Ok(Self::Settings),
             _ => Err("UI preview must be hud, pause or machine".into()),
         }
     }
@@ -35,13 +39,22 @@ pub enum Action {
     SensUp,
     ToggleFrameLimit,
     FrameRate(u16),
+    Settings,
+    SettingsBack,
+    SettingsTab(Tab),
+    Toggle(OptionId),
+    Value(OptionId, u16),
+    Rebind(Binding),
+    ResetSettings,
 }
 
 #[derive(Default)]
 pub struct State {
     pub mode: Mode,
     pub cursor: [f64; 2],
-    pub frame_limit: crate::frame_pacing::FrameLimit,
+    pub settings: Settings,
+    pub tab: Tab,
+    pub rebinding: Option<Binding>,
     capture: torse_ui::Pointer<Action>,
 }
 impl State {
@@ -51,17 +64,21 @@ impl State {
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.capture.cancel();
+        self.rebinding = None;
     }
     fn event(event: Option<torse_ui::Event<Action>>) -> Option<Action> {
         match event? {
             torse_ui::Event::Activated(action) => Some(action),
             torse_ui::Event::Changed(Action::FrameRate(_), fps) => Some(Action::FrameRate(fps)),
+            torse_ui::Event::Changed(Action::Value(option, _), value) => {
+                Some(Action::Value(option, value))
+            }
             _ => None,
         }
     }
     pub fn pointer(&mut self, down: bool, size: [u32; 2]) -> Option<Action> {
         let layout = Layout::new(size);
-        let controls = layout.controls(self.mode);
+        let controls = layout.controls(self.mode, self.tab);
         self.capture.cursor = layout.point(self.cursor);
         Self::event(self.capture.button(down, &controls))
     }
@@ -70,7 +87,7 @@ impl State {
         let layout = Layout::new(size);
         Self::event(
             self.capture
-                .motion(layout.point(cursor), &layout.controls(self.mode)),
+                .motion(layout.point(cursor), &layout.controls(self.mode, self.tab)),
         )
     }
 }
@@ -89,7 +106,9 @@ impl Layout {
         }
     }
     fn panel(&self, mode: Mode) -> Rect {
-        let (w, h) = if mode == Mode::Pause {
+        let (w, h) = if mode == Mode::Settings {
+            (400, 248)
+        } else if mode == Mode::Pause {
             (284, 238)
         } else {
             (324, 140)
@@ -103,10 +122,11 @@ impl Layout {
             h,
         )
     }
-    fn buttons(&self, mode: Mode) -> Vec<(Action, Rect, &'static str)> {
+    fn buttons(&self, mode: Mode, tab: Tab) -> Vec<(Action, Rect, &'static str)> {
         let p = self.panel(mode);
         match mode {
             Mode::Game | Mode::MachinePreview => Vec::new(),
+            Mode::Settings => self.settings_buttons(tab),
             Mode::Pause => vec![
                 (
                     Action::Resume,
@@ -114,9 +134,9 @@ impl Layout {
                     "menu_resume",
                 ),
                 (
-                    Action::Preview,
+                    Action::Settings,
                     Rect::new(p.x + 14, p.y + 60, p.w.saturating_sub(28), 22),
-                    "menu_preview",
+                    "menu_settings",
                 ),
                 (
                     Action::Quit,
@@ -159,12 +179,12 @@ impl Layout {
         let p = self.panel(mode);
         Rect::new(p.x + p.w as i32 - 22, p.y + 3, 18, 16)
     }
-    fn controls(&self, mode: Mode) -> Vec<torse_ui::Control<Action>> {
+    fn controls(&self, mode: Mode, tab: Tab) -> Vec<torse_ui::Control<Action>> {
         if mode == Mode::Game {
             return Vec::new();
         }
         let mut controls: Vec<_> = self
-            .buttons(mode)
+            .buttons(mode, tab)
             .into_iter()
             .map(|(key, rect, _)| torse_ui::Control::Button { key, rect })
             .collect();
@@ -180,9 +200,21 @@ impl Layout {
                 max: crate::frame_pacing::MAX_FPS,
             });
         }
+        if mode == Mode::Settings {
+            controls.extend(
+                self.settings_sliders(tab)
+                    .into_iter()
+                    .map(|(key, rect, min, max)| torse_ui::Control::Slider {
+                        key,
+                        rect,
+                        min,
+                        max,
+                    }),
+            );
+        }
         controls
     }
-    fn hit(&self, mode: Mode, cursor: [f64; 2]) -> Option<Action> {
+    fn hit(&self, mode: Mode, cursor: [f64; 2], tab: Tab) -> Option<Action> {
         if mode == Mode::Game {
             return None;
         }
@@ -193,7 +225,7 @@ impl Layout {
         if self.close(mode).contains(p) {
             return Some(Action::Resume);
         }
-        self.buttons(mode)
+        self.buttons(mode, tab)
             .into_iter()
             .find(|(_, rect, _)| rect.contains(p))
             .map(|(a, _, _)| a)
@@ -241,6 +273,10 @@ struct View {
     close_hot: bool,
     frame_limit: crate::frame_pacing::FrameLimit,
     dragging_fps: bool,
+    settings: Settings,
+    tab: Tab,
+    rebinding: Option<Binding>,
+    debug_lines: Vec<String>,
 }
 
 pub struct Layer {
@@ -261,6 +297,7 @@ pub struct Hud<'a> {
     pub names: Vec<String>,
     /// Captured-look sensitivity, shown and tuned in the pause menu.
     pub sensitivity: f64,
+    pub debug_lines: &'a [String],
 }
 impl Layer {
     pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) -> Result<(), String> {
@@ -323,10 +360,18 @@ impl Layer {
             result: hud.result.chars().take(120).collect(),
             names: hud.names.into_iter().take(3).collect(),
             sensitivity: (hud.sensitivity * 100.0).round() as u16,
-            hover: layout.hit(state.mode, state.cursor),
+            hover: layout.hit(state.mode, state.cursor, state.tab),
             pressed: state.capture.active(),
-            frame_limit: state.frame_limit,
+            frame_limit: state.settings.frame_limit,
             dragging_fps: state.capture.dragging(),
+            settings: state.settings.clone(),
+            tab: state.tab,
+            rebinding: state.rebinding,
+            debug_lines: if state.settings.debug {
+                hud.debug_lines.to_vec()
+            } else {
+                Vec::new()
+            },
             close_hot: {
                 let p = [
                     (state.cursor[0] / f64::from(layout.scale)) as i32,
@@ -395,16 +440,23 @@ impl Layer {
         self.text.set_scale(u16::try_from(c.scale).unwrap_or(1));
         let w = l.width as i32;
         let h = l.height as i32;
-        self.paint_hud(c, l, v, w, h);
+        if v.settings.hud {
+            self.paint_hud(c, l, v, w, h);
+        }
+        self.paint_debug(c, l, v);
         if v.mode == Mode::Game {
-            self.theme
-                .paint(c, Part::Crosshair, Rect::new(w / 2 - 7, h / 2 - 7, 16, 16));
+            if v.settings.hud {
+                self.theme
+                    .paint(c, Part::Crosshair, Rect::new(w / 2 - 7, h / 2 - 7, 16, 16));
+            }
             return;
         }
         c.fill(Rect::new(0, 0, l.width, l.height), [8, 9, 11, 130]);
         let p = l.panel(v.mode);
         self.theme.paint(c, Part::Window, p);
-        let title = if v.mode == Mode::Pause {
+        let title = if v.mode == Mode::Settings {
+            "menu_settings"
+        } else if v.mode == Mode::Pause {
             "menu_title"
         } else {
             "machine_title"
@@ -426,17 +478,20 @@ impl Layer {
             l.close(v.mode),
         );
         style::hline(c, p.x, p.y + 21, p.w, SEPARATOR);
-        if v.mode == Mode::Pause {
+        if v.mode == Mode::Settings {
+            self.paint_settings(c, l, v);
+        } else if v.mode == Mode::Pause {
             self.paint_pause(c, l, v, p);
         } else {
             self.paint_machine(c, p);
         }
-        for (action, rect, key) in l.buttons(v.mode) {
+        for (action, rect, key) in l.buttons(v.mode, v.tab) {
             self.theme.button(
                 c,
                 rect,
                 v.hover == Some(action),
-                v.pressed == Some(action) && v.hover == Some(action),
+                (v.pressed == Some(action) && v.hover == Some(action))
+                    || action == Action::SettingsTab(v.tab),
             );
             if action == Action::ToggleFrameLimit {
                 self.theme.checkbox(
@@ -445,7 +500,26 @@ impl Layer {
                     v.frame_limit.enabled,
                 );
             }
-            let text = self.labels.get(key).copied().unwrap_or("?").to_owned();
+            if let Action::Toggle(option) = action {
+                self.theme.checkbox(
+                    c,
+                    Rect::new(rect.x + 4, rect.y + 3, 14, 14),
+                    v.settings.checked(option),
+                );
+            }
+            let text = if let Action::Rebind(binding) = action {
+                format!(
+                    "{}: {}",
+                    self.labels.get(key).copied().unwrap_or("?"),
+                    if v.rebinding == Some(binding) {
+                        "...".to_owned()
+                    } else {
+                        format!("{:?}", v.settings.bindings.key(binding))
+                    }
+                )
+            } else {
+                self.labels.get(key).copied().unwrap_or("?").to_owned()
+            };
             let label = text.as_str();
             let tw = self.text.measure(label, 12).min(rect.w.saturating_sub(12));
             let color = if v.hover == Some(action) {
@@ -664,7 +738,7 @@ mod tests {
         let mut state = State::default();
         state.set_mode(Mode::Pause);
         let l = Layout::new([960, 540]);
-        let r = l.buttons(Mode::Pause)[0].1;
+        let r = l.buttons(Mode::Pause, Tab::Graphics)[0].1;
         state.cursor = [f64::from((r.x + 5) * 2), f64::from((r.y + 5) * 2)];
         assert_eq!(state.pointer(true, [960, 540]), None);
         state.cursor = [0.0, 0.0];
@@ -682,8 +756,11 @@ mod tests {
                 f64::from((r.x + 10) * l.scale as i32),
                 f64::from((r.y + 10) * l.scale as i32),
             ];
-            assert_eq!(l.hit(Mode::MachinePreview, cursor), Some(Action::Resume));
-            assert_eq!(l.hit(Mode::Game, cursor), None);
+            assert_eq!(
+                l.hit(Mode::MachinePreview, cursor, Tab::Graphics),
+                Some(Action::Resume)
+            );
+            assert_eq!(l.hit(Mode::Game, cursor, Tab::Graphics), None);
         }
     }
 
@@ -723,6 +800,29 @@ mod tests {
             state.set_mode(Mode::Game);
             assert_eq!(state.motion(pointer(rect.x + 30), size), None);
             assert_eq!(state.pointer(true, size), None);
+        }
+    }
+
+    #[test]
+    fn settings_buttons_are_reachable_on_every_tab_and_scale() {
+        for size in [[640, 360], [960, 540], [1920, 1080]] {
+            let layout = Layout::new(size);
+            for tab in [Tab::Debug, Tab::Gameplay, Tab::Graphics, Tab::Controls] {
+                let mut state = State {
+                    mode: Mode::Settings,
+                    tab,
+                    ..State::default()
+                };
+                for (action, rect, _) in layout.buttons(Mode::Settings, tab) {
+                    assert!(layout.panel(Mode::Settings).contains([rect.x, rect.y]));
+                    state.cursor = [
+                        f64::from((rect.x + 2) * layout.scale as i32),
+                        f64::from((rect.y + 2) * layout.scale as i32),
+                    ];
+                    assert_eq!(state.pointer(true, size), None);
+                    assert_eq!(state.pointer(false, size), Some(action));
+                }
+            }
         }
     }
 }

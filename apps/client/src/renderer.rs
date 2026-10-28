@@ -1279,6 +1279,7 @@ impl Renderer {
             [self.width, self.height],
             &state,
             crate::ui::Hud {
+                debug_lines: &[],
                 material: 0,
                 network: false,
                 ready: true,

@@ -855,6 +855,12 @@ impl Scene {
     pub fn sections(&self) -> &[SectionPos] {
         &self.sections
     }
+    /// Change local streaming interest; mirrors retain their authorized scope.
+    pub fn set_view_radius(&mut self, radius: i64) {
+        if !self.is_network() {
+            self.radius = radius.clamp(0, 16);
+        }
+    }
 
     /// Number of cached meshes.
     pub fn mesh_count(&self) -> usize {

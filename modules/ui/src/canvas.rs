@@ -422,7 +422,7 @@ impl Text {
             .take(160)
             .map(|c| self.raster(c, scaled).advance.max(0) as u32)
             .sum();
-        total / u32::from(self.scale)
+        total.div_ceil(u32::from(self.scale))
     }
     pub fn draw(
         &mut self,

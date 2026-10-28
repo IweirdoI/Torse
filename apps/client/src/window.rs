@@ -31,6 +31,7 @@ use torse_render::{FrameBudget, FrameLimits, SectionUploadQueue};
 use torse_sim::PresentationClock;
 use torse_types::{BlockPos, ContentKey, SectionPos};
 use torse_world::Position;
+mod settings;
 
 /// How far the pick ray reaches, in blocks.
 const PICK_RANGE: f32 = 64.0;
@@ -57,6 +58,8 @@ const WALKER_EYE_OFFSET: f64 = 0.7;
 /// Startup parameters for the windowed run.
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
+    pub preferences: crate::settings::Settings,
+    pub settings_tab: crate::settings::Tab,
     /// Explicit section interest; absent keeps the local demonstration scope.
     pub sections: Option<Vec<torse_types::SectionPos>>,
     pub tls: Option<crate::net::TlsClient>,
@@ -156,6 +159,7 @@ pub struct WindowSummary {
 }
 
 struct Gpu {
+    present_modes: Vec<wgpu::PresentMode>,
     ui: crate::ui::Layer,
     context: GpuContext,
     surface: Surface<'static>,
@@ -168,6 +172,9 @@ struct Gpu {
 }
 
 struct WindowApp {
+    preferences_dirty: Option<Instant>,
+    debug_lines: Vec<String>,
+    current_fps: u32,
     work_budget: FrameBudget,
     pending_uploads: SectionUploadQueue,
     ui: crate::ui::State,
@@ -245,13 +252,19 @@ impl WindowApp {
             .map(|name| ContentKey::parse(name).expect("static material key"))
             .collect();
         Self {
+            preferences_dirty: None,
+            debug_lines: Vec::new(),
+            current_fps: 0,
             work_budget: FrameBudget::new(FRAME_LIMITS, 16_666),
             pending_uploads: SectionUploadQueue::default(),
             ui: {
                 let mut state = crate::ui::State::default();
                 state.set_mode(config.ui_mode);
+                state.settings = config.preferences.clone();
+                state.tab = config.settings_tab;
                 if let Some(fps) = config.fps_limit {
-                    state.frame_limit = crate::frame_pacing::FrameLimit { enabled: true, fps };
+                    state.settings.frame_limit =
+                        crate::frame_pacing::FrameLimit { enabled: true, fps };
                 }
                 state
             },
@@ -348,7 +361,8 @@ impl WindowApp {
         // The HUD needs the pack labels before the GPU borrow starts.
         let names = self.hotbar_names();
         let frame_started = Instant::now();
-        self.frame_pacer.started(frame_started, self.ui.frame_limit);
+        self.frame_pacer
+            .started(frame_started, self.ui.settings.frame_limit);
         if !self.poll_network(event_loop) {
             return;
         }
@@ -408,6 +422,7 @@ impl WindowApp {
                                 result: &self.last_result,
                                 names: names.clone(),
                                 sensitivity: self.look_sensitivity,
+                                debug_lines: &self.debug_lines,
                             },
                         );
                         gpu.ui.draw(&mut encoder, &view);
@@ -424,6 +439,10 @@ impl WindowApp {
         let speed_now = self.camera.as_ref().expect("camera").speed;
         let (mut motion, speed) = self.input.take_input(speed_now);
         self.camera.as_mut().expect("camera").speed = speed;
+        if (speed - speed_now).abs() > f32::EPSILON {
+            self.ui.settings.fly_speed = speed.round().clamp(1.0, 300.0) as u16;
+            self.save_preferences();
+        }
         if self.config.autoplay && !self.ui.modal() {
             motion.forward = 1.0;
         }
@@ -587,7 +606,9 @@ impl WindowApp {
 
         // Stage the selection outline from the post-edit aim so it matches
         // what the next frame will show.
-        let outline = {
+        let outline = if !self.ui.settings.outline {
+            Vec::new()
+        } else {
             let Some(scene) = self.scene.as_ref() else {
                 return;
             };
@@ -688,7 +709,11 @@ impl WindowApp {
                 // Entity bodies change without mesh rebuilds; refresh them
                 // alongside any terrain upload.
                 if self.entity_sequence != Some(sequence) {
-                    let (entity_vertices, entity_indices) = scene.entity_geometry();
+                    let (entity_vertices, entity_indices) = if self.ui.settings.entities {
+                        scene.entity_geometry()
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                     let entity_bytes = Scene::vertex_bytes(&entity_vertices);
                     if gpu.context.upload_section(
                         crate::renderer::ENTITY_SLOT,
@@ -789,6 +814,7 @@ impl WindowApp {
                 result: &self.last_result,
                 names: names.to_vec(),
                 sensitivity: self.look_sensitivity,
+                debug_lines: &self.debug_lines,
             },
         );
         gpu.ui.draw(&mut encoder, &view);
@@ -842,11 +868,42 @@ impl WindowApp {
                 } else {
                     self.last_result.clone()
                 };
-                gpu.window.set_title(&format!(
-                    "Torse client | {fps:.0} fps | sections {} | meshes {} | {material} | {status}",
-                    scene.sections().len(),
-                    scene.mesh_count(),
-                ));
+                self.current_fps = fps.round() as u32;
+                self.debug_lines = vec![
+                    format!(
+                        "FPS: {} | frame: {:.2} ms",
+                        self.current_fps,
+                        frame_us as f64 / 1000.0
+                    ),
+                    format!(
+                        "sections: {} | meshes: {}",
+                        scene.sections().len(),
+                        scene.mesh_count()
+                    ),
+                    format!(
+                        "CPU memory: {:.1} MiB",
+                        self.memory.usage().total as f64 / (1024.0 * 1024.0)
+                    ),
+                    format!(
+                        "GPU geometry: {:.1} MiB",
+                        gpu.context.geometry_usage().bytes as f64 / (1024.0 * 1024.0)
+                    ),
+                    format!("position: {:.1}, {:.1}, {:.1}", eye[0], eye[1], eye[2]),
+                    format!(
+                        "mode: {} | material: {material}",
+                        if self.walk { "walk" } else { "fly" }
+                    ),
+                    format!(
+                        "edits: {} ok / {} rejected",
+                        self.actions_ok, self.actions_rejected
+                    ),
+                    format!(
+                        "network: {} | requests: {}",
+                        self.net.is_some(),
+                        self.requests_sent
+                    ),
+                    format!("status: {status}"),
+                ];
             }
             self.fps_origin = Instant::now();
             self.fps_frames = 0;
@@ -962,7 +1019,8 @@ impl WindowApp {
         }
         let step = LOGIC_STEP_SECONDS as f32;
         for _ in 0..steps {
-            let jump = self.input.jump_held() || (self.config.autoplay && self.walk_blocked);
+            let jump = self.input.jump_held()
+                || ((self.config.autoplay || self.ui.settings.auto_jump) && self.walk_blocked);
             let before = (
                 f64::from(self.present_next[0]),
                 f64::from(self.present_next[2]),
@@ -1296,13 +1354,18 @@ impl WindowApp {
     }
 
     fn ui_action(&mut self, action: crate::ui::Action, event_loop: &ActiveEventLoop) {
+        if self.settings_action(action) {
+            self.apply_preferences();
+            self.save_preferences();
+            return;
+        }
         match action {
             crate::ui::Action::ToggleFrameLimit => {
-                self.ui.frame_limit.enabled = !self.ui.frame_limit.enabled;
+                self.ui.settings.frame_limit.enabled = !self.ui.settings.frame_limit.enabled;
                 self.frame_pacer.reset();
             }
             crate::ui::Action::FrameRate(fps) => {
-                self.ui.frame_limit.fps = fps;
+                self.ui.settings.frame_limit.fps = fps;
                 self.frame_pacer.reset();
             }
             crate::ui::Action::Quit => self.finish(event_loop),
@@ -1311,15 +1374,20 @@ impl WindowApp {
             crate::ui::Action::SensDown => {
                 self.look_sensitivity = (self.look_sensitivity - 0.1).clamp(0.2, 5.0);
                 self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                self.ui.settings.sensitivity = (self.look_sensitivity * 100.0).round() as u16;
             }
             crate::ui::Action::SensUp => {
                 self.look_sensitivity = (self.look_sensitivity + 0.1).clamp(0.2, 5.0);
                 self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                self.ui.settings.sensitivity = (self.look_sensitivity * 100.0).round() as u16;
             }
+            _ => {}
         }
+        self.save_preferences();
     }
 
     fn finish(&mut self, event_loop: &ActiveEventLoop) {
+        self.flush_preferences(true);
         if let Some((scene, gpu)) = self.scene.as_ref().zip(self.gpu.as_ref()) {
             let (vertices, faces) = scene.geometry_counts();
             self.summary = Some(WindowSummary {
@@ -1448,7 +1516,14 @@ impl ApplicationHandler for WindowApp {
                     return;
                 }
             };
-        let present = if capabilities
+        let present = if self.ui.settings.vsync
+            && capabilities
+                .present_modes
+                .contains(&wgpu::PresentMode::Fifo)
+        {
+            config.present_mode = wgpu::PresentMode::Fifo;
+            wgpu::PresentMode::Fifo
+        } else if capabilities
             .present_modes
             .contains(&wgpu::PresentMode::Immediate)
         {
@@ -1591,6 +1666,7 @@ impl ApplicationHandler for WindowApp {
             }
         };
         self.gpu = Some(Gpu {
+            present_modes: capabilities.present_modes.clone(),
             ui,
             backend_name: format!("{:?}", info.backend),
             present_mode: format!("{present:?}"),
@@ -1621,6 +1697,7 @@ impl ApplicationHandler for WindowApp {
             self.enter_walk(eye);
         }
         self.look_sensitivity = self.config.sensitivity;
+        self.apply_preferences();
         self.started = Some(Instant::now());
         self.fps_origin = Instant::now();
         // Capture the mouse right away; Esc opens the pause menu with the
@@ -1660,6 +1737,23 @@ impl ApplicationHandler for WindowApp {
                 if event.state == ElementState::Pressed
                     && let winit::keyboard::PhysicalKey::Code(code) = event.physical_key
                 {
+                    if !event.repeat && self.rebind_key(code) {
+                        return;
+                    }
+                    if !self.ui.modal() && !event.repeat {
+                        if code == self.ui.settings.bindings.debug {
+                            self.toggle_debug();
+                            return;
+                        }
+                        if code == self.ui.settings.bindings.walk {
+                            self.toggle_walk();
+                            return;
+                        }
+                    }
+                    if code == self.ui.settings.bindings.screenshot && !event.repeat {
+                        self.input.key(event.physical_key, event.state);
+                        return;
+                    }
                     match code {
                         KeyCode::Escape if !event.repeat => {
                             let mode = if self.ui.modal() {
@@ -1683,15 +1777,10 @@ impl ApplicationHandler for WindowApp {
                             self.set_grab(!self.ui.modal());
                             return;
                         }
-                        KeyCode::F12 => {
-                            self.input.key(event.physical_key, event.state);
-                            return;
-                        }
                         _ if self.ui.modal() => return,
                         KeyCode::Digit1 => self.material = 0,
                         KeyCode::Digit2 => self.material = 1,
                         KeyCode::Digit3 => self.material = 2,
-                        KeyCode::F5 if !event.repeat => self.toggle_walk(),
                         _ => {}
                     }
                 }
@@ -1747,6 +1836,9 @@ impl ApplicationHandler for WindowApp {
                             * 1.08f64.powf(notches.clamp(-8.0, 8.0)))
                         .clamp(0.2, 5.0);
                         self.last_result = format!("sens {:.2}", self.look_sensitivity);
+                        self.ui.settings.sensitivity =
+                            (self.look_sensitivity * 100.0).round() as u16;
+                        self.save_preferences();
                     }
                 } else if !self.ui.modal() {
                     self.input.wheel(delta);
@@ -1788,12 +1880,13 @@ impl ApplicationHandler for WindowApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.flush_preferences(false);
         if !self.poll_network(event_loop) {
             return;
         }
         if let Some(gpu) = self.gpu.as_ref() {
             let now = Instant::now();
-            if self.ui.frame_limit.enabled {
+            if self.ui.settings.frame_limit.enabled {
                 let deadline = self.frame_pacer.deadline(now);
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                 if now >= deadline {
@@ -2122,8 +2215,10 @@ mod tests {
         );
     }
 
-    fn app() -> WindowApp {
+    pub(super) fn app() -> WindowApp {
         let mut app = WindowApp::new(WindowConfig {
+            preferences: crate::settings::Settings::default(),
+            settings_tab: crate::settings::Tab::Graphics,
             sections: None,
             tls: None,
             memory_mib: 512,

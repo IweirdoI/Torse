@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 pub const MIN_FPS: u16 = 30;
 pub const MAX_FPS: u16 = 1000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FrameLimit {
     pub enabled: bool,
     pub fps: u16,

@@ -13,6 +13,7 @@ mod net;
 mod pick;
 mod renderer;
 mod scene;
+mod settings;
 mod texture;
 mod ui;
 mod window;
@@ -48,10 +49,11 @@ fn main() -> ExitCode {
     let mut autoplay = false;
     let mut walk = false;
     let mut connect: Option<String> = None;
-    let mut sensitivity = 1.0f64;
+    let mut sensitivity = None;
     let mut fps_limit = None;
     let mut probe_outside = false;
     let mut ui_preview = None;
+    let mut settings_tab = settings::Tab::Graphics;
     let mut places: Vec<(String, [i64; 3])> = Vec::new();
     let mut content: Option<String> = None;
     let mut memory_mib = 512u64;
@@ -133,7 +135,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            "--sensitivity" => sensitivity = value().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            "--sensitivity" => sensitivity = value().and_then(|v| v.parse::<f64>().ok()),
             "--fps-limit" => match value().and_then(|v| v.parse::<u16>().ok()) {
                 Some(fps @ 30..=1000) => fps_limit = Some(fps),
                 _ => {
@@ -141,6 +143,19 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--settings-tab" => {
+                settings_tab = match value().as_deref() {
+                    Some("debug") => settings::Tab::Debug,
+                    Some("gameplay") => settings::Tab::Gameplay,
+                    Some("graphics") => settings::Tab::Graphics,
+                    Some("controls") => settings::Tab::Controls,
+                    _ => {
+                        eprintln!("--settings-tab requires debug, gameplay, graphics or controls");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                ui_preview = Some(ui::Mode::Settings);
+            }
             "--probe-outside" => probe_outside = true,
             "--place" => match value().as_deref().map(parse_place) {
                 Some(Ok(place)) => places.push(place),
@@ -200,12 +215,34 @@ fn main() -> ExitCode {
             eprintln!("--place is only available with --capture");
             return ExitCode::FAILURE;
         }
+        let mut preferences = match settings::Settings::load(&settings::Settings::path()) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("client settings failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if radius_set {
+            preferences.radius = radius.min(16) as u16;
+        }
+        if let Some(value) = sensitivity {
+            preferences.sensitivity = (value.clamp(0.2, 5.0) * 100.0).round() as u16;
+        }
+        if let Some(fps) = fps_limit {
+            preferences.frame_limit = frame_pacing::FrameLimit { enabled: true, fps };
+        }
+        if let Err(error) = preferences.validate() {
+            eprintln!("client settings failed: {error}");
+            return ExitCode::FAILURE;
+        }
         let config = WindowConfig {
+            preferences: preferences.clone(),
+            settings_tab,
             sections: (!sections.is_empty()).then_some(sections),
             tls,
             memory_mib,
             geometry_mib,
-            radius: if radius_set { radius } else { 4 },
+            radius: i64::from(preferences.radius),
             width,
             height,
             frames,
@@ -214,7 +251,7 @@ fn main() -> ExitCode {
             walk,
             connect,
             probe_outside,
-            sensitivity: sensitivity.clamp(0.2, 5.0),
+            sensitivity: f64::from(preferences.sensitivity) / 100.0,
             fps_limit,
             ui_mode: ui_preview.unwrap_or_default(),
             content: content.clone(),

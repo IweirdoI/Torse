@@ -1606,6 +1606,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use torse_types::EntityId;
 
+    #[test]
+    fn foreground_visuals_honor_the_frame_budget_and_eventually_match_full_refresh() {
+        let mut scene = Scene::new(1).unwrap();
+        assert!(scene.background.is_none());
+        assert!(scene.refresh_visuals(0).unwrap().is_empty());
+        assert_eq!(scene.mesh_count(), 0);
+        let sections = scene.sections.len();
+        for expected in 1..=sections {
+            assert_eq!(scene.refresh_visuals(1).unwrap().len(), 1);
+            assert_eq!(scene.mesh_count(), expected);
+        }
+        assert!(scene.refresh_visuals(1).unwrap().is_empty());
+        let incremental = scene.geometry();
+        scene.meshes.clear();
+        assert_eq!(scene.refresh_meshes().len(), sections);
+        assert_eq!(scene.geometry(), incremental);
+    }
     struct RegionTint(AtomicU64);
 
     impl torse_assets::texture::PositionTintProvider for RegionTint {

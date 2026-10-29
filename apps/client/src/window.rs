@@ -159,6 +159,12 @@ pub struct WindowSummary {
     pub stream_frame_us: u64,
     /// Mean frame time containing mesh rebuilds.
     pub rebuild_frame_us: u64,
+    /// Mean main-thread streaming and mesh admission time.
+    pub cpu_us: u64,
+    /// Mean terrain-buffer upload time.
+    pub upload_us: u64,
+    /// Mean render encoding and presentation time.
+    pub present_us: u64,
     pub cpu: crate::scene::BackgroundStats,
 }
 
@@ -238,6 +244,12 @@ struct WindowApp {
     rebuilds_mark: usize,
     rebuild_total_us: u128,
     rebuild_count: u32,
+    cpu_total_us: u128,
+    cpu_samples: u32,
+    upload_total_us: u128,
+    upload_samples: u32,
+    present_total_us: u128,
+    present_samples: u32,
     pending_shot: Option<String>,
     /// Palette waiting for the next frame to be uploaded, set when a scene is
     /// installed before the GPU context exists or from a network baseline.
@@ -246,6 +258,14 @@ struct WindowApp {
     failure: Option<String>,
     rebuild_network: bool,
     memory: torse_types::MemoryPool,
+}
+
+fn mean_us(total: u128, samples: u32) -> u64 {
+    if samples == 0 {
+        0
+    } else {
+        u64::try_from(total / u128::from(samples)).unwrap_or(0)
+    }
 }
 
 impl WindowApp {
@@ -327,6 +347,12 @@ impl WindowApp {
             rebuilds_mark: 0,
             rebuild_total_us: 0,
             rebuild_count: 0,
+            cpu_total_us: 0,
+            cpu_samples: 0,
+            upload_total_us: 0,
+            upload_samples: 0,
+            present_total_us: 0,
+            present_samples: 0,
             pending_shot: None,
             pending_palette: None,
             summary: None,
@@ -481,15 +507,18 @@ impl WindowApp {
         // Local scenes stream continuously with a per-frame generation
         // budget: a crossing no longer stalls one frame with a whole ring of
         // fresh sections. Network scenes keep the subscribed sections.
+        let mut cpu_us = 0u128;
         if self.scene.as_ref().is_some_and(|scene| !scene.is_network()) {
             let Some(scene) = self.scene.as_mut() else {
                 return;
             };
+            let started = Instant::now();
             if let Err(error) = scene.stream_around(center, self.work_budget.limits().generation) {
                 self.failure = Some(format!("streaming failed: {error}"));
                 event_loop.exit();
                 return;
             }
+            cpu_us += started.elapsed().as_micros();
             if self.center != Some(center) {
                 self.center = Some(center);
                 self.streams += 1;
@@ -673,6 +702,7 @@ impl WindowApp {
                 return;
             }
         };
+        cpu_us += meshing_at.elapsed().as_micros();
         self.rebuilds += rebuilt.len();
         let meshed_at = Instant::now();
         self.pending_uploads.extend(rebuilt);
@@ -720,6 +750,7 @@ impl WindowApp {
         let scene = self.scene.as_ref().expect("active scene");
         let interest: std::collections::BTreeSet<_> = scene.sections().iter().copied().collect();
         self.pending_uploads.retain(|p| interest.contains(&p));
+        let upload_started = Instant::now();
         let uploads = match self.pending_uploads.select_where(
             center,
             self.work_budget.limits(),
@@ -791,6 +822,10 @@ impl WindowApp {
                 scene.surface_section_uploaded(pos);
             }
         }
+        self.cpu_total_us += cpu_us;
+        self.cpu_samples += 1;
+        self.upload_total_us += upload_started.elapsed().as_micros();
+        self.upload_samples += 1;
         let uploaded_at = Instant::now();
         // Belt and braces: some focus transitions skip the Focused event, and
         // a captured look with no focus moves the camera from outside.
@@ -911,6 +946,9 @@ impl WindowApp {
             }
         }
         queue.present(frame);
+
+        self.present_total_us += draw_started.elapsed().as_micros();
+        self.present_samples += 1;
 
         let frame_us = frame_started.elapsed().as_micros();
         if self.config.benchmark {
@@ -1566,6 +1604,9 @@ impl WindowApp {
                     u64::try_from(self.rebuild_total_us / u128::from(self.rebuild_count))
                         .unwrap_or(0)
                 },
+                cpu_us: mean_us(self.cpu_total_us, self.cpu_samples),
+                upload_us: mean_us(self.upload_total_us, self.upload_samples),
+                present_us: mean_us(self.present_total_us, self.present_samples),
             });
         }
         event_loop.exit();

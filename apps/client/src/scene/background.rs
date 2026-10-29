@@ -11,11 +11,16 @@ use torse_world_services::SectionGenerator;
 
 use super::*;
 
+const TASK_CAP: usize = 8;
+
+fn worker_count(parallelism: usize) -> usize {
+    parallelism.saturating_sub(1).clamp(1, 64)
+}
+
 pub(super) fn default_config() -> ExecutorConfig {
     ExecutorConfig {
-        workers: std::thread::available_parallelism()
-            .map_or(1, |n| n.get().saturating_sub(2).clamp(1, 4)),
-        max_jobs: 8,
+        workers: worker_count(std::thread::available_parallelism().map_or(1, |count| count.get())),
+        max_jobs: TASK_CAP,
         max_input_bytes: 8 * 1024 * 1024,
         max_output_bytes: 32 * 1024 * 1024,
     }

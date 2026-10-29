@@ -42,7 +42,7 @@ cargo run --release -p torse-client --locked -- --window --frames 2400 --walk --
 
 ### 窗口记录
 
-环境为Windows、Release构建、RTX4060LaptopGPU、Vulkan和Mailbox，默认324个分区。窗口截图验证HUD、选中轮廓及地形仍正常绘制。[原始计数](../../data/client-stability/01-release/metrics.csv)记录各次运行。
+环境为Windows、Release构建、RTX4060LaptopGPU、Vulkan和Mailbox，默认324个分区。窗口截图验证HUD、选中轮廓及地形仍正常绘制。[原始计数](../data/client-stability/01-release/metrics.csv)记录各次运行。
 
 | 场景 | 帧数 | 平均帧耗时 | 最大帧耗时 | 网格重建 | 上传 |
 |---|---|---|---|---|---|

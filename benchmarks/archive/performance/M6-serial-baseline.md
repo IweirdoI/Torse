@@ -78,9 +78,9 @@ MemoryBackend的Flush随保留日志增长明显变慢，128项场景平均每Ti
 
 ### 五、原始数据
 
-- [环境](../../data/serial-baseline/environment.txt)。
-- [21组汇总](../../data/serial-baseline/01-profiled/summary.csv)、[逐Tick](../../data/serial-baseline/01-profiled/ticks.csv)、[阶段原始样本](../../data/serial-baseline/01-profiled/samples.csv.gz)、[运行参数](../../data/serial-baseline/01-profiled/run.txt)。
-- [采样开启对照](../../data/serial-baseline/02-control-on/ticks.csv)、[采样关闭对照](../../data/serial-baseline/03-control-off/ticks.csv)。两个目录同时保留汇总、压缩阶段样本和运行参数。
+- [环境](../data/serial-baseline/environment.txt)。
+- [21组汇总](../data/serial-baseline/01-profiled/summary.csv)、[逐Tick](../data/serial-baseline/01-profiled/ticks.csv)、[阶段原始样本](../data/serial-baseline/01-profiled/samples.csv.gz)、[运行参数](../data/serial-baseline/01-profiled/run.txt)。
+- [采样开启对照](../data/serial-baseline/02-control-on/ticks.csv)、[采样关闭对照](../data/serial-baseline/03-control-off/ticks.csv)。两个目录同时保留汇总、压缩阶段样本和运行参数。
 
 阶段CSV的sample表示完成顺序，elapsed_ns是扣除内嵌阶段后的时长，bytes仅在encoding表示完整日志记录字节数。summary按调用样本计算P50、P95、P99与最大值；ticks保留每Tick的总时长、驱动时长、记录数和批次数。ticks中的state_crc32c是该场景最终快照摘要，重复写入用于关联，并非逐Tick快照。关闭采样时summary的阶段调用数为0，表示未采集。压缩文件为标准Gzip包裹的CSV。
 

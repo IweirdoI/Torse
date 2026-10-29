@@ -100,8 +100,8 @@ cargo run -p torse-client -- --window --connect 127.0.0.1:7801 --frames 60 --scr
 
 ## 画面
 
-![窗口中的贴图地形](../../figures/04-textured-terrain.png)
+![窗口中的贴图地形](../figures/04-textured-terrain.png)
 
-![玻璃半透明与植物二值透明](../../figures/05-textured-alpha.png)
+![玻璃半透明与植物二值透明](../figures/05-textured-alpha.png)
 
 两张图均由客户端自身截图写入。第二张按上面的`--place`命令复现：左侧为玻璃半砖，可透出后方地形，表面保留高光条纹；右侧两株植物只保留叶片像素，背景透明。

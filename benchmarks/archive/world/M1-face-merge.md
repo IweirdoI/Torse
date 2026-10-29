@@ -41,7 +41,7 @@ cargo run -p torse-client -- --capture .work/pair.png --width 960 --height 540 \
 
 ## 画面
 
-![玻璃接触面合并](../../figures/12-glass-contact-merge.png)
+![玻璃接触面合并](../figures/12-glass-contact-merge.png)
 
 左侧两块相邻玻璃读作一个连续玻璃体，接触处无接缝与重合面；右侧透过玻璃可见石头贴面。
 

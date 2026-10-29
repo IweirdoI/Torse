@@ -26,9 +26,9 @@ manifest整理先验证拟保留快照，将这些引用写入并同步临时文
 
 ### 三、验证
 
-完整工作区783项测试通过，零失败、零忽略。逐套原始计数见[workspace.csv](../../data/storage-reclamation/01-bounded/workspace.csv)，环境与配置见[environment.txt](../../data/storage-reclamation/01-bounded/environment.txt)。
+完整工作区783项测试通过，零失败、零忽略。逐套原始计数见[workspace.csv](../data/storage-reclamation/01-bounded/workspace.csv)，环境与配置见[environment.txt](../data/storage-reclamation/01-bounded/environment.txt)。
 
-启用Mod的服务端175项测试通过，计数见[mods.csv](../../data/storage-reclamation/01-bounded/mods.csv)。格式、Clippy及相关API文档检查通过。
+启用Mod的服务端175项测试通过，计数见[mods.csv](../data/storage-reclamation/01-bounded/mods.csv)。格式、Clippy及相关API文档检查通过。
 
 | 场景 | 配置与结果 |
 |---|---|

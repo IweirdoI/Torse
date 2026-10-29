@@ -41,7 +41,7 @@ Vulkan离屏生成9个分区、2203个四边面。窗口自动推进完成121帧
 
 ### 对照
 
-数据见[CPU测量](../../data/adaptive-meshing/01-runs/mesh.csv)及[窗口测量](../../data/adaptive-meshing/01-runs/window.csv)。16格完整立方体重复构建100次，比较如下。
+数据见[CPU测量](../data/adaptive-meshing/01-runs/mesh.csv)及[窗口测量](../data/adaptive-meshing/01-runs/window.csv)。16格完整立方体重复构建100次，比较如下。
 
 | 版本 | 四边面 | 载荷字节 | 总耗时（微秒） |
 |---|---|---|---|

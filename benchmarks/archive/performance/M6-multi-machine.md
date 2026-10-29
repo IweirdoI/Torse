@@ -8,7 +8,7 @@
 
 ## 目标
 
-基线：5071b44加本轮多机器夹具。原始数据见[data/multi-machine](../../data/multi-machine)。
+基线：5071b44加本轮多机器夹具。原始数据见[data/multi-machine](../data/multi-machine)。
 
 ## 方法
 
@@ -70,7 +70,7 @@ RuntimeBudget现在按EventId和完整TimedEvent值复用已测成本，命中�
 
 预算差分覆盖0、1、16、64、128个事件、嵌套字段、同身份内容变化、移除事件、精确条目和字节上下界，以及编码帧和字段限制改变。每次与完整encode/decode结果比较。客户端补充1/4线程下覆盖材质与位置色调网格的完整几何对照，已完成结果遇色调版本变化时拒绝，输入容量继续受限。
 
-本地工作区589项、服务端mods特性117项、Mod宿主package特性18项通过，宿主另有1项原有忽略测试。并行组合专项重复10轮共370次通过，格式、默认和mods严格Clippy通过，详见[environment.txt](../../data/multi-machine/environment.txt)。CI补充Windows及Linux的mods构建、严格Clippy、Mod宿主和服务端测试、真实多机器重复回归及文件基准冒烟；已有CPU取消与并行路径重复测试扩展到两个平台。远端状态查询遇GitHub API限流，新工作流尚待远端运行，不宣称远端CI通过。
+本地工作区589项、服务端mods特性117项、Mod宿主package特性18项通过，宿主另有1项原有忽略测试。并行组合专项重复10轮共370次通过，格式、默认和mods严格Clippy通过，详见[environment.txt](../data/multi-machine/environment.txt)。CI补充Windows及Linux的mods构建、严格Clippy、Mod宿主和服务端测试、真实多机器重复回归及文件基准冒烟；已有CPU取消与并行路径重复测试扩展到两个平台。远端状态查询遇GitHub API限流，新工作流尚待远端运行，不宣称远端CI通过。
 
 ### 五、复跑与结论
 

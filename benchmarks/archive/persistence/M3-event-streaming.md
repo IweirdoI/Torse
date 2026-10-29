@@ -32,9 +32,9 @@ ResidencyArchive读取全部parked页，在总预算内与驻留快照合并，�
 
 ### 三、验证
 
-完整工作区792项测试通过，零失败、零忽略。原始逐套计数见[workspace.csv](../../data/event-streaming/01-bounded/workspace.csv)，配置与环境见[environment.txt](../../data/event-streaming/01-bounded/environment.txt)。
+完整工作区792项测试通过，零失败、零忽略。原始逐套计数见[workspace.csv](../data/event-streaming/01-bounded/workspace.csv)，配置与环境见[environment.txt](../data/event-streaming/01-bounded/environment.txt)。
 
-启用Mod的服务端182项测试通过，计数见[mods.csv](../../data/event-streaming/01-bounded/mods.csv)。格式、Clippy与相关API文档检查通过。
+启用Mod的服务端182项测试通过，计数见[mods.csv](../data/event-streaming/01-bounded/mods.csv)。格式、Clippy与相关API文档检查通过。
 
 | 场景 | 结果 |
 |---|---|

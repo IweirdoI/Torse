@@ -40,7 +40,7 @@ cargo run -p torse-client -- --capture .work/glass.png --width 960 --height 540 
 
 ## 画面
 
-![透明遮挡](../../figures/11-glass-occlusion.png)
+![透明遮挡](../figures/11-glass-occlusion.png)
 
 透过玻璃方块可见其后石头方块的贴面纹理，无缺面空洞；右侧为无遮挡对照。
 

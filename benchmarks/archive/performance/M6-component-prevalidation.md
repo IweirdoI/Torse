@@ -8,7 +8,7 @@
 
 ## 目标
 
-基线：ad9d2b4。原始数据见[data/component-prevalidation](../../data/component-prevalidation)。
+基线：ad9d2b4。原始数据见[data/component-prevalidation](../data/component-prevalidation)。
 
 ## 方法
 

@@ -70,7 +70,7 @@ cargo doc -p torse-mod-host --features package -p torse-world --no-deps --locked
 
 全工作区默认测试760项通过，零忽略。Mod宿主启用package后的测试35项通过，原有性能测量保留1项显式忽略。服务端启用mods后的测试172项通过，零忽略。
 
-测试结果逐目标汇总见[原始结果表](../../data/mod-host-budgets/01-bounded/tests.csv)，运行环境见[环境记录](../../data/mod-host-budgets/01-bounded/environment.txt)。
+测试结果逐目标汇总见[原始结果表](../data/mod-host-budgets/01-bounded/tests.csv)，运行环境见[环境记录](../data/mod-host-budgets/01-bounded/environment.txt)。
 
 ### 五、未覆盖范围
 

@@ -91,11 +91,11 @@ cargo run --release -p torse-client --locked -- --window --walk --autoplay --fra
 
 飞行截图显示持续生成、重建与编辑后的场景。
 
-![后台流式与编辑](../../figures/bounded-executor/01-stream.png)
+![后台流式与编辑](../figures/bounded-executor/01-stream.png)
 
 行走截图在地形阻挡处结束，移动结算使用已装载世界。
 
-![后台流式与行走](../../figures/bounded-executor/02-walk.png)
+![后台流式与行走](../figures/bounded-executor/02-walk.png)
 
 两张图片均由本轮本地客户端运行直接截图，未引入外部素材。
 
@@ -126,9 +126,9 @@ torse-runtime新增固定线程的Executor。应用先调用try_reserve预留任
 
 ### 五、证据与限制
 
-- [飞行原始指标](../../data/bounded-executor/window.txt)。
-- [行走原始指标](../../data/bounded-executor/walk.txt)。
-- [测试及重复运行计数](../../data/bounded-executor/validation.txt)。
+- [飞行原始指标](../data/bounded-executor/window.txt)。
+- [行走原始指标](../data/bounded-executor/walk.txt)。
+- [测试及重复运行计数](../data/bounded-executor/validation.txt)。
 - [执行器接口](../../../crates/runtime/README.md)、[场景适配](../../../apps/client/src/scene/background.rs)。
 
 远端CI未运行。尚未实现服务端权威规划并行、异步磁盘加载、资源热更新、光照、寻路或巨型Domain分解。主线程仍构造有限网格快照和上传GPU资源；本轮只将拥有独立输入的生成与网格计算移入有界CPU池，未修改事务顺序、存档格式和持久确认语义。

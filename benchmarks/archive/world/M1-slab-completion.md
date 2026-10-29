@@ -45,11 +45,11 @@ cargo run -p torse-client -- --capture .work/cull.png --width 960 --height 540 \
 
 ## 画面
 
-![半砖合并](../../figures/09-slab-merge.png)
+![半砖合并](../figures/09-slab-merge.png)
 
 左为单块半砖，中为两次放置合并出的完整玻璃，右为石头；两种玻璃共用同一材质。
 
-![遮挡场景](../../figures/10-slab-cull.png)
+![遮挡场景](../figures/10-slab-cull.png)
 
 石头墙前贴半砖：墙面完整，半砖以上没有透视空洞。
 

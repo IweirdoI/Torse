@@ -8,7 +8,7 @@
 
 ## 目标
 
-基线提交：deb744a，包含本轮工作区改动。数据位于[data/runtime-commit](../../data/runtime-commit)。
+基线提交：deb744a，包含本轮工作区改动。数据位于[data/runtime-commit](../data/runtime-commit)。
 
 ## 方法
 
@@ -53,9 +53,9 @@ MemoryBackend另改为有硬容量上限的几何扩容，避免每次小追加�
 
 | 数据目录 | 运行态 | 每批记录上限 |
 |---|---|---:|
-| [01-full-runtime](../../data/runtime-commit/01-full-runtime) | 完整记录和完整编码/解码校验 | 1 |
-| [02-compact-runtime](../../data/runtime-commit/02-compact-runtime) | 进度记录及不可变表成本缓存 | 1 |
-| [03-batch-16](../../data/runtime-commit/03-batch-16) | 进度记录及不可变表成本缓存 | 16 |
+| [01-full-runtime](../data/runtime-commit/01-full-runtime) | 完整记录和完整编码/解码校验 | 1 |
+| [02-compact-runtime](../data/runtime-commit/02-compact-runtime) | 进度记录及不可变表成本缓存 | 1 |
+| [03-batch-16](../data/runtime-commit/03-batch-16) | 进度记录及不可变表成本缓存 | 16 |
 
 三种模式使用相同当前代码和最终状态验证，均经过真实Server、Journal编码、预留、接纳与同步接口。sink丢弃日志，memory保留日志且不执行设备同步，file执行真实文件追加与sync_all。文件场景结束后从初始检查点重放整个日志并逐字节比较最终执行快照。各模式和后端的最终状态摘要相同。
 
@@ -87,7 +87,7 @@ MemoryBackend另改为有硬容量上限的几何扩容，避免每次小追加�
 | 64 | 50.7 | 107.1 |
 | 128 | 100.3 | 106.6 |
 
-该负载尚无并行预验证收益，因此本轮保留串行准备和发布。准备项还绑定观察到的提交序号及阶段，不能把同一起点生成的多份PreparedChange直接按完成次序发布。后续若复杂碰撞或其他真实事务显著增加验证成本，再测分类和最终复核成本。完整结果见[预验证原始数据](../../data/runtime-commit/prevalidation.csv)与[汇总](../../data/runtime-commit/prevalidation-summary.csv)。
+该负载尚无并行预验证收益，因此本轮保留串行准备和发布。准备项还绑定观察到的提交序号及阶段，不能把同一起点生成的多份PreparedChange直接按完成次序发布。后续若复杂碰撞或其他真实事务显著增加验证成本，再测分类和最终复核成本。完整结果见[预验证原始数据](../data/runtime-commit/prevalidation.csv)与[汇总](../data/runtime-commit/prevalidation-summary.csv)。
 
 | 验证 | 结果 |
 |---|---|
@@ -123,7 +123,7 @@ cargo run --release -p torse-server --example prevalidation_baseline --locked --
     .work/runtime-commit/prevalidation.csv
 ```
 
-输出目录和预验证CSV必须尚不存在。执行环境和验证计数见[environment.txt](../../data/runtime-commit/environment.txt)。Gzip仅由本次测量CSV生成，本轮没有新增图像或其他媒体素材。
+输出目录和预验证CSV必须尚不存在。执行环境和验证计数见[environment.txt](../data/runtime-commit/environment.txt)。Gzip仅由本次测量CSV生成，本轮没有新增图像或其他媒体素材。
 
 ## 边界
 

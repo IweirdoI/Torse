@@ -44,15 +44,15 @@ cargo run -p torse-client -- --window --ui-preview pause --frames 8 --screenshot
 
 ## 画面
 
-![机器面板](../../figures/06-ui-imgui-machine.png)
+![机器面板](../figures/06-ui-imgui-machine.png)
 
 机器面板：输入组带示例物品与数量，输出组为空，中列进度与比例，底部状态行。
 
-![暂停菜单](../../figures/07-ui-imgui-pause.png)
+![暂停菜单](../figures/07-ui-imgui-pause.png)
 
 暂停菜单：标题栏、三个整宽按钮、灵敏度行与说明，快捷栏在遮罩后继续可见。
 
-![HUD](../../figures/08-ui-imgui-hud.png)
+![HUD](../figures/08-ui-imgui-hud.png)
 
 HUD：选中槽位强调边框、深色状态条、十字准星与帮助行。
 

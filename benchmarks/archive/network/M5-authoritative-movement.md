@@ -8,7 +8,7 @@
 
 ## 目标
 
-验证服务端玩家绑定、固定Tick结算、持久运动状态和独立客户端预测。原始汇总见[data/authoritative-movement/01-fixed-tick](../../data/authoritative-movement/01-fixed-tick)，环境与命令见其中的environment.txt。
+验证服务端玩家绑定、固定Tick结算、持久运动状态和独立客户端预测。原始汇总见[data/authoritative-movement/01-fixed-tick](../data/authoritative-movement/01-fixed-tick)，环境与命令见其中的environment.txt。
 
 ## 方法
 

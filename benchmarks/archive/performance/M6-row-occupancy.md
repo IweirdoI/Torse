@@ -55,7 +55,7 @@ cargo run -p torse-client --locked -- --capture .work/row-occupancy.png --width 
 
 147项客户端及渲染功能测试通过，计时用例默认忽略并已独立执行。当前设备复跑20次32格满立方体，参考耗时83508微秒，行优化23483微秒；全空场景为9288和3184微秒。采样次数与上表一致。复跑采用Windows、release及Rust1.93.1，仅计CPU耗时。
 
-共面合并对照仍使用相同未优化参考，100次16格满立方体输出由1536个面、411648字节降至96个面、25728字节，耗时37704和34120微秒。前述原始测量保留为分支基线，当前数据见[data/row-occupancy/01-integrated](../../data/row-occupancy/01-integrated/cpu.csv)。
+共面合并对照仍使用相同未优化参考，100次16格满立方体输出由1536个面、411648字节降至96个面、25728字节，耗时37704和34120微秒。前述原始测量保留为分支基线，当前数据见[data/row-occupancy/01-integrated](../data/row-occupancy/01-integrated/cpu.csv)。
 
 ## 结果
 

@@ -73,7 +73,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-工作负载、环境及实际程序汇总见[原始记录](../../data/user-authentication/01-mutual-tls)。功能及拒绝路径验证不等同于互联网规模、外部渗透或证书运维体系的验收。
+工作负载、环境及实际程序汇总见[原始记录](../data/user-authentication/01-mutual-tls)。功能及拒绝路径验证不等同于互联网规模、外部渗透或证书运维体系的验收。
 
 本机首次链接完整调试类型的TLS与Wasm组合时出现MSVC的LNK1318、PDB LIMIT(12)。开发配置改为`debug = "limited"`，测试继承该设置，断言和溢出检查仍启用，Release配置不变。该选项保留模块及源码调试位置，省略类型和局部变量级信息，定义见[Cargo调试信息配置](https://doc.rust-lang.org/cargo/reference/profiles.html#debug)。随后按默认命令重新构建和验证。
 

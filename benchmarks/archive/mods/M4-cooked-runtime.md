@@ -37,7 +37,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 ```
 
-第三条预期失败。输出及环境见[data/cooked-runtime/01-budgeted](../../data/cooked-runtime/01-budgeted/metrics.csv)。
+第三条预期失败。输出及环境见[data/cooked-runtime/01-budgeted](../data/cooked-runtime/01-budgeted/metrics.csv)。
 
 ## 边界
 

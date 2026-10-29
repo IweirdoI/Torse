@@ -48,6 +48,6 @@ cargo run -p torse-client -- --capture out.png --width 960 --height 720 --radius
 
 ## 画面
 
-![丘陵地形的离屏渲染](../../figures/M1-client.png)
+![丘陵地形的离屏渲染](../figures/M1-client.png)
 
 俯视全景相机位于`(40, 18, 40)`，看向`(0, 6, 0)`。地形为种子7的丘陵生成器，基准高度7、振幅9，分区边长16，半径2。

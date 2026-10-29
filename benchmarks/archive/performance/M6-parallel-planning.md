@@ -8,7 +8,7 @@
 
 ## 目标
 
-基线提交：7dde86b，包含本轮工作区改动。原始数据见[data/parallel-planning](../../data/parallel-planning)。
+基线提交：7dde86b，包含本轮工作区改动。原始数据见[data/parallel-planning](../data/parallel-planning)。
 
 ## 方法
 
@@ -77,7 +77,7 @@
 
 CPU独立负载的规划约为串行的3.64倍速度，完整驱动约为3.41倍；轻负载多出的线程启动和校验成本超过计算收益。默认串行及规则显式加入因此保留。测量只含一次运行，没有用该合成结果推算现有Mod或整体服务端的加速比。
 
-每组跨三种模式逐字节比较完整最终执行快照，并校验流式日志CRC32C一致。独立组的状态摘要为dd6844a1、日志摘要为c157f16b；争用组分别为a3391504、b72433b4。日志逐字节等价另由文件回归测试验证。逐Tick耗时、P50/P95和参数分别保存在[ticks.csv](../../data/parallel-planning/ticks.csv)、[summary.csv](../../data/parallel-planning/summary.csv)和[run.txt](../../data/parallel-planning/run.txt)。
+每组跨三种模式逐字节比较完整最终执行快照，并校验流式日志CRC32C一致。独立组的状态摘要为dd6844a1、日志摘要为c157f16b；争用组分别为a3391504、b72433b4。日志逐字节等价另由文件回归测试验证。逐Tick耗时、P50/P95和参数分别保存在[ticks.csv](../data/parallel-planning/ticks.csv)、[summary.csv](../data/parallel-planning/summary.csv)和[run.txt](../data/parallel-planning/run.txt)。
 
 ## 复现
 
@@ -94,7 +94,7 @@ cargo fmt --all -- --check
 cargo run --release -p torse-server --example parallel_baseline --locked -- --output .work/parallel-planning/01-measurement
 ```
 
-输出目录必须不存在。`--ticks`允许1到1000，`--warmup`允许0到100；默认分别为20和3。workers为0的CSV行表示原串行参考，1和4表示已启用的借用批次，max_in_flight固定为8。[validation.txt](../../data/parallel-planning/validation.txt)记录本轮验证计数与启动结果。
+输出目录必须不存在。`--ticks`允许1到1000，`--warmup`允许0到100；默认分别为20和3。workers为0的CSV行表示原串行参考，1和4表示已启用的借用批次，max_in_flight固定为8。[validation.txt](../data/parallel-planning/validation.txt)记录本轮验证计数与启动结果。
 
 ## 边界
 

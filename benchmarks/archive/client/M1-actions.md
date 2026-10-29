@@ -58,6 +58,6 @@ cargo run -p torse-client -- --window --autoplay --frames 360 --screenshot figur
 
 ## 画面
 
-![窗口模式下的选中框与破坏痕迹](../../figures/M1-actions.png)
+![窗口模式下的选中框与破坏痕迹](../figures/M1-actions.png)
 
 相机贴近地表前向飞行，准星套在目标方块上的深色线框为选中框；画面中的凹陷是自动破坏留下的缺口。截取于debug运行最后一帧。

@@ -8,7 +8,7 @@
 
 ## 目标
 
-前态：84df89a，后态：0a0dbdc加本轮工作区改动。两次测量之间的已提交差异仅为仓库模板。原始CSV及分项样本位于[data/movement-prevalidation](../../data/movement-prevalidation)。
+前态：84df89a，后态：0a0dbdc加本轮工作区改动。两次测量之间的已提交差异仅为仓库模板。原始CSV及分项样本位于[data/movement-prevalidation](../data/movement-prevalidation)。
 
 ## 方法
 

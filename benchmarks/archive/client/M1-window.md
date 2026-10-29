@@ -60,6 +60,6 @@ cargo run -p torse-client -- --window --autoplay --frames 120 --screenshot figur
 
 ## 画面
 
-![窗口模式下的飞行视角](../../figures/M1-window.png)
+![窗口模式下的飞行视角](../figures/M1-window.png)
 
 初始相机站在`scene.eye()`给出的地表位置，默认带轻微俯角，自动飞行方向为负z。半径3共49个分区，画面与离屏路径共用同一网格与管线。

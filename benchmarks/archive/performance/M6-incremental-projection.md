@@ -8,7 +8,7 @@
 
 ## 目标
 
-基线：92fe51b。原始CSV和分项样本见[data/incremental-projection](../../data/incremental-projection)。
+基线：92fe51b。原始CSV和分项样本见[data/incremental-projection](../data/incremental-projection)。
 
 ### 一、按提交目标更新
 

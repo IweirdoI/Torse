@@ -12,8 +12,8 @@
 |---|---|---|
 | `README.md` | 索引与目录规范 | 新增记录后补一行索引 |
 | `archive/<语义>/` | 历史验证与测量记录 | 按语义分组，不再放回根目录 |
-| `data/<场景>/` | 原始测量数据 | 按场景分目录，保留环境与运行编号 |
-| `figures/NN-<主题>.png` | 编号图 | 两位序号，按首次引用顺序递增 |
+| `archive/data/<场景>/` | 原始测量数据 | 按场景分目录，保留环境与运行编号 |
+| `archive/figures/NN-<主题>.png` | 编号图 | 两位序号，按首次引用顺序递增 |
 
 根目录只保留当前状态记录；历史记录归档到`archive/`并按语义分组。数据与图仍各自独立存放，避免把二进制和正文混在同一层。
 
@@ -23,9 +23,9 @@
 |---|---|---|
 | 报告 | `<批次>/<批次>-<主题>.md` | `M6/M6-frame-budget.md` |
 | 批次前缀 | `M0` 到 `M6`、`A`、`B`、`CLN`、`ENG` 系列 | `A8-acceptance.md` |
-| 数据目录 | `<场景>/<NN>-<变体>/` | `data/incremental-projection/01-before/` |
+| 数据目录 | `archive/data/<场景>/<NN>-<变体>/` | `rchive/data/incremental-projection/01-before/` |
 | 环境文件 | `environment.txt` | 设备、系统、工具链 |
-| 图 | 新图 `NN-<主题>.png`，旧记录沿用原文件名 | `figures/09-slab-merge.png`、`figures/M1-actions.png` |
+| 图 | `archive/figures/NN-<主题>.png`，旧记录沿用原文件名 | `figures/09-slab-merge.png`、`archive/figures/M1-actions.png` |
 
 主题用小写英文和连字符，不复述批次；同一场景的对照运行用两位序号区分。
 
@@ -77,15 +77,15 @@
 
 ## 新增流程
 
-1. 运行场景，把原始输出放到 `data/<场景>/`，并写 `environment.txt`。
-2. 截图或图表放到 `figures/`，按顺序编号。
+1. 运行场景，把原始输出放到 `archive/data/<场景>/`，并写 `environment.txt`。
+2. 截图或图表放到 `archive/figures/`，按顺序编号。
 3. 在根目录写报告，套用上面的记录格式。
 4. 记录完成后更新本文件索引；需要归档时移入`archive/<语义>/`。
 5. 不改旧记录的数字与结论；新的对照另起记录，并在旧记录里补一行指向新记录。
 
 ## 图文件
 
-截图统一放在 `figures/`。新图用两位序号命名，旧记录沿用原文件名（如 `figures/M1-actions.png`），不再散落到报告目录。报告里引用图时写相对路径 `figures/<name>`。
+截图统一放在 `archive/figures/`。新图用两位序号命名，旧记录沿用原文件名（如 `archive/figures/M1-actions.png`），不再散落到报告目录。报告里引用图时写相对路径 `archive/figures/<name>`。
 
 ## 历史记录
 

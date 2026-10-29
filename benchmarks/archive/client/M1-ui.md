@@ -49,15 +49,15 @@ cargo run -p torse-client -- --window --ui-preview pause --frames 8 --screenshot
 
 机器面板标明示例数据，显示输入、输出、进度与状态，不提供修改真实机器的按钮。
 
-![机器面板预览](../../figures/01-ui-machine.png)
+![机器面板预览](../figures/01-ui-machine.png)
 
 HUD显示当前方块、准星和三格快捷栏，文字带阴影以适应浅色地形。
 
-![HUD](../../figures/02-ui-hud.png)
+![HUD](../figures/02-ui-hud.png)
 
 窗口菜单实际运行9帧并从surface读回PNG，期间actions_ok、actions_rejected和walk_ticks均为0，证明自动捕获未执行世界操作。
 
-![窗口菜单](../../figures/03-ui-menu.png)
+![窗口菜单](../figures/03-ui-menu.png)
 
 ## 后续
 

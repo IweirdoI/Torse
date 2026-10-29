@@ -129,6 +129,7 @@ pub struct Scene {
     lighting: Option<lighting::Lighting>,
     surfaces: surfaces::Previews,
 }
+mod borders;
 mod items;
 mod lighting;
 mod memory;
@@ -604,7 +605,7 @@ impl Scene {
                     uv: [0.0, 0.0],
                     material: 0,
                     overlay_material: u32::MAX,
-                    tint: [1.0; 3],
+                    tint: [0.05; 3],
                     overlay_tint: [1.0; 3],
                     light: -1.0,
                 });

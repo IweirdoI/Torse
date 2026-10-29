@@ -27,6 +27,7 @@ pub enum OptionId {
     Debug,
     Hud,
     Outline,
+    SectionBorders,
     InvertY,
     AutoJump,
     Entities,
@@ -159,6 +160,7 @@ pub struct Settings {
     pub debug: bool,
     pub hud: bool,
     pub outline: bool,
+    pub section_borders: bool,
     pub invert_y: bool,
     pub auto_jump: bool,
     pub entities: bool,
@@ -178,6 +180,7 @@ impl Default for Settings {
             debug: false,
             hud: true,
             outline: true,
+            section_borders: false,
             invert_y: false,
             auto_jump: false,
             entities: true,
@@ -276,6 +279,7 @@ impl Settings {
             OptionId::Debug => &mut self.debug,
             OptionId::Hud => &mut self.hud,
             OptionId::Outline => &mut self.outline,
+            OptionId::SectionBorders => &mut self.section_borders,
             OptionId::InvertY => &mut self.invert_y,
             OptionId::AutoJump => &mut self.auto_jump,
             OptionId::Entities => &mut self.entities,
@@ -289,6 +293,7 @@ impl Settings {
             OptionId::Debug => self.debug,
             OptionId::Hud => self.hud,
             OptionId::Outline => self.outline,
+            OptionId::SectionBorders => self.section_borders,
             OptionId::InvertY => self.invert_y,
             OptionId::AutoJump => self.auto_jump,
             OptionId::Entities => self.entities,
@@ -362,6 +367,7 @@ mod tests {
         settings.save(&path).unwrap();
         settings.fov = 90;
         settings.skin = SkinChoice::Blue;
+        settings.section_borders = true;
         settings
             .bindings
             .rebind(Binding::Forward, KeyCode::KeyZ)

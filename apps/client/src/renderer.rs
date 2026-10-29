@@ -238,14 +238,20 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 
+struct LineOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec3<f32>,
+};
 @vertex
-fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-    return camera.view_proj * vec4<f32>(position, 1.0);
+fn vs_main(@location(0) position: vec3<f32>, @location(1) color: vec3<f32>) -> LineOut {
+    var out: LineOut;
+    out.position = camera.view_proj * vec4<f32>(position, 1.0);
+    out.color = color;
+    return out;
 }
-
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.05, 0.05, 0.05, 1.0);
+fn fs_main(input: LineOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 1.0);
 }
 "#;
 
@@ -259,6 +265,7 @@ pub const SKY: Color = Color {
 
 /// Selection outline capacity: 12 cube edges of 2 vertices each.
 const MAX_LINE_VERTICES: usize = 24;
+const MAX_BORDER_VERTICES: usize = 384;
 
 /// Bytes per terrain vertex: position, normal, uv, and one material slot.
 const VERTEX_STRIDE: usize = 68;
@@ -287,6 +294,7 @@ pub struct GpuContext {
     geometry_evictions: u64,
     draw_stats: std::cell::Cell<DrawStats>,
     line_pipeline: RenderPipeline,
+    border_pipeline: RenderPipeline,
     sky_pipeline: RenderPipeline,
     camera: Buffer,
     camera_bind: BindGroup,
@@ -299,6 +307,7 @@ pub struct GpuContext {
     terrain: BTreeMap<torse_types::SectionPos, SectionBuffers>,
     line_buffer: Buffer,
     line_count: u32,
+    border_count: u32,
     animation_origin: Instant,
 }
 
@@ -596,48 +605,62 @@ impl GpuContext {
         let transparent_pipeline = make_pipeline(true);
         // The outline only reads depth, so it never occludes the terrain it
         // marks. It ignores texture coordinates and material slots.
-        let line_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("client outline pipeline"),
-            layout: Some(&line_pipeline_layout),
-            vertex: VertexState {
-                module: &line_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: VERTEX_STRIDE as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
-                })],
-            },
-            fragment: Some(FragmentState {
-                module: &line_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(ColorTargetState {
-                    format: color_format,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            primitive: PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                ..PrimitiveState::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_line = |label, compare| {
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&line_pipeline_layout),
+                vertex: VertexState {
+                    module: &line_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: VERTEX_STRIDE as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 40,
+                                shader_location: 1,
+                            },
+                        ],
+                    })],
+                },
+                fragment: Some(FragmentState {
+                    module: &line_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: color_format,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                primitive: PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    ..PrimitiveState::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(compare),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let line_pipeline = make_line("client outline pipeline", wgpu::CompareFunction::Less);
+        let border_pipeline = make_line(
+            "client section border pipeline",
+            wgpu::CompareFunction::Always,
+        );
         // The sky covers the whole target behind the terrain, so it carries no
         // bind group and never writes depth.
         let sky_shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -682,7 +705,7 @@ impl GpuContext {
         });
         let line_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("client outline vertices"),
-            size: (MAX_LINE_VERTICES * VERTEX_STRIDE) as u64,
+            size: ((MAX_LINE_VERTICES + MAX_BORDER_VERTICES) * VERTEX_STRIDE) as u64,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -701,6 +724,7 @@ impl GpuContext {
             geometry_evictions: 0,
             draw_stats: std::cell::Cell::new(DrawStats::default()),
             line_pipeline,
+            border_pipeline,
             sky_pipeline,
             camera,
             camera_bind,
@@ -710,6 +734,7 @@ impl GpuContext {
             terrain: BTreeMap::new(),
             line_buffer,
             line_count: 0,
+            border_count: 0,
             animation_origin: Instant::now(),
         }
     }
@@ -1053,6 +1078,16 @@ impl GpuContext {
         self.line_count = (limit / VERTEX_STRIDE) as u32;
     }
 
+    pub fn write_borders(&mut self, vertex_bytes: &[u8]) {
+        let limit = vertex_bytes.len().min(MAX_BORDER_VERTICES * VERTEX_STRIDE);
+        self.queue.write_buffer(
+            &self.line_buffer,
+            (MAX_LINE_VERTICES * VERTEX_STRIDE) as u64,
+            &vertex_bytes[..limit],
+        );
+        self.border_count = (limit / VERTEX_STRIDE) as u32;
+    }
+
     /// Encode the one terrain pass onto any colour and depth view pair.
     pub fn encode_draw(
         &self,
@@ -1164,6 +1199,15 @@ impl GpuContext {
             pass.set_bind_group(0, &self.camera_bind, &[]);
             pass.set_vertex_buffer(0, self.line_buffer.slice(..));
             pass.draw(0..self.line_count, 0..1);
+        }
+        if self.border_count > 0 {
+            pass.set_pipeline(&self.border_pipeline);
+            pass.set_bind_group(0, &self.camera_bind, &[]);
+            pass.set_vertex_buffer(0, self.line_buffer.slice(..));
+            pass.draw(
+                MAX_LINE_VERTICES as u32..MAX_LINE_VERTICES as u32 + self.border_count,
+                0..1,
+            );
         }
         true
     }

@@ -34,6 +34,7 @@ skin_hint=点击切换皮肤；自定义贴图需先配置目录
 settings_debug_overlay=显示调试信息
 settings_hud=显示HUD与准星
 settings_outline=显示选择框
+settings_section_borders=显示分区边界
 settings_entities=显示实体
 settings_invert_y=反转鼠标纵向
 settings_auto_jump=行走遇障碍自动跳跃

@@ -634,6 +634,17 @@ impl WindowApp {
         };
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.context.write_lines(&outline);
+            let borders = if self.ui.settings.section_borders {
+                self.scene
+                    .as_ref()
+                    .zip(self.camera.as_ref())
+                    .map_or_else(Vec::new, |(scene, camera)| {
+                        scene.section_border_bytes(camera.eye)
+                    })
+            } else {
+                Vec::new()
+            };
+            gpu.context.write_borders(&borders);
         }
 
         let rebuilt = match self
@@ -941,6 +952,14 @@ impl WindowApp {
                         gpu.context.geometry_usage().bytes as f64 / (1024.0 * 1024.0)
                     ),
                     format!("position: {:.1}, {:.1}, {:.1}", eye[0], eye[1], eye[2]),
+                    scene
+                        .section_location(eye)
+                        .map_or_else(String::new, |(section, local)| {
+                            format!(
+                                "section: {}, {}, {} | local: {}, {}, {}",
+                                section.x, section.y, section.z, local.x, local.y, local.z
+                            )
+                        }),
                     format!(
                         "mode: {} | material: {material}",
                         if self.walk { "walk" } else { "fly" }

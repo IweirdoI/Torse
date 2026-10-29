@@ -40,7 +40,12 @@ impl Layout {
                 row(1, Action::Toggle(OptionId::Hud), "settings_hud");
                 row(2, Action::Toggle(OptionId::Outline), "settings_outline");
                 row(3, Action::Toggle(OptionId::Entities), "settings_entities");
-                row(4, Action::Preview, "menu_preview");
+                row(
+                    4,
+                    Action::Toggle(OptionId::SectionBorders),
+                    "settings_section_borders",
+                );
+                row(5, Action::Preview, "menu_preview");
             }
             Tab::Gameplay => {
                 row(0, Action::Toggle(OptionId::InvertY), "settings_invert_y");

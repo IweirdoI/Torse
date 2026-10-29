@@ -34,6 +34,7 @@ skin_hint=Select a skin; custom textures require a configured directory.
 settings_debug_overlay=Debug information
 settings_hud=HUD and crosshair
 settings_outline=Selection outline
+settings_section_borders=Section boundaries
 settings_entities=Entity rendering
 settings_invert_y=Invert mouse Y
 settings_auto_jump=Auto jump when blocked

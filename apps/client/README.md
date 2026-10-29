@@ -14,6 +14,8 @@
 cargo run -p torse-client -- --window
 ```
 
+开发构建对热循环启用一级优化，保留调试断言、溢出检查和有限符号。逐语句调试需要完全不优化时，使用`cargo run --profile debug-unoptimized -p torse-client -- --window`。测试继续使用未优化配置。可复现实测见[开发性能记录](../../benchmarks/CLN-debug-performance.md)。[20261029]
+
 离屏模式输出一张PNG，仍需要GPU与可用的图形后端：
 
 ```sh
@@ -47,6 +49,7 @@ cargo run -p torse-client -- --window --connect 127.0.0.1:7777 --walk
 | `--view overview`、`--view player` | 离屏相机，默认俯视全景 |
 | `--place KEY:X,Y,Z` | 离屏模式先放置一个方块，可重复；用于复现形状与透明检查 |
 | `--frames N` | 窗口呈现指定帧数后退出，用于自动验证 |
+| `--benchmark` | 配合正数`--frames`固定视点并忽略键鼠输入，不捕获鼠标；显式`--autoplay`仍会执行 |
 | `--fps-limit N` | 启动时启用30到1000FPS上限，仍可在菜单调整或关闭 |
 | `--settings-tab debug`、`gameplay`、`graphics`、`controls` | 启动时打开指定设置页，便于界面验证 |
 | `--screenshot FILE` | 窗口正常退出前保存最后一帧 |

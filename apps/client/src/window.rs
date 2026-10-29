@@ -79,6 +79,8 @@ pub struct WindowConfig {
     pub screenshot: Option<String>,
     /// Fly forward automatically instead of waiting for keys.
     pub autoplay: bool,
+    /// Ignore interactive input and leave the cursor free during finite measurement.
+    pub benchmark: bool,
     /// Start in walk mode with a player entity on the ground.
     pub walk: bool,
     /// Connect to a standalone server and mirror its authorized projection.
@@ -225,6 +227,7 @@ struct WindowApp {
     fps_origin: Instant,
     fps_frames: u32,
     frame_total_us: u128,
+    benchmark_mark_us: u128,
     frame_max_us: u128,
     frame_count: u32,
     streams_mark: usize,
@@ -312,6 +315,7 @@ impl WindowApp {
             fps_origin: Instant::now(),
             fps_frames: 0,
             frame_total_us: 0,
+            benchmark_mark_us: 0,
             frame_max_us: 0,
             frame_count: 0,
             streams_mark: 0,
@@ -869,6 +873,14 @@ impl WindowApp {
         }
 
         self.frames += 1;
+        if self.config.benchmark && self.frames.is_multiple_of(300) {
+            eprintln!(
+                "benchmark_frame={} sample_frames=300 mean_frame_us={}",
+                self.frames,
+                (self.frame_total_us - self.benchmark_mark_us) / 300
+            );
+            self.benchmark_mark_us = self.frame_total_us;
+        }
         self.fps_frames += 1;
         let title_span = self.fps_origin.elapsed().as_secs_f32();
         if title_span >= 0.5 {
@@ -1269,7 +1281,7 @@ impl WindowApp {
     fn set_grab(&mut self, grab: bool) {
         // Never capture while the window is unfocused; the next focus event
         // or the per-frame check re-arms capture.
-        let grab = grab && self.focused;
+        let grab = grab && self.focused && !self.config.benchmark;
         if let Some(gpu) = self.gpu.as_ref() {
             self.grabbed = if grab && gpu.window.has_focus() && !self.ui.modal() {
                 // On Windows Locked pins the current desktop position, even
@@ -1749,6 +1761,17 @@ impl ApplicationHandler for WindowApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.config.benchmark
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseWheel { .. }
+            )
+        {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.finish(event_loop);
@@ -1925,6 +1948,9 @@ impl ApplicationHandler for WindowApp {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
+        if self.config.benchmark {
+            return;
+        }
         if let DeviceEvent::MouseMotion { delta } = event {
             self.captured_motion(delta);
         }
@@ -2280,6 +2306,7 @@ mod tests {
             frames: None,
             screenshot: None,
             autoplay: false,
+            benchmark: false,
             walk: false,
             connect: None,
             sensitivity: 1.0,

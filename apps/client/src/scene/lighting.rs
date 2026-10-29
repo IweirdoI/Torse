@@ -15,6 +15,60 @@ const LIMITS: LightLimits = LightLimits {
     bytes: WORK_BYTES,
 };
 
+pub(super) struct Inputs {
+    binding: Binding,
+    content: torse_types::Digest,
+    side: u32,
+    bounds: WorldBounds,
+    wanted: Vec<SectionPos>,
+    observations: Vec<(SectionPos, Option<torse_types::Revision>, bool, Option<u64>)>,
+}
+impl Inputs {
+    fn observation(
+        scene: &Scene,
+        pos: SectionPos,
+    ) -> (SectionPos, Option<torse_types::Revision>, bool, Option<u64>) {
+        let store = scene.authority.store();
+        (
+            pos,
+            store.revision(pos),
+            matches!(
+                store.phase(pos),
+                Some(torse_world::SectionPhase::Ready | torse_world::SectionPhase::Active)
+            ),
+            scene.load_generations.get(&pos).copied(),
+        )
+    }
+    pub fn capture(binding: Binding, scene: &Scene) -> Self {
+        Self {
+            binding,
+            content: scene.authority.registry().authority_digest(),
+            side: scene.side,
+            bounds: scene.authority.store().bounds(),
+            wanted: scene.sections.clone(),
+            observations: scene
+                .authority
+                .store()
+                .positions()
+                .map(|pos| Self::observation(scene, pos))
+                .collect(),
+        }
+    }
+    pub fn matches(&self, binding: Binding, scene: &Scene) -> bool {
+        self.binding == binding
+            && self.content == scene.authority.registry().authority_digest()
+            && self.side == scene.side
+            && self.bounds == scene.authority.store().bounds()
+            && self.wanted == scene.sections
+            && self.observations.len() == scene.authority.store().len()
+            && self
+                .observations
+                .iter()
+                .zip(scene.authority.store().positions())
+                .all(|(old, pos)| *old == Self::observation(scene, pos))
+    }
+}
+
 struct Pending {
     target: SectionPos,
     kind: usize,
@@ -43,6 +97,7 @@ pub(super) struct Lighting {
     cache_bytes: [usize; 2],
     pending: Option<Pending>,
     memory: Option<MemoryPool>,
+    inputs: Option<Inputs>,
     pub generation: u64,
 }
 impl Lighting {
@@ -53,6 +108,7 @@ impl Lighting {
             cache_bytes: [0; 2],
             pending: None,
             memory,
+            inputs: None,
             generation: 0,
         })
     }
@@ -66,26 +122,33 @@ impl Lighting {
     pub fn step(&mut self, scene: &Scene, work: usize) -> Result<(), String> {
         let store = scene.authority.store();
         let registry = scene.authority.registry();
-        for kind in 0..2 {
-            let removed: Vec<_> = self.entries[kind]
-                .iter()
-                .filter_map(|(pos, entry)| {
-                    (!scene.sections.contains(pos)
-                        || entry.load != scene.load_generations.get(pos).copied())
-                    .then_some(*pos)
-                })
-                .collect();
-            for pos in removed {
-                self.advance_generation()?;
-                if let Some(old) = self.entries[kind].remove(&pos) {
-                    self.cache_bytes[kind] -= old.bytes();
+        if !self
+            .inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.matches(self.binding, scene))
+        {
+            for kind in 0..2 {
+                let removed: Vec<_> = self.entries[kind]
+                    .iter()
+                    .filter_map(|(pos, entry)| {
+                        (!scene.sections.contains(pos)
+                            || entry.load != scene.load_generations.get(pos).copied())
+                        .then_some(*pos)
+                    })
+                    .collect();
+                for pos in removed {
+                    self.advance_generation()?;
+                    if let Some(old) = self.entries[kind].remove(&pos) {
+                        self.cache_bytes[kind] -= old.bytes();
+                    }
+                }
+                // Validate each dependency set once per update, rather than once
+                // for every neighboring mesh stamp captured in the frame.
+                for entry in self.entries[kind].values_mut() {
+                    entry.current = entry.data.validate(self.binding, store, registry);
                 }
             }
-            // Validate each dependency set once per update, rather than once
-            // for every neighboring mesh stamp captured in the frame.
-            for entry in self.entries[kind].values_mut() {
-                entry.current = entry.data.validate(self.binding, store, registry);
-            }
+            self.inputs = Some(Inputs::capture(self.binding, scene));
         }
         if let Some(pending) = self.pending.as_mut() {
             if !scene.sections.contains(&pending.target) {
@@ -628,6 +691,53 @@ mod tests {
                 "x={x}: {shades:?}"
             );
         }
+    }
+    #[test]
+    fn reloaded_external_halo_invalidates_reused_lighting_validation() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let glass = scene
+            .authority
+            .registry()
+            .default_state(&key("base:glass"))
+            .unwrap();
+        for x in -16..48 {
+            for z in -16..32 {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, 12, z), stone)
+                    .unwrap();
+            }
+        }
+        let wall = BlockPos::new(30, 8, 8);
+        scene.authority.store_mut().edit(wall, stone).unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        assert!(
+            block(&scene, wall).face_shades.unwrap()[1]
+                .iter()
+                .all(|value| *value < 40)
+        );
+        for _ in 0..4 {
+            assert!(scene.refresh_lighting(1).unwrap());
+        }
+        let external = SectionPos::new(2, 0, 0);
+        scene.authority.store_mut().unload(external).unwrap();
+        scene.load_generations.remove(&external);
+        let mut section = Section::empty(16).unwrap();
+        section.set(LocalPos { x: 0, y: 8, z: 8 }, glass).unwrap();
+        scene.install_generated(external, section).unwrap();
+        resolve(&mut scene);
+        assert!(
+            block(&scene, wall).face_shades.unwrap()[1]
+                .iter()
+                .all(|value| *value > 200)
+        );
     }
     fn block(scene: &Scene, pos: BlockPos) -> RenderBlock {
         let view = scene.lighting.as_ref().unwrap().view(scene);

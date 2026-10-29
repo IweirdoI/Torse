@@ -125,10 +125,19 @@ struct Meshing {
     job: Job<Output>,
 }
 
+struct Scan {
+    inputs: lighting::Inputs,
+    assets: u64,
+    tint: u64,
+    light: u64,
+    meshes: usize,
+}
+
 pub(super) struct Background {
     pool: Executor<Output>,
     generating: BTreeMap<SectionPos, Generation>,
     meshing: BTreeMap<SectionPos, Meshing>,
+    scanned: Option<Scan>,
     stats: BackgroundStats,
     config: ExecutorConfig,
 }
@@ -139,6 +148,7 @@ impl Background {
             pool: Executor::new(config).map_err(|e| e.to_string())?,
             generating: BTreeMap::new(),
             meshing: BTreeMap::new(),
+            scanned: None,
             stats: BackgroundStats::default(),
             config,
         })
@@ -163,6 +173,7 @@ impl Background {
                 .map_err(|error| torse_types::Fault::resource_limit(error.to_string()))?,
             generating: BTreeMap::new(),
             meshing: BTreeMap::new(),
+            scanned: None,
             stats: BackgroundStats::default(),
             config,
         })
@@ -368,21 +379,52 @@ impl Background {
             }
         }
         self.cancel_old_meshes(scene);
+        let binding = torse_types::Binding {
+            world: scene.authority.world(),
+            epoch: scene.epoch,
+            compatibility: scene.authority.coordinator().compatibility(),
+        };
+        let light = scene
+            .lighting
+            .as_ref()
+            .map_or(0, |lighting| lighting.generation);
+        // Dynamic tint providers expose per-section revisions, so they must
+        // retain the normal scan even when terrain and lighting are stable.
+        if self.meshing.is_empty()
+            && scene.tint_provider.is_none()
+            && self.scanned.as_ref().is_some_and(|scan| {
+                scan.assets == scene.asset_generation
+                    && scan.tint == scene.tint_provider_generation
+                    && scan.light == light
+                    && scan.meshes == scene.meshes.len()
+                    && scan.inputs.matches(binding, scene)
+            })
+        {
+            return Ok(rebuilt);
+        }
+        let mut clean = true;
         let mut admitted = 0;
         for pos in scene.sections.clone() {
             if admitted >= budget {
+                clean = false;
                 break;
             }
             let stamp = MeshStamp::capture(scene, pos);
-            if stamp.terrain.section_revision.is_none()
-                || self.meshing.contains_key(&pos)
-                || scene
-                    .meshes
-                    .get(&pos)
-                    .is_some_and(|(previous, _)| previous == &stamp)
+            if stamp.terrain.section_revision.is_none() {
+                continue;
+            }
+            if self.meshing.contains_key(&pos) {
+                clean = false;
+                continue;
+            }
+            if scene
+                .meshes
+                .get(&pos)
+                .is_some_and(|(previous, _)| previous == &stamp)
             {
                 continue;
             }
+            clean = false;
             let side = scene.side as usize;
             let max_faces = side.pow(3) * 6;
             // Geometry, two per-vertex tint channels, indices, and two slots.
@@ -439,6 +481,17 @@ impl Background {
             self.meshing.insert(pos, Meshing { stamp, job });
             admitted += 1;
         }
+        self.scanned = if clean && self.meshing.is_empty() && scene.tint_provider.is_none() {
+            Some(Scan {
+                inputs: lighting::Inputs::capture(binding, scene),
+                assets: scene.asset_generation,
+                tint: scene.tint_provider_generation,
+                light,
+                meshes: scene.meshes.len(),
+            })
+        } else {
+            None
+        };
         Ok(rebuilt)
     }
 }

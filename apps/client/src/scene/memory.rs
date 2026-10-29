@@ -27,7 +27,7 @@ impl Scene {
             let wanted = ((self.radius * 2 + 1).pow(2) * self.layers) as u64;
             memory._control.resize(
                 wanted
-                    .saturating_mul(256)
+                    .saturating_mul(512)
                     .saturating_add(self.state_materials.len() as u64 * 4096)
                     .saturating_add(4096),
             )?;
@@ -86,7 +86,7 @@ impl Scene {
         let control = pool.reserve(
             MemoryClass::Resource,
             wanted
-                .saturating_mul(256)
+                .saturating_mul(512)
                 .saturating_add(self.state_materials.len() as u64 * 4096)
                 .saturating_add(4096),
             EvictionRank::Pinned,

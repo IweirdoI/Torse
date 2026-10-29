@@ -148,6 +148,29 @@ fn drain_meshes(scene: &mut Scene) {
 }
 
 #[test]
+fn stable_scan_rebuilds_after_eviction_and_terrain_change() {
+    let mut scene = Scene::new(0).unwrap();
+    scene.enable_background(config(1, 2)).unwrap();
+    drain_meshes(&mut scene);
+    scene.refresh_visuals(4).unwrap();
+    assert!(scene.background.as_ref().unwrap().scanned.is_some());
+    scene.forget_mesh(&SectionPos::ZERO);
+    drain_meshes(&mut scene);
+    scene.refresh_visuals(4).unwrap();
+    assert!(scene.background.as_ref().unwrap().scanned.is_some());
+    scene
+        .authority
+        .store_mut()
+        .edit(BlockPos::new(1, 1, 1), BlockStateId::EMPTY)
+        .unwrap();
+    drain_meshes(&mut scene);
+    assert_eq!(
+        scene.meshes[&SectionPos::ZERO].0,
+        MeshStamp::capture(&scene, SectionPos::ZERO)
+    );
+}
+
+#[test]
 fn one_and_four_workers_match_serial_generation_and_meshes_under_backpressure() {
     let mut reference = Scene::new(1).unwrap();
     reference.refresh_meshes();

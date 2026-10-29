@@ -30,7 +30,8 @@ const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N
                     [--place KEY:X,Y,Z]...\n\
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
                         [--screenshot <png>] [--autoplay] [--sensitivity F] [--fps-limit 30..1000]\n\
-                        [--ui-preview hud|pause|machine|settings|inventory] [--settings-tab debug|gameplay|graphics|controls]\n\
+                        [--benchmark; requires --frames] [--ui-preview hud|pause|machine|settings|inventory]\n\
+                        [--settings-tab debug|gameplay|graphics|controls]\n\
                         [--connect ADDRESS] [--walk] [--section X,Y,Z]...\n\
                         [--tls-ca PEM --tls-cert PEM --tls-key PEM --server-name DNS]\n\
        both modes accept [--memory-mib N; default 512] [--gpu-memory-mib N; default 64] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
     let mut frames: Option<u32> = None;
     let mut screenshot: Option<String> = None;
     let mut autoplay = false;
+    let mut benchmark = false;
     let mut walk = false;
     let mut connect: Option<String> = None;
     let mut sensitivity = None;
@@ -97,6 +99,7 @@ fn main() -> ExitCode {
             }
             "--screenshot" => screenshot = value(),
             "--autoplay" => autoplay = true,
+            "--benchmark" => benchmark = true,
             "--walk" => walk = true,
             "--connect" => connect = value(),
             "--content" => content = value(),
@@ -216,6 +219,10 @@ fn main() -> ExitCode {
             eprintln!("--place is only available with --capture");
             return ExitCode::FAILURE;
         }
+        if benchmark && frames.is_none_or(|count| count == 0) {
+            eprintln!("--benchmark requires a positive --frames count");
+            return ExitCode::FAILURE;
+        }
         let mut preferences = match settings::Settings::load(&settings::Settings::path()) {
             Ok(value) => value,
             Err(error) => {
@@ -249,6 +256,7 @@ fn main() -> ExitCode {
             frames,
             screenshot,
             autoplay,
+            benchmark,
             walk,
             connect,
             probe_outside,

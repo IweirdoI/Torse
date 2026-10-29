@@ -127,10 +127,12 @@ pub struct Scene {
     memory: Option<memory::Memory>,
     startup_notice: Option<String>,
     lighting: Option<lighting::Lighting>,
+    surfaces: surfaces::Previews,
 }
 mod items;
 mod lighting;
 mod memory;
+mod surfaces;
 
 /// One content pack for every client mode, matching the server demo assembly
 /// so the handshake compatibility and the block colours agree everywhere.
@@ -264,6 +266,7 @@ impl Scene {
             radius,
             meshes: BTreeMap::new(),
             lighting: None,
+            surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
@@ -318,6 +321,7 @@ impl Scene {
             radius: 0,
             meshes: BTreeMap::new(),
             lighting: None,
+            surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
@@ -786,16 +790,15 @@ impl Scene {
         target: BlockPos,
         half: u32,
     ) -> Result<(), String> {
-        let _preview_memory = if self.lighting.is_some() {
+        let _preview_memory = {
             self.reserve_memory(
                 torse_types::MemoryClass::Executor,
                 lighting::PREVIEW_BYTES,
                 torse_types::EvictionRank::Pinned,
             )
             .map_err(|error| error.to_string())?
-        } else {
-            None
         };
+        let surfaces = self.prepare_surfaces(target)?;
         self.edit_counter += 1;
         let counter = self.edit_counter;
         let action = if place {
@@ -850,6 +853,7 @@ impl Scene {
         self.authority
             .publish(prepared)
             .map_err(|fault| format!("{fault:?}"))?;
+        self.surfaces.record(surfaces);
         self.preview_lighting(&[target])?;
         self.reconcile_world_memory(growth)
             .map_err(|error| error.to_string())?;
@@ -1142,6 +1146,7 @@ impl Scene {
             radius,
             meshes: BTreeMap::new(),
             lighting: None,
+            surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),

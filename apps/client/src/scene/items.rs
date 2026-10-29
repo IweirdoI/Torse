@@ -189,6 +189,10 @@ impl Scene {
                 EvictionRank::Pinned,
             )
             .map_err(|error| error.to_string())?;
+        let surfaces = match request.target {
+            ActionTarget::Block(pos) => self.prepare_surfaces(pos)?,
+            _ => Vec::new(),
+        };
         let output = self
             .service
             .plan(&self.authority, &actor, Phase::Interaction, &request)
@@ -209,6 +213,7 @@ impl Scene {
         self.authority
             .publish(prepared)
             .map_err(|error| format!("{error:?}"))?;
+        self.surfaces.record(surfaces);
         if let ActionTarget::Block(pos) = request.target {
             self.preview_lighting(&[pos])?;
         }

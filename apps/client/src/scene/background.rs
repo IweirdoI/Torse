@@ -48,6 +48,12 @@ fn ready_revision(store: &SectionStore, pos: SectionPos) -> Option<Revision> {
 }
 
 impl MeshStamp {
+    pub fn same_surface_input(&self, other: &Self) -> bool {
+        self.terrain == other.terrain
+            && self.epoch == other.epoch
+            && self.assets == other.assets
+            && self.loads == other.loads
+    }
     pub fn capture(scene: &Scene, pos: SectionPos) -> Self {
         let mut loads = [None; 7];
         let positions =

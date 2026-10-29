@@ -673,18 +673,39 @@ impl WindowApp {
                 self.entity_sequence = None;
             }
         }
+        let surfaces_ready = if let Some(scene) = self.scene.as_mut() {
+            scene.prune_surfaces();
+            if scene.surfaces_dirty() {
+                let (vertices, indices) = scene.surface_geometry();
+                let bytes = Scene::vertex_bytes(&vertices);
+                let ready = self.gpu.as_mut().is_some_and(|gpu| {
+                    gpu.context
+                        .upload_section(crate::renderer::SURFACE_SLOT, &bytes, &indices)
+                });
+                if ready {
+                    scene.surfaces_uploaded();
+                }
+                ready
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        let scene = self.scene.as_ref().expect("active scene");
         self.pending_uploads
             .retain(|p| scene.sections().contains(&p));
         let uploads = match self.pending_uploads.select_where(
             center,
             self.work_budget.limits(),
             |p| {
-                self.gpu.as_ref().is_some_and(|gpu| {
-                    scene.section_geometry_bytes(p).is_none_or(|bytes| {
-                        gpu.context
-                            .should_upload(p, scene.authority().store().side(), bytes)
+                surfaces_ready
+                    && self.gpu.as_ref().is_some_and(|gpu| {
+                        scene.section_geometry_bytes(p).is_none_or(|bytes| {
+                            gpu.context
+                                .should_upload(p, scene.authority().store().side(), bytes)
+                        })
                     })
-                })
             },
             |p| scene.section_geometry_bytes(p),
         ) {
@@ -702,6 +723,7 @@ impl WindowApp {
             .authority()
             .seq()
             .0;
+        let mut presented = Vec::new();
         if !uploads.is_empty() || !self.uploaded || self.entity_sequence != Some(sequence) {
             let scene = self.scene.as_ref().expect("camera implies scene");
             if let Some(gpu) = self.gpu.as_mut() {
@@ -715,6 +737,7 @@ impl WindowApp {
                             self.pending_uploads.extend([*pos]);
                         } else {
                             self.uploads += 1;
+                            presented.push(*pos);
                         }
                     }
                 }
@@ -737,6 +760,11 @@ impl WindowApp {
                 }
             }
             self.uploaded = true;
+        }
+        if let Some(scene) = self.scene.as_mut() {
+            for pos in presented {
+                scene.surface_section_uploaded(pos);
+            }
         }
         // Unloaded sections must stop drawing even when nothing rebuilt this
         // frame; retention is cheap and the entity slot survives it.

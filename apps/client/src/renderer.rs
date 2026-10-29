@@ -269,6 +269,8 @@ const SURFACE_BYTES: u64 = 64;
 /// Synthetic key carrying the entity box buffers; retention never drops it.
 pub const ENTITY_SLOT: torse_types::SectionPos =
     torse_types::SectionPos::new(i64::MAX, 0, i64::MAX);
+pub const SURFACE_SLOT: torse_types::SectionPos =
+    torse_types::SectionPos::new(i64::MAX - 1, 0, i64::MAX);
 
 /// Device, queue, pipelines, camera uniform, and terrain buffers.
 pub struct GpuContext {
@@ -773,8 +775,14 @@ impl GpuContext {
             !self.terrain.contains_key(&section) && self.terrain.len() >= 4096,
             self.terrain
                 .iter()
-                .filter(|(pos, _)| **pos != section && **pos != ENTITY_SLOT)
-                .filter(|(pos, _)| section == ENTITY_SLOT || priority(**pos, self.focus) > rank)
+                .filter(|(pos, _)| {
+                    **pos != section && **pos != ENTITY_SLOT && **pos != SURFACE_SLOT
+                })
+                .filter(|(pos, _)| {
+                    section == ENTITY_SLOT
+                        || section == SURFACE_SLOT
+                        || priority(**pos, self.focus) > rank
+                })
                 .map(|(pos, b)| (*pos, b.bytes, priority(*pos, self.focus))),
         )?;
         Some(GeometryAdmission {
@@ -1017,7 +1025,7 @@ impl GpuContext {
     /// positions change.
     pub fn retain_sections(&mut self, keep: &[torse_types::SectionPos]) {
         self.terrain
-            .retain(|pos, _| keep.contains(pos) || *pos == ENTITY_SLOT);
+            .retain(|pos, _| keep.contains(pos) || *pos == ENTITY_SLOT || *pos == SURFACE_SLOT);
         self.geometry_bytes = self.terrain.values().map(|b| b.bytes).sum();
     }
 

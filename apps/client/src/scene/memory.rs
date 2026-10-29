@@ -29,7 +29,7 @@ impl Scene {
                 wanted
                     .saturating_mul(512)
                     .saturating_add(self.state_materials.len() as u64 * 4096)
-                    .saturating_add(4096),
+                    .saturating_add(super::surfaces::CONTROL_BYTES),
             )?;
         }
         Ok(())
@@ -88,7 +88,7 @@ impl Scene {
             wanted
                 .saturating_mul(512)
                 .saturating_add(self.state_materials.len() as u64 * 4096)
-                .saturating_add(4096),
+                .saturating_add(super::surfaces::CONTROL_BYTES),
             EvictionRank::Pinned,
         )?;
         let mut meshes = BTreeMap::new();

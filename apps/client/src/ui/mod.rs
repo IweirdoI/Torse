@@ -308,6 +308,7 @@ pub struct Layer {
     text: Text,
     labels: BTreeMap<&'static str, &'static str>,
     last: Option<View>,
+    canvas: Option<Canvas>,
     theme: Theme,
     selected_skin: SkinChoice,
     external_skin: Option<std::path::PathBuf>,
@@ -327,6 +328,8 @@ pub struct Hud<'a> {
 }
 impl Layer {
     pub fn attach_memory(&mut self, pool: torse_types::MemoryPool) -> Result<(), String> {
+        self.canvas = None;
+        self.last = None;
         self.theme.attach_memory(pool.clone())?;
         self.text.attach_memory(pool.clone())?;
         for icon in &mut self.skin.icons {
@@ -372,6 +375,7 @@ impl Layer {
                 .filter_map(|line| line.split_once('='))
                 .collect(),
             last: None,
+            canvas: None,
             memory: None,
             theme,
             selected_skin,
@@ -437,19 +441,35 @@ impl Layer {
         if self.last.as_ref() == Some(&view) {
             return;
         }
-        let Ok(mut canvas) = Canvas::try_new(
-            layout.width,
-            layout.height,
-            layout.scale,
-            self.memory.as_ref(),
-        ) else {
-            self.text.clear_cache();
-            return;
+        let mut canvas = match self.canvas.take() {
+            Some(mut canvas)
+                if canvas.width == layout.width
+                    && canvas.height == layout.height
+                    && canvas.scale == layout.scale =>
+            {
+                canvas.clear();
+                canvas
+            }
+            old => {
+                drop(old);
+                let Ok(canvas) = Canvas::try_new(
+                    layout.width,
+                    layout.height,
+                    layout.scale,
+                    self.memory.as_ref(),
+                ) else {
+                    self.text.clear_cache();
+                    return;
+                };
+                canvas
+            }
         };
         self.paint(&mut canvas, &layout, &view);
         // The canvas already matches the surface one to one; the shader
         // must not divide again.
-        if self.overlay.upload(device, queue, &canvas, 1).is_err() {
+        let uploaded = self.overlay.upload(device, queue, &canvas, 1);
+        self.canvas = Some(canvas);
+        if uploaded.is_err() {
             return;
         }
         self.last = Some(view);
@@ -795,6 +815,48 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn saturated_world_budget_cannot_freeze_a_prepared_menu_canvas() {
+        use torse_types::{EvictionRank, MemoryBudget, MemoryClass, MemoryPool};
+        let session = torse_render::open_headless().unwrap();
+        let pool = MemoryPool::new(MemoryBudget::new(128 * 1024 * 1024));
+        let mut layer = Layer::new(&session.device, wgpu::TextureFormat::Rgba8Unorm).unwrap();
+        layer.attach_memory(pool.clone()).unwrap();
+        let mut state = State::default();
+        let hud = || Hud {
+            material: 0,
+            network: false,
+            ready: true,
+            result: "",
+            names: Vec::new(),
+            sensitivity: 1.0,
+            debug_lines: &[],
+            inventory: Vec::new(),
+        };
+        state.set_mode(Mode::Pause);
+        layer.prepare(&session.device, &session.queue, [640, 360], &state, hud());
+        state.set_mode(Mode::Game);
+        layer.prepare(&session.device, &session.queue, [640, 360], &state, hud());
+        let game = layer.canvas.as_ref().unwrap().as_pixels().to_vec();
+        let held = pool
+            .reserve(
+                MemoryClass::World,
+                128 * 1024 * 1024 - pool.usage().total,
+                EvictionRank::Pinned,
+            )
+            .unwrap();
+        state.set_mode(Mode::Pause);
+        layer.prepare(&session.device, &session.queue, [640, 360], &state, hud());
+        assert_eq!(layer.last.as_ref().unwrap().mode, Mode::Pause);
+        assert_ne!(layer.canvas.as_ref().unwrap().as_pixels(), game);
+        state.set_mode(Mode::Game);
+        layer.prepare(&session.device, &session.queue, [640, 360], &state, hud());
+        assert_eq!(layer.canvas.as_ref().unwrap().as_pixels(), game);
+        drop(held);
+        drop(layer);
+        assert_eq!(pool.usage().total, 0);
+    }
     #[test]
     fn content_icons_decode_at_the_declared_dimensions() {
         let skin = Skin::load().unwrap();

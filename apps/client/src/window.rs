@@ -405,6 +405,21 @@ impl WindowApp {
         if self.camera.is_none() {
             return;
         }
+        // Protect presentation headroom before world jobs can fill the pool.
+        // Release it only at draw time, so menus and diagnostics still repaint.
+        let presentation_memory = match self.scene.as_mut() {
+            Some(scene) => scene.reserve_frame_memory(4 * 1024 * 1024),
+            None => self
+                .memory
+                .reserve(
+                    torse_types::MemoryClass::Codec,
+                    4 * 1024 * 1024,
+                    torse_types::EvictionRank::Pinned,
+                )
+                .map(Some),
+        }
+        .ok()
+        .flatten();
         let frame_bytes = self.gpu.as_ref().map_or(0, |gpu| {
             u64::from(gpu.config.width) * u64::from(gpu.config.height) * 16 + 64 * 1024 * 1024
         });
@@ -424,8 +439,9 @@ impl WindowApp {
             Err(_) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.ui.clear_caches();
-                    gpu.window.request_redraw();
                 }
+                self.last_result = "memory pressure: world work deferred".to_owned();
+                self.draw(event_loop, &names, frame_started, presentation_memory);
                 return;
             }
         };
@@ -851,11 +867,18 @@ impl WindowApp {
                 *sum += elapsed.as_micros();
             }
         }
-        self.draw(event_loop, &names, frame_started);
+        self.draw(event_loop, &names, frame_started, presentation_memory);
     }
 
     /// Present one frame. This does not pump logic steps.
-    fn draw(&mut self, event_loop: &ActiveEventLoop, names: &[String], frame_started: Instant) {
+    fn draw(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        names: &[String],
+        frame_started: Instant,
+        presentation_memory: Option<torse_types::MemoryLease>,
+    ) {
+        drop(presentation_memory);
         let draw_started = Instant::now();
         let frame = match self.gpu.as_mut() {
             Some(gpu) => match gpu.surface.get_current_texture() {
@@ -903,8 +926,25 @@ impl WindowApp {
             .context
             .encode_draw(&mut encoder, &view, &gpu.depth_view)
         {
-            gpu.window.request_redraw();
-            return;
+            // A rejected terrain sort must not hide the interactive UI.
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("client pressure fallback"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.12,
+                            b: 0.15,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
         }
         gpu.ui.prepare(
             device,
@@ -978,6 +1018,12 @@ impl WindowApp {
                 (self.frame_total_us - self.benchmark_mark_us) / 300
             );
             self.benchmark_mark_us = self.frame_total_us;
+            let usage = self.memory.usage();
+            eprintln!(
+                "benchmark_memory total_bytes={} world_bytes={}",
+                usage.total,
+                usage.current[torse_types::MemoryClass::World.index()]
+            );
             eprintln!(
                 "benchmark_stages_us stream={} mesh={} upload={} draw={}",
                 self.benchmark_stages[0] / 300,

@@ -271,6 +271,38 @@ impl Scene {
 mod tests {
     use super::*;
     #[test]
+    fn stream_over_thousands_of_centers_keeps_world_reservations_bounded() {
+        let pool = MemoryPool::new(torse_types::MemoryBudget::new(128 * 1024 * 1024));
+        let mut scene = Scene::new(0).unwrap();
+        scene.attach_memory(pool.clone()).unwrap();
+        scene.enable_items(None).unwrap();
+        let owner = scene.item_owner().unwrap();
+        scene
+            .apply_item_call(torse_items::edit_call(
+                owner,
+                true,
+                2,
+                BlockPos::new(8, 14, 8),
+                0,
+            ))
+            .unwrap();
+        scene.stream_around(SectionPos::new(1, 0, 0), 1).unwrap();
+        scene.stream_around(SectionPos::ZERO, 1).unwrap();
+        let before = pool.usage().current[MemoryClass::World.index()];
+        for x in 1..=3072 {
+            scene.stream_around(SectionPos::new(x, 0, 0), 1).unwrap();
+            let used = pool.usage().current[MemoryClass::World.index()];
+            assert!(
+                used < before + 8 * 1024 * 1024,
+                "world reservation kept growing at {x}: {used}"
+            );
+        }
+        scene.stream_around(SectionPos::ZERO, 1).unwrap();
+        assert!(scene.authority.store().revision(SectionPos::ZERO).is_some());
+        drop(scene);
+        assert_eq!(pool.usage().total, 0);
+    }
+    #[test]
     fn foreground_occupancy_denial_precedes_work_and_preserves_the_world() {
         let pool = MemoryPool::new(
             MemoryBudget::new(128 * 1024 * 1024).with_class_limit(MemoryClass::Mesh, 0),

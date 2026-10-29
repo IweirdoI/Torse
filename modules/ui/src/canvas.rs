@@ -155,6 +155,10 @@ impl Canvas {
     pub fn as_pixels(&self) -> &[u8] {
         &self.pixels
     }
+    /// Clear retained pixels without allocating another frame buffer.
+    pub fn clear(&mut self) {
+        self.pixels.fill(0);
+    }
     fn blend_px(&mut self, x: i32, y: i32, source: [u8; 4]) {
         if x < 0
             || y < 0

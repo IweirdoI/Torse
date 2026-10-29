@@ -33,6 +33,12 @@
 
 规则及接口见[物品模块](../../modules/items/README.md)。默认演示的内容与规则身份现已包含物品模块；旧世界需要新目录或显式迁移，不能直接替换摘要装载。存储和网络编码未变。
 
+## 玩家兴趣跟随
+
+`--players N --follow-radius R`按玩家已持久提交的位置更新水平兴趣窗口，`R`范围为0到64；省略`--follow-radius`时保留原固定订阅行为。API使用`NetworkHub::enable_player_follow`，必须在接纳连接前启用，并先装配服务端驻留调度器。窗口始终是用户批准范围的子集，按距离选择垂直分区并受数量上限约束，不扩大actor权限或用户授权。
+
+范围变化后，网络层替换会话的兴趣范围、重建基线，并把需要的分区合并到驻留意向。预算或来源暂时不可用时等待后续轮询。没有绑定玩家的观察者仍使用显式订阅。默认演示仅在已有有限世界中运行，不会因窗口移动而自动注册无限地形生成器。
+
 ## 串行计时
 
 `Server::set_serial_profiler`可接入有界的`torse_diagnostics::SerialProfiler`，默认关闭。规划与准备、复制投影与发布分别计时并扣除嵌套成本，日志另计编码字节与刷盘耗时。计时只服务诊断，不改变规则或持久数据。
@@ -73,7 +79,7 @@ cargo run --release -p torse-server --example serial_baseline --locked -- --outp
 
 复制源默认根据提交实际修改的分区和实体更新订阅，只重建改变的Section及实体可见组件集合。状态引用计数维护完整可见字典，缓存成本继续检查整个投影的条目和字节上限；队列也在克隆载荷前检查。每个可见提交仍输出一个原子批次，撤权、慢订阅重置和DurableSeq发送门槛保持原语义。
 
-`Server::set_projection_optimization(false)`可切换到完整投影作诊断对照，ExecutionHost及ReplicaSource也提供同名入口。重新启用时从当前订阅基线重建派生缓存。缓存不进入存档或协议；本轮不提供运行期地形装卸。测量、容量边界和编码一致性验证见[增量投影记录](../../benchmarks/archive/performance/M6-incremental-projection.md)。
+`Server::set_projection_optimization(false)`可切换到完整投影作诊断对照，ExecutionHost及ReplicaSource也提供同名入口。重新启用时从当前订阅基线重建派生缓存。缓存不进入存档或协议；运行期地形装卸由独立的持久驻留接口处理。测量、容量边界和编码一致性验证见[增量投影记录](../../benchmarks/archive/performance/M6-incremental-projection.md)。
 
 ## 启动与连接
 
@@ -251,6 +257,8 @@ ExecutionHost已接入Server::unload_section、reload_section和install_section�
 GenerationIdentity在`generation.bin`保存生成器内容键、正整数版本及参数摘要，种子和全部地形参数应进入摘要。已有描述不匹配时拒绝启用，普通启动和只读预检也校验描述文件完整性。装配方应在WorldLease阶段用`GenerationIdentity::verify`核对预期生成器，再开始运行代数；缺少描述时首次启用是显式注册。修改生成语义需要独立世界迁移，不覆盖现有描述。草稿文件不参与恢复。
 
 旧`capture_archive`继续要求全部分区驻留。`capture_residency_archive`在持久Tick边界读取未驻留页，按总预算生成完整ResidencyArchive，保留生成器身份，不改变运行中驻留状态。恢复时须提供匹配的生成器描述；内容或规则迁移仍使用既有显式迁移入口。输出超预算返回ResourceLimit，源世界保持原状。事件声明、生成器描述与归档格式见[载荷说明](../../crates/codec/EXECUTION.md)，验证见[事件感知流送](../../benchmarks/archive/persistence/M3-event-streaming.md)。
+
+生成页可以包含新实体及其初始组件。`Server::install_section`通过生成页准备路径调用`WorldAuthority::prepare_generated_section`，检查连续实体ID、分配水位和分区归属，将地形、实体、组件及新水位作为同一份装载记录提交。坏页和预算拒绝不会提前消耗实体ID；卸载后的普通页重载沿用旧身份。装卸记录的`SectionChange.fresh`区分新生成与既有页，恢复时沿用对应校验路径，不改变记录格式。
 
 ## 实体碰撞体
 

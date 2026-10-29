@@ -92,7 +92,7 @@
 | [客户端会话心跳](network/B7-heartbeat.md) | 客户端会话心跳 |
 | [玩家兴趣范围自动跟随](network/M5-player-follow.md) | 玩家兴趣范围自动跟随 |
 
-授权复制、联机编辑与权威移动已接入协议及TCP，客户端独立预测并按持久结果校正。显式范围替换已验证，自动跟随玩家的兴趣策略仍待装配。
+授权复制、联机编辑与权威移动已接入协议及TCP，客户端独立预测并按持久结果校正。服务端支持显式范围替换，也支持在批准范围内自动跟随玩家调整兴趣窗口，配置与限制见[服务端说明](../../apps/server/README.md)。
 
 ## Mod平台
 
@@ -109,7 +109,7 @@
 | [Minimal machine UI and authorized actions](mods/M4-machine-ui.md) | Minimal machine UI and authorized actions |
 | [Mod动作与规则身份](mods/M4-mod-actions.md) | Mod动作与规则身份 |
 
-现有机器状态与动作模型已供服务端和无GPU客户端验证，图形客户端的真实机器面板仍待接入。开发入口见[Mod示例与工具](../examples/mods/README.md)。
+现有机器状态与动作模型已供服务端和无GPU客户端验证，图形客户端的真实机器面板仍待接入。开发入口见[Mod示例与工具](../../examples/mods/README.md)。
 
 ## 记录要求
 

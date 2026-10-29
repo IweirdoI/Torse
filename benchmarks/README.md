@@ -2,7 +2,7 @@
 
 本目录保存各次验证的复现命令、运行环境、画面、测量结果与未覆盖范围。记录中的日期和代码状态决定其适用范围；早期记录里尚未实现的能力，可能已由后续记录补齐。当前使用方式见[项目README](../README.md)和各应用说明。
 
-图形客户端已移出内核仓库；涉及窗口与界面的记录保留为当时内核能力的测量数据，其中的`apps/client`路径不再有效。
+图形客户端位于`apps/client`，当前启动方式见[客户端说明](../apps/client/README.md)。历史窗口与界面记录保留当时的运行环境和测量结果，不代表当前性能。
 
 现有资料主要验证正确性与故障处理。[帧预算记录](archive/performance/M6-frame-budget.md)包含指定设备上的Release对照测量，尚未建立覆盖不同设备、规模和负载的统一性能基准。
 
@@ -21,11 +21,11 @@
 
 | 类型 | 规则 | 示例 |
 |---|---|---|
-| 报告 | `<批次>/<批次>-<主题>.md` | `M6/M6-frame-budget.md` |
+| 历史报告 | `archive/<语义>/<批次>-<主题>.md` | `archive/performance/M6-frame-budget.md` |
 | 批次前缀 | `M0` 到 `M6`、`A`、`B`、`CLN`、`ENG` 系列 | `A8-acceptance.md` |
-| 数据目录 | `archive/data/<场景>/<NN>-<变体>/` | `rchive/data/incremental-projection/01-before/` |
+| 数据目录 | `archive/data/<场景>/<NN>-<变体>/` | `archive/data/incremental-projection/01-before/` |
 | 环境文件 | `environment.txt` | 设备、系统、工具链 |
-| 图 | `archive/figures/NN-<主题>.png`，旧记录沿用原文件名 | `figures/09-slab-merge.png`、`archive/figures/M1-actions.png` |
+| 图 | `archive/figures/NN-<主题>.png`，旧记录沿用原文件名 | `archive/figures/09-slab-merge.png`、`archive/figures/M1-actions.png` |
 
 主题用小写英文和连字符，不复述批次；同一场景的对照运行用两位序号区分。
 

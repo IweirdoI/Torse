@@ -77,7 +77,7 @@ impl Default for Bindings {
             descend: KeyCode::ShiftLeft,
             walk: KeyCode::F5,
             screenshot: KeyCode::F12,
-            debug: KeyCode::F3,
+            debug: KeyCode::F8,
             inventory: KeyCode::Tab,
         }
     }
@@ -162,7 +162,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             frame_limit: FrameLimit::default(),
             debug: false,
             hud: true,
@@ -186,7 +186,7 @@ impl Settings {
             .unwrap_or_else(|| PathBuf::from(".work/client-settings.toml"))
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1
+        if self.version != 2
             || !(MIN_FPS..=MAX_FPS).contains(&self.frame_limit.fps)
             || !(40..=110).contains(&self.fov)
             || self.radius > 16
@@ -213,7 +213,19 @@ impl Settings {
         if text.len() > 64 * 1024 {
             return Err("client settings exceed the source budget".into());
         }
-        let settings: Self = toml::from_str(&text).map_err(|error| error.to_string())?;
+        let mut settings: Self = toml::from_str(&text).map_err(|error| error.to_string())?;
+        if settings.version == 1 {
+            let legacy = Bindings {
+                debug: KeyCode::F3,
+                ..Bindings::default()
+            };
+            // Only an entirely unchanged legacy layout is a known old default.
+            // Preserve customized layouts rather than guessing user intent.
+            if settings.bindings == legacy {
+                settings.bindings = Bindings::default();
+            }
+            settings.version = 2;
+        }
         settings.validate()?;
         Ok(settings)
     }
@@ -318,9 +330,9 @@ mod tests {
             toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
         assert_eq!(decoded, settings);
         assert!(decoded.validate().is_ok());
-        settings.version = 2;
+        settings.version = 3;
         assert!(settings.validate().is_err());
-        settings.version = 1;
+        settings.version = 2;
         settings.fov = 0;
         assert!(settings.validate().is_err());
     }
@@ -343,6 +355,29 @@ mod tests {
         settings.fov = 1;
         assert!(settings.save(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn legacy_default_binding_moves_to_f8_without_overwriting_custom_layouts() {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.work");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("settings-legacy-{}.toml", std::process::id()));
+        let mut legacy = Settings {
+            version: 1,
+            ..Settings::default()
+        };
+        legacy.bindings.debug = KeyCode::F3;
+        std::fs::write(&path, toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        let current = Settings::load(&path).unwrap();
+        assert_eq!(current.version, 2);
+        assert_eq!(current.bindings.debug, KeyCode::F8);
+        legacy.bindings.forward = KeyCode::KeyZ;
+        legacy.bindings.screenshot = KeyCode::F8;
+        std::fs::write(&path, toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        let current = Settings::load(&path).unwrap();
+        assert_eq!(current.bindings, legacy.bindings);
+        current.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), current);
         std::fs::remove_file(path).unwrap();
     }
 }

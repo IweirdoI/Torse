@@ -169,29 +169,67 @@ impl Layer {
         if view.debug_lines.is_empty() {
             return;
         }
-        let width = layout.width.saturating_sub(16).min(280);
-        let height =
-            (view.debug_lines.len().min(12) as u32 * 13 + 10).min(layout.height.saturating_sub(56));
-        let rect = Rect::new(
-            layout.width.saturating_sub(width + 8) as i32,
-            48,
-            width,
-            height,
-        );
+        let widths: Vec<_> = view
+            .debug_lines
+            .iter()
+            .take(12)
+            .map(|line| self.text.measure(line, 10))
+            .collect();
+        let Some((rect, count)) = layout.debug_panel(&widths) else {
+            return;
+        };
         self.theme.paint(canvas, Part::Chip, rect);
-        for (index, line) in view.debug_lines.iter().take(12).enumerate() {
+        for (index, line) in view.debug_lines.iter().take(count).enumerate() {
             self.text.draw(
                 canvas,
                 line,
                 Rect::new(
                     rect.x + 6,
                     rect.y + 5 + index as i32 * 13,
-                    width.saturating_sub(12),
+                    rect.w.saturating_sub(12),
                     13,
                 ),
                 10,
                 TEXT,
             );
         }
+    }
+}
+
+impl Layout {
+    fn debug_panel(&self, widths: &[u32]) -> Option<(Rect, usize)> {
+        let count = widths
+            .len()
+            .min(12)
+            .min(self.height.saturating_sub(106) as usize / 13);
+        let width = widths
+            .iter()
+            .take(count)
+            .max()?
+            .saturating_add(12)
+            .min(self.width.saturating_sub(16));
+        (count != 0 && width > 12)
+            .then_some((Rect::new(8, 56, width, count as u32 * 13 + 10), count))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn debug_background_tracks_visible_text_and_stays_on_the_window_edge() {
+        let layout = Layout::new([960, 540]);
+        let (short, count) = layout.debug_panel(&[30, 60, 42]).unwrap();
+        assert_eq!(
+            (short.x, short.y, short.w, short.h, count),
+            (8, 56, 72, 49, 3)
+        );
+        let (long, _) = layout.debug_panel(&[30, 160, 42]).unwrap();
+        assert_eq!(long.w, 172);
+        let (clamped, count) = layout.debug_panel(&[10000; 20]).unwrap();
+        assert!(clamped.x + clamped.w as i32 <= layout.width as i32 - 8);
+        assert!(clamped.y + clamped.h as i32 <= layout.height as i32 - 40);
+        assert!(count <= 12);
+        assert!(Layout::new([80, 80]).debug_panel(&[20; 3]).is_none());
     }
 }

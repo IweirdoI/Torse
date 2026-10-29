@@ -1,5 +1,6 @@
 //! Incremental derived lighting. The scene thread alone validates and publishes.
 use super::*;
+use std::cell::RefCell;
 use torse_types::{Binding, EvictionRank, MemoryClass, MemoryLease, MemoryPool};
 use torse_world_services::lighting::{LightJob, LightLimits, LightSection};
 mod preview;
@@ -234,6 +235,7 @@ impl Lighting {
             grids: [&self.entries[0], &self.entries[1]],
             side: scene.side,
             bounds: scene.authority.store().bounds(),
+            direct_sky: RefCell::new(BTreeMap::new()),
         }
     }
     pub fn stamp(&self, target: SectionPos) -> [u64; 2] {
@@ -248,8 +250,62 @@ pub(super) struct View<'a> {
     grids: [&'a BTreeMap<SectionPos, Cached>; 2],
     side: u32,
     bounds: WorldBounds,
+    // One immutable mesh snapshot shares bounded fallback column samples.
+    direct_sky: RefCell<BTreeMap<(i64, i64), Vec<u8>>>,
 }
 impl View<'_> {
+    fn sky(&self, scene: &Scene, pos: BlockPos) -> u8 {
+        if let Some(level) = self.light(1, pos) {
+            return level;
+        }
+        // Missing derived data must not imply daylight underground. This
+        // presentation fallback only admits direct sky through known cells;
+        // exact jobs remain responsible for lateral propagation and queries.
+        let Ok(height) =
+            usize::try_from(i128::from(self.bounds.max_y) - i128::from(self.bounds.min_y))
+        else {
+            return 0;
+        };
+        if height > 256 {
+            return 0;
+        }
+        let mut columns = self.direct_sky.borrow_mut();
+        let column = (pos.x, pos.z);
+        if !columns.contains_key(&column) {
+            if columns.len() == 512 {
+                return 0;
+            }
+            let mut levels = vec![0; height];
+            let mut level = 15u8;
+            for index in (0..height).rev() {
+                let y = self.bounds.min_y + index as i64;
+                let absorption = match scene
+                    .authority
+                    .store()
+                    .query(BlockPos::new(pos.x, y, pos.z))
+                {
+                    TerrainQuery::Ready(state) if state.is_empty() => 0,
+                    TerrainQuery::Ready(state) => scene
+                        .authority
+                        .registry()
+                        .definition(state)
+                        .map_or(15, |definition| {
+                            (definition.light_transport.absorption * 15.0)
+                                .ceil()
+                                .clamp(0.0, 15.0) as u8
+                        }),
+                    _ => 15,
+                };
+                level = level.saturating_sub(absorption);
+                levels[index] = level;
+                if level == 0 {
+                    break;
+                }
+            }
+            columns.insert(column, levels);
+        }
+        columns[&column][(pos.y - self.bounds.min_y) as usize]
+    }
     fn light(&self, kind: usize, pos: BlockPos) -> Option<u8> {
         if !self.bounds.contains_y(pos.y) {
             return Some(if kind == 1 && pos.y >= self.bounds.max_y {
@@ -266,6 +322,15 @@ impl View<'_> {
             .map(|entry| entry.levels[torse_world::linear_index(self.side, local)])
     }
     pub fn shade(&self, scene: &Scene, pos: BlockPos, block: &mut RenderBlock) {
+        if block.cross {
+            // Both sides of thin foliage share the open cell's illumination.
+            // Opaque neighboring cells do not describe either diagonal plane.
+            let light = (f32::from(self.light(0, pos).unwrap_or(0)) / 15.0)
+                .max(f32::from(self.sky(scene, pos)) / 15.0)
+                .max(0.08);
+            block.face_shades = Some([[(light * 255.0).round() as u8; 4]; 6]);
+            return;
+        }
         let mut faces = [[255; 4]; 6];
         for face in torse_render::Face::ALL {
             let normal = face.normal();
@@ -302,10 +367,7 @@ impl View<'_> {
                 .light(0, pos)
                 .unwrap_or(0)
                 .max(self.light(0, outside).unwrap_or(0));
-            // Uncomputed presentation uses the original directional shading.
-            // A real, resolved zero still represents darkness. Missing terrain
-            // remains opaque to the light solver and to collision queries.
-            let sky = self.light(1, outside).unwrap_or(15);
+            let sky = self.sky(scene, outside);
             let directional = match face {
                 torse_render::Face::PosY => 1.0,
                 torse_render::Face::NegY => 0.5,
@@ -475,6 +537,97 @@ mod tests {
             }
         }
         panic!("derived light did not finish");
+    }
+    #[test]
+    fn uncomputed_neighbor_does_not_turn_a_sealed_tunnel_into_daylight() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        for x in -16..48 {
+            for z in -16..32 {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, 12, z), stone)
+                    .unwrap();
+            }
+        }
+        for x in [15, 16] {
+            for y in [1, 13] {
+                scene
+                    .authority
+                    .store_mut()
+                    .edit(BlockPos::new(x, y, 8), stone)
+                    .unwrap();
+            }
+        }
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        // A newly visible neighboring section has terrain before its light job finishes.
+        scene.lighting.as_mut().unwrap().entries[1].remove(&SectionPos::new(1, 0, 0));
+        for x in [15, 16] {
+            let underground = block(&scene, BlockPos::new(x, 1, 8)).face_shades.unwrap()[4];
+            assert!(
+                underground.iter().all(|value| *value < 40),
+                "x={x}: {underground:?}"
+            );
+            let outdoors = block(&scene, BlockPos::new(x, 13, 8)).face_shades.unwrap()[4];
+            assert!(
+                outdoors.iter().all(|value| *value > 100),
+                "x={x}: {outdoors:?}"
+            );
+        }
+    }
+    #[test]
+    fn crossed_foliage_samples_its_open_cell_equally_for_both_planes() {
+        let mut scene = scene();
+        let stone = scene
+            .authority
+            .registry()
+            .default_state(&key("base:stone"))
+            .unwrap();
+        let plant = scene
+            .authority
+            .registry()
+            .default_state(&key("base:plant"))
+            .unwrap();
+        for x in [15, 16] {
+            scene
+                .authority
+                .store_mut()
+                .edit(BlockPos::new(x, 8, 8), plant)
+                .unwrap();
+            scene
+                .authority
+                .store_mut()
+                .edit(BlockPos::new(x - 1, 8, 8), stone)
+                .unwrap();
+        }
+        // Restore the first plant overwritten by the second plant's neighbor.
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(15, 8, 8), plant)
+            .unwrap();
+        scene
+            .authority
+            .store_mut()
+            .edit(BlockPos::new(17, 8, 8), stone)
+            .unwrap();
+        scene.enable_lighting().unwrap();
+        resolve(&mut scene);
+        for x in [15, 16] {
+            let sample = block(&scene, BlockPos::new(x, 8, 8));
+            let shades = sample.face_shades.unwrap();
+            assert_eq!(shades[0], shades[1]);
+            assert!(
+                shades[0].iter().all(|value| *value > 200),
+                "x={x}: {shades:?}"
+            );
+        }
     }
     fn block(scene: &Scene, pos: BlockPos) -> RenderBlock {
         let view = scene.lighting.as_ref().unwrap().view(scene);

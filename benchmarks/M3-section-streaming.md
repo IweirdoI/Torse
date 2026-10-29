@@ -1,8 +1,18 @@
 # 持久分区装卸
 
-日期：2026-10-26。ExecutionHost新增显式装卸入口，复用既有日志预留、发布、失效控制与持久确认。
+日期：[20261026]
+类型：验收
+状态：已验收
+环境：未记录
+范围：未记录
 
-## 实现
+## 目标
+
+ExecutionHost新增显式装卸入口，复用既有日志预留、发布、失效控制与持久确认。
+
+## 方法
+
+### 实现
 
 Server::unload_section先捕获目标分区的持久投影，将页同步发布，再预留并提交卸载记录。Server::reload_section读取记录中指定的页，核对摘要、内容、身份及驻留状态后提交装载。Server::install_section接收可信生成的单分区页，新页不能引入实体身份。准备和发布阶段均不做文件I/O。
 
@@ -12,7 +22,9 @@ Server::unload_section先捕获目标分区的持久投影，将页同步发布�
 
 装卸要求空闲Tick边界，没有已接纳输入或冻结规划；票据仍阻止卸载。受影响的授权订阅走独立失效控制，清除已排队数据并断开对应Peer，重连获取新基线；不相交的Peer保持连接。重装推进地形修订，旧网格任务不能因修订重用而进入缓存。
 
-## 验证
+## 结果
+
+### 验证
 
 新增11项专项测试，包括子进程测试入口。Windows全工作区649项测试、格式、Clippy、Rustdoc与mods特性编译均通过。
 
@@ -31,7 +43,7 @@ Server::unload_section先捕获目标分区的持久投影，将页同步发布�
 
 测试见[streaming.rs](../apps/server/tests/streaming.rs)。
 
-## 实跑
+### 实跑
 
 ```powershell
 cargo run -p torse-server --example durable_stream -- .work/stream-world park
@@ -47,8 +59,16 @@ seq=26 tick=2 resident=2 parked=0 entities=2 next_entity=3
 seq=39 tick=3 resident=3 parked=0 entities=2 next_entity=3
 ```
 
-## 范围
+### 范围
 
 这是显式库接口和文件示例。演示主程序继续使用固定范围，不自动按相机选区，不新增种子、生成规则版本迁移或异步I/O。驻留分区和未驻留索引各最多4096项，单页及完整索引同时受预算限制；页文件数量由SectionPages单独限制。未来事件保守固定驻留，尚不做逐事件分区依赖推导。
 
 世界格式仍为3，网络应用协议仍为2，wire仍为1。ExecutionCodec写执行快照2和提交3，读取旧格式。重开含装卸历史的世界时，恢复器须用with_section_pages接入同一页目录。备份须保留日志、检查点和被引用的sections页；K03便携归档要求先装回全部未驻留分区，避免漏掉页数据。Windows文件同步继续沿用既有平台限制，未新增硬件断电保证。
+
+## 复现
+
+未记录
+
+## 边界
+
+未记录

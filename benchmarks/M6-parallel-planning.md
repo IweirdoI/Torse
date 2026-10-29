@@ -1,8 +1,18 @@
 # 冻结前并行规划
 
-日期：2026-10-25。基线提交：7dde86b，包含本轮工作区改动。环境：Windows 11 Pro 10.0.26300、Intel Core i7-14700KF、28个逻辑CPU、Rust 1.93.1、Release。原始数据见[data/parallel-planning](data/parallel-planning)。
+日期：[20261025]
+类型：测量
+状态：已验收
+环境：Windows 11 Pro 10.0.26300、Intel Core i7-14700KF、28个逻辑CPU、Rust 1.93.1、Release
+范围：未记录
 
-## 一、接入位置
+## 目标
+
+基线提交：7dde86b，包含本轮工作区改动。原始数据见[data/parallel-planning](data/parallel-planning)。
+
+## 方法
+
+### 一、接入位置
 
 `ExecutionHost::collect_phase`在阶段任务持久冻结之前并行执行符合条件的周期规划。默认仍为串行；宿主通过`set_parallel_planning`配置workers和max_in_flight，规则通过`DurableRule::parallel_planner`返回`Some(self)`加入，编译器要求实现Sync。
 
@@ -12,7 +22,9 @@
 
 冻结缓存、逐项prepare、日志预留、publish、accept、授权投影、刷盘和恢复代码沿用既有流程，执行载荷版本仍为1。恢复只消费冻结任务和最终变更，不运行规划器。
 
-## 二、容量与失败
+## 结果
+
+### 二、容量与失败
 
 | 项目 | 行为 |
 |---|---|
@@ -30,7 +42,7 @@
 
 规划Fault会使Server按既有策略停止实例；日志容量阻塞仍可继续重试。直接使用ExecutionHost时，尚未冻结的纯规划失败不改变权威状态。
 
-## 三、等价与恢复验证
+### 三、等价与恢复验证
 
 [专项测试](../apps/server/tests/parallel_planning.rs)使用真实ExecutionHost和文件服务端，覆盖以下场景。
 
@@ -50,7 +62,7 @@
 
 本轮在本机运行；Linux与Windows远端CI尚未验证。CI已加入规划专项重复执行及配置入口启动检查。未增加断电保证、并行提交或Guest并发承诺。
 
-## 四、Release测量
+### 四、Release测量
 
 使用8个纯原生周期规则，每项生成一个独立或成对争用的格值事务。轻负载只生成事务；CPU负载每规则额外执行200000次确定性只读格值查询与校验计算，用于控制规划成本。三种模式均预热3Tick后测20Tick，使用执行阶段分项计时。
 
@@ -67,7 +79,9 @@ CPU独立负载的规划约为串行的3.64倍速度，完整驱动约为3.41倍
 
 每组跨三种模式逐字节比较完整最终执行快照，并校验流式日志CRC32C一致。独立组的状态摘要为dd6844a1、日志摘要为c157f16b；争用组分别为a3391504、b72433b4。日志逐字节等价另由文件回归测试验证。逐Tick耗时、P50/P95和参数分别保存在[ticks.csv](data/parallel-planning/ticks.csv)、[summary.csv](data/parallel-planning/summary.csv)和[run.txt](data/parallel-planning/run.txt)。
 
-## 五、复现
+## 复现
+
+### 五、复现
 
 ```powershell
 cargo test -p torse-runtime --lib --locked
@@ -81,3 +95,7 @@ cargo run --release -p torse-server --example parallel_baseline --locked -- --ou
 ```
 
 输出目录必须不存在。`--ticks`允许1到1000，`--warmup`允许0到100；默认分别为20和3。workers为0的CSV行表示原串行参考，1和4表示已启用的借用批次，max_in_flight固定为8。[validation.txt](data/parallel-planning/validation.txt)记录本轮验证计数与启动结果。
+
+## 边界
+
+未记录

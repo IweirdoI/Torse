@@ -1,14 +1,28 @@
 # M4前置：Mod机器接入持久执行
 
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：未记录
+范围：Mod平台持久化接线，非M4验收
+
+## 目标
+
 本页记录B8历史实现。B9已将机器修改和库存转移改为同一任务的一条持久记录，当前行为与验收见[Mod原子执行](M4-mod-atomic.md)。下文的单来源拆分、下一Tick转移和旧测试输出仅用于说明当时的实现。
 
-日期：2026-10-24。范围：Mod平台持久化接线，非M4验收。维护：Mod平台侧(T05)。前置：[M4-mod-package.md](M4-mod-package.md)。执行宿主说明见[服务端文档](../apps/server/README.md)。
+维护：Mod平台侧(T05)。前置：[M4-mod-package.md](M4-mod-package.md)。执行宿主说明见[服务端文档](../apps/server/README.md)。
 
-## 问题
+### 问题
 
 把P2的进程内唤醒队列迁移到B6持久事件基础设施，使行为包的定时器与计划修改在服务端重启后继续，且结算、失败与恢复遵守执行宿主的记录语义。
 
-## 接线设计
+## 方法
+
+未记录
+
+## 结果
+
+### 接线设计
 
 - **每包一个`DurableRule`**(apps/server/src/mods.rs,feature `mods`)：spec id `<pkg>:rule/behavior`，Simulation阶段；`plan()`在Tick 0为携带本包schema的实体装填首个唤醒；`event()`按事件载荷分派。
 - **计划分解为单来源结算**：guest返回的WIT计划由mod_host的`convert_plan`对真实世界转换：本包组件编辑与块编辑成为一个事务（source=包principal）；至多一个转移编码为**下一Tick的转移事件**（载荷携带两端实体与槽位）；guest唤醒成为持久`EventDraft`。机器完成步的结算因此是：机器事务+（转移事件@T+1，唤醒@T+1）同记录原子落账；转移事件到点后由宿主原生`plan_transfer`产单事务结算。
@@ -17,7 +31,7 @@
 - **失败语义**：转移业务拒绝->空屏障终态，机器下一循环自愈；计划验证失败（如越权schema）->空屏障终态；宿主结构性错误不外泄为阶段Fault，单包失败不拖累其他任务。
 - 事件载荷字段用包命名空间键(`<pkg>:event/kind|entity|key|attempt|source|...`)。
 
-## 验收结果
+### 验收结果
 
 `cargo test -p torse-server --features mods --test mod_durability`，6项全过：
 
@@ -36,7 +50,13 @@
 cargo test -p torse-server --features mods --test mod_durability
 ```
 
-## 已知边界
+## 复现
+
+未记录
+
+## 边界
+
+### 已知边界
 
 - 快照派发的查询面为5x5x5框与框内实体的扁平组件；框外返回NotLoaded，嵌套值不可见（与P2边界一致）。端口估计不参与持久派发。
 - 陷阱停机的包没有外部再启动路径（等交互事件或重装）；重试节奏固定+8 Tick、上限8次。

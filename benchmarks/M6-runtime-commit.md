@@ -1,8 +1,22 @@
 # 运行态与批量提交
 
-日期：2026-10-25。基线提交：deb744a，包含本轮工作区改动。环境：Windows 11 Pro 10.0.26300、Intel Core i7-14700KF、28个逻辑CPU、NTFS、Rust 1.93.1、Release。数据位于[data/runtime-commit](data/runtime-commit)。
+日期：[20261025]
+类型：测量
+状态：已验收
+环境：Windows 11 Pro 10.0.26300、Intel Core i7-14700KF、28个逻辑CPU、NTFS、Rust 1.93.1、Release
+范围：未记录
 
-## 一、运行态记录
+## 目标
+
+基线提交：deb744a，包含本轮工作区改动。数据位于[data/runtime-commit](data/runtime-commit)。
+
+## 方法
+
+未记录
+
+## 结果
+
+### 一、运行态记录
 
 [串行基线](M6-serial-baseline.md)显示，冻结任务反复进入每项任务的完整运行态记录，放大了复制、校验和编码成本。本轮将规则声明及冻结任务列表改为Arc共享。容量推迟需要修改列表时使用写时复制，已缓存的列表保持不可变。
 
@@ -14,7 +28,7 @@
 
 `set_runtime_optimization(false)`关闭进度记录及预算缓存，作为对照。该模式仍保留内存表共享，因此本轮完整模式是对记录与校验策略的同代码对照，不能解释为原提交每个内部步骤的精确复现。
 
-## 二、批量刷盘
+### 二、批量刷盘
 
 `drive_one`保持每条记录同步。新增drive_batch逐项执行prepare、try_stage、publish、立即accept及失效控制；达到记录上限、Tick边界、空闲或日志容量阻塞后，对已接纳前缀执行一次flush_through，再返回CommitBatch。
 
@@ -33,7 +47,7 @@ Server的Tick驱动默认每批1条；主程序默认16条并设置相应日志�
 
 MemoryBackend另改为有硬容量上限的几何扩容，避免每次小追加都精确扩容。已用10003次单字节追加验证内容与容量上限。该实现同时用于本轮各对照模式，本次没有单独测量扩容算法的加速比。
 
-## 三、Release对照
+### 三、Release对照
 
 复用serial_baseline的21组矩阵，每组预热5Tick后测30Tick，依次运行以下模式。
 
@@ -63,7 +77,7 @@ MemoryBackend另改为有硬容量上限的几何扩容，避免每次小追加�
 
 这是同一设备上的一次顺序运行，每场景30个测量Tick，不设跨设备性能承诺。原始数据每目录包含summary.csv、ticks.csv、samples.csv.gz和run.txt。三组分别保留241380、241380、200700项阶段样本，已核对调用数、耗时、峰值及编码字节汇总；每组630行逐Tick结果。
 
-## 四、预验证决策与验证
+### 四、预验证决策与验证
 
 另用prevalidation_baseline隔离测量冻结事务的restore及prepare_group，分别串行、1线程和4线程。每组预热10轮后测100轮；工作线程只借用同一只读世界，每项预留64KiB工作空间。结果只用于成本实验，不复用准备项进行发布，也未计入独立性分类成本。
 
@@ -88,7 +102,9 @@ MemoryBackend另改为有硬容量上限的几何扩容，避免每次小追加�
 
 工作区526项、服务端mods特性107项测试通过；运行态/批量与规划组合专项重复20轮，共240次测试通过。工作区和mods特性Clippy、格式检查通过。实际主程序默认批量创建至Tick 2，再以逐条同步重开至Tick 4，DurableSeq从24继续至48。远端CI尚未运行，相关重复测试及批量基准冒烟已加入CI。
 
-## 五、复现
+## 复现
+
+### 五、复现
 
 ```powershell
 cargo test -p torse-server --test runtime_commit --test parallel_planning --locked
@@ -108,3 +124,7 @@ cargo run --release -p torse-server --example prevalidation_baseline --locked --
 ```
 
 输出目录和预验证CSV必须尚不存在。执行环境和验证计数见[environment.txt](data/runtime-commit/environment.txt)。Gzip仅由本次测量CSV生成，本轮没有新增图像或其他媒体素材。
+
+## 边界
+
+未记录

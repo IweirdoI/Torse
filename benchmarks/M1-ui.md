@@ -1,28 +1,26 @@
 # 客户端UI基础
 
-日期：2026-10-24。环境：Windows，Rust 1.93.1，Vulkan，960x540，NVIDIA GeForce RTX 4080 SUPER。本轮交付客户端界面基础与机器面板预览，不声明B10授权机器UI完成。
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：Windows，Rust 1.93.1，Vulkan，960x540，NVIDIA GeForce RTX 4080 SUPER
+范围：未记录
 
-## 行为
+## 目标
+
+本轮交付客户端界面基础与机器面板预览，不声明B10授权机器UI完成。
+
+## 方法
+
+### 行为
 
 使用基础游戏的14张PNG：面板、按钮三态、物品槽、进度条、准星、关闭图标及三个物品图标。素材编译时嵌入，解码检查实际尺寸；面板和按钮按九宫格保持边框，界面按1到4倍整数缩放显示。UI通过独立透明混合pass叠加到地形之后，窗口和离屏捕获使用同一绘制代码。
 
 字体由操作系统提供，中文与英文文案从资源文件读取。当前界面状态未改变时，不重新光栅化和上传纹理；字形缓存上限1024。F12截图包含UI，Esc打开菜单，E打开机器面板预览，1到3切换当前方块。模态面板拦截移动与编辑输入，网络轮询继续；失去焦点清空输入，松开先前的鼠标不触发世界操作。
 
-## 画面
+## 结果
 
-机器面板标明示例数据，显示输入、输出、进度与状态，不提供修改真实机器的按钮。
-
-![机器面板预览](figures/01-ui-machine.png)
-
-HUD显示当前方块、准星和三格快捷栏，文字带阴影以适应浅色地形。
-
-![HUD](figures/02-ui-hud.png)
-
-窗口菜单实际运行9帧并从surface读回PNG，期间actions_ok、actions_rejected和walk_ticks均为0，证明自动捕获未执行世界操作。
-
-![窗口菜单](figures/03-ui-menu.png)
-
-## 验证
+### 验证
 
 客户端43项测试通过，其中UI基础新增6项覆盖素材尺寸与解码、九宫格角点与透明度、进度裁切、缩放命中、同一目标按下释放和焦点切换后的输入取消。另有3项客户端测试覆盖滚轮调速和流式装载的溢出回归。真实GPU路径已分别验证机器面板、HUD离屏捕获及窗口菜单截图。
 
@@ -38,6 +36,28 @@ cargo clippy -p torse-client --all-targets --locked -- -D warnings
 cargo run -p torse-client -- --capture .work/ui.png --width 960 --height 540 --ui-preview machine
 cargo run -p torse-client -- --window --ui-preview pause --frames 8 --screenshot .work/menu.png
 ```
+
+## 复现
+
+未记录
+
+## 边界
+
+未记录
+
+## 画面
+
+机器面板标明示例数据，显示输入、输出、进度与状态，不提供修改真实机器的按钮。
+
+![机器面板预览](figures/01-ui-machine.png)
+
+HUD显示当前方块、准星和三格快捷栏，文字带阴影以适应浅色地形。
+
+![HUD](figures/02-ui-hud.png)
+
+窗口菜单实际运行9帧并从surface读回PNG，期间actions_ok、actions_rejected和walk_ticks均为0，证明自动捕获未执行世界操作。
+
+![窗口菜单](figures/03-ui-menu.png)
 
 ## 后续
 

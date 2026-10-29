@@ -1,12 +1,22 @@
 # M4前置：行为Mod接入真实权威
 
-日期：2026-10-24。范围：P2原型，非M4验收。维护：Mod平台侧(T05)。前置：[M4-mod-component.md](M4-mod-component.md)。
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：未记录
+范围：P2原型，非M4验收
 
-## 问题
+## 目标
+
+维护：Mod平台侧(T05)。前置：[M4-mod-component.md](M4-mod-component.md)。
+
+### 问题
 
 把组件边界从夹具宿主接到真实权威：import读真实`WorldAuthority`，返回的计划经既有事务接口提交，并用一台加工机器示例验证加工、原子性、权限与故障路径。
 
-## 实现
+## 方法
+
+### 实现
 
 - `crates/mod_host/src/authority.rs`(feature `authority`)：`AuthorityHost`持有`WorldAuthority`，实现`query`/`diagnostics`/`schedule`三类import；`ModInstance`封装实例与调用循环，trap后丢弃实例并从同一宿主数据重建；`machine_scenario`组装内容（库存、方块动作、机器schema）、权威、三实体（机器/输入箱/输出箱）与授权上下文。
 - `examples/mods/machine`：机器guest。每次唤醒推进私有进度，第四步在同一计划中转移一颗石头（输入箱槽0->输出箱槽0）并归零进度；`spin`/`intrude`特性分别供trap与越权测试。
@@ -29,7 +39,7 @@
 
 默认工作区`cargo test --workspace --all-targets` 400项通过；`cargo fmt`与`cargo clippy`（默认与`authority`/`component`特性组合）零告警。
 
-## 发现与决定
+### 发现与决定
 
 1. **跨模块原子性**：协调器强制组件编辑归属事务source，机器进度（机器schema）与库存转移（库存schema）必须分属两个事务。落地语义：一次计划->多个按来源拆分的事务，前置检查目标不相交，顺序prepare->publish；任何首个prepare拒绝即整计划丢弃，后续prepare在目标不相交下不可能因前序发布失效，若仍拒绝按不变量故障传播。设计文档DM02据此细化。
 2. **prepare捕获提交位置**：全部prepare后再publish会撞上"prepared change is not at the current commit position"不变量，必须每个事务prepare后立刻publish。
@@ -37,7 +47,13 @@
 4. **唤醒必须绑定对象**：派发需要self对象，唤醒登记与事件载荷携带实体身份。
 5. 首版计划至多一个转移；`plan_transfer`逐个转移产出事务，同对象多转移会因previous失效互相冲突，批量库存原语属A侧后续。
 
-## 已知边界
+## 复现
+
+未记录
+
+## 边界
+
+### 已知边界
 
 - 唤醒队列仍是进程内，不持久；等B6定时事件记录。
 - 库存槽位是嵌套List(Record)，不可过扁平atom边界；机器经`plan_transfer`原语操作库存，不直读槽位，嵌套表示仍为开放问题。

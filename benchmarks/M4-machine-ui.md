@@ -1,12 +1,28 @@
 # Minimal machine UI and authorized actions
 
+日期：[20261024]
+类型：验收
+状态：待复验
+环境：未记录
+范围：未记录
+
+## 目标
+
 Date: 2026-10-24. Environment: Windows, Rust 1.93.1, server `mods` feature.
 
 The B-side delivery provides a shared presentation model, authorized machine state,
+
 an existing inventory action binding, and durable block notifications. Graphical
+
 client integration remains pending; these results do not certify a rendered UI.
 
-## Implementation
+## 方法
+
+未记录
+
+## 结果
+
+### Implementation
 
 - `crates/mod_api/src/ui.rs` defines a fixed four-node description and rebuilds
   progress and inventory summaries from an authorized projection. Missing data
@@ -26,7 +42,7 @@ client integration remains pending; these results do not certify a rendered UI.
   `--machine-operators` demo policy grants machine and port access to every peer.
   It is a local scenario policy, without an authentication claim.
 
-## Reproduction
+### Reproduction
 
 Run at the repository root:
 
@@ -75,7 +91,7 @@ sets. Machine 3 showed progress 3/4, an empty input and one `base:stone` in outp
 After 100 ticks the server closed at durable sequence 1209. Reopening the same
 directory started epoch 2 at tick 100 and closed after two ticks at sequence 1233.
 
-## Limits
+### Limits
 
 The description is compiled for the example machine, rather than downloaded as
 an arbitrary package UI tree. Clients must load matching content and clear the
@@ -86,3 +102,11 @@ action place/break mutations, not arbitrary trusted or guest writes. Event count
 phase work and runtime budgets remain finite. Protocol, WIT and execution envelope
 versions remain unchanged; changed content compatibility digests reject old demo
 worlds without migration.
+
+## 复现
+
+未记录
+
+## 边界
+
+未记录

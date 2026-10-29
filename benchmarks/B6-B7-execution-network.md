@@ -1,8 +1,18 @@
 # B6持久执行与B7网络验收
 
-日期：2026-10-24。环境：Windows本地，Rust1.93.1，默认features，真实文件系统与回环TCP。范围是有限世界与同步日志的正确性，非性能承诺。
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：Windows本地，Rust1.93.1，默认features，真实文件系统与回环TCP
+范围：未记录
 
-## 入口
+## 目标
+
+范围是有限世界与同步日志的正确性，非性能承诺。
+
+## 方法
+
+### 入口
 
 ```sh
 cargo test -p torse-server --test execution --locked
@@ -37,7 +47,7 @@ RUSTDOCFLAGS=-D warnings下运行`cargo doc --workspace --no-deps --locked`。
 | 有界关闭 | 当前接纳请求结算后保存；截止范围外请求持久记录Stopping，未来事件保留 |
 | TCP边界 | 每poll只读写3字节时仍完整重组200字节帧；超大长度前缀拒绝；内存控制关闭清空未发数据 |
 
-## 可执行程序
+### 可执行程序
 
 ```sh
 cargo run -p torse-server -- .work/execution-world --listen 127.0.0.1:7777 --ticks 60
@@ -47,6 +57,10 @@ cargo run -p torse-server --example headless_client -- 127.0.0.1:7777
 第一条单独启动服务端，第二条在另一终端连接。--ticks 0表示持续运行，有限Tick完成后关闭并保存。演示使用只读访客策略。
 
 真实程序复跑结果：新目录运行2 Tick，epoch=1、初始tick=0、durable_seq=24；同目录重开再运行2 Tick，epoch=2、初始tick=2、durable_seq=48。另一次60 Tick运行完成到durable_seq=720，独立headless_client取得session=1、epoch=1、2个Section、2个实体、0个可见组件集合。基线序号随连接时点变化，此次为252。
+
+## 复现
+
+未记录
 
 ## 边界
 

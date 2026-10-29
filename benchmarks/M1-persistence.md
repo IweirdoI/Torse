@@ -1,16 +1,18 @@
 # 持久化场景记录
 
-日期：2026-10-23
+日期：[20261023]
+类型：验收
+状态：已验收
 环境：Windows 11 x86_64，Rust 1.93.1，debug profile
-状态：功能验收。命令内含断言，保存、读取、重放或续号回退时以非零状态退出。
+范围：未记录
 
-## 运行命令
+## 目标
 
-```sh
-cargo run -p torse-tools -- persistence-scenario
-```
+命令内含断言，保存、读取、重放或续号回退时以非零状态退出。
 
-## 场景内容
+## 方法
+
+### 场景内容
 
 以`WorldAuthority`装配世界，载入库存模块内容，装载`x`为-1、0的两个边长16的分区，铺设12格石头，生成两个带库存组件的实体，其中一个持有3个石头。
 
@@ -20,7 +22,9 @@ cargo run -p torse-tools -- persistence-scenario
 
 文件写在工作区`.work/persistence`下的独立目录，成功后逐个删除；失败时保留目录并在错误中给出路径。
 
-## 输出
+## 结果
+
+### 输出
 
 ```text
 snapshot_bytes=16907
@@ -35,7 +39,7 @@ loaded_equal=true
 recovered_equal=true
 ```
 
-## 判读
+### 判读
 
 - `snapshot_bytes=16907`：完整快照包裹的长度。两个稠密分区各占8192字节单元数据，其余为元数据、状态表与实体。
 - `states=1`：位置0时只放置了石头，玻璃半砖在之后的提交中写入，因此只出现在日志里。
@@ -44,7 +48,17 @@ recovered_equal=true
 - `recovered_equal`：快照加日志尾重建的世界与原世界的完整快照相等，覆盖单元、实体位置与库存组件，恢复位置一致。
 - `continued_seq=4`：重开的日志与恢复后的协调器从位置3继续，新提交得到位置4。
 
-## 未覆盖
+## 复现
+
+### 运行命令
+
+```sh
+cargo run -p torse-tools -- persistence-scenario
+```
+
+## 边界
+
+### 未覆盖
 
 - 服务端装配：本场景直接调用storage，未经过apps/server的HostAuthority与目录锁，属B6。
 - 格式兼容：世界格式版本1是M1临时格式，本场景写出的文件不作兼容承诺。

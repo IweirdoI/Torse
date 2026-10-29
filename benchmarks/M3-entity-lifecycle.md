@@ -1,8 +1,22 @@
 # 实体生命周期事务验证
 
-日期：2026-10-24。环境：Windows，Rust1.93.1，默认功能。
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：Windows，Rust1.93.1，默认功能
+范围：未记录
 
-## 范围
+## 目标
+
+未记录
+
+## 方法
+
+未记录
+
+## 结果
+
+### 范围
 
 Transaction新增spawns与despawns，生成请求不携带持久身份，准备阶段按当前水位与请求顺序提出身份。EntityLifecycle保存生成最终状态、销毁完整旧状态和前后分配水位，发布与恢复均先验证整组，再修改世界。
 
@@ -10,7 +24,7 @@ Transaction新增spawns与despawns，生成请求不携带持久身份，准备�
 
 生命周期入口供可信宿主使用。ActionService在目标和创建授权扩展前拒绝原生处理器返回生命周期事务。ActionOutput::Mutation改为持有Box<Transaction>，保持规划结果的小型枚举表示。完整Tick执行循环、定时事件、请求结果与去重仍待B6后续。
 
-## 验证
+### 验证
 
 ```sh
 cargo test -p torse-server --test world
@@ -38,7 +52,7 @@ Rustdoc检查使用RUSTDOCFLAGS=-D warnings，执行cargo doc --workspace --no-d
 
 本轮新增10项测试，工作区共366项通过，0失败；格式、Clippy与Rustdoc检查通过。生命周期专项样例包含初始嵌套组件和精确负零位置位模式。
 
-## 示例
+### 示例
 
 ```sh
 cargo run -p torse-server --example durable_world -- .work/lifecycle-world
@@ -47,3 +61,11 @@ cargo run -p torse-server --example durable_world -- .work/lifecycle-world
 在新目录连续运行三次，实体数量依次为1、0、1，next_entity_id依次为2、2、3。epoch、commit_seq和durable_seq均从1递增到3。销毁实体没有回退身份分配水位。
 
 世界格式写入版本升级为3，读取继续接受版本2快照与变更集。包裹版本仍为1，既有日志无需重写；旧程序不能读取新版本记录。文件分段回收、硬件断电与跨平台目录项持久性不属于本轮验收。
+
+## 复现
+
+未记录
+
+## 边界
+
+未记录

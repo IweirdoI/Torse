@@ -1,8 +1,18 @@
 # A7授权投影与复制源验证
 
-日期：2026-10-24。范围：A7正确性与A侧接口收尾，非完整M5联机验收。Windows本地，Rust1.93.1，默认features。
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：未记录
+范围：A7正确性与A侧接口收尾，非完整M5联机验收
 
-## 实现
+## 目标
+
+Windows本地，Rust1.93.1，默认features。
+
+## 方法
+
+### 实现
 
 - `crates/sim/src/replica.rs`：ReplicaSource独占WorldAuthority，基线与发布共用串行边界；按宿主scope、ActorContext目标授权及组件声明生成规范载荷。
 - 复用types的Viewer、Binding与泛型seed/batch包裹。领域载荷不包含私有组件、旧值或身份分配水位；地形符号附稳定内容字典。
@@ -10,20 +20,11 @@
 - Publication增加invalidated_replicas。撤权即时返回独立控制信号；超限清空订阅并在发布结果中通知，其他订阅和世界继续推进。
 - 库存container声明Authorized，请求参数声明仍为Private。只有宿主授予对象读取访问的Viewer取得实际嵌套槽位。
 
-接入与字段登记见设计仓库`contracts/04-authorized-replicas.md`。
+接入方式与字段由授权复制契约固定。
 
-## 复跑
+## 结果
 
-```sh
-cargo test -p torse-sim --test replica --locked
-cargo test -p torse-inventory --test transactions replica:: --locked
-cargo test --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-```
-
-Rustdoc使用`RUSTDOCFLAGS=-D warnings`执行`cargo doc --workspace --no-deps --locked`。本轮只格式化A侧修改的sim与inventory包；全仓格式检查也需要其他并行工作保持格式正确。
-
-## 场景与结果
+### 场景与结果
 
 16项sim专项测试与2项真实库存集成测试通过：
 
@@ -44,7 +45,22 @@ Rustdoc使用`RUSTDOCFLAGS=-D warnings`执行`cargo doc --workspace --no-deps --
 
 提交前合并A7与Mod平台P2复查：全工作区400项通过、0失败，其中A7新增18项。全仓格式、默认工作区Clippy与Mod宿主authority特性Clippy通过；P2真实权威机器5项测试通过。前轮警告视为失败的Rustdoc也已通过。测试记录是本地工作树证据，未运行远端CI。
 
-## 未覆盖
+## 复现
+
+### 复跑
+
+```sh
+cargo test -p torse-sim --test replica --locked
+cargo test -p torse-inventory --test transactions replica:: --locked
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+Rustdoc使用`RUSTDOCFLAGS=-D warnings`执行`cargo doc --workspace --no-deps --locked`。本轮只格式化A侧修改的sim与inventory包；全仓格式检查也需要其他并行工作保持格式正确。
+
+## 边界
+
+### 未覆盖
 
 没有网络编码、真实连接、分片重组、客户端协议实现或发送任务；DurableSeq门槛和B侧撤权清队列由B7接线，测试不宣称已验证真实网络撤权。当前LocalWorldModel仍无复制订阅。
 

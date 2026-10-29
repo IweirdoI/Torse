@@ -1,8 +1,18 @@
 # 内核一致性
 
-日期：2026-10-26。基线：`dd54abf`及本文描述的工作区改动。
+日期：[20261026]
+类型：验收
+状态：已验收
+环境：未记录
+范围：未记录
 
-## 实现行为
+## 目标
+
+基线：`dd54abf`及本文描述的工作区改动。
+
+## 方法
+
+### 实现行为
 
 持久世界快照与日志变更现在按组件持久策略筛选数据。Always保留，Never省略，OwnerDefined默认保留，所有者可在可信启动阶段选择省略。生命周期观察采用相同投影，包括检查点之后重放的销毁记录。无损交换与授权复制保持各自语义。持久投影为空时仍记录提交位置和执行结果。
 
@@ -12,23 +22,9 @@
 
 放置占用检查现在解析目标方块状态的实际碰撞形状，覆盖上半、下半以及半高形体补全后的完整形状。
 
-## 复现
+## 结果
 
-在仓库根目录执行：
-
-```powershell
-cargo test -p torse-content block_instance_schema_is_reserved_and_defaults_must_be_unique
-cargo test -p torse-sim --test core_consistency
-cargo test -p torse-server --test core_consistency
-cargo test -p torse-client attached_block_instances_do_not_add_entity_placeholder_geometry
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-$env:RUSTDOCFLAGS = '-D warnings'
-cargo doc --workspace --no-deps
-```
-
-## 验证结果
+### 验证结果
 
 Windows工作区验证通过606项测试，无忽略项。格式检查、禁止警告的Clippy及Rustdoc检查通过。新增覆盖横跨内容编译、模拟、持久执行和客户端几何；客户端测试直接比较生成的几何，不需要GPU。
 
@@ -48,6 +44,22 @@ Windows工作区验证通过606项测试，无忽略项。格式检查、禁止�
 | 客户端收到附属实例 | 地形及普通实体占位几何保持不变 |
 
 进程测试使用退出码74和75，重开实际日志和检查点目录，子进程不执行正常关闭流程。覆盖范围为进程终止，未验证硬件断电。
+
+## 复现
+
+在仓库根目录执行：
+
+```powershell
+cargo test -p torse-content block_instance_schema_is_reserved_and_defaults_must_be_unique
+cargo test -p torse-sim --test core_consistency
+cargo test -p torse-server --test core_consistency
+cargo test -p torse-client attached_block_instances_do_not_add_entity_placeholder_geometry
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+$env:RUSTDOCFLAGS = '-D warnings'
+cargo doc --workspace --no-deps
+```
 
 ## 边界
 

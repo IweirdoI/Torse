@@ -1,8 +1,18 @@
 # Mod机器原子持久执行
 
-日期：2026-10-24。范围：B9接入A9的TransactionGroup，补齐机器、库存与事件的共同提交及恢复。环境：Windows，Rust 1.93.1，文件日志与真实Wasm机器包。此记录不声明完整Mod平台、UI或硬件断电验收。
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：Windows，Rust 1.93.1，文件日志与真实Wasm机器包
+范围：B9接入A9的TransactionGroup，补齐机器、库存与事件的共同提交及恢复
 
-## 一、实现
+## 目标
+
+此记录不声明完整Mod平台、UI或硬件断电验收。
+
+## 方法
+
+### 一、实现
 
 WorkPlan.transaction改为`Option<TransactionGroup>`，单事务构造器包装为单成员组。FrozenTask保存组身份和按来源排列的StoredTransaction成员；执行宿主按组准备，经原有日志预留、发布、接纳和刷盘返回持久结果。机器完成加工时，自有组件修改与plan_transfer生成的库存成员在同一提交中生效，新唤醒随同一条执行记录保存。
 
@@ -12,7 +22,9 @@ WorkPlan.transaction改为`Option<TransactionGroup>`，单事务构造器包装�
 
 冻结任务字段保留标签0和标签1，新增标签2保存组。单成员旧字节保持不变，旧日志可以继续恢复；旧二进制不能读取含新标签的任务。布局见[执行格式](../crates/codec/EXECUTION.md)。
 
-## 二、验收
+## 结果
+
+### 二、验收
 
 | 场景 | 验证结果 |
 |---|---|
@@ -29,7 +41,9 @@ WorkPlan.transaction改为`Option<TransactionGroup>`，单事务构造器包装�
 
 真实进程退出使用子进程exit直接结束，不经过服务端关闭或对象析构；退出码分别验证命中目标位置。刷盘失败在文件日志后端同步前注入，不能代替真实断电或磁盘设备故障测试。
 
-## 三、复现
+## 复现
+
+### 三、复现
 
 ```sh
 cargo test -p torse-codec --test execution_groups --locked
@@ -40,3 +54,7 @@ cargo clippy --workspace --all-targets --features torse-server/mods --locked -- 
 ```
 
 全工作区启用torse-server/mods后494项通过、1项原有测试忽略，其中Mod持久执行11项、组编码3项通过。默认工作区466项通过；格式、全工作区Clippy与Rustdoc通过。回归中修正了既有清单测试对带反引号字段名的错误断言，并清理Mod工具及包测试的无效调用；这些调整不改变包格式或命令行为。
+
+## 边界
+
+未记录

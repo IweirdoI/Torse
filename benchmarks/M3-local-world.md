@@ -1,14 +1,28 @@
 # 真实世界持久化装配验证
 
-日期：2026-10-24。环境：Windows，Rust1.93.1，默认功能。
+日期：[20261024]
+类型：验收
+状态：已验收
+环境：Windows，Rust1.93.1，默认功能
+范围：未记录
 
-## 范围
+## 目标
+
+未记录
+
+## 方法
+
+未记录
+
+## 结果
+
+### 范围
 
 WorldHost与WorldHostRecovery把WorldAuthority、完整ChangeSet和WorldCodec接入服务端已有协调器、文件日志、检查点与目录锁。可信本地事务在固定Tick边界执行，可包含块编辑、碰撞解析后的实体移动和受保护组件修改。世界完全驻留，快照保留实体分配水位。
 
 本次属于B6的本地事务装配。Simulation执行循环、实体生成与销毁事务、持久事件、网络请求与去重结果、授权复制仍未接入，完整M3验收尚未完成。
 
-## 验证
+### 验证
 
 ```sh
 cargo test -p torse-server --test world
@@ -33,7 +47,7 @@ Rustdoc检查使用RUSTDOCFLAGS=-D warnings，执行cargo doc --workspace --no-d
 
 专项测试入口共8项，其中1项是子进程入口，7项为父进程验收场景。工作区共356项测试通过，0失败，格式、Clippy和Rustdoc检查通过。
 
-## 可运行示例
+### 可运行示例
 
 ```sh
 cargo run -p torse-server --example durable_world -- .work/local-world
@@ -43,3 +57,11 @@ cargo run -p torse-server --example durable_world -- .work/local-world
 在新目录执行时，首轮输出epoch=1、commit_seq=1、durable_seq=1，方块由空气变为石头。第二轮输出epoch=2、commit_seq=2、durable_seq=2，方块恢复后变回空气。输出中的运行时方块编号只用于本轮诊断，持久记录仍使用稳定内容身份。
 
 测试覆盖进程退出与文件恢复，未验证硬件断电或目录项的跨平台持久性。文件包裹版本仍为1，世界格式仍为2，本次未改动字节布局。
+
+## 复现
+
+未记录
+
+## 边界
+
+未记录

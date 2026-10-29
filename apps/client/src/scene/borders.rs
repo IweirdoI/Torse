@@ -104,6 +104,13 @@ mod tests {
         );
         assert_eq!(location([f32::NAN, 0.0, 0.0], 16), None);
         let grid = vertices([-0.1, 16.0, -16.1], 16);
+        assert_eq!(
+            grid.iter().map(|v| v.position).collect::<Vec<_>>(),
+            vertices([-0.9, 17.0, -17.0], 16)
+                .iter()
+                .map(|v| v.position)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(grid.len(), 288);
         assert_eq!(
             grid.iter().filter(|v| v.tint == [0.95, 0.5, 0.08]).count(),

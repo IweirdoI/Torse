@@ -1,5 +1,5 @@
 //! Owned generation/mesh inputs. Only the scene thread installs their results.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use torse_render::{Face, MeshBuildError, MeshJob, build_mesh_optimized_bounded};
 use torse_runtime::{
@@ -144,6 +144,7 @@ pub(super) struct Background {
     generating: BTreeMap<SectionPos, Generation>,
     meshing: BTreeMap<SectionPos, Meshing>,
     scanned: Option<Scan>,
+    dirty: BTreeSet<SectionPos>,
     stats: BackgroundStats,
     config: ExecutorConfig,
 }
@@ -155,6 +156,7 @@ impl Background {
             generating: BTreeMap::new(),
             meshing: BTreeMap::new(),
             scanned: None,
+            dirty: BTreeSet::new(),
             stats: BackgroundStats::default(),
             config,
         })
@@ -180,6 +182,7 @@ impl Background {
             generating: BTreeMap::new(),
             meshing: BTreeMap::new(),
             scanned: None,
+            dirty: BTreeSet::new(),
             stats: BackgroundStats::default(),
             config,
         })
@@ -220,28 +223,31 @@ impl Background {
         wanted: Vec<SectionPos>,
         budget: usize,
     ) -> Result<(), String> {
-        self.generating.retain(|pos, _| {
-            let keep = wanted.contains(pos);
-            if !keep {
-                scene.load_generations.remove(pos);
-                self.stats.cancelled += 1;
-            }
-            keep
-        });
-        for pos in scene.sections.clone() {
-            if !wanted.contains(&pos) {
-                if scene.authority.store().phase(pos).is_some() {
-                    scene
-                        .authority
-                        .store_mut()
-                        .unload(pos)
-                        .map_err(|e| e.to_string())?;
+        if scene.sections != wanted {
+            let membership: std::collections::BTreeSet<_> = wanted.iter().copied().collect();
+            self.generating.retain(|pos, _| {
+                let keep = membership.contains(pos);
+                if !keep {
+                    scene.load_generations.remove(pos);
+                    self.stats.cancelled += 1;
                 }
-                scene.forget_mesh(&pos);
-                scene.load_generations.remove(&pos);
+                keep
+            });
+            for pos in scene.sections.clone() {
+                if !membership.contains(&pos) {
+                    if scene.authority.store().phase(pos).is_some() {
+                        scene
+                            .authority
+                            .store_mut()
+                            .unload(pos)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    scene.forget_mesh(&pos);
+                    scene.load_generations.remove(&pos);
+                }
             }
+            scene.sections = wanted;
         }
-        scene.sections = wanted;
         self.cancel_old_meshes(scene);
         let generator = *scene.generator.as_ref().expect("local generator");
         let version = generator.generation_version();
@@ -373,6 +379,7 @@ impl Background {
             match result {
                 Ok((Output::Meshed(mesh), lease)) => {
                     scene.install_mesh(pos, task.stamp, mesh, lease);
+                    self.dirty.remove(&pos);
                     rebuilt.push(pos);
                 }
                 Err(JobError::Cancelled) => {}
@@ -397,6 +404,7 @@ impl Background {
         // Dynamic tint providers expose per-section revisions, so they must
         // retain the normal scan even when terrain and lighting are stable.
         if self.meshing.is_empty()
+            && self.dirty.is_empty()
             && scene.tint_provider.is_none()
             && self.scanned.as_ref().is_some_and(|scan| {
                 scan.assets == scene.asset_generation
@@ -408,29 +416,73 @@ impl Background {
         {
             return Ok(rebuilt);
         }
-        let mut clean = true;
+        let inputs = lighting::Inputs::capture(binding, scene);
+        let membership: BTreeSet<_> = scene.sections.iter().copied().collect();
+        self.dirty.retain(|pos| membership.contains(pos));
+        let changed = self
+            .scanned
+            .as_ref()
+            .and_then(|scan| scan.inputs.changed_sections(&inputs));
+        let all = self.scanned.as_ref().is_none_or(|scan| {
+            scan.assets != scene.asset_generation || scan.tint != scene.tint_provider_generation
+        }) || scene.tint_provider.is_some()
+            || changed.is_none();
+        if all {
+            self.dirty.extend(scene.sections.iter().copied());
+        } else {
+            let mut changed = changed.unwrap_or_default();
+            if let Some(lighting) = &scene.lighting {
+                changed.extend(
+                    lighting.changed_sections(self.scanned.as_ref().map_or(0, |scan| scan.light)),
+                );
+            }
+            for pos in changed {
+                for y in -1..=1 {
+                    for z in -1..=1 {
+                        for x in -1..=1 {
+                            if let Some(p) = pos
+                                .x
+                                .checked_add(x)
+                                .zip(pos.y.checked_add(y))
+                                .zip(pos.z.checked_add(z))
+                                .map(|((x, y), z)| SectionPos::new(x, y, z))
+                                && membership.contains(&p)
+                            {
+                                self.dirty.insert(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.dirty.extend(
+            scene
+                .sections
+                .iter()
+                .copied()
+                .filter(|pos| !scene.meshes.contains_key(pos)),
+        );
         let mut admitted = 0;
         for pos in scene.sections.clone() {
             if admitted >= budget {
-                clean = false;
                 break;
             }
-            let stamp = MeshStamp::capture(scene, pos);
-            if stamp.terrain.section_revision.is_none() {
+            if !self.dirty.contains(&pos) || ready_revision(scene.authority.store(), pos).is_none()
+            {
                 continue;
             }
             if self.meshing.contains_key(&pos) {
-                clean = false;
                 continue;
             }
+            let stamp = MeshStamp::capture(scene, pos);
             if scene
                 .meshes
                 .get(&pos)
                 .is_some_and(|(previous, _)| previous == &stamp)
             {
+                self.dirty.remove(&pos);
                 continue;
             }
-            clean = false;
             let side = scene.side as usize;
             let max_faces = side.pow(3) * 6;
             // Geometry, two per-vertex tint channels, indices, and two slots.
@@ -487,17 +539,13 @@ impl Background {
             self.meshing.insert(pos, Meshing { stamp, job });
             admitted += 1;
         }
-        self.scanned = if clean && self.meshing.is_empty() && scene.tint_provider.is_none() {
-            Some(Scan {
-                inputs: lighting::Inputs::capture(binding, scene),
-                assets: scene.asset_generation,
-                tint: scene.tint_provider_generation,
-                light,
-                meshes: scene.meshes.len(),
-            })
-        } else {
-            None
-        };
+        self.scanned = Some(Scan {
+            inputs,
+            assets: scene.asset_generation,
+            tint: scene.tint_provider_generation,
+            light,
+            meshes: scene.meshes.len(),
+        });
         Ok(rebuilt)
     }
 }

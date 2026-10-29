@@ -81,6 +81,7 @@ pub struct WindowConfig {
     pub autoplay: bool,
     /// Ignore interactive input and leave the cursor free during finite measurement.
     pub benchmark: bool,
+    pub benchmark_motion: Option<crate::camera::BenchmarkMotion>,
     /// Start in walk mode with a player entity on the ground.
     pub walk: bool,
     /// Connect to a standalone server and mirror its authorized projection.
@@ -228,6 +229,7 @@ struct WindowApp {
     fps_frames: u32,
     frame_total_us: u128,
     benchmark_mark_us: u128,
+    benchmark_stages: [u128; 4],
     frame_max_us: u128,
     frame_count: u32,
     streams_mark: usize,
@@ -316,6 +318,7 @@ impl WindowApp {
             fps_frames: 0,
             frame_total_us: 0,
             benchmark_mark_us: 0,
+            benchmark_stages: [0; 4],
             frame_max_us: 0,
             frame_count: 0,
             streams_mark: 0,
@@ -462,6 +465,14 @@ impl WindowApp {
             return;
         }
 
+        if let Some(motion) = self.config.benchmark_motion {
+            let eye = motion.eye(self.frames);
+            if let Some(camera) = self.camera.as_mut() {
+                camera.eye = eye;
+            }
+            self.present_prev = eye;
+            self.present_next = eye;
+        }
         let center = self
             .scene
             .as_ref()
@@ -487,6 +498,7 @@ impl WindowApp {
             self.center = None;
         }
 
+        let streamed_at = Instant::now();
         // Resolve the aim from the fresh camera, translate clicks and the
         // autoplay demo into place or break intents, and commit them before
         // this frame's meshes are captured.
@@ -647,6 +659,7 @@ impl WindowApp {
             gpu.context.write_borders(&borders);
         }
 
+        let meshing_at = Instant::now();
         let rebuilt = match self
             .scene
             .as_mut()
@@ -661,6 +674,7 @@ impl WindowApp {
             }
         };
         self.rebuilds += rebuilt.len();
+        let meshed_at = Instant::now();
         self.pending_uploads.extend(rebuilt);
         let scene = self.scene.as_ref().expect("camera implies scene");
         if let Some(gpu) = self.gpu.as_mut() {
@@ -704,8 +718,8 @@ impl WindowApp {
             false
         };
         let scene = self.scene.as_ref().expect("active scene");
-        self.pending_uploads
-            .retain(|p| scene.sections().contains(&p));
+        let interest: std::collections::BTreeSet<_> = scene.sections().iter().copied().collect();
+        self.pending_uploads.retain(|p| interest.contains(&p));
         let uploads = match self.pending_uploads.select_where(
             center,
             self.work_budget.limits(),
@@ -777,13 +791,7 @@ impl WindowApp {
                 scene.surface_section_uploaded(pos);
             }
         }
-        // Unloaded sections must stop drawing even when nothing rebuilt this
-        // frame; retention is cheap and the entity slot survives it.
-        if let Some(gpu) = self.gpu.as_mut()
-            && let Some(scene) = self.scene.as_ref()
-        {
-            gpu.context.retain_sections(scene.sections());
-        }
+        let uploaded_at = Instant::now();
         // Belt and braces: some focus transitions skip the Focused event, and
         // a captured look with no focus moves the camera from outside.
         if self.grabbed
@@ -799,11 +807,21 @@ impl WindowApp {
             self.pending_shot = Some(format!("torse-shot-{}.png", self.screenshots + 1));
         }
 
+        if self.config.benchmark {
+            for (sum, elapsed) in self.benchmark_stages.iter_mut().zip([
+                streamed_at.duration_since(frame_started),
+                meshed_at.duration_since(meshing_at),
+                uploaded_at.duration_since(meshed_at),
+            ]) {
+                *sum += elapsed.as_micros();
+            }
+        }
         self.draw(event_loop, &names, frame_started);
     }
 
     /// Present one frame. This does not pump logic steps.
     fn draw(&mut self, event_loop: &ActiveEventLoop, names: &[String], frame_started: Instant) {
+        let draw_started = Instant::now();
         let frame = match self.gpu.as_mut() {
             Some(gpu) => match gpu.surface.get_current_texture() {
                 CurrentSurfaceTexture::Success(frame)
@@ -895,6 +913,9 @@ impl WindowApp {
         queue.present(frame);
 
         let frame_us = frame_started.elapsed().as_micros();
+        if self.config.benchmark {
+            self.benchmark_stages[3] += draw_started.elapsed().as_micros();
+        }
         self.work_budget
             .observe(frame_us.min(u128::from(u64::MAX)) as u64);
         self.frame_total_us += frame_us;
@@ -919,6 +940,14 @@ impl WindowApp {
                 (self.frame_total_us - self.benchmark_mark_us) / 300
             );
             self.benchmark_mark_us = self.frame_total_us;
+            eprintln!(
+                "benchmark_stages_us stream={} mesh={} upload={} draw={}",
+                self.benchmark_stages[0] / 300,
+                self.benchmark_stages[1] / 300,
+                self.benchmark_stages[2] / 300,
+                self.benchmark_stages[3] / 300
+            );
+            self.benchmark_stages.fill(0);
         }
         self.fps_frames += 1;
         let title_span = self.fps_origin.elapsed().as_secs_f32();
@@ -936,7 +965,7 @@ impl WindowApp {
                     format!(
                         "FPS: {} | frame: {:.2} ms",
                         self.current_fps,
-                        frame_us as f64 / 1000.0
+                        f64::from(title_span) * 1000.0 / f64::from(self.fps_frames.max(1))
                     ),
                     format!(
                         "sections: {} | meshes: {}",
@@ -950,6 +979,12 @@ impl WindowApp {
                     format!(
                         "GPU geometry: {:.1} MiB",
                         gpu.context.geometry_usage().bytes as f64 / (1024.0 * 1024.0)
+                    ),
+                    format!(
+                        "GPU sections: {} | visible: {} | evictions: {}",
+                        gpu.context.geometry_usage().sections,
+                        gpu.context.draw_stats().visible_sections,
+                        gpu.context.geometry_usage().evictions
                     ),
                     format!("position: {:.1}, {:.1}, {:.1}", eye[0], eye[1], eye[2]),
                     scene
@@ -2354,6 +2389,7 @@ mod tests {
             screenshot: None,
             autoplay: false,
             benchmark: false,
+            benchmark_motion: None,
             walk: false,
             connect: None,
             sensitivity: 1.0,

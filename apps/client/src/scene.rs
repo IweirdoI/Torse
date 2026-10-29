@@ -110,6 +110,7 @@ pub struct Scene {
     /// a neighbour edit is detected by validating this stored job.
     meshes: BTreeMap<SectionPos, (MeshStamp, MeshData)>,
     sections: Vec<SectionPos>,
+    stream_interest: Option<(SectionPos, i64, i64)>,
     epoch: WorldEpoch,
     asset_generation: u64,
     next_load_generation: u64,
@@ -269,6 +270,7 @@ impl Scene {
             lighting: None,
             surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
+            stream_interest: None,
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
             next_load_generation: 1,
@@ -324,6 +326,7 @@ impl Scene {
             lighting: None,
             surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
+            stream_interest: None,
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
             next_load_generation: 1,
@@ -897,10 +900,18 @@ impl Scene {
         if self.generator.is_none() && self.layered.is_none() {
             return Ok(());
         }
-        let wanted = self.wanted_sections(center)?;
+        let interest = (center, self.radius, self.layers);
+        let wanted = if self.stream_interest == Some(interest) {
+            self.sections.clone()
+        } else {
+            self.wanted_sections(center)?
+        };
         if let Some(mut background) = self.background.take() {
             let result = background.stream(self, wanted, budget);
             self.background = Some(background);
+            if result.is_ok() {
+                self.stream_interest = Some(interest);
+            }
             self.reconcile_world_memory(None)
                 .map_err(|error| error.to_string())?;
             return result;
@@ -938,8 +949,9 @@ impl Scene {
                 }
             }
         }
+        let membership: std::collections::BTreeSet<_> = wanted.iter().copied().collect();
         for pos in self.sections.clone() {
-            if !wanted.contains(&pos) {
+            if !membership.contains(&pos) {
                 if self.authority.store().phase(pos).is_some() {
                     self.authority
                         .store_mut()
@@ -951,6 +963,7 @@ impl Scene {
             }
         }
         self.sections = wanted;
+        self.stream_interest = Some(interest);
         self.reconcile_world_memory(None)
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -1149,6 +1162,7 @@ impl Scene {
             lighting: None,
             surfaces: surfaces::Previews::default(),
             sections: Vec::new(),
+            stream_interest: None,
             epoch: scene_epoch()?,
             asset_generation: palette.asset_generation(),
             next_load_generation: 1,

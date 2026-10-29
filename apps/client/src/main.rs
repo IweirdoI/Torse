@@ -31,6 +31,7 @@ const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
                         [--screenshot <png>] [--autoplay] [--sensitivity F] [--fps-limit 30..1000]\n\
                         [--benchmark; requires --frames] [--ui-preview hud|pause|machine|settings|inventory]\n\
+                        [--benchmark-motion stationary|local|travel]\n\
                         [--settings-tab debug|gameplay|graphics|controls|ui]\n\
                         [--connect ADDRESS] [--walk] [--section X,Y,Z]...\n\
                         [--tls-ca PEM --tls-cert PEM --tls-key PEM --server-name DNS]\n\
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
     let mut screenshot: Option<String> = None;
     let mut autoplay = false;
     let mut benchmark = false;
+    let mut benchmark_motion = None;
     let mut walk = false;
     let mut connect: Option<String> = None;
     let mut sensitivity = None;
@@ -100,6 +102,17 @@ fn main() -> ExitCode {
             "--screenshot" => screenshot = value(),
             "--autoplay" => autoplay = true,
             "--benchmark" => benchmark = true,
+            "--benchmark-motion" => {
+                benchmark_motion = match value().as_deref() {
+                    Some("stationary") => Some(camera::BenchmarkMotion::Stationary),
+                    Some("local") => Some(camera::BenchmarkMotion::Local),
+                    Some("travel") => Some(camera::BenchmarkMotion::Travel),
+                    _ => {
+                        eprintln!("--benchmark-motion requires stationary, local or travel");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            }
             "--walk" => walk = true,
             "--connect" => connect = value(),
             "--content" => content = value(),
@@ -226,6 +239,10 @@ fn main() -> ExitCode {
             eprintln!("--benchmark requires a positive --frames count");
             return ExitCode::FAILURE;
         }
+        if benchmark_motion.is_some() && (!benchmark || walk || connect.is_some() || autoplay) {
+            eprintln!("--benchmark-motion requires a local fly benchmark without autoplay");
+            return ExitCode::FAILURE;
+        }
         let mut preferences = match settings::Settings::load(&settings::Settings::path()) {
             Ok(value) => value,
             Err(error) => {
@@ -263,6 +280,7 @@ fn main() -> ExitCode {
             screenshot,
             autoplay,
             benchmark,
+            benchmark_motion,
             walk,
             connect,
             probe_outside,

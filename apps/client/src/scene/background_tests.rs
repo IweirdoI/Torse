@@ -171,6 +171,31 @@ fn stable_scan_rebuilds_after_eviction_and_terrain_change() {
 }
 
 #[test]
+fn sparse_validation_tracks_diagonal_halo_arrivals_and_reload_generations() {
+    let mut scene = Scene::new(0).unwrap();
+    scene.generator = None;
+    scene.enable_lighting().unwrap();
+    scene.enable_background(config(1, 2)).unwrap();
+    drain_meshes(&mut scene);
+    let admitted = scene.background_stats().admitted;
+    let diagonal = SectionPos::new(1, 0, 1);
+    scene
+        .install_generated(diagonal, Section::empty(16).unwrap())
+        .unwrap();
+    drain_meshes(&mut scene);
+    assert!(scene.background_stats().admitted > admitted);
+    let load = scene.load_generations[&diagonal];
+    let admitted = scene.background_stats().admitted;
+    scene.authority.store_mut().unload(diagonal).unwrap();
+    scene
+        .install_generated(diagonal, Section::empty(16).unwrap())
+        .unwrap();
+    assert!(scene.load_generations[&diagonal] > load);
+    drain_meshes(&mut scene);
+    assert!(scene.background_stats().admitted > admitted);
+}
+
+#[test]
 fn one_and_four_workers_match_serial_generation_and_meshes_under_backpressure() {
     let mut reference = Scene::new(1).unwrap();
     reference.refresh_meshes();

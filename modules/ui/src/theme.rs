@@ -26,6 +26,8 @@ pub enum Part {
     Close,
     CloseHover,
     Crosshair,
+    /// Optional title band; omitted by older skins.
+    Title,
 }
 const PARTS: [Part; 18] = [
     Part::Window,
@@ -105,7 +107,14 @@ impl Theme {
             AssetGuid(0x746f7273655f75695f736b696e000001),
         )
     }
-    /// Parse a bounded atlas and require exactly one region for every role.
+    pub fn load_blue() -> Result<Self, String> {
+        Self::from_png(
+            include_bytes!("../assets/blue.png"),
+            include_str!("../assets/blue.toml"),
+            AssetGuid(0x746f7273655f75695f736b696e000002),
+        )
+    }
+    /// Require all base roles once, with an optional title band.
     pub fn from_png(png: &[u8], manifest: &str, guid: AssetGuid) -> Result<Self, String> {
         if png.len() > 8 * 1024 * 1024 || manifest.len() > 32 * 1024 {
             return Err("UI skin source exceeds its budget".into());
@@ -115,7 +124,7 @@ impl Theme {
             || description.height == 0
             || description.width > 1024
             || description.height > 1024
-            || description.regions.len() != PARTS.len()
+            || !(PARTS.len()..=PARTS.len() + 1).contains(&description.regions.len())
         {
             return Err("invalid UI skin dimensions or roles".into());
         }
@@ -143,7 +152,9 @@ impl Theme {
         self.atlas.attach_memory(memory)
     }
     pub fn paint(&self, canvas: &mut Canvas, part: Part, rect: Rect) {
-        let region = &self.regions[&part];
+        let Some(region) = self.regions.get(&part) else {
+            return;
+        };
         canvas.sprite_region(
             &self.atlas,
             Rect::new(
@@ -210,6 +221,26 @@ impl Theme {
 mod tests {
     use super::*;
     use torse_types::{MemoryBudget, MemoryPool};
+    #[test]
+    fn blue_skin_changes_controls_and_optional_title_preserves_legacy_skins() {
+        let dark = Theme::load_default().unwrap();
+        let blue = Theme::load_blue().unwrap();
+        let mut a = Canvas::new(40, 40, 1);
+        let mut b = Canvas::new(40, 40, 1);
+        let rect = Rect::new(0, 0, 40, 40);
+        dark.paint(&mut a, Part::Title, rect);
+        assert!(a.as_pixels().iter().all(|v| *v == 0));
+        blue.paint(&mut b, Part::Title, rect);
+        assert!(b.as_pixels().chunks_exact(4).all(|p| p[2] > p[0]));
+        dark.button(&mut a, rect, false, false);
+        blue.button(&mut b, rect, false, false);
+        assert_ne!(a.as_pixels(), b.as_pixels());
+        let invalid =
+            include_str!("../assets/blue.toml").replace("part = \"title\"", "part = \"window\"");
+        assert!(
+            Theme::from_png(include_bytes!("../assets/blue.png"), &invalid, AssetGuid(1)).is_err()
+        );
+    }
     #[test]
     fn custom_skin_changes_rendering_and_releases_its_shared_reservation() {
         let mut bytes = Vec::new();

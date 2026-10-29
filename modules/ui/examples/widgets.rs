@@ -4,10 +4,15 @@ use torse_ui::{Canvas, Control, Part, Pointer, Rect, Text, Theme};
 fn run() -> Result<(), String> {
     let path = std::env::args()
         .nth(1)
-        .ok_or("usage: widgets <output.png>")?;
-    let theme = Theme::load_default()?;
+        .ok_or("usage: widgets <output.png> [dark|blue]")?;
+    let theme = match std::env::args().nth(2).as_deref() {
+        None | Some("dark") => Theme::load_default()?,
+        Some("blue") => Theme::load_blue()?,
+        _ => return Err("skin must be dark or blue".into()),
+    };
     let mut canvas = Canvas::try_new(320, 160, 2, None)?;
     theme.paint(&mut canvas, Part::Window, Rect::new(0, 0, 320, 160));
+    theme.paint(&mut canvas, Part::Title, Rect::new(1, 1, 318, 26));
     theme.button(&mut canvas, Rect::new(16, 36, 288, 24), true, false);
     theme.checkbox(&mut canvas, Rect::new(16, 76, 14, 14), true);
     theme.paint(&mut canvas, Part::Track, Rect::new(16, 108, 288, 14));

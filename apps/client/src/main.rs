@@ -31,7 +31,7 @@ const USAGE: &str = "usage: torse-client --capture <png> [--width N] [--height N
        torse-client --window [--width N] [--height N] [--radius N] [--frames N]\n\
                         [--screenshot <png>] [--autoplay] [--sensitivity F] [--fps-limit 30..1000]\n\
                         [--benchmark; requires --frames] [--ui-preview hud|pause|machine|settings|inventory]\n\
-                        [--settings-tab debug|gameplay|graphics|controls]\n\
+                        [--settings-tab debug|gameplay|graphics|controls|ui]\n\
                         [--connect ADDRESS] [--walk] [--section X,Y,Z]...\n\
                         [--tls-ca PEM --tls-cert PEM --tls-key PEM --server-name DNS]\n\
        both modes accept [--memory-mib N; default 512] [--gpu-memory-mib N; default 64] and [--content <dir>] to load a data-driven pack (atlas.toml,\n\
@@ -153,8 +153,11 @@ fn main() -> ExitCode {
                     Some("gameplay") => settings::Tab::Gameplay,
                     Some("graphics") => settings::Tab::Graphics,
                     Some("controls") => settings::Tab::Controls,
+                    Some("ui") => settings::Tab::Interface,
                     _ => {
-                        eprintln!("--settings-tab requires debug, gameplay, graphics or controls");
+                        eprintln!(
+                            "--settings-tab requires debug, gameplay, graphics, controls or ui"
+                        );
                         return ExitCode::FAILURE;
                     }
                 };
@@ -238,6 +241,9 @@ fn main() -> ExitCode {
         }
         if let Some(fps) = fps_limit {
             preferences.frame_limit = frame_pacing::FrameLimit { enabled: true, fps };
+        }
+        if std::env::var_os("TORSE_UI_SKIN").is_some() {
+            preferences.skin = settings::SkinChoice::External;
         }
         if let Err(error) = preferences.validate() {
             eprintln!("client settings failed: {error}");

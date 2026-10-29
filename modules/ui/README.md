@@ -26,22 +26,24 @@ torse-ui = { path = "modules/ui", default-features = false }
 
 ## 贴图与默认皮肤
 
-默认皮肤为紧凑的IMGUI风格，包括窗口、分组、按钮三态、字段、槽位、进度、复选框、滑块、关闭图标和准星。PNG与TOML描述位于[assets](assets)，全部像素由仓内脚本原创生成，采用本仓库GPL-3.0-only许可。重建命令：
+内置紧凑深色和蓝色面板两种皮肤，均为IMGUI风格，包括窗口、分组、按钮三态、字段、槽位、进度、复选框、滑块、关闭图标和准星。蓝色面板使用黑灰底、蓝色标题带及控件。PNG与TOML描述位于[assets](assets)，全部像素由仓内脚本原创生成，采用本仓库GPL-3.0-only许可。重建命令：
 
 ```sh
 python modules/ui/assets/make-skin.py
 ```
 
-`Theme::from_png`接受PNG字节、TOML区域描述和宿主资源标识。每个角色恰好声明一次，区域可以重新排布，九宫格边距保留边角并拉伸中部。文字不在图集中，便于本地化和自定义字体。
+`Theme::load_default()`加载紧凑深色，`Theme::load_blue()`加载蓝色面板。`Theme::from_png`接受PNG字节、TOML区域描述和宿主资源标识。18个基础角色各声明一次，可额外声明一个`title`角色绘制标题带；旧描述无需补充该角色，调用时不绘制。区域可以重新排布，九宫格边距保留边角并拉伸中部。文字不在图集中，便于本地化和自定义字体。[20261029]
 
-`Theme::load_dir`读取目录中的`default.png`与`default.toml`。客户端默认使用此库，设置`TORSE_UI_SKIN`后可加载自己的皮肤目录；命名保留为这两个文件，图像和区域内容均可替换：
+公开枚举`Part`新增`Title`变体，宿主若对该枚举做完整匹配，需要补充分支；旧18角色贴图描述保持兼容。
+
+`Theme::load_dir`读取目录中的`default.png`与`default.toml`。客户端在设置的“界面”页选择内置皮肤并保存偏好，设置`TORSE_UI_SKIN`后启动时优先加载该目录，也可在游戏内切回内置皮肤；目录文件命名保留为这两个名称，图像和区域内容均可替换：
 
 ```powershell
 $env:TORSE_UI_SKIN = ".work/my-ui"
 cargo run --release -p torse-client -- --window
 ```
 
-非法皮肤在构建时返回错误，不以部分角色覆盖已有皮肤。准备好新的`Theme`后再交给界面，可以保持替换原子性。
+非法皮肤在构建时返回错误，不以部分角色覆盖已有皮肤。客户端替换前完成解码和预算申请，失败保留当前主题和选择；启动时没有可用旧主题则回到内置深色并显示原因。环境变量每次启动优先于保存值，移除后使用保存的选择。
 
 ## 预算与生命周期
 
@@ -56,6 +58,7 @@ cargo test -p torse-ui --locked
 cargo test -p torse-ui --no-default-features --locked
 cargo test -p torse-client --features gpu-tests --locked
 cargo run -p torse-ui --no-default-features --example widgets -- .work/ui-preview.png
+cargo run -p torse-ui --no-default-features --example widgets -- .work/ui-blue.png blue
 ```
 
 回归覆盖九宫格边角、缩放、匹配释放、拖动与取消、自定义贴图生效、非法区域、预算拒绝及生命周期归零。客户端保留场景装配与具体界面内容，不保留私有画布、字体、GPU叠加层或控件捕获实现。

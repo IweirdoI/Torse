@@ -15,6 +15,10 @@ impl WindowApp {
             Action::Toggle(option) => self.ui.settings.toggle(option),
             Action::Value(option, value) => self.ui.settings.set(option, value),
             Action::Rebind(binding) => self.ui.rebinding = Some(binding),
+            Action::Skin(choice) => {
+                self.ui.settings.skin = choice;
+                self.last_result.clear();
+            }
             Action::ResetSettings => {
                 self.ui.settings = Settings::default();
                 self.ui.rebinding = None;
@@ -39,6 +43,10 @@ impl WindowApp {
             scene.set_view_radius(i64::from(self.ui.settings.radius));
         }
         if let Some(gpu) = self.gpu.as_mut() {
+            if let Err(error) = gpu.ui.select_skin(self.ui.settings.skin) {
+                self.ui.settings.skin = gpu.ui.skin_choice();
+                self.last_result = format!("UI skin load failed: {error}");
+            }
             let selected = if self.ui.settings.vsync {
                 wgpu::PresentMode::Fifo
             } else if gpu.present_modes.contains(&wgpu::PresentMode::Immediate) {
@@ -125,5 +133,16 @@ mod tests {
         scene.stream_around(SectionPos::ZERO, 9).unwrap();
         assert_eq!(scene.sections().len(), 9);
         assert_eq!(scene.authority().seq(), before);
+    }
+
+    #[test]
+    fn skin_action_replaces_an_old_error_and_reset_restores_the_default() {
+        let mut app = super::super::tests::app();
+        app.last_result = "previous skin load failed".into();
+        assert!(app.settings_action(crate::ui::Action::Skin(crate::settings::SkinChoice::Blue)));
+        assert_eq!(app.ui.settings.skin, crate::settings::SkinChoice::Blue);
+        assert!(app.last_result.is_empty());
+        assert!(app.settings_action(crate::ui::Action::ResetSettings));
+        assert_eq!(app.ui.settings.skin, crate::settings::SkinChoice::Dark);
     }
 }

@@ -3,7 +3,7 @@
 //! authoritative mutation.
 use torse_ui::{canvas, gpu, style};
 
-use crate::settings::{Binding, OptionId, Settings, Tab};
+use crate::settings::{Binding, OptionId, Settings, SkinChoice, Tab};
 use canvas::{Canvas, Rect, Sprite, Text};
 use gpu::Overlay;
 use std::collections::BTreeMap;
@@ -11,6 +11,7 @@ use style::{MUTED, SEPARATOR, TEXT, TITLE_TEXT};
 use torse_ui::{Part, Theme};
 mod inventory;
 mod settings;
+mod themes;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -50,6 +51,7 @@ pub enum Action {
     Rebind(Binding),
     ResetSettings,
     Slot(usize),
+    Skin(SkinChoice),
 }
 
 #[derive(Default)]
@@ -307,6 +309,8 @@ pub struct Layer {
     labels: BTreeMap<&'static str, &'static str>,
     last: Option<View>,
     theme: Theme,
+    selected_skin: SkinChoice,
+    external_skin: Option<std::path::PathBuf>,
     memory: Option<torse_types::MemoryPool>,
 }
 pub struct Hud<'a> {
@@ -347,6 +351,18 @@ impl Layer {
                 "/../../games/base/assets/locales/en.txt"
             ))
         };
+        let external_skin = std::env::var_os("TORSE_UI_SKIN").map(std::path::PathBuf::from);
+        let mut selected_skin = if external_skin.is_some() {
+            SkinChoice::External
+        } else {
+            SkinChoice::Dark
+        };
+        let theme =
+            themes::load(selected_skin, external_skin.as_deref(), None).or_else(|error| {
+                eprintln!("UI skin load failed: {error}; using the built-in dark skin");
+                selected_skin = SkinChoice::Dark;
+                Theme::load_default()
+            })?;
         Ok(Self {
             overlay: Overlay::new(device, format),
             skin: Skin::load()?,
@@ -357,11 +373,9 @@ impl Layer {
                 .collect(),
             last: None,
             memory: None,
-            theme: if let Some(directory) = std::env::var_os("TORSE_UI_SKIN") {
-                Theme::load_dir(std::path::Path::new(&directory))?
-            } else {
-                Theme::load_default()?
-            },
+            theme,
+            selected_skin,
+            external_skin,
         })
     }
     pub fn prepare(
@@ -493,6 +507,11 @@ impl Layer {
         c.fill(Rect::new(0, 0, l.width, l.height), [8, 9, 11, 130]);
         let p = l.panel(v.mode);
         self.theme.paint(c, Part::Window, p);
+        self.theme.paint(
+            c,
+            Part::Title,
+            Rect::new(p.x + 1, p.y + 1, p.w.saturating_sub(2), 20),
+        );
         let title = if v.mode == Mode::Inventory {
             "inventory_title"
         } else if v.mode == Mode::Settings {
@@ -534,7 +553,8 @@ impl Layer {
                 rect,
                 v.hover == Some(action),
                 (v.pressed == Some(action) && v.hover == Some(action))
-                    || action == Action::SettingsTab(v.tab),
+                    || action == Action::SettingsTab(v.tab)
+                    || action == Action::Skin(v.settings.skin),
             );
             if action == Action::ToggleFrameLimit {
                 self.theme.checkbox(
@@ -857,7 +877,13 @@ mod tests {
     fn settings_buttons_are_reachable_on_every_tab_and_scale() {
         for size in [[640, 360], [960, 540], [1920, 1080]] {
             let layout = Layout::new(size);
-            for tab in [Tab::Debug, Tab::Gameplay, Tab::Graphics, Tab::Controls] {
+            for tab in [
+                Tab::Debug,
+                Tab::Gameplay,
+                Tab::Graphics,
+                Tab::Controls,
+                Tab::Interface,
+            ] {
                 let mut state = State {
                     mode: Mode::Settings,
                     tab,

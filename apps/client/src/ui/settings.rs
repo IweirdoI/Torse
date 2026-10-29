@@ -4,12 +4,13 @@ use super::*;
 impl Layout {
     pub(super) fn settings_buttons(&self, tab: Tab) -> Vec<(Action, Rect, &'static str)> {
         let p = self.panel(Mode::Settings);
-        let width = p.w.saturating_sub(24) / 4;
+        let width = p.w.saturating_sub(24) / 5;
         let mut buttons: Vec<_> = [
             (Tab::Debug, "settings_debug"),
             (Tab::Gameplay, "settings_gameplay"),
             (Tab::Graphics, "settings_graphics"),
             (Tab::Controls, "settings_controls"),
+            (Tab::Interface, "settings_ui"),
         ]
         .into_iter()
         .enumerate()
@@ -48,6 +49,11 @@ impl Layout {
             Tab::Graphics => {
                 row(0, Action::Toggle(OptionId::Vsync), "settings_vsync");
                 row(1, Action::ToggleFrameLimit, "menu_frame_limit");
+            }
+            Tab::Interface => {
+                row(0, Action::Skin(SkinChoice::Dark), "skin_dark");
+                row(1, Action::Skin(SkinChoice::Blue), "skin_blue");
+                row(2, Action::Skin(SkinChoice::External), "skin_external");
             }
             Tab::Controls => {
                 let column = p.w.saturating_sub(28) / 2;
@@ -149,12 +155,19 @@ impl Layer {
                 Rect::new(x, rect.y + 1, 8, rect.h.saturating_sub(2)),
             );
         }
-        if view.tab == Tab::Controls {
+        if matches!(view.tab, Tab::Controls | Tab::Interface) {
             let p = layout.panel(Mode::Settings);
             let hint = if !view.result.is_empty() {
                 view.result.as_str()
             } else {
-                self.labels.get("bind_hint").copied().unwrap_or("?")
+                self.labels
+                    .get(if view.tab == Tab::Controls {
+                        "bind_hint"
+                    } else {
+                        "skin_hint"
+                    })
+                    .copied()
+                    .unwrap_or("?")
             };
             self.text.draw(
                 canvas,

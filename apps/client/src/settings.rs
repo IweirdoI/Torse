@@ -11,6 +11,16 @@ pub enum Tab {
     #[default]
     Graphics,
     Controls,
+    Interface,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkinChoice {
+    #[default]
+    Dark,
+    Blue,
+    External,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptionId {
@@ -158,6 +168,7 @@ pub struct Settings {
     pub fly_speed: u16,
     pub sensitivity: u16,
     pub bindings: Bindings,
+    pub skin: SkinChoice,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -176,6 +187,7 @@ impl Default for Settings {
             fly_speed: 12,
             sensitivity: 100,
             bindings: Bindings::default(),
+            skin: SkinChoice::default(),
         }
     }
 }
@@ -339,12 +351,17 @@ mod tests {
 
     #[test]
     fn preference_replacement_is_complete_and_rejected_values_preserve_previous_bytes() {
+        assert_eq!(
+            toml::from_str::<Settings>("version=2").unwrap().skin,
+            SkinChoice::Dark
+        );
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.work");
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("settings-roundtrip-{}.toml", std::process::id()));
         let mut settings = Settings::default();
         settings.save(&path).unwrap();
         settings.fov = 90;
+        settings.skin = SkinChoice::Blue;
         settings
             .bindings
             .rebind(Binding::Forward, KeyCode::KeyZ)
